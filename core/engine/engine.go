@@ -58,18 +58,18 @@ func (e *Engine) Start(profileJSON string) error {
 }
 
 func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
-	vpnLine := profile.FindLine(config.LineIDCompanyVPN)
-	if vpnLine == nil || vpnLine.Type != config.LineTypeCompanyVPN {
-		e.fail("no company VPN line configured")
+	vpnExit := profile.VPNExit()
+	if vpnExit == nil {
+		e.fail("no VPN exit configured")
 		return
 	}
 
-	slog.Info("connecting to VPN", "server", vpnLine.VPNServer)
+	slog.Info("connecting to VPN", "server", vpnExit.VPNServer)
 
 	vpnInfo, err := e.vpn.Connect(VPNConfig{
-		Server:   vpnLine.VPNServer,
-		Username: vpnLine.VPNUsername,
-		Password: vpnLine.VPNPassword,
+		Server:   vpnExit.VPNServer,
+		Username: vpnExit.VPNUsername,
+		Password: vpnExit.VPNPassword,
 	})
 	if err != nil {
 		e.fail(fmt.Sprintf("VPN connect failed: %v", err))
