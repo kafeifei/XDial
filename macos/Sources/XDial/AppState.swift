@@ -4,36 +4,7 @@ import SwiftUI
 
 @MainActor
 final class AppState: ObservableObject {
-    // VPN credentials
-    @Published var server: String = ""
-    @Published var username: String = ""
-    @Published var password: String = ""
-    @Published var rememberPassword: Bool = true
-    @Published var activePreset: String = "overseas"
-
-    // Company domains
-    @Published var companyDomains: String = ""
-
-    // Airport line
-    @Published var airportEnabled: Bool = false
-    @Published var airportType: String = "trojan"
-    @Published var trojanServer: String = ""
-    @Published var trojanPort: String = "443"
-    @Published var trojanPassword: String = ""
-    @Published var trojanSNI: String = ""
-    @Published var ssServer: String = ""
-    @Published var ssPort: String = "8388"
-    @Published var ssMethod: String = "aes-256-gcm"
-    @Published var ssPassword: String = ""
-    @Published var vmessServer: String = ""
-    @Published var vmessPort: String = "443"
-    @Published var vmessUUID: String = ""
-    @Published var vmessAltID: String = "0"
-
-    // Custom rules
-    @Published var customDomains: String = ""
-    @Published var customCIDRs: String = ""
-    @Published var customLineID: String = "company_vpn"
+    @Published var profile: Profile
 
     @Published var helperInstalled: Bool = false
     @Published var helperNeedsUpdate: Bool = false
@@ -41,14 +12,30 @@ final class AppState: ObservableObject {
     let engine = GoEngine.shared
     private var engineSub: AnyCancellable?
 
-    private let keychainVPN = "xdial-vpn"
-    private let keychainTrojan = "xdial-trojan"
-    private let keychainSS = "xdial-ss"
-    private let keychainVMess = "xdial-vmess"
+    private let profileKey = "xdial.profile"
+    private let keychainPrefix = "xdial-exit-"
 
     var isConnected: Bool { engine.isConnected }
     var isBusy: Bool { engine.isBusy }
-    var canConnect: Bool { !server.isEmpty && !username.isEmpty && !password.isEmpty && helperInstalled && !isBusy }
+
+    var canConnect: Bool {
+        guard helperInstalled, !isBusy else { return false }
+        guard let s = activeStrategy else { return false }
+        // 必须有效的 VPN 凭据（如果策略用到 VPN）
+        for binding in s.bindings {
+            if let exit = profile.exits.first(where: { $0.id == binding.exitID }),
+               exit.type == "vpn",
+               (exit.vpnServer.isEmpty || exit.vpnUsername.isEmpty || exit.vpnPassword.isEmpty) {
+                return false
+            }
+        }
+        if let exit = profile.exits.first(where: { $0.id == s.defaultExitID }),
+           exit.type == "vpn",
+           (exit.vpnServer.isEmpty || exit.vpnUsername.isEmpty || exit.vpnPassword.isEmpty) {
+            return false
+        }
+        return true
+    }
 
     var statusText: String {
         switch engine.status {
@@ -61,7 +48,14 @@ final class AppState: ObservableObject {
         }
     }
 
+    var activeStrategy: Strategy? {
+        profile.strategies.first { $0.id == profile.activeStrategyID }
+    }
+
     init() {
+        // 先用 bootstrap 初始化，loadSaved 后会被覆盖
+        self.profile = Profile.bootstrap()
+
         engineSub = engine.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
@@ -69,6 +63,8 @@ final class AppState: ObservableObject {
         checkHelper()
         engine.syncStatus()
     }
+
+    // MARK: - Connect
 
     func connect() {
         guard canConnect else { return }
@@ -95,63 +91,55 @@ final class AppState: ObservableObject {
     // MARK: - Persistence
 
     func save() {
-        let d = UserDefaults.standard
-        d.set(server, forKey: "xdial.server")
-        d.set(username, forKey: "xdial.username")
-        d.set(activePreset, forKey: "xdial.preset")
-        d.set(companyDomains, forKey: "xdial.companyDomains")
-        d.set(airportEnabled, forKey: "xdial.airportEnabled")
-        d.set(airportType, forKey: "xdial.airportType")
-        d.set(trojanServer, forKey: "xdial.trojanServer")
-        d.set(trojanPort, forKey: "xdial.trojanPort")
-        d.set(trojanSNI, forKey: "xdial.trojanSNI")
-        d.set(ssServer, forKey: "xdial.ssServer")
-        d.set(ssPort, forKey: "xdial.ssPort")
-        d.set(ssMethod, forKey: "xdial.ssMethod")
-        d.set(vmessServer, forKey: "xdial.vmessServer")
-        d.set(vmessPort, forKey: "xdial.vmessPort")
-        d.set(vmessAltID, forKey: "xdial.vmessAltID")
-        d.set(customDomains, forKey: "xdial.customDomains")
-        d.set(customCIDRs, forKey: "xdial.customCIDRs")
-        d.set(customLineID, forKey: "xdial.customLineID")
-
-        if rememberPassword {
-            KeychainStore.save(password: password, account: keychainVPN)
-        } else {
-            KeychainStore.delete(account: keychainVPN)
+        // Profile 中的密码字段拷贝到 Keychain，存储时用 "***"
+        var sanitized = profile
+        for i in sanitized.exits.indices {
+            let id = sanitized.exits[i].id
+            if !sanitized.exits[i].vpnPassword.isEmpty {
+                KeychainStore.save(password: sanitized.exits[i].vpnPassword,
+                                   account: keychainPrefix + id + "-vpn")
+                sanitized.exits[i].vpnPassword = ""
+            }
+            if !sanitized.exits[i].trojanPassword.isEmpty {
+                KeychainStore.save(password: sanitized.exits[i].trojanPassword,
+                                   account: keychainPrefix + id + "-trojan")
+                sanitized.exits[i].trojanPassword = ""
+            }
+            if !sanitized.exits[i].ssPassword.isEmpty {
+                KeychainStore.save(password: sanitized.exits[i].ssPassword,
+                                   account: keychainPrefix + id + "-ss")
+                sanitized.exits[i].ssPassword = ""
+            }
+            if !sanitized.exits[i].vmessUUID.isEmpty {
+                KeychainStore.save(password: sanitized.exits[i].vmessUUID,
+                                   account: keychainPrefix + id + "-vmess")
+                sanitized.exits[i].vmessUUID = ""
+            }
         }
-        KeychainStore.save(password: trojanPassword, account: keychainTrojan)
-        KeychainStore.save(password: ssPassword, account: keychainSS)
-        KeychainStore.save(password: vmessUUID, account: keychainVMess)
+
+        guard let data = try? JSONEncoder().encode(sanitized) else { return }
+        UserDefaults.standard.set(data, forKey: profileKey)
     }
 
     private func loadSaved() {
-        let d = UserDefaults.standard
-        server = d.string(forKey: "xdial.server") ?? ""
-        username = d.string(forKey: "xdial.username") ?? ""
-        activePreset = d.string(forKey: "xdial.preset") ?? "overseas"
-        companyDomains = d.string(forKey: "xdial.companyDomains") ?? ""
-        airportEnabled = d.bool(forKey: "xdial.airportEnabled")
-        airportType = d.string(forKey: "xdial.airportType") ?? "trojan"
-        trojanServer = d.string(forKey: "xdial.trojanServer") ?? ""
-        trojanPort = d.string(forKey: "xdial.trojanPort") ?? "443"
-        trojanSNI = d.string(forKey: "xdial.trojanSNI") ?? ""
-        ssServer = d.string(forKey: "xdial.ssServer") ?? ""
-        ssPort = d.string(forKey: "xdial.ssPort") ?? "8388"
-        ssMethod = d.string(forKey: "xdial.ssMethod") ?? "aes-256-gcm"
-        vmessServer = d.string(forKey: "xdial.vmessServer") ?? ""
-        vmessPort = d.string(forKey: "xdial.vmessPort") ?? "443"
-        vmessAltID = d.string(forKey: "xdial.vmessAltID") ?? "0"
-        customDomains = d.string(forKey: "xdial.customDomains") ?? ""
-        customCIDRs = d.string(forKey: "xdial.customCIDRs") ?? ""
-        customLineID = d.string(forKey: "xdial.customLineID") ?? "company_vpn"
-
-        if rememberPassword {
-            password = KeychainStore.load(account: keychainVPN) ?? ""
+        guard let data = UserDefaults.standard.data(forKey: profileKey),
+              var loaded = try? JSONDecoder().decode(Profile.self, from: data) else {
+            // 第一次启动，保留 bootstrap
+            return
         }
-        trojanPassword = KeychainStore.load(account: keychainTrojan) ?? ""
-        ssPassword = KeychainStore.load(account: keychainSS) ?? ""
-        vmessUUID = KeychainStore.load(account: keychainVMess) ?? ""
+        // 从 Keychain 恢复密码
+        for i in loaded.exits.indices {
+            let id = loaded.exits[i].id
+            loaded.exits[i].vpnPassword =
+                KeychainStore.load(account: keychainPrefix + id + "-vpn") ?? ""
+            loaded.exits[i].trojanPassword =
+                KeychainStore.load(account: keychainPrefix + id + "-trojan") ?? ""
+            loaded.exits[i].ssPassword =
+                KeychainStore.load(account: keychainPrefix + id + "-ss") ?? ""
+            loaded.exits[i].vmessUUID =
+                KeychainStore.load(account: keychainPrefix + id + "-vmess") ?? ""
+        }
+        self.profile = loaded
     }
 
     private func checkHelper() {
@@ -159,142 +147,78 @@ final class AppState: ObservableObject {
         helperNeedsUpdate = PrivilegeManager.needsUpdate
     }
 
-    // MARK: - Profile JSON
+    // MARK: - Strategy Management
 
-    private func parseDomains(_ text: String) -> [String] {
-        text.split(whereSeparator: { $0.isNewline || $0 == "," })
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+    func createStrategy(from template: StrategyTemplate, named name: String) {
+        let direct = profile.exits.first(where: { $0.type == "direct" })?.id ?? "direct"
+        let vpn = profile.exits.first(where: { $0.type == "vpn" })?.id ?? "vpn"
+        let ss = profile.exits.first(where: { $0.type != "direct" && $0.type != "vpn" })?.id ?? "ss"
+
+        let manualRules = profile.rules
+            .filter { $0.type == "manual" && $0.enabled }
+            .map { $0.id }
+        let gfwRule = profile.rules
+            .first(where: { $0.type == "url" && $0.enabled })?.id ?? ""
+
+        var s: Strategy
+        switch template {
+        case .overseas:
+            s = Profile.templateOverseas(
+                domainRuleIDs: manualRules,
+                vpnExitID: vpn,
+                directExitID: direct
+            )
+        case .domestic:
+            s = Profile.templateDomestic(
+                domainRuleIDs: manualRules,
+                gfwRuleID: gfwRule,
+                vpnExitID: vpn,
+                directExitID: direct
+            )
+        case .domesticSS:
+            s = Profile.templateDomesticSS(
+                domainRuleIDs: manualRules,
+                gfwRuleID: gfwRule,
+                vpnExitID: vpn,
+                ssExitID: ss,
+                directExitID: direct
+            )
+        case .blank:
+            s = Strategy(id: UUID().uuidString, name: name, defaultExitID: direct)
+        }
+        s.name = name
+        profile.strategies.append(s)
+        if profile.activeStrategyID.isEmpty {
+            profile.activeStrategyID = s.id
+        }
+        save()
     }
 
-    private func buildProfileJSON() -> String {
-        let companyDomainList = parseDomains(companyDomains)
-        let customDomainList = parseDomains(customDomains)
-        let customCIDRList = parseDomains(customCIDRs)
-
-        var airportLine: [String: Any] = [
-            "id": "airport",
-            "name": "机场",
-            "type": airportType,
-            "enabled": airportEnabled,
-        ]
-        switch airportType {
-        case "trojan":
-            airportLine["trojan_server"] = trojanServer
-            airportLine["trojan_port"] = Int(trojanPort) ?? 443
-            airportLine["trojan_password"] = trojanPassword
-            airportLine["trojan_sni"] = trojanSNI
-        case "shadowsocks":
-            airportLine["ss_server"] = ssServer
-            airportLine["ss_port"] = Int(ssPort) ?? 8388
-            airportLine["ss_method"] = ssMethod
-            airportLine["ss_password"] = ssPassword
-        case "vmess":
-            airportLine["vmess_server"] = vmessServer
-            airportLine["vmess_port"] = Int(vmessPort) ?? 443
-            airportLine["vmess_uuid"] = vmessUUID
-            airportLine["vmess_alt_id"] = Int(vmessAltID) ?? 0
-        default: break
+    func deleteStrategy(_ s: Strategy) {
+        profile.strategies.removeAll { $0.id == s.id }
+        if profile.activeStrategyID == s.id {
+            profile.activeStrategyID = profile.strategies.first?.id ?? ""
         }
+        save()
+    }
 
-        var diverters: [[String: Any]] = [
-            [
-                "id": "company_domains",
-                "name": "公司域名",
-                "type": "company_domains",
-                "enabled": !companyDomainList.isEmpty,
-                "domains": companyDomainList,
-            ],
-            [
-                "id": "gfw",
-                "name": "GFW",
-                "type": "gfw",
-                "enabled": true,
-            ],
-            [
-                "id": "china_ip",
-                "name": "国内 IP",
-                "type": "china_ip",
-                "enabled": true,
-            ],
-        ]
+    // MARK: - Build profile JSON
 
-        if !customDomainList.isEmpty || !customCIDRList.isEmpty {
-            var custom: [String: Any] = [
-                "id": "custom",
-                "name": "自定义规则",
-                "type": "custom",
-                "enabled": true,
-            ]
-            if !customDomainList.isEmpty { custom["domains"] = customDomainList }
-            if !customCIDRList.isEmpty { custom["cidrs"] = customCIDRList }
-            diverters.append(custom)
-        }
-
-        var presets = defaultPresets()
-        if !customDomainList.isEmpty || !customCIDRList.isEmpty {
-            for i in presets.indices {
-                var bindings = presets[i]["bindings"] as? [[String: String]] ?? []
-                bindings.append(["diverter_id": "custom", "line_id": customLineID])
-                presets[i]["bindings"] = bindings
-            }
-        }
-
-        let profile: [String: Any] = [
-            "lines": [
-                [
-                    "id": "company_vpn",
-                    "name": "公司 VPN",
-                    "type": "company_vpn",
-                    "enabled": true,
-                    "vpn_server": server,
-                    "vpn_username": username,
-                    "vpn_password": password,
-                ],
-                airportLine,
-                [
-                    "id": "direct",
-                    "name": "直连",
-                    "type": "direct",
-                    "enabled": true,
-                ],
-            ],
-            "diverters": diverters,
-            "presets": presets,
-            "active_preset_id": activePreset,
-            "default_line_id": "direct",
-        ]
-
-        guard let data = try? JSONSerialization.data(withJSONObject: profile) else { return "{}" }
+    func buildProfileJSON() -> String {
+        guard let data = try? JSONEncoder().encode(profile) else { return "{}" }
         return String(data: data, encoding: .utf8) ?? "{}"
     }
+}
 
-    private func defaultPresets() -> [[String: Any]] {
-        [
-            [
-                "id": "overseas",
-                "name": "国外",
-                "bindings": [
-                    ["diverter_id": "company_domains", "line_id": "company_vpn"],
-                    ["diverter_id": "gfw", "line_id": "direct"],
-                ] as [[String: String]],
-            ],
-            [
-                "id": "domestic",
-                "name": "国内",
-                "bindings": [
-                    ["diverter_id": "company_domains", "line_id": "company_vpn"],
-                    ["diverter_id": "gfw", "line_id": "company_vpn"],
-                ] as [[String: String]],
-            ],
-            [
-                "id": "domestic_airport",
-                "name": "国内+机场",
-                "bindings": [
-                    ["diverter_id": "company_domains", "line_id": "company_vpn"],
-                    ["diverter_id": "gfw", "line_id": "airport"],
-                ] as [[String: String]],
-            ],
-        ]
+enum StrategyTemplate: String, CaseIterable {
+    case overseas, domestic, domesticSS, blank
+
+    var displayName: String {
+        switch self {
+        case .overseas: return "海外"
+        case .domestic: return "国内"
+        case .domesticSS: return "国内+SS"
+        case .blank: return "空白"
+        }
     }
 }

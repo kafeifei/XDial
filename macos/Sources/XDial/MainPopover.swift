@@ -5,10 +5,10 @@ struct MainPopover: View {
     @State private var showSettings = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             header
             Divider()
-            credentials
+            strategyRow
             Divider()
             statusRow
             actionRow
@@ -25,34 +25,33 @@ struct MainPopover: View {
             Text("XDial")
                 .font(.headline)
             Spacer()
-            Picker("", selection: $state.activePreset) {
-                Text("国外").tag("overseas")
-                Text("国内").tag("domestic")
-                Text("国内+机场").tag("domestic_airport")
-            }
-            .pickerStyle(.menu)
-            .frame(width: 100)
-            .disabled(state.isConnected || state.isBusy)
         }
     }
 
-    private var credentials: some View {
-        VStack(spacing: 6) {
-            TextField("VPN 服务器", text: $state.server)
-                .textFieldStyle(.roundedBorder)
-                .disabled(state.isConnected || state.isBusy)
-            TextField("用户名", text: $state.username)
-                .textFieldStyle(.roundedBorder)
-                .disabled(state.isConnected || state.isBusy)
-            SecureField("密码", text: $state.password)
-                .textFieldStyle(.roundedBorder)
-                .disabled(state.isConnected || state.isBusy)
-            HStack {
-                Toggle("记住密码", isOn: $state.rememberPassword)
+    private var strategyRow: some View {
+        HStack(spacing: 6) {
+            Text("策略组")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if state.profile.strategies.isEmpty {
+                Text("（请先在设置中创建）")
                     .font(.caption)
-                    .disabled(state.isConnected || state.isBusy)
-                Spacer()
+                    .foregroundStyle(.orange)
+            } else {
+                Picker("", selection: SwiftUI.Binding(
+                    get: { state.profile.activeStrategyID },
+                    set: { state.profile.activeStrategyID = $0; state.save() }
+                )) {
+                    ForEach(state.profile.strategies) { s in
+                        Text(s.name).tag(s.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .disabled(state.isConnected || state.isBusy)
             }
+            Spacer()
         }
     }
 
@@ -118,7 +117,6 @@ struct MainPopover: View {
             .popover(isPresented: $showSettings, arrowEdge: .leading) {
                 SettingsView()
                     .environmentObject(state)
-                    .disabled(state.isConnected || state.isBusy)
             }
 
             Menu {

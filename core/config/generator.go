@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"path"
+	"strings"
 )
 
 type SingBoxConfig struct {
@@ -14,9 +16,9 @@ type SingBoxConfig struct {
 }
 
 func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byte, error) {
-	preset := profile.ActivePreset()
-	if preset == nil {
-		return nil, fmt.Errorf("no active preset")
+	strategy := profile.ActiveStrategy()
+	if strategy == nil {
+		return nil, fmt.Errorf("no active strategy")
 	}
 
 	outbounds := []map[string]interface{}{
@@ -29,23 +31,30 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 		},
 	}
 
-	for _, line := range profile.Lines {
-		if !line.Enabled || line.Type == LineTypeDirect || line.Type == LineTypeCompanyVPN {
+	for _, exit := range profile.Exits {
+		if !exit.Enabled || exit.Type == ExitTypeDirect || exit.Type == ExitTypeVPN {
 			continue
 		}
-		ob := buildProxyOutbound(&line)
+		ob := buildProxyOutbound(&exit)
 		if ob != nil {
 			outbounds = append(outbounds, ob)
 		}
 	}
 
-	routeRules := buildRouteRules(profile, preset)
-	ruleSets := collectRuleSets(profile, preset)
+	routeRules := buildRouteRules(profile, strategy)
+	ruleSets := collectRuleSets(profile, strategy)
+
+	defaultTag := "direct"
+	if strategy.DefaultExitID != "" {
+		if e := profile.FindExit(strategy.DefaultExitID); e != nil {
+			defaultTag = resolveOutboundTag(e)
+		}
+	}
 
 	route := map[string]interface{}{
 		"rules":                 routeRules,
 		"auto_detect_interface": true,
-		"final":                 "direct",
+		"final":                 defaultTag,
 	}
 	if len(ruleSets) > 0 {
 		route["rule_set"] = ruleSets
@@ -93,7 +102,7 @@ func buildDNS() map[string]interface{} {
 	}
 }
 
-func buildRouteRules(profile *Profile, preset *Preset) []map[string]interface{} {
+func buildRouteRules(profile *Profile, strategy *Strategy) []map[string]interface{} {
 	var rules []map[string]interface{}
 
 	rules = append(rules, map[string]interface{}{
@@ -106,146 +115,157 @@ func buildRouteRules(profile *Profile, preset *Preset) []map[string]interface{} 
 		"outbound": "direct",
 	})
 
-	for _, binding := range preset.Bindings {
-		diverter := profile.FindDiverter(binding.DiverterID)
-		line := profile.FindLine(binding.LineID)
-		if diverter == nil || line == nil || !diverter.Enabled {
+	for _, binding := range strategy.Bindings {
+		rule := profile.FindRule(binding.RuleID)
+		exit := profile.FindExit(binding.ExitID)
+		if rule == nil || exit == nil || !rule.Enabled {
 			continue
 		}
 
-		outTag := resolveOutboundTag(line)
-		rule := buildRule(diverter, outTag)
-		if rule != nil {
-			rules = append(rules, rule)
+		outTag := resolveOutboundTag(exit)
+		routeRule := buildRouteRule(rule, outTag)
+		if routeRule != nil {
+			rules = append(rules, routeRule)
 		}
 	}
 
 	return rules
 }
 
-func buildRule(d *Diverter, outTag string) map[string]interface{} {
-	switch d.Type {
-	case DiverterTypeCompanyDomains:
-		if len(d.Domains) == 0 {
+func buildRouteRule(r *Rule, outTag string) map[string]interface{} {
+	switch r.Type {
+	case RuleTypeURL:
+		if r.URL == "" {
 			return nil
 		}
 		return map[string]interface{}{
-			"domain_suffix": d.Domains,
-			"outbound":      outTag,
+			"rule_set": ruleSetTag(r),
+			"outbound": outTag,
 		}
-	case DiverterTypeGFW:
-		return map[string]interface{}{
-			"rule_set":  "geosite-gfw",
-			"outbound":  outTag,
-		}
-	case DiverterTypeChinaIP:
-		return map[string]interface{}{
-			"rule_set":  "geoip-cn",
-			"outbound":  outTag,
-		}
-	case DiverterTypeCustom:
+	case RuleTypeManual:
 		rule := map[string]interface{}{
 			"outbound": outTag,
 		}
-		if len(d.Domains) > 0 {
-			rule["domain_suffix"] = d.Domains
+		if len(r.Domains) > 0 {
+			rule["domain_suffix"] = r.Domains
 		}
-		if len(d.CIDRs) > 0 {
-			rule["ip_cidr"] = d.CIDRs
+		if len(r.CIDRs) > 0 {
+			rule["ip_cidr"] = r.CIDRs
+		}
+		if len(r.Domains) == 0 && len(r.CIDRs) == 0 {
+			return nil
 		}
 		return rule
 	}
 	return nil
 }
 
-func collectRuleSets(profile *Profile, preset *Preset) []map[string]interface{} {
-	needed := map[string]bool{}
-	for _, binding := range preset.Bindings {
-		d := profile.FindDiverter(binding.DiverterID)
-		if d == nil || !d.Enabled {
+func collectRuleSets(profile *Profile, strategy *Strategy) []map[string]interface{} {
+	seen := map[string]bool{}
+	var sets []map[string]interface{}
+
+	for _, binding := range strategy.Bindings {
+		r := profile.FindRule(binding.RuleID)
+		if r == nil || !r.Enabled || r.Type != RuleTypeURL || r.URL == "" {
 			continue
 		}
-		switch d.Type {
-		case DiverterTypeGFW:
-			needed["geosite-gfw"] = true
-		case DiverterTypeChinaIP:
-			needed["geoip-cn"] = true
+		tag := ruleSetTag(r)
+		if seen[tag] {
+			continue
 		}
-	}
+		seen[tag] = true
 
-	var sets []map[string]interface{}
-	if needed["geosite-gfw"] {
+		format := resolveRuleSetFormat(r)
 		sets = append(sets, map[string]interface{}{
 			"type":            "remote",
-			"tag":             "geosite-gfw",
-			"format":          "binary",
-			"url":             "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-gfw.srs",
-			"download_detour": "direct",
-		})
-	}
-	if needed["geoip-cn"] {
-		sets = append(sets, map[string]interface{}{
-			"type":            "remote",
-			"tag":             "geoip-cn",
-			"format":          "binary",
-			"url":             "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geoip/geoip-cn.srs",
+			"tag":             tag,
+			"format":          format,
+			"url":             r.URL,
 			"download_detour": "direct",
 		})
 	}
 	return sets
 }
 
-func resolveOutboundTag(line *Line) string {
-	switch line.Type {
-	case LineTypeDirect:
-		return "direct"
-	case LineTypeCompanyVPN:
-		return "vpn"
+// ruleSetTag 为 URL 规则生成唯一的 sing-box rule_set tag
+func ruleSetTag(r *Rule) string {
+	return "ruleset-" + r.ID
+}
+
+// resolveRuleSetFormat 根据 Rule.Format 或 URL 后缀判断格式
+func resolveRuleSetFormat(r *Rule) string {
+	if r.Format != "" && r.Format != "auto" {
+		switch r.Format {
+		case "srs":
+			return "binary"
+		case "json":
+			return "source"
+		default:
+			return r.Format
+		}
+	}
+	ext := strings.ToLower(path.Ext(r.URL))
+	switch ext {
+	case ".srs":
+		return "binary"
+	case ".json":
+		return "source"
 	default:
-		return "proxy-" + line.ID
+		return "binary"
 	}
 }
 
-func buildProxyOutbound(line *Line) map[string]interface{} {
-	switch line.Type {
-	case LineTypeTrojan:
-		if line.TrojanServer == "" {
+func resolveOutboundTag(exit *Exit) string {
+	switch exit.Type {
+	case ExitTypeDirect:
+		return "direct"
+	case ExitTypeVPN:
+		return "vpn"
+	default:
+		return "proxy-" + exit.ID
+	}
+}
+
+func buildProxyOutbound(exit *Exit) map[string]interface{} {
+	switch exit.Type {
+	case ExitTypeTrojan:
+		if exit.TrojanServer == "" {
 			return nil
 		}
 		return map[string]interface{}{
 			"type":        "trojan",
-			"tag":         "proxy-" + line.ID,
-			"server":      line.TrojanServer,
-			"server_port": line.TrojanPort,
-			"password":    line.TrojanPassword,
+			"tag":         "proxy-" + exit.ID,
+			"server":      exit.TrojanServer,
+			"server_port": exit.TrojanPort,
+			"password":    exit.TrojanPassword,
 			"tls": map[string]interface{}{
 				"enabled":     true,
-				"server_name": line.TrojanSNI,
+				"server_name": exit.TrojanSNI,
 			},
 		}
-	case LineTypeShadowsocks:
-		if line.SSServer == "" {
+	case ExitTypeShadowsocks:
+		if exit.SSServer == "" {
 			return nil
 		}
 		return map[string]interface{}{
 			"type":        "shadowsocks",
-			"tag":         "proxy-" + line.ID,
-			"server":      line.SSServer,
-			"server_port": line.SSPort,
-			"method":      line.SSMethod,
-			"password":    line.SSPass,
+			"tag":         "proxy-" + exit.ID,
+			"server":      exit.SSServer,
+			"server_port": exit.SSPort,
+			"method":      exit.SSMethod,
+			"password":    exit.SSPass,
 		}
-	case LineTypeVMess:
-		if line.VMessServer == "" {
+	case ExitTypeVMess:
+		if exit.VMessServer == "" {
 			return nil
 		}
 		return map[string]interface{}{
 			"type":        "vmess",
-			"tag":         "proxy-" + line.ID,
-			"server":      line.VMessServer,
-			"server_port": line.VMessPort,
-			"uuid":        line.VMessUUID,
-			"alter_id":    line.VMessAltID,
+			"tag":         "proxy-" + exit.ID,
+			"server":      exit.VMessServer,
+			"server_port": exit.VMessPort,
+			"uuid":        exit.VMessUUID,
+			"alter_id":    exit.VMessAltID,
 		}
 	}
 	return nil

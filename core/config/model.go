@@ -1,26 +1,27 @@
 package config
 
-type LineType string
+// ExitType 出口类型
+type ExitType string
 
 const (
-	LineTypeDirect      LineType = "direct"
-	LineTypeCompanyVPN  LineType = "company_vpn"
-	LineTypeTrojan      LineType = "trojan"
-	LineTypeShadowsocks LineType = "shadowsocks"
-	LineTypeVMess       LineType = "vmess"
+	ExitTypeDirect      ExitType = "direct"
+	ExitTypeVPN         ExitType = "vpn"
+	ExitTypeTrojan      ExitType = "trojan"
+	ExitTypeShadowsocks ExitType = "shadowsocks"
+	ExitTypeVMess       ExitType = "vmess"
 )
 
-type Line struct {
+// Exit 出口：流量从哪个通道出去
+type Exit struct {
 	ID      string   `json:"id"`
 	Name    string   `json:"name"`
-	Type    LineType `json:"type"`
+	Type    ExitType `json:"type"`
 	Enabled bool     `json:"enabled"`
 
-	// Company VPN (AnyConnect via sslcon)
+	// VPN (AnyConnect via sslcon)
 	VPNServer   string `json:"vpn_server,omitempty"`
 	VPNUsername string `json:"vpn_username,omitempty"`
 	VPNPassword string `json:"vpn_password,omitempty"`
-	VPNProtocol string `json:"vpn_protocol,omitempty"`
 
 	// Trojan
 	TrojanServer   string `json:"trojan_server,omitempty"`
@@ -41,67 +42,84 @@ type Line struct {
 	VMessAltID  int    `json:"vmess_alt_id,omitempty"`
 }
 
-type DiverterType string
+// RuleType 规则类型
+type RuleType string
 
 const (
-	DiverterTypeCompanyDomains DiverterType = "company_domains"
-	DiverterTypeGFW            DiverterType = "gfw"
-	DiverterTypeChinaIP        DiverterType = "china_ip"
-	DiverterTypeCustom         DiverterType = "custom"
+	RuleTypeURL    RuleType = "url"
+	RuleTypeManual RuleType = "manual"
 )
 
-type Diverter struct {
-	ID      string       `json:"id"`
-	Name    string       `json:"name"`
-	Type    DiverterType `json:"type"`
-	Enabled bool         `json:"enabled"`
+// Rule 规则：匹配哪些流量
+type Rule struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Type    RuleType `json:"type"`
+	Enabled bool     `json:"enabled"`
 
+	// URL 规则（远程规则集）
+	URL    string `json:"url,omitempty"`
+	Format string `json:"format,omitempty"` // srs / json / text / clash / auto
+
+	// 手动规则
 	Domains []string `json:"domains,omitempty"`
 	CIDRs   []string `json:"cidrs,omitempty"`
 }
 
+// Binding 策略组中的一条绑定：规则→出口
 type Binding struct {
-	DiverterID string `json:"diverter_id"`
-	LineID     string `json:"line_id"`
+	RuleID string `json:"rule_id"`
+	ExitID string `json:"exit_id"`
 }
 
-type Preset struct {
-	ID       string    `json:"id"`
-	Name     string    `json:"name"`
-	Bindings []Binding `json:"bindings"`
+// Strategy 策略组：一组规则→出口的绑定
+type Strategy struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Bindings      []Binding `json:"bindings"`
+	DefaultExitID string    `json:"default_exit_id"`
 }
 
+// Profile 完整配置
 type Profile struct {
-	Lines           []Line     `json:"lines"`
-	Diverters       []Diverter `json:"diverters"`
-	Presets          []Preset   `json:"presets"`
-	ActivePresetID  string     `json:"active_preset_id"`
-	DefaultLineID   string     `json:"default_line_id"`
-	SubscriptionURL string     `json:"subscription_url,omitempty"`
+	Exits            []Exit     `json:"exits"`
+	Rules            []Rule     `json:"rules"`
+	Strategies       []Strategy `json:"strategies"`
+	ActiveStrategyID string     `json:"active_strategy_id"`
 }
 
-func (p *Profile) ActivePreset() *Preset {
-	for i := range p.Presets {
-		if p.Presets[i].ID == p.ActivePresetID {
-			return &p.Presets[i]
+func (p *Profile) ActiveStrategy() *Strategy {
+	for i := range p.Strategies {
+		if p.Strategies[i].ID == p.ActiveStrategyID {
+			return &p.Strategies[i]
 		}
 	}
 	return nil
 }
 
-func (p *Profile) FindLine(id string) *Line {
-	for i := range p.Lines {
-		if p.Lines[i].ID == id {
-			return &p.Lines[i]
+func (p *Profile) FindExit(id string) *Exit {
+	for i := range p.Exits {
+		if p.Exits[i].ID == id {
+			return &p.Exits[i]
 		}
 	}
 	return nil
 }
 
-func (p *Profile) FindDiverter(id string) *Diverter {
-	for i := range p.Diverters {
-		if p.Diverters[i].ID == id {
-			return &p.Diverters[i]
+func (p *Profile) FindRule(id string) *Rule {
+	for i := range p.Rules {
+		if p.Rules[i].ID == id {
+			return &p.Rules[i]
+		}
+	}
+	return nil
+}
+
+// VPNExit 返回第一个 VPN 类型的出口（用于获取 VPN 服务器地址）
+func (p *Profile) VPNExit() *Exit {
+	for i := range p.Exits {
+		if p.Exits[i].Type == ExitTypeVPN {
+			return &p.Exits[i]
 		}
 	}
 	return nil

@@ -1,100 +1,49 @@
 package config
 
-const (
-	LineIDCompanyVPN = "company_vpn"
-	LineIDAirport    = "airport"
-	LineIDDirect     = "direct"
+// 模板策略组工厂函数
+// 这些不是硬编码的预设——用户从模板创建自己的策略组后可任意修改
 
-	DiverterIDCompany = "company_domains"
-	DiverterIDGFW     = "gfw"
-	DiverterIDChinaIP = "china_ip"
-
-	PresetIDOverseas        = "overseas"
-	PresetIDDomestic        = "domestic"
-	PresetIDDomesticAirport = "domestic_airport"
-)
-
-func DefaultDiverters() []Diverter {
-	return []Diverter{
-		{
-			ID:      DiverterIDCompany,
-			Name:    "公司域名",
-			Type:    DiverterTypeCompanyDomains,
-			Enabled: true,
-		},
-		{
-			ID:      DiverterIDGFW,
-			Name:    "GFW",
-			Type:    DiverterTypeGFW,
-			Enabled: true,
-		},
-		{
-			ID:      DiverterIDChinaIP,
-			Name:    "国内 IP",
-			Type:    DiverterTypeChinaIP,
-			Enabled: true,
-		},
+// TemplateOverseas 海外模式：自定义规则→VPN，其他→直连
+func TemplateOverseas(ruleIDs []string, vpnExitID, directExitID string) Strategy {
+	var bindings []Binding
+	for _, rid := range ruleIDs {
+		bindings = append(bindings, Binding{RuleID: rid, ExitID: vpnExitID})
+	}
+	return Strategy{
+		Name:          "海外",
+		Bindings:      bindings,
+		DefaultExitID: directExitID,
 	}
 }
 
-func DefaultLines() []Line {
-	return []Line{
-		{
-			ID:      LineIDCompanyVPN,
-			Name:    "公司 VPN",
-			Type:    LineTypeCompanyVPN,
-			Enabled: true,
-		},
-		{
-			ID:      LineIDAirport,
-			Name:    "机场",
-			Type:    LineTypeTrojan,
-			Enabled: false,
-		},
-		{
-			ID:      LineIDDirect,
-			Name:    "直连",
-			Type:    LineTypeDirect,
-			Enabled: true,
-		},
+// TemplateDomestic 国内模式：自定义规则→VPN，GFW→VPN，其他→直连
+func TemplateDomestic(domainRuleIDs []string, gfwRuleID, vpnExitID, directExitID string) Strategy {
+	var bindings []Binding
+	for _, rid := range domainRuleIDs {
+		bindings = append(bindings, Binding{RuleID: rid, ExitID: vpnExitID})
+	}
+	if gfwRuleID != "" {
+		bindings = append(bindings, Binding{RuleID: gfwRuleID, ExitID: vpnExitID})
+	}
+	return Strategy{
+		Name:          "国内",
+		Bindings:      bindings,
+		DefaultExitID: directExitID,
 	}
 }
 
-func DefaultPresets() []Preset {
-	return []Preset{
-		{
-			ID:   PresetIDOverseas,
-			Name: "国外",
-			Bindings: []Binding{
-				{DiverterID: DiverterIDCompany, LineID: LineIDCompanyVPN},
-				{DiverterID: DiverterIDGFW, LineID: LineIDDirect},
-			},
-		},
-		{
-			ID:   PresetIDDomestic,
-			Name: "国内",
-			Bindings: []Binding{
-				{DiverterID: DiverterIDCompany, LineID: LineIDCompanyVPN},
-				{DiverterID: DiverterIDGFW, LineID: LineIDCompanyVPN},
-			},
-		},
-		{
-			ID:   PresetIDDomesticAirport,
-			Name: "国内+机场",
-			Bindings: []Binding{
-				{DiverterID: DiverterIDCompany, LineID: LineIDCompanyVPN},
-				{DiverterID: DiverterIDGFW, LineID: LineIDAirport},
-			},
-		},
+// TemplateDomesticSS 国内+SS模式：自定义规则→VPN，GFW→SS，其他→直连
+func TemplateDomesticSS(domainRuleIDs []string, gfwRuleID, vpnExitID, ssExitID, directExitID string) Strategy {
+	var bindings []Binding
+	for _, rid := range domainRuleIDs {
+		bindings = append(bindings, Binding{RuleID: rid, ExitID: vpnExitID})
 	}
-}
-
-func NewDefaultProfile() *Profile {
-	return &Profile{
-		Lines:          DefaultLines(),
-		Diverters:      DefaultDiverters(),
-		Presets:        DefaultPresets(),
-		ActivePresetID: PresetIDOverseas,
-		DefaultLineID:  LineIDDirect,
+	if gfwRuleID != "" {
+		bindings = append(bindings, Binding{RuleID: gfwRuleID, ExitID: ssExitID})
+	}
+	return Strategy{
+		Name:          "国内+SS",
+		Bindings:      bindings,
+		DefaultExitID: directExitID,
 	}
 }
