@@ -3,3 +3,4 @@ build/
 macos/.build/
 /tmp/
 *.log
+.claude/worktrees/

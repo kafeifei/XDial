@@ -6,42 +6,159 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("", selection: $tab) {
-                Text("出口").tag(0)
-                Text("规则").tag(1)
-                Text("策略组").tag(2)
+            HStack(spacing: 12) {
+                Picker("", selection: $tab) {
+                    Text("⚓️ \(state.tr("港口", "Ports"))").tag(0)
+                    Text("📦 \(state.tr("货品", "Cargoes"))").tag(1)
+                    Text("🚢 \(state.tr("邮轮", "Cruises"))").tag(2)
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: .infinity)
+
+                Button {
+                    tab = 3
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "gearshape")
+                        Text(state.tr("通用", "General"))
+                    }
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 8)
+                    .background(tab == 3 ? Color.accentColor.opacity(0.2) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
             }
-            .pickerStyle(.segmented)
             .padding(8)
 
             Divider()
 
             ZStack {
-                if tab == 0 { ExitsTab() }
-                else if tab == 1 { RulesTab() }
-                else { StrategiesTab() }
+                if tab == 0 { PortsTab() }
+                else if tab == 1 { CargoesTab() }
+                else if tab == 2 { CruisesTab() }
+                else { GeneralTab() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 480, height: 480)
+        .frame(width: 540, height: 520)
     }
 }
 
-// MARK: - 出口 Tab
+// MARK: - 通用 Tab
 
-struct ExitsTab: View {
+struct GeneralTab: View {
+    @EnvironmentObject var state: AppState
+    @State private var confirmingUninstall = false
+    @State private var deleteDataOnUninstall = false
+    @State private var uninstallError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Group {
+                HStack {
+                    Text(state.tr("语言", "Language"))
+                        .frame(width: 120, alignment: .leading)
+                    Picker("", selection: $state.language) {
+                        ForEach(Lang.allCases, id: \.self) { l in
+                            Text(l.displayName).tag(l)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 160)
+                    Spacer()
+                }
+
+                Toggle(isOn: $state.launchAtLogin) {
+                    Text(state.tr("开机自动启动", "Launch at login"))
+                }
+                .toggleStyle(.switch)
+            }
+            .padding(.horizontal, 16)
+
+            Divider().padding(.vertical, 4)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(state.tr("卸载", "Uninstall"))
+                    .font(.headline)
+                Text(state.tr(
+                    "停止 helper、删除 LaunchDaemon 和相关文件。",
+                    "Stop helper, remove LaunchDaemon and related files."
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Button(role: .destructive) {
+                    confirmingUninstall = true
+                } label: {
+                    Text(state.tr("卸载…", "Uninstall…"))
+                }
+            }
+            .padding(.horizontal, 16)
+
+            Spacer()
+
+            if let err = uninstallError {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 16)
+            }
+        }
+        .padding(.vertical, 16)
+        .confirmationDialog(
+            state.tr("确认卸载 XDial？", "Uninstall XDial?"),
+            isPresented: $confirmingUninstall,
+            titleVisibility: .visible
+        ) {
+            Button(state.tr("仅卸载 helper", "Uninstall helper only")) {
+                deleteDataOnUninstall = false
+                runUninstall()
+            }
+            Button(state.tr("卸载并删除所有数据", "Uninstall and delete all data"), role: .destructive) {
+                deleteDataOnUninstall = true
+                runUninstall()
+            }
+            Button(state.tr("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(state.tr(
+                "「卸载并删除所有数据」会清除你保存的所有出口、规则、策略组和 Keychain 中的密码。",
+                "“Uninstall and delete all data” removes all your ports, cargoes, cruises, and Keychain passwords."
+            ))
+        }
+    }
+
+    private func runUninstall() {
+        state.uninstall(deleteData: deleteDataOnUninstall) { ok, err in
+            if ok {
+                uninstallError = nil
+                if deleteDataOnUninstall {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        NSApp.terminate(nil)
+                    }
+                }
+            } else {
+                uninstallError = err
+            }
+        }
+    }
+}
+
+// MARK: - 港口 Tab
+
+struct PortsTab: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 8) {
-                    ForEach($state.profile.exits) { $exit in
-                        ExitRow(exit: $exit, onDelete: { delete(exit) })
+                    ForEach($state.profile.ports) { $port in
+                        PortRow(port: $port, onDelete: { delete(port) })
                     }
                 }
                 .padding(10)
             }
+            .onAppear { state.probeNetwork() }
             Divider()
             HStack {
                 Spacer()
@@ -51,7 +168,7 @@ struct ExitsTab: View {
                     Button("Shadowsocks") { add(type: "shadowsocks") }
                     Button("VMess") { add(type: "vmess") }
                 } label: {
-                    Label("添加出口", systemImage: "plus")
+                    Label("添加港口", systemImage: "plus")
                 }
                 .menuStyle(.borderlessButton)
                 .padding(8)
@@ -69,91 +186,171 @@ struct ExitsTab: View {
         case "vmess": name = "VMess 节点"
         default: name = "节点"
         }
-        state.profile.exits.append(Exit(id: id, name: name, type: type))
+        state.profile.ports.append(Port(id: id, name: name, type: type))
         state.save()
     }
 
-    private func delete(_ exit: Exit) {
-        if exit.type == "direct" { return }
-        state.profile.exits.removeAll { $0.id == exit.id }
+    private func delete(_ port: Port) {
+        if port.type == "direct" { return }
+        state.profile.ports.removeAll { $0.id == port.id }
         state.save()
     }
 }
 
-struct ExitRow: View {
-    @SwiftUI.Binding var exit: Exit
+struct PortRow: View {
+    @SwiftUI.Binding var port: Port
     var onDelete: () -> Void
     @State private var expanded = false
     @EnvironmentObject var state: AppState
+    @ObservedObject private var net = NetworkInfo.shared
+
+    private var isLocked: Bool { port.type == "direct" }
+
+    /// 当前是否为活跃出口：直连任何时候、VPN/SS 仅当连上且当前邮轮用到它时
+    private var isActive: Bool {
+        guard let s = state.activeCruise else { return false }
+        let usedIDs = Set(s.bindings.map { $0.portID } + [s.defaultPortID])
+        switch port.type {
+        case "direct":
+            // 没连上时 direct 才是真正活跃的（流量走真实网络）
+            return state.engine.status != "connected"
+        default:
+            return state.engine.status == "connected" && usedIDs.contains(port.id)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                if !isLocked {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 12)
+                } else {
+                    Image(systemName: "lock.fill")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 12)
+                }
+
+                // 验证状态：实心钩=已验证，空心钩=未验证。全灰度。
+                Image(systemName: port.verified ? "checkmark.seal.fill" : "checkmark.seal")
                     .foregroundStyle(.secondary)
-                    .onTapGesture { expanded.toggle() }
-                TextField("名称", text: $exit.name)
-                    .textFieldStyle(.plain)
+                    .help(port.verified ? "已验证" : "未验证")
+
+                Text(port.name)
                     .font(.system(size: 13, weight: .medium))
-                    .onChange(of: exit.name) { _, _ in state.save() }
+                    .foregroundStyle(.primary)
+
+                if !briefInfo.isEmpty {
+                    Text(briefInfo)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
                 Spacer()
+
                 Text(typeLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                if exit.type != "direct" {
-                    Toggle("", isOn: $exit.enabled)
+
+                if !isLocked {
+                    Toggle("", isOn: $port.enabled)
                         .toggleStyle(.switch)
                         .controlSize(.mini)
                         .labelsHidden()
-                        .onChange(of: exit.enabled) { _, _ in state.save() }
+                        .onChange(of: port.enabled) { _, _ in state.save() }
                     Button(action: onDelete) {
-                        Image(systemName: "trash").foregroundStyle(.red)
+                        Image(systemName: "trash").foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
                 }
             }
-            if expanded && exit.type != "direct" {
-                detailFields
-                    .padding(.leading, 18)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if !isLocked { expanded.toggle() }
+            }
+
+            if expanded && !isLocked {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("名称").font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
+                        TextField("名称", text: $port.name)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption)
+                            .onChange(of: port.name) { _, _ in state.save() }
+                    }
+                    detailFields
+                }
+                .padding(.leading, 18)
             }
         }
         .padding(8)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.08)))
+        .opacity(port.verified ? 1.0 : 0.55)
+    }
+
+    private var briefInfo: String {
+        // 已探测：显示真实出口 IP/地区
+        if let info = net.perPort[port.id], !info.summary.isEmpty {
+            return info.summary
+        }
+        // 仅启用且当前在探测时显示"检测中"
+        if net.probing && port.enabled {
+            return "检测中…"
+        }
+        // 未启用或已探测但无结果：显示静态配置
+        switch port.type {
+        case "vpn":
+            return port.vpnServer
+        case "trojan":
+            guard !port.trojanServer.isEmpty else { return "" }
+            return "\(port.trojanServer):\(port.trojanPort)"
+        case "shadowsocks":
+            guard !port.ssServer.isEmpty else { return "" }
+            return "\(port.ssServer):\(port.ssPort)"
+        case "vmess":
+            guard !port.vmessServer.isEmpty else { return "" }
+            return "\(port.vmessServer):\(port.vmessPort)"
+        default:
+            return ""
+        }
     }
 
     private var typeLabel: String {
-        switch exit.type {
+        switch port.type {
         case "direct": return "直连"
         case "vpn": return "VPN"
         case "trojan": return "Trojan"
         case "shadowsocks": return "SS"
         case "vmess": return "VMess"
-        default: return exit.type
+        default: return port.type
         }
     }
 
     @ViewBuilder
     private var detailFields: some View {
-        switch exit.type {
+        switch port.type {
         case "vpn":
-            field("服务器", $exit.vpnServer, placeholder: "vpn.example.com:8443")
-            field("用户名", $exit.vpnUsername)
-            secureField("密码", $exit.vpnPassword)
+            field("服务器", $port.vpnServer, placeholder: "vpn.example.com:8443")
+            field("用户名", $port.vpnUsername)
+            secureField("密码", $port.vpnPassword)
         case "trojan":
-            field("服务器", $exit.trojanServer)
-            intField("端口", $exit.trojanPort)
-            field("SNI", $exit.trojanSNI)
-            secureField("密码", $exit.trojanPassword)
+            field("服务器", $port.trojanServer)
+            intField("端口", $port.trojanPort)
+            field("SNI", $port.trojanSNI)
+            secureField("密码", $port.trojanPassword)
         case "shadowsocks":
-            field("服务器", $exit.ssServer)
-            intField("端口", $exit.ssPort)
-            field("加密方法", $exit.ssMethod)
-            secureField("密码", $exit.ssPassword)
+            field("服务器", $port.ssServer)
+            intField("端口", $port.ssPort)
+            field("加密方法", $port.ssMethod)
+            secureField("密码", $port.ssPassword)
         case "vmess":
-            field("服务器", $exit.vmessServer)
-            intField("端口", $exit.vmessPort)
-            secureField("UUID", $exit.vmessUUID)
-            intField("Alter ID", $exit.vmessAltID)
+            field("服务器", $port.vmessServer)
+            intField("端口", $port.vmessPort)
+            secureField("UUID", $port.vmessUUID)
+            intField("Alter ID", $port.vmessAltID)
         default:
             EmptyView()
         }
@@ -162,20 +359,26 @@ struct ExitRow: View {
     private func field(_ label: String, _ binding: SwiftUI.Binding<String>, placeholder: String = "") -> some View {
         HStack {
             Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-            TextField(placeholder, text: binding)
+            ASCIITextField(placeholder: placeholder, text: binding)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
-                .onChange(of: binding.wrappedValue) { _, _ in state.save() }
+                .onChange(of: binding.wrappedValue) { _, _ in
+                    port.verified = false
+                    state.save()
+                }
         }
     }
 
     private func secureField(_ label: String, _ binding: SwiftUI.Binding<String>) -> some View {
         HStack {
             Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-            SecureField("", text: binding)
+            ASCIISecureField(placeholder: "", text: binding)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
-                .onChange(of: binding.wrappedValue) { _, _ in state.save() }
+                .onChange(of: binding.wrappedValue) { _, _ in
+                    port.verified = false
+                    state.save()
+                }
         }
     }
 
@@ -185,22 +388,25 @@ struct ExitRow: View {
             TextField("", value: binding, format: .number)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
-                .onChange(of: binding.wrappedValue) { _, _ in state.save() }
+                .onChange(of: binding.wrappedValue) { _, _ in
+                    port.verified = false
+                    state.save()
+                }
         }
     }
 }
 
-// MARK: - 规则 Tab
+// MARK: - 货品 Tab
 
-struct RulesTab: View {
+struct CargoesTab: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 8) {
-                    ForEach($state.profile.rules) { $rule in
-                        RuleRow(rule: $rule, onDelete: { delete(rule) })
+                    ForEach($state.profile.cargoes) { $rule in
+                        CargoRow(rule: $rule, onDelete: { delete(rule) })
                     }
                 }
                 .padding(10)
@@ -209,10 +415,10 @@ struct RulesTab: View {
             HStack {
                 Spacer()
                 Menu {
-                    Button("URL 规则") { add(type: "url") }
+                    Button("URL 货品") { add(type: "url") }
                     Button("手动域名/IP") { add(type: "manual") }
                 } label: {
-                    Label("添加规则", systemImage: "plus")
+                    Label("添加货品", systemImage: "plus")
                 }
                 .menuStyle(.borderlessButton)
                 .padding(8)
@@ -222,25 +428,38 @@ struct RulesTab: View {
 
     private func add(type: String) {
         let id = "rule-" + String(UUID().uuidString.prefix(6))
-        let name = type == "url" ? "新 URL 规则" : "新手动规则"
-        state.profile.rules.append(Rule(id: id, name: name, type: type))
+        let name = type == "url" ? "新 URL 货品" : "新手动货品"
+        state.profile.cargoes.append(Cargo(id: id, name: name, type: type))
         state.save()
     }
 
-    private func delete(_ rule: Rule) {
-        state.profile.rules.removeAll { $0.id == rule.id }
-        for i in state.profile.strategies.indices {
-            state.profile.strategies[i].bindings.removeAll { $0.ruleID == rule.id }
+    private func delete(_ rule: Cargo) {
+        state.profile.cargoes.removeAll { $0.id == rule.id }
+        for i in state.profile.cruises.indices {
+            state.profile.cruises[i].bindings.removeAll { $0.cargoID == rule.id }
         }
         state.save()
     }
 }
 
-struct RuleRow: View {
-    @SwiftUI.Binding var rule: Rule
+struct CargoRow: View {
+    @SwiftUI.Binding var rule: Cargo
     var onDelete: () -> Void
     @State private var expanded = true
+    @State private var domainsText = ""
+    @State private var cidrsText = ""
+    @State private var loaded = false
     @EnvironmentObject var state: AppState
+
+    private func saveDomainsAndCIDRs() {
+        rule.domains = domainsText.split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        rule.cidrs = cidrsText.split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        state.save()
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -282,7 +501,7 @@ struct RuleRow: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text("URL").font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
-                TextField("https://...", text: $rule.url)
+                ASCIITextField(placeholder: "https://...", text: $rule.url)
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
                     .onChange(of: rule.url) { _, _ in state.save() }
@@ -307,42 +526,37 @@ struct RuleRow: View {
         VStack(alignment: .leading, spacing: 4) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("域名（每行一个）").font(.caption).foregroundStyle(.secondary)
-                TextEditor(text: SwiftUI.Binding(
-                    get: { rule.domains.joined(separator: "\n") },
-                    set: {
-                        rule.domains = $0.split(whereSeparator: \.isNewline)
-                            .map { String($0).trimmingCharacters(in: .whitespaces) }
-                            .filter { !$0.isEmpty }
-                        state.save()
+                TextEditor(text: $domainsText)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(height: 60)
+                    .border(Color.gray.opacity(0.3))
+                    .onChange(of: domainsText) { _, _ in
+                        if loaded { saveDomainsAndCIDRs() }
                     }
-                ))
-                .font(.system(size: 11, design: .monospaced))
-                .frame(height: 60)
-                .border(Color.gray.opacity(0.3))
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text("IP CIDR（每行一个）").font(.caption).foregroundStyle(.secondary)
-                TextEditor(text: SwiftUI.Binding(
-                    get: { rule.cidrs.joined(separator: "\n") },
-                    set: {
-                        rule.cidrs = $0.split(whereSeparator: \.isNewline)
-                            .map { String($0).trimmingCharacters(in: .whitespaces) }
-                            .filter { !$0.isEmpty }
-                        state.save()
+                TextEditor(text: $cidrsText)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(height: 50)
+                    .border(Color.gray.opacity(0.3))
+                    .onChange(of: cidrsText) { _, _ in
+                        if loaded { saveDomainsAndCIDRs() }
                     }
-                ))
-                .font(.system(size: 11, design: .monospaced))
-                .frame(height: 50)
-                .border(Color.gray.opacity(0.3))
             }
         }
         .padding(.leading, 18)
+        .onAppear {
+            domainsText = rule.domains.joined(separator: "\n")
+            cidrsText = rule.cidrs.joined(separator: "\n")
+            loaded = true
+        }
     }
 }
 
-// MARK: - 策略组 Tab
+// MARK: - 邮轮 Tab
 
-struct StrategiesTab: View {
+struct CruisesTab: View {
     @EnvironmentObject var state: AppState
     @State private var showTemplate = false
     @State private var newName = ""
@@ -350,15 +564,15 @@ struct StrategiesTab: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                if state.profile.strategies.isEmpty {
-                    Text("还没有策略组")
+                if state.profile.cruises.isEmpty {
+                    Text("还没有邮轮")
                         .foregroundStyle(.secondary)
                 } else {
                     Picker("当前编辑", selection: SwiftUI.Binding(
-                        get: { state.profile.activeStrategyID },
-                        set: { state.profile.activeStrategyID = $0; state.save() }
+                        get: { state.profile.activeCruiseID },
+                        set: { state.profile.activeCruiseID = $0; state.save() }
                     )) {
-                        ForEach(state.profile.strategies) { s in
+                        ForEach(state.profile.cruises) { s in
                             Text(s.name).tag(s.id)
                         }
                     }
@@ -371,7 +585,7 @@ struct StrategiesTab: View {
                 } label: {
                     Label("新建", systemImage: "plus")
                 }
-                .popover(isPresented: $showTemplate) {
+                .sheet(isPresented: $showTemplate) {
                     templatePicker
                 }
             }
@@ -379,11 +593,11 @@ struct StrategiesTab: View {
 
             Divider()
 
-            if let idx = state.profile.strategies.firstIndex(where: { $0.id == state.profile.activeStrategyID }) {
-                StrategyEditor(strategy: $state.profile.strategies[idx])
+            if let idx = state.profile.cruises.firstIndex(where: { $0.id == state.profile.activeCruiseID }) {
+                StrategyEditor(strategy: $state.profile.cruises[idx])
             } else {
                 Spacer()
-                Text("点击「新建」创建策略组")
+                Text("点击「新建」创建邮轮")
                     .foregroundStyle(.secondary)
                 Spacer()
             }
@@ -391,44 +605,50 @@ struct StrategiesTab: View {
     }
 
     private var templatePicker: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("从模板创建").font(.headline)
-            TextField("名称", text: $newName)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("从模板创建邮轮").font(.headline)
+                Spacer()
+                Button("取消") { showTemplate = false }
+            }
+            TextField("邮轮名称", text: $newName)
                 .textFieldStyle(.roundedBorder)
-            ForEach(StrategyTemplate.allCases, id: \.self) { t in
+            ForEach(CruiseTemplate.allCases, id: \.self) { t in
                 Button {
                     let name = newName.isEmpty ? t.displayName : newName
-                    state.createStrategy(from: t, named: name)
+                    state.createCruise(from: t, named: name)
                     newName = ""
                     showTemplate = false
                 } label: {
                     HStack {
-                        Text(t.displayName)
+                        Text(t.displayName).font(.system(size: 13, weight: .medium))
                         Spacer()
                         Text(templateDescription(t))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
                 }
                 .buttonStyle(.bordered)
             }
         }
-        .padding(12)
-        .frame(width: 280)
+        .padding(16)
+        .frame(width: 360)
     }
 
-    private func templateDescription(_ t: StrategyTemplate) -> String {
+    private func templateDescription(_ t: CruiseTemplate) -> String {
         switch t {
-        case .overseas: return "规则→VPN，其他→直连"
-        case .domestic: return "规则+GFW→VPN，其他→直连"
-        case .domesticSS: return "规则→VPN，GFW→SS，其他→直连"
+        case .overseas: return "货品→VPN，其他→直连"
+        case .domestic: return "货品+GFW→VPN，其他→直连"
+        case .domesticSS: return "货品→VPN，GFW→SS，其他→直连"
         case .blank: return "空白"
         }
     }
 }
 
 struct StrategyEditor: View {
-    @SwiftUI.Binding var strategy: Strategy
+    @SwiftUI.Binding var strategy: Cruise
     @EnvironmentObject var state: AppState
 
     var body: some View {
@@ -440,7 +660,7 @@ struct StrategyEditor: View {
                     .onChange(of: strategy.name) { _, _ in state.save() }
                 Spacer()
                 Button {
-                    state.deleteStrategy(strategy)
+                    state.deleteCruise(strategy)
                 } label: {
                     Image(systemName: "trash").foregroundStyle(.red)
                 }
@@ -453,9 +673,9 @@ struct StrategyEditor: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("规则").font(.caption).foregroundStyle(.secondary)
+                        Text("货品").font(.caption).foregroundStyle(.secondary)
                             .frame(width: 200, alignment: .leading)
-                        Text("出口").font(.caption).foregroundStyle(.secondary)
+                        Text("港口").font(.caption).foregroundStyle(.secondary)
                     }
 
                     ForEach(strategy.bindings) { binding in
@@ -469,8 +689,8 @@ struct StrategyEditor: View {
                             .font(.caption)
                             .frame(width: 200, alignment: .leading)
                         exitPicker(selectedID: SwiftUI.Binding(
-                            get: { strategy.defaultExitID },
-                            set: { strategy.defaultExitID = $0; state.save() }
+                            get: { strategy.defaultPortID },
+                            set: { strategy.defaultPortID = $0; state.save() }
                         ))
                     }
                 }
@@ -482,21 +702,21 @@ struct StrategyEditor: View {
             HStack {
                 Spacer()
                 Menu {
-                    let usedIDs = Set(strategy.bindings.map { $0.ruleID })
-                    let available = state.profile.rules.filter { !usedIDs.contains($0.id) }
+                    let usedIDs = Set(strategy.bindings.map { $0.cargoID })
+                    let available = state.profile.cargoes.filter { !usedIDs.contains($0.id) }
                     if available.isEmpty {
-                        Button("（无可用规则）") {}.disabled(true)
+                        Button("（无可用货品）") {}.disabled(true)
                     } else {
                         ForEach(available) { rule in
                             Button(rule.name) {
-                                let firstExit = state.profile.exits.first?.id ?? ""
-                                strategy.bindings.append(RouteBinding(ruleID: rule.id, exitID: firstExit))
+                                let firstExit = state.profile.ports.first?.id ?? ""
+                                strategy.bindings.append(CargoLink(cargoID: rule.id, portID: firstExit))
                                 state.save()
                             }
                         }
                     }
                 } label: {
-                    Label("添加规则", systemImage: "plus")
+                    Label("添加货品", systemImage: "plus")
                 }
                 .menuStyle(.borderlessButton)
                 .padding(8)
@@ -505,14 +725,14 @@ struct StrategyEditor: View {
     }
 
     @ViewBuilder
-    private func bindingRow(_ binding: RouteBinding) -> some View {
-        if let idx = strategy.bindings.firstIndex(where: { $0.ruleID == binding.ruleID }) {
+    private func bindingRow(_ binding: CargoLink) -> some View {
+        if let idx = strategy.bindings.firstIndex(where: { $0.cargoID == binding.cargoID }) {
             HStack {
-                Text(state.profile.rules.first(where: { $0.id == binding.ruleID })?.name ?? "（已删除）")
+                Text(state.profile.cargoes.first(where: { $0.id == binding.cargoID })?.name ?? "（已删除）")
                     .frame(width: 200, alignment: .leading)
-                exitPicker(selectedID: $strategy.bindings[idx].exitID)
+                exitPicker(selectedID: $strategy.bindings[idx].portID)
                 Button {
-                    strategy.bindings.removeAll { $0.ruleID == binding.ruleID }
+                    strategy.bindings.removeAll { $0.cargoID == binding.cargoID }
                     state.save()
                 } label: {
                     Image(systemName: "minus.circle").foregroundStyle(.red)
@@ -524,7 +744,7 @@ struct StrategyEditor: View {
 
     private func exitPicker(selectedID: SwiftUI.Binding<String>) -> some View {
         Picker("", selection: selectedID) {
-            ForEach(state.profile.exits.filter { $0.enabled }) { e in
+            ForEach(state.profile.ports.filter { $0.enabled }) { e in
                 Text(e.name).tag(e.id)
             }
         }

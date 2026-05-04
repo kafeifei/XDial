@@ -7,11 +7,13 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/things-go/go-socks5"
 
 	"github.com/kafeifei/xdial/core/config"
+	"sslcon/session"
 )
 
 type Engine struct {
@@ -58,21 +60,29 @@ func (e *Engine) Start(profileJSON string) error {
 }
 
 func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
-	vpnExit := profile.VPNExit()
-	if vpnExit == nil {
-		e.fail("no VPN exit configured")
+	vpnPort := profile.VPNPort()
+	if vpnPort == nil {
+		e.fail("没有配置 VPN 港口")
+		return
+	}
+	if vpnPort.VPNServer == "" {
+		e.fail("VPN 服务器地址未填写")
+		return
+	}
+	if vpnPort.VPNUsername == "" || vpnPort.VPNPassword == "" {
+		e.fail("VPN 用户名或密码未填写")
 		return
 	}
 
-	slog.Info("connecting to VPN", "server", vpnExit.VPNServer)
+	slog.Info("connecting to VPN", "server", vpnPort.VPNServer)
 
 	vpnInfo, err := e.vpn.Connect(VPNConfig{
-		Server:   vpnExit.VPNServer,
-		Username: vpnExit.VPNUsername,
-		Password: vpnExit.VPNPassword,
+		Server:   vpnPort.VPNServer,
+		Username: vpnPort.VPNUsername,
+		Password: vpnPort.VPNPassword,
 	})
 	if err != nil {
-		e.fail(fmt.Sprintf("VPN connect failed: %v", err))
+		e.fail(humanizeVPNError(err, vpnPort.VPNServer))
 		return
 	}
 
@@ -81,7 +91,7 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 	bridge, err := NewVPNBridge(vpnInfo.VPNAddress, vpnInfo.MTU)
 	if err != nil {
 		e.vpn.Disconnect()
-		e.fail(fmt.Sprintf("bridge init failed: %v", err))
+		e.fail("VPN 隧道初始化失败")
 		return
 	}
 
@@ -89,7 +99,7 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 	if cSess == nil {
 		bridge.Close()
 		e.vpn.Disconnect()
-		e.fail("VPN session lost")
+		e.fail("VPN 会话已断开")
 		return
 	}
 	bridge.Start(cSess)
@@ -98,7 +108,7 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 	if err != nil {
 		bridge.Close()
 		e.vpn.Disconnect()
-		e.fail(fmt.Sprintf("SOCKS5 start failed: %v", err))
+		e.fail("本地代理启动失败")
 		return
 	}
 
@@ -115,6 +125,9 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 	e.mu.Unlock()
 
 	e.setStatus(StatusConnected)
+
+	closeCh := session.Sess.CloseChan
+	go e.monitorVPN(closeCh)
 }
 
 func (e *Engine) startSOCKS(bridge *VPNBridge) (string, error) {
@@ -189,6 +202,43 @@ func (e *Engine) Status() string {
 	return string(b)
 }
 
+func (e *Engine) monitorVPN(closeCh chan struct{}) {
+	<-closeCh
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.status != StatusConnected {
+		return
+	}
+
+	slog.Warn("VPN session lost unexpectedly, cleaning up")
+
+	if e.singbox != nil {
+		e.singbox.Stop()
+		e.singbox = nil
+	}
+	if e.socksLn != nil {
+		e.socksLn.Close()
+		e.socksLn = nil
+	}
+	if e.bridge != nil {
+		e.bridge.Close()
+		e.bridge = nil
+	}
+
+	if e.callback != nil {
+		e.callback.OnError(2, "VPN 连接意外断开")
+	}
+	e.setStatus(StatusDisconnected)
+}
+
+func (e *Engine) KillSession() {
+	if cSess := session.Sess.CSess; cSess != nil {
+		cSess.Close()
+	}
+}
+
 func (e *Engine) setStatus(s Status) {
 	e.status = s
 	if e.callback != nil {
@@ -198,12 +248,39 @@ func (e *Engine) setStatus(s Status) {
 	}
 }
 
+// humanizeVPNError 把底层错误翻译成给人看的提示
+func humanizeVPNError(err error, server string) string {
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "Login failed") ||
+		strings.Contains(s, "login failed") ||
+		strings.Contains(s, "401"):
+		return "用户名或密码错误"
+	case strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "deadline exceeded"):
+		return fmt.Sprintf("连接 %s 超时，请检查地址和端口是否正确，或网络是否通畅", server)
+	case strings.Contains(s, "no such host") ||
+		strings.Contains(s, "DNS"):
+		return fmt.Sprintf("无法解析服务器地址 %s，请检查域名是否正确", server)
+	case strings.Contains(s, "connection refused"):
+		return fmt.Sprintf("服务器 %s 拒绝连接，请检查端口是否正确", server)
+	case strings.Contains(s, "no route to host"):
+		return "网络不通，请检查网络连接"
+	case strings.Contains(s, "certificate") ||
+		strings.Contains(s, "x509"):
+		return "服务器证书验证失败"
+	default:
+		return "VPN 连接失败：" + s
+	}
+}
+
 func (e *Engine) fail(msg string) {
 	slog.Error("engine error", "msg", msg)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.status = StatusDisconnected
 	if e.callback != nil {
 		e.callback.OnError(1, msg)
 	}
+	// 广播状态变化，让 UI 知道连接失败、可以重试
+	e.setStatus(StatusDisconnected)
 }

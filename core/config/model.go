@@ -1,21 +1,21 @@
 package config
 
-// ExitType 出口类型
-type ExitType string
+// PortType 港口类型（流量出口）
+type PortType string
 
 const (
-	ExitTypeDirect      ExitType = "direct"
-	ExitTypeVPN         ExitType = "vpn"
-	ExitTypeTrojan      ExitType = "trojan"
-	ExitTypeShadowsocks ExitType = "shadowsocks"
-	ExitTypeVMess       ExitType = "vmess"
+	PortTypeDirect      PortType = "direct"
+	PortTypeVPN         PortType = "vpn"
+	PortTypeTrojan      PortType = "trojan"
+	PortTypeShadowsocks PortType = "shadowsocks"
+	PortTypeVMess       PortType = "vmess"
 )
 
-// Exit 出口：流量从哪个通道出去
-type Exit struct {
+// Port 港口：流量从哪个通道出去
+type Port struct {
 	ID      string   `json:"id"`
 	Name    string   `json:"name"`
-	Type    ExitType `json:"type"`
+	Type    PortType `json:"type"`
 	Enabled bool     `json:"enabled"`
 
 	// VPN (AnyConnect via sslcon)
@@ -42,84 +42,84 @@ type Exit struct {
 	VMessAltID  int    `json:"vmess_alt_id,omitempty"`
 }
 
-// RuleType 规则类型
-type RuleType string
+// CargoType 货品类型（流量匹配规则）
+type CargoType string
 
 const (
-	RuleTypeURL    RuleType = "url"
-	RuleTypeManual RuleType = "manual"
+	CargoTypeURL    CargoType = "url"
+	CargoTypeManual CargoType = "manual"
 )
 
-// Rule 规则：匹配哪些流量
-type Rule struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Type    RuleType `json:"type"`
-	Enabled bool     `json:"enabled"`
+// Cargo 货品：匹配哪些流量
+type Cargo struct {
+	ID      string    `json:"id"`
+	Name    string    `json:"name"`
+	Type    CargoType `json:"type"`
+	Enabled bool      `json:"enabled"`
 
-	// URL 规则（远程规则集）
+	// URL 货品（远程规则集）
 	URL    string `json:"url,omitempty"`
-	Format string `json:"format,omitempty"` // srs / json / text / clash / auto
+	Format string `json:"format,omitempty"`
 
-	// 手动规则
+	// 手动货品
 	Domains []string `json:"domains,omitempty"`
 	CIDRs   []string `json:"cidrs,omitempty"`
 }
 
-// Binding 策略组中的一条绑定：规则→出口
+// Binding 邮轮中的一条绑定：货品→港口
 type Binding struct {
-	RuleID string `json:"rule_id"`
-	ExitID string `json:"exit_id"`
+	CargoID string `json:"cargo_id"`
+	PortID  string `json:"port_id"`
 }
 
-// Strategy 策略组：一组规则→出口的绑定
-type Strategy struct {
+// Cruise 邮轮：一组货品→港口的绑定
+type Cruise struct {
 	ID            string    `json:"id"`
 	Name          string    `json:"name"`
 	Bindings      []Binding `json:"bindings"`
-	DefaultExitID string    `json:"default_exit_id"`
+	DefaultPortID string    `json:"default_port_id"`
 }
 
 // Profile 完整配置
 type Profile struct {
-	Exits            []Exit     `json:"exits"`
-	Rules            []Rule     `json:"rules"`
-	Strategies       []Strategy `json:"strategies"`
-	ActiveStrategyID string     `json:"active_strategy_id"`
+	Ports          []Port   `json:"ports"`
+	Cargoes        []Cargo  `json:"cargoes"`
+	Cruises        []Cruise `json:"cruises"`
+	ActiveCruiseID string   `json:"active_cruise_id"`
 }
 
-func (p *Profile) ActiveStrategy() *Strategy {
-	for i := range p.Strategies {
-		if p.Strategies[i].ID == p.ActiveStrategyID {
-			return &p.Strategies[i]
+func (p *Profile) ActiveCruise() *Cruise {
+	for i := range p.Cruises {
+		if p.Cruises[i].ID == p.ActiveCruiseID {
+			return &p.Cruises[i]
 		}
 	}
 	return nil
 }
 
-func (p *Profile) FindExit(id string) *Exit {
-	for i := range p.Exits {
-		if p.Exits[i].ID == id {
-			return &p.Exits[i]
+func (p *Profile) FindPort(id string) *Port {
+	for i := range p.Ports {
+		if p.Ports[i].ID == id {
+			return &p.Ports[i]
 		}
 	}
 	return nil
 }
 
-func (p *Profile) FindRule(id string) *Rule {
-	for i := range p.Rules {
-		if p.Rules[i].ID == id {
-			return &p.Rules[i]
+func (p *Profile) FindCargo(id string) *Cargo {
+	for i := range p.Cargoes {
+		if p.Cargoes[i].ID == id {
+			return &p.Cargoes[i]
 		}
 	}
 	return nil
 }
 
-// VPNExit 返回第一个 VPN 类型的出口（用于获取 VPN 服务器地址）
-func (p *Profile) VPNExit() *Exit {
-	for i := range p.Exits {
-		if p.Exits[i].Type == ExitTypeVPN {
-			return &p.Exits[i]
+// VPNPort 返回第一个 VPN 类型的港口（用于获取 VPN 服务器地址）
+func (p *Profile) VPNPort() *Port {
+	for i := range p.Ports {
+		if p.Ports[i].Type == PortTypeVPN {
+			return &p.Ports[i]
 		}
 	}
 	return nil

@@ -18,41 +18,36 @@ SOCKET_PATH = "/tmp/xdial.sock"
 
 
 def get_vpn_password() -> str:
-    out = subprocess.run(
-        ["security", "find-generic-password", "-s", "com.kafeifei.xdial",
-         "-a", "xdial-exit-vpn-vpn", "-w"],
-        capture_output=True, text=True
-    )
-    if out.returncode == 0:
-        return out.stdout.strip()
-    # 回退到旧账号名
-    out = subprocess.run(
-        ["security", "find-generic-password", "-s", "com.kafeifei.xdial",
-         "-a", "xdial-vpn", "-w"],
-        capture_output=True, text=True
-    )
-    return out.stdout.strip() if out.returncode == 0 else ""
+    for account in ["xdial-port-vpn-vpn", "xdial-exit-vpn-vpn", "xdial-vpn"]:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", "com.kafeifei.xdial",
+             "-a", account, "-w"],
+            capture_output=True, text=True, timeout=5
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    return ""
 
 
 def make_profile(password: str) -> dict:
     return {
-        "exits": [
+        "ports": [
             {"id": "direct", "name": "直连", "type": "direct", "enabled": True},
             {"id": "vpn", "name": "VPN", "type": "vpn", "enabled": True,
              "vpn_server": "vpn.example.com:8443",
              "vpn_username": "kafeifei",
              "vpn_password": password},
         ],
-        "rules": [
+        "cargoes": [
             {"id": "internal", "name": "内部域名", "type": "manual", "enabled": True,
              "domains": ["example.com", "example.net", "example.org"]},
         ],
-        "strategies": [
+        "cruises": [
             {"id": "test", "name": "测试",
-             "bindings": [{"rule_id": "internal", "exit_id": "vpn"}],
-             "default_exit_id": "direct"},
+             "bindings": [{"cargo_id": "internal", "port_id": "vpn"}],
+             "default_port_id": "direct"},
         ],
-        "active_strategy_id": "test",
+        "active_cruise_id": "test",
     }
 
 

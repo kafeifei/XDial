@@ -7,70 +7,70 @@ import (
 
 func testProfile() *Profile {
 	return &Profile{
-		Exits: []Exit{
-			{ID: "direct", Name: "直连", Type: ExitTypeDirect, Enabled: true},
-			{ID: "vpn", Name: "VPN", Type: ExitTypeVPN, Enabled: true,
+		Ports: []Port{
+			{ID: "direct", Name: "直连", Type: PortTypeDirect, Enabled: true},
+			{ID: "vpn", Name: "VPN", Type: PortTypeVPN, Enabled: true,
 				VPNServer: "vpn.example.com:8443", VPNUsername: "user"},
-			{ID: "ss", Name: "SS", Type: ExitTypeTrojan, Enabled: true,
+			{ID: "ss", Name: "SS", Type: PortTypeTrojan, Enabled: true,
 				TrojanServer: "proxy.example.com", TrojanPort: 443,
 				TrojanPassword: "pass", TrojanSNI: "proxy.example.com"},
 		},
-		Rules: []Rule{
-			{ID: "internal", Name: "内部域名", Type: RuleTypeManual, Enabled: true,
+		Cargoes: []Cargo{
+			{ID: "internal", Name: "内部域名", Type: CargoTypeManual, Enabled: true,
 				Domains: []string{"example.com", "internal.corp"}},
-			{ID: "gfw", Name: "GFW", Type: RuleTypeURL, Enabled: true,
+			{ID: "gfw", Name: "GFW", Type: CargoTypeURL, Enabled: true,
 				URL: "https://example.com/geosite-gfw.srs"},
-			{ID: "cnip", Name: "国内IP", Type: RuleTypeURL, Enabled: true,
+			{ID: "cnip", Name: "国内IP", Type: CargoTypeURL, Enabled: true,
 				URL: "https://example.com/geoip-cn.json", Format: "json"},
 		},
-		Strategies: []Strategy{
+		Cruises: []Cruise{
 			{
 				ID: "overseas", Name: "海外",
 				Bindings: []Binding{
-					{RuleID: "internal", ExitID: "vpn"},
+					{CargoID: "internal", PortID: "vpn"},
 				},
-				DefaultExitID: "direct",
+				DefaultPortID: "direct",
 			},
 			{
 				ID: "domestic", Name: "国内",
 				Bindings: []Binding{
-					{RuleID: "internal", ExitID: "vpn"},
-					{RuleID: "gfw", ExitID: "vpn"},
+					{CargoID: "internal", PortID: "vpn"},
+					{CargoID: "gfw", PortID: "vpn"},
 				},
-				DefaultExitID: "direct",
+				DefaultPortID: "direct",
 			},
 			{
 				ID: "domestic-ss", Name: "国内+SS",
 				Bindings: []Binding{
-					{RuleID: "internal", ExitID: "vpn"},
-					{RuleID: "gfw", ExitID: "ss"},
+					{CargoID: "internal", PortID: "vpn"},
+					{CargoID: "gfw", PortID: "ss"},
 				},
-				DefaultExitID: "direct",
+				DefaultPortID: "direct",
 			},
 		},
-		ActiveStrategyID: "overseas",
+		ActiveCruiseID: "overseas",
 	}
 }
 
 func TestProfileFinders(t *testing.T) {
 	p := testProfile()
-	if e := p.FindExit("vpn"); e == nil || e.Name != "VPN" {
-		t.Fatal("FindExit(vpn) failed")
+	if e := p.FindPort("vpn"); e == nil || e.Name != "VPN" {
+		t.Fatal("FindPort(vpn) failed")
 	}
-	if r := p.FindRule("gfw"); r == nil || r.URL == "" {
-		t.Fatal("FindRule(gfw) failed")
+	if r := p.FindCargo("gfw"); r == nil || r.URL == "" {
+		t.Fatal("FindCargo(gfw) failed")
 	}
-	if s := p.ActiveStrategy(); s == nil || s.Name != "海外" {
-		t.Fatal("ActiveStrategy failed")
+	if s := p.ActiveCruise(); s == nil || s.Name != "海外" {
+		t.Fatal("ActiveCruise failed")
 	}
-	if v := p.VPNExit(); v == nil || v.VPNServer == "" {
-		t.Fatal("VPNExit failed")
+	if v := p.VPNPort(); v == nil || v.VPNServer == "" {
+		t.Fatal("VPNPort failed")
 	}
 }
 
-func TestGenerateWithManualRule(t *testing.T) {
+func TestGenerateWithManualCargo(t *testing.T) {
 	p := testProfile()
-	p.ActiveStrategyID = "overseas"
+	p.ActiveCruiseID = "overseas"
 
 	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 	if err != nil {
@@ -82,7 +82,6 @@ func TestGenerateWithManualRule(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 检查手动规则生成了 domain_suffix
 	found := false
 	for _, rule := range cfg.Route["rules"].([]interface{}) {
 		r := rule.(map[string]interface{})
@@ -91,29 +90,28 @@ func TestGenerateWithManualRule(t *testing.T) {
 			if len(domains) == 2 && domains[0] == "example.com" {
 				found = true
 				if r["outbound"] != "vpn" {
-					t.Errorf("manual rule should route to vpn, got %v", r["outbound"])
+					t.Errorf("manual cargo should route to vpn, got %v", r["outbound"])
 				}
 			}
 		}
 	}
 	if !found {
-		t.Fatal("manual domain rule not found in route rules")
+		t.Fatal("manual domain cargo not found in route rules")
 	}
 
-	// 海外策略不用 GFW rule-set，不应有 rule_set
 	if rs, ok := cfg.Route["rule_set"]; ok {
 		sets := rs.([]interface{})
 		if len(sets) > 0 {
-			t.Errorf("overseas strategy should not have rule_sets, got %d", len(sets))
+			t.Errorf("overseas cruise should not have rule_sets, got %d", len(sets))
 		}
 	}
 
 	t.Log(string(data))
 }
 
-func TestGenerateWithURLRule_SRS(t *testing.T) {
+func TestGenerateWithURLCargo_SRS(t *testing.T) {
 	p := testProfile()
-	p.ActiveStrategyID = "domestic"
+	p.ActiveCruiseID = "domestic"
 
 	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 	if err != nil {
@@ -125,10 +123,9 @@ func TestGenerateWithURLRule_SRS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 检查 rule_set 包含 GFW .srs
 	rs, ok := cfg.Route["rule_set"].([]interface{})
 	if !ok || len(rs) == 0 {
-		t.Fatal("domestic strategy should have rule_sets")
+		t.Fatal("domestic cruise should have rule_sets")
 	}
 
 	gfwSet := rs[0].(map[string]interface{})
@@ -142,17 +139,16 @@ func TestGenerateWithURLRule_SRS(t *testing.T) {
 	t.Log(string(data))
 }
 
-func TestGenerateWithURLRule_JSON(t *testing.T) {
+func TestGenerateWithURLCargo_JSON(t *testing.T) {
 	p := testProfile()
-	// 加一个使用 cnip (json format) 的策略
-	p.Strategies = append(p.Strategies, Strategy{
+	p.Cruises = append(p.Cruises, Cruise{
 		ID: "with-cnip", Name: "含国内IP",
 		Bindings: []Binding{
-			{RuleID: "cnip", ExitID: "direct"},
+			{CargoID: "cnip", PortID: "direct"},
 		},
-		DefaultExitID: "vpn",
+		DefaultPortID: "vpn",
 	})
-	p.ActiveStrategyID = "with-cnip"
+	p.ActiveCruiseID = "with-cnip"
 
 	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 	if err != nil {
@@ -171,9 +167,9 @@ func TestGenerateWithURLRule_JSON(t *testing.T) {
 	}
 }
 
-func TestGenerateMultipleRules(t *testing.T) {
+func TestGenerateMultipleCargoes(t *testing.T) {
 	p := testProfile()
-	p.ActiveStrategyID = "domestic-ss"
+	p.ActiveCruiseID = "domestic-ss"
 
 	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 	if err != nil {
@@ -185,12 +181,10 @@ func TestGenerateMultipleRules(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 应有 3 个 outbound：direct + vpn(socks) + ss(trojan)
-	if len(cfg.Outbounds) < 3 {
-		t.Fatalf("expected 3+ outbounds, got %d", len(cfg.Outbounds))
+	if len(cfg.Outbounds) < 4 { // direct + vpn + ss + selector
+		t.Fatalf("expected 4+ outbounds, got %d", len(cfg.Outbounds))
 	}
 
-	// GFW 规则应走 ss (proxy-ss)
 	rules := cfg.Route["rules"].([]interface{})
 	for _, rule := range rules {
 		r := rule.(map[string]interface{})
@@ -204,9 +198,9 @@ func TestGenerateMultipleRules(t *testing.T) {
 	t.Log(string(data))
 }
 
-func TestGenerateDefaultExit(t *testing.T) {
+func TestGenerateDefaultPort(t *testing.T) {
 	p := testProfile()
-	p.ActiveStrategyID = "overseas"
+	p.ActiveCruiseID = "overseas"
 
 	data, err := GenerateSingBox(p, 10800, "")
 	if err != nil {
@@ -219,7 +213,7 @@ func TestGenerateDefaultExit(t *testing.T) {
 	}
 
 	if cfg.Route["final"] != "direct" {
-		t.Errorf("default exit should be direct, got %v", cfg.Route["final"])
+		t.Errorf("default port should be direct, got %v", cfg.Route["final"])
 	}
 }
 

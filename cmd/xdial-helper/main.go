@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -28,7 +27,7 @@ func (d *daemonCallback) OnError(code int, message string) {
 	slog.Error("engine", "code", code, "msg", message)
 	d.clients.Broadcast(Response{
 		Type:    "error",
-		Message: fmt.Sprintf("[%d] %s", code, message),
+		Message: message,
 	})
 }
 
@@ -131,6 +130,10 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 			} else {
 				client.Send(Response{Type: "result", Cmd: "stop", OK: true})
 			}
+
+		case "kill-session":
+			eng.KillSession()
+			client.Send(Response{Type: "result", Cmd: "kill-session", OK: true})
 
 		case "status":
 			client.Send(Response{Type: "status", Data: eng.Status()})

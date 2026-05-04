@@ -1,10 +1,11 @@
 import Foundation
 
-struct Exit: Codable, Identifiable, Hashable {
+struct Port: Codable, Identifiable, Hashable {
     var id: String
     var name: String
     var type: String  // direct / vpn / trojan / shadowsocks / vmess
     var enabled: Bool = true
+    var verified: Bool = false
 
     var vpnServer: String = ""
     var vpnUsername: String = ""
@@ -26,7 +27,7 @@ struct Exit: Codable, Identifiable, Hashable {
     var vmessAltID: Int = 0
 
     enum CodingKeys: String, CodingKey {
-        case id, name, type, enabled
+        case id, name, type, enabled, verified
         case vpnServer = "vpn_server"
         case vpnUsername = "vpn_username"
         case vpnPassword = "vpn_password"
@@ -45,7 +46,7 @@ struct Exit: Codable, Identifiable, Hashable {
     }
 }
 
-struct Rule: Codable, Identifiable, Hashable {
+struct Cargo: Codable, Identifiable, Hashable {
     var id: String
     var name: String
     var type: String  // url / manual
@@ -56,95 +57,95 @@ struct Rule: Codable, Identifiable, Hashable {
     var cidrs: [String] = []
 }
 
-struct RouteBinding: Codable, Hashable, Identifiable {
-    var ruleID: String
-    var exitID: String
+struct CargoLink: Codable, Hashable, Identifiable {
+    var cargoID: String
+    var portID: String
 
-    var id: String { ruleID }
+    var id: String { cargoID }
 
     enum CodingKeys: String, CodingKey {
-        case ruleID = "rule_id"
-        case exitID = "exit_id"
+        case cargoID = "cargo_id"
+        case portID = "port_id"
     }
 }
 
-struct Strategy: Codable, Identifiable, Hashable {
+struct Cruise: Codable, Identifiable, Hashable {
     var id: String
     var name: String
-    var bindings: [RouteBinding] = []
-    var defaultExitID: String = ""
+    var bindings: [CargoLink] = []
+    var defaultPortID: String = ""
 
     enum CodingKeys: String, CodingKey {
         case id, name, bindings
-        case defaultExitID = "default_exit_id"
+        case defaultPortID = "default_port_id"
     }
 }
 
 struct Profile: Codable {
-    var exits: [Exit] = []
-    var rules: [Rule] = []
-    var strategies: [Strategy] = []
-    var activeStrategyID: String = ""
+    var ports: [Port] = []
+    var cargoes: [Cargo] = []
+    var cruises: [Cruise] = []
+    var activeCruiseID: String = ""
 
     enum CodingKeys: String, CodingKey {
-        case exits, rules, strategies
-        case activeStrategyID = "active_strategy_id"
+        case ports, cargoes, cruises
+        case activeCruiseID = "active_cruise_id"
     }
 }
 
 extension Profile {
     static func bootstrap() -> Profile {
         var p = Profile()
-        p.exits = [
-            Exit(id: "direct", name: "直连", type: "direct"),
-            Exit(id: "vpn", name: "VPN", type: "vpn"),
-            Exit(id: "ss", name: "SS 节点", type: "trojan", enabled: false),
+        p.ports = [
+            Port(id: "direct", name: "直连", type: "direct", verified: true),
+            Port(id: "vpn", name: "VPN", type: "vpn"),
+            Port(id: "ss", name: "SS 节点", type: "trojan", enabled: false),
         ]
-        p.rules = [
-            Rule(id: "internal", name: "内部域名", type: "manual"),
-            Rule(id: "gfw", name: "GFW",
-                 type: "url",
-                 url: "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-gfw.srs",
-                 format: "srs"),
-            Rule(id: "cnip", name: "国内 IP", type: "url", enabled: false,
-                 url: "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geoip/geoip-cn.srs",
-                 format: "srs"),
+        p.cargoes = [
+            Cargo(id: "internal", name: "内部域名", type: "manual"),
+            Cargo(id: "gfw", name: "GFW",
+                  type: "url",
+                  url: "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-gfw.srs",
+                  format: "srs"),
+            Cargo(id: "cnip", name: "国内 IP", type: "url", enabled: false,
+                  url: "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geoip/geoip-cn.srs",
+                  format: "srs"),
         ]
         return p
     }
 
-    static func templateOverseas(domainRuleIDs: [String], vpnExitID: String, directExitID: String) -> Strategy {
-        Strategy(
+    static func templateOverseas(cargoIDs: [String], vpnPortID: String, directPortID: String) -> Cruise {
+        Cruise(
             id: UUID().uuidString,
             name: "海外",
-            bindings: domainRuleIDs.map { RouteBinding(ruleID: $0, exitID: vpnExitID) },
-            defaultExitID: directExitID
+            bindings: cargoIDs.map { CargoLink(cargoID: $0, portID: vpnPortID) },
+            defaultPortID: directPortID
         )
     }
 
-    static func templateDomestic(domainRuleIDs: [String], gfwRuleID: String, vpnExitID: String, directExitID: String) -> Strategy {
-        var bindings = domainRuleIDs.map { RouteBinding(ruleID: $0, exitID: vpnExitID) }
-        if !gfwRuleID.isEmpty {
-            bindings.append(RouteBinding(ruleID: gfwRuleID, exitID: vpnExitID))
+    static func templateDomestic(cargoIDs: [String], gfwCargoID: String, vpnPortID: String, directPortID: String) -> Cruise {
+        var bindings = cargoIDs.map { CargoLink(cargoID: $0, portID: vpnPortID) }
+        if !gfwCargoID.isEmpty {
+            bindings.append(CargoLink(cargoID: gfwCargoID, portID: vpnPortID))
         }
-        return Strategy(
+        return Cruise(
             id: UUID().uuidString,
             name: "国内",
             bindings: bindings,
-            defaultExitID: directExitID
+            defaultPortID: directPortID
         )
     }
 
-    static func templateDomesticSS(domainRuleIDs: [String], gfwRuleID: String, vpnExitID: String, ssExitID: String, directExitID: String) -> Strategy {
-        var bindings = domainRuleIDs.map { RouteBinding(ruleID: $0, exitID: vpnExitID) }
-        if !gfwRuleID.isEmpty {
-            bindings.append(RouteBinding(ruleID: gfwRuleID, exitID: ssExitID))
+    static func templateDomesticSS(cargoIDs: [String], gfwCargoID: String, vpnPortID: String, ssPortID: String, directPortID: String) -> Cruise {
+        var bindings = cargoIDs.map { CargoLink(cargoID: $0, portID: vpnPortID) }
+        if !gfwCargoID.isEmpty {
+            bindings.append(CargoLink(cargoID: gfwCargoID, portID: ssPortID))
         }
-        return Strategy(
+        return Cruise(
             id: UUID().uuidString,
             name: "国内+SS",
             bindings: bindings,
-            defaultExitID: directExitID
+            defaultPortID: directPortID
         )
     }
 }

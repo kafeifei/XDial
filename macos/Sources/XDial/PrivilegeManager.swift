@@ -79,10 +79,14 @@ enum PrivilegeManager {
     static func uninstall() throws {
         let shell = """
         launchctl bootout system/\(label) 2>/dev/null || true
-        rm -f '\(plistPath)' '\(helperPath)'
-        rm -f '\(socketPath)'
+        rm -f '\(plistPath)' '\(helperPath)' '\(socketPath)' '/tmp/xdial-helper.log' '/tmp/xdial-app.log'
+        rm -rf '/tmp/xdial-engine'
+        rm -f '/etc/sudoers.d/xdial'
         """
-        runAdminShell(shell)
+        if !runAdminShell(shell) {
+            throw NSError(domain: "XDial", code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "卸载失败（用户取消或权限不足）"])
+        }
     }
 
     // MARK: - Private
