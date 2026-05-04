@@ -1,49 +1,49 @@
 package config
 
-// 模板策略组工厂函数
-// 这些不是硬编码的预设——用户从模板创建自己的策略组后可任意修改
+// 邮轮模板工厂函数
+// 用户从模板创建自己的邮轮后可任意修改
 
-// TemplateOverseas 海外模式：自定义规则→VPN，其他→直连
-func TemplateOverseas(ruleIDs []string, vpnExitID, directExitID string) Strategy {
+// TemplateOverseas 海外模式：自定义货品→VPN，其他→直连
+func TemplateOverseas(cargoIDs []string, vpnPortID, directPortID string) Cruise {
 	var bindings []Binding
-	for _, rid := range ruleIDs {
-		bindings = append(bindings, Binding{RuleID: rid, ExitID: vpnExitID})
+	for _, cid := range cargoIDs {
+		bindings = append(bindings, Binding{CargoID: cid, PortID: vpnPortID})
 	}
-	return Strategy{
+	return Cruise{
 		Name:          "海外",
 		Bindings:      bindings,
-		DefaultExitID: directExitID,
+		DefaultPortID: directPortID,
 	}
 }
 
-// TemplateDomestic 国内模式：自定义规则→VPN，REMOTE→VPN，其他→直连
-func TemplateDomestic(domainRuleIDs []string, remoteRuleID, vpnExitID, directExitID string) Strategy {
+// TemplateDomestic 国内模式：自定义货品→VPN，REMOTE→VPN，其他→直连
+func TemplateDomestic(domainCargoIDs []string, remoteCargoID, vpnPortID, directPortID string) Cruise {
 	var bindings []Binding
-	for _, rid := range domainRuleIDs {
-		bindings = append(bindings, Binding{RuleID: rid, ExitID: vpnExitID})
+	for _, cid := range domainCargoIDs {
+		bindings = append(bindings, Binding{CargoID: cid, PortID: vpnPortID})
 	}
-	if remoteRuleID != "" {
-		bindings = append(bindings, Binding{RuleID: remoteRuleID, ExitID: vpnExitID})
+	if remoteCargoID != "" {
+		bindings = append(bindings, Binding{CargoID: remoteCargoID, PortID: vpnPortID})
 	}
-	return Strategy{
+	return Cruise{
 		Name:          "国内",
 		Bindings:      bindings,
-		DefaultExitID: directExitID,
+		DefaultPortID: directPortID,
 	}
 }
 
-// TemplateDomesticSS 国内+SS模式：自定义规则→VPN，REMOTE→SS，其他→直连
-func TemplateDomesticSS(domainRuleIDs []string, remoteRuleID, vpnExitID, ssExitID, directExitID string) Strategy {
+// TemplateDomesticSS 国内+SS模式：自定义货品→VPN，REMOTE→SS，其他→直连
+func TemplateDomesticSS(domainCargoIDs []string, remoteCargoID, vpnPortID, ssPortID, directPortID string) Cruise {
 	var bindings []Binding
-	for _, rid := range domainRuleIDs {
-		bindings = append(bindings, Binding{RuleID: rid, ExitID: vpnExitID})
+	for _, cid := range domainCargoIDs {
+		bindings = append(bindings, Binding{CargoID: cid, PortID: vpnPortID})
 	}
-	if remoteRuleID != "" {
-		bindings = append(bindings, Binding{RuleID: remoteRuleID, ExitID: ssExitID})
+	if remoteCargoID != "" {
+		bindings = append(bindings, Binding{CargoID: remoteCargoID, PortID: ssPortID})
 	}
-	return Strategy{
+	return Cruise{
 		Name:          "国内+SS",
 		Bindings:      bindings,
-		DefaultExitID: directExitID,
+		DefaultPortID: directPortID,
 	}
 }

@@ -2,7 +2,7 @@ import SwiftUI
 
 struct MainPopover: View {
     @EnvironmentObject var state: AppState
-    @State private var showSettings = false
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -30,20 +30,19 @@ struct MainPopover: View {
 
     private var strategyRow: some View {
         HStack(spacing: 6) {
-            Text("策略组")
+            Text("🚢")
                 .font(.caption)
-                .foregroundStyle(.secondary)
 
-            if state.profile.strategies.isEmpty {
+            if state.profile.cruises.isEmpty {
                 Text("（请先在设置中创建）")
                     .font(.caption)
                     .foregroundStyle(.orange)
             } else {
                 Picker("", selection: SwiftUI.Binding(
-                    get: { state.profile.activeStrategyID },
-                    set: { state.profile.activeStrategyID = $0; state.save() }
+                    get: { state.profile.activeCruiseID },
+                    set: { state.profile.activeCruiseID = $0; state.save() }
                 )) {
-                    ForEach(state.profile.strategies) { s in
+                    ForEach(state.profile.cruises) { s in
                         Text(s.name).tag(s.id)
                     }
                 }
@@ -108,16 +107,13 @@ struct MainPopover: View {
             Spacer()
 
             Button {
-                showSettings.toggle()
+                openWindow(id: "settings")
+                NSApp.activate(ignoringOtherApps: true)
             } label: {
                 Image(systemName: "gearshape")
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
-            .popover(isPresented: $showSettings, arrowEdge: .leading) {
-                SettingsView()
-                    .environmentObject(state)
-            }
 
             Menu {
                 if state.helperInstalled {

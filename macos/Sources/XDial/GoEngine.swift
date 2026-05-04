@@ -1,6 +1,6 @@
 import Foundation
 
-private func appLog(_ msg: String) {
+func appLog(_ msg: String) {
     let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
     if let fh = FileHandle(forWritingAtPath: "/tmp/xdial-app.log") {
         fh.seekToEndOfFile()
@@ -226,6 +226,9 @@ final class GoEngine: ObservableObject {
             }
         case "error":
             lastError = resp.message
+            if status == "connecting" || status == "disconnecting" {
+                sendCommand("status")
+            }
         case "result":
             if resp.ok != true {
                 lastError = resp.message

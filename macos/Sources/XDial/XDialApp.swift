@@ -10,10 +10,16 @@ struct XDialApp: App {
             MainPopover()
                 .environmentObject(state)
         } label: {
-            Image(systemName: state.isConnected ? "shield.checkered" : "shield")
-                .symbolRenderingMode(.hierarchical)
+            Text("🚢")
         }
         .menuBarExtraStyle(.window)
+
+        Window("XDial 设置", id: "settings") {
+            SettingsView()
+                .environmentObject(state)
+        }
+        .defaultSize(width: 540, height: 540)
+        .windowResizability(.contentSize)
     }
 }
 

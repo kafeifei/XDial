@@ -8,17 +8,26 @@ import (
 )
 
 type SingBoxConfig struct {
-	Log       map[string]interface{}   `json:"log"`
-	DNS       map[string]interface{}   `json:"dns"`
-	Inbounds  []map[string]interface{} `json:"inbounds"`
-	Outbounds []map[string]interface{} `json:"outbounds"`
-	Route     map[string]interface{}   `json:"route"`
+	Log          map[string]interface{}   `json:"log"`
+	DNS          map[string]interface{}   `json:"dns"`
+	Inbounds     []map[string]interface{} `json:"inbounds"`
+	Outbounds    []map[string]interface{} `json:"outbounds"`
+	Route        map[string]interface{}   `json:"route"`
+	Experimental map[string]interface{}   `json:"experimental,omitempty"`
 }
 
+// 测试 IP 信息的域名（流量走 selector 出口组）
+var testDomains = []string{"ip.sb", "ipinfo.io", "ip-api.com"}
+
+const (
+	testSelectorTag    = "test-out"
+	clashAPIController = "127.0.0.1:9090"
+)
+
 func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byte, error) {
-	strategy := profile.ActiveStrategy()
-	if strategy == nil {
-		return nil, fmt.Errorf("no active strategy")
+	cruise := profile.ActiveCruise()
+	if cruise == nil {
+		return nil, fmt.Errorf("no active cruise")
 	}
 
 	outbounds := []map[string]interface{}{
@@ -31,23 +40,39 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 		},
 	}
 
-	for _, exit := range profile.Exits {
-		if !exit.Enabled || exit.Type == ExitTypeDirect || exit.Type == ExitTypeVPN {
+	for _, port := range profile.Ports {
+		if !port.Enabled || port.Type == PortTypeDirect || port.Type == PortTypeVPN {
 			continue
 		}
-		ob := buildProxyOutbound(&exit)
+		ob := buildProxyOutbound(&port)
 		if ob != nil {
 			outbounds = append(outbounds, ob)
 		}
 	}
 
-	routeRules := buildRouteRules(profile, strategy)
-	ruleSets := collectRuleSets(profile, strategy)
+	// selector 出口组：包含所有有效港口，App 通过 Clash API 切换以测试每个港口的真实 IP
+	selectorMembers := []string{"direct", "vpn"}
+	for _, ob := range outbounds {
+		tag, _ := ob["tag"].(string)
+		if tag == "direct" || tag == "vpn" {
+			continue
+		}
+		selectorMembers = append(selectorMembers, tag)
+	}
+	outbounds = append(outbounds, map[string]interface{}{
+		"type":      "selector",
+		"tag":       testSelectorTag,
+		"outbounds": selectorMembers,
+		"default":   "direct",
+	})
+
+	routeRules := buildRouteRules(profile, cruise)
+	ruleSets := collectRuleSets(profile, cruise)
 
 	defaultTag := "direct"
-	if strategy.DefaultExitID != "" {
-		if e := profile.FindExit(strategy.DefaultExitID); e != nil {
-			defaultTag = resolveOutboundTag(e)
+	if cruise.DefaultPortID != "" {
+		if p := profile.FindPort(cruise.DefaultPortID); p != nil {
+			defaultTag = resolveOutboundTag(p)
 		}
 	}
 
@@ -70,6 +95,11 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 		},
 		Outbounds: outbounds,
 		Route:     route,
+		Experimental: map[string]interface{}{
+			"clash_api": map[string]interface{}{
+				"external_controller": clashAPIController,
+			},
+		},
 	}
 
 	return json.MarshalIndent(cfg, "", "  ")
@@ -102,7 +132,7 @@ func buildDNS() map[string]interface{} {
 	}
 }
 
-func buildRouteRules(profile *Profile, strategy *Strategy) []map[string]interface{} {
+func buildRouteRules(profile *Profile, cruise *Cruise) []map[string]interface{} {
 	var rules []map[string]interface{}
 
 	rules = append(rules, map[string]interface{}{
@@ -115,15 +145,21 @@ func buildRouteRules(profile *Profile, strategy *Strategy) []map[string]interfac
 		"outbound": "direct",
 	})
 
-	for _, binding := range strategy.Bindings {
-		rule := profile.FindRule(binding.RuleID)
-		exit := profile.FindExit(binding.ExitID)
-		if rule == nil || exit == nil || !rule.Enabled {
+	// 测试 IP 域名走 selector 出口组
+	rules = append(rules, map[string]interface{}{
+		"domain_suffix": testDomains,
+		"outbound":      testSelectorTag,
+	})
+
+	for _, binding := range cruise.Bindings {
+		cargo := profile.FindCargo(binding.CargoID)
+		port := profile.FindPort(binding.PortID)
+		if cargo == nil || port == nil || !cargo.Enabled {
 			continue
 		}
 
-		outTag := resolveOutboundTag(exit)
-		routeRule := buildRouteRule(rule, outTag)
+		outTag := resolveOutboundTag(port)
+		routeRule := buildRouteRule(cargo, outTag)
 		if routeRule != nil {
 			rules = append(rules, routeRule)
 		}
@@ -132,27 +168,27 @@ func buildRouteRules(profile *Profile, strategy *Strategy) []map[string]interfac
 	return rules
 }
 
-func buildRouteRule(r *Rule, outTag string) map[string]interface{} {
-	switch r.Type {
-	case RuleTypeURL:
-		if r.URL == "" {
+func buildRouteRule(c *Cargo, outTag string) map[string]interface{} {
+	switch c.Type {
+	case CargoTypeURL:
+		if c.URL == "" {
 			return nil
 		}
 		return map[string]interface{}{
-			"rule_set": ruleSetTag(r),
+			"rule_set": ruleSetTag(c),
 			"outbound": outTag,
 		}
-	case RuleTypeManual:
+	case CargoTypeManual:
 		rule := map[string]interface{}{
 			"outbound": outTag,
 		}
-		if len(r.Domains) > 0 {
-			rule["domain_suffix"] = r.Domains
+		if len(c.Domains) > 0 {
+			rule["domain_suffix"] = c.Domains
 		}
-		if len(r.CIDRs) > 0 {
-			rule["ip_cidr"] = r.CIDRs
+		if len(c.CIDRs) > 0 {
+			rule["ip_cidr"] = c.CIDRs
 		}
-		if len(r.Domains) == 0 && len(r.CIDRs) == 0 {
+		if len(c.Domains) == 0 && len(c.CIDRs) == 0 {
 			return nil
 		}
 		return rule
@@ -160,51 +196,49 @@ func buildRouteRule(r *Rule, outTag string) map[string]interface{} {
 	return nil
 }
 
-func collectRuleSets(profile *Profile, strategy *Strategy) []map[string]interface{} {
+func collectRuleSets(profile *Profile, cruise *Cruise) []map[string]interface{} {
 	seen := map[string]bool{}
 	var sets []map[string]interface{}
 
-	for _, binding := range strategy.Bindings {
-		r := profile.FindRule(binding.RuleID)
-		if r == nil || !r.Enabled || r.Type != RuleTypeURL || r.URL == "" {
+	for _, binding := range cruise.Bindings {
+		c := profile.FindCargo(binding.CargoID)
+		if c == nil || !c.Enabled || c.Type != CargoTypeURL || c.URL == "" {
 			continue
 		}
-		tag := ruleSetTag(r)
+		tag := ruleSetTag(c)
 		if seen[tag] {
 			continue
 		}
 		seen[tag] = true
 
-		format := resolveRuleSetFormat(r)
+		format := resolveRuleSetFormat(c)
 		sets = append(sets, map[string]interface{}{
 			"type":            "remote",
 			"tag":             tag,
 			"format":          format,
-			"url":             r.URL,
+			"url":             c.URL,
 			"download_detour": "direct",
 		})
 	}
 	return sets
 }
 
-// ruleSetTag 为 URL 规则生成唯一的 sing-box rule_set tag
-func ruleSetTag(r *Rule) string {
-	return "ruleset-" + r.ID
+func ruleSetTag(c *Cargo) string {
+	return "ruleset-" + c.ID
 }
 
-// resolveRuleSetFormat 根据 Rule.Format 或 URL 后缀判断格式
-func resolveRuleSetFormat(r *Rule) string {
-	if r.Format != "" && r.Format != "auto" {
-		switch r.Format {
+func resolveRuleSetFormat(c *Cargo) string {
+	if c.Format != "" && c.Format != "auto" {
+		switch c.Format {
 		case "srs":
 			return "binary"
 		case "json":
 			return "source"
 		default:
-			return r.Format
+			return c.Format
 		}
 	}
-	ext := strings.ToLower(path.Ext(r.URL))
+	ext := strings.ToLower(path.Ext(c.URL))
 	switch ext {
 	case ".srs":
 		return "binary"
@@ -215,57 +249,57 @@ func resolveRuleSetFormat(r *Rule) string {
 	}
 }
 
-func resolveOutboundTag(exit *Exit) string {
-	switch exit.Type {
-	case ExitTypeDirect:
+func resolveOutboundTag(port *Port) string {
+	switch port.Type {
+	case PortTypeDirect:
 		return "direct"
-	case ExitTypeVPN:
+	case PortTypeVPN:
 		return "vpn"
 	default:
-		return "proxy-" + exit.ID
+		return "proxy-" + port.ID
 	}
 }
 
-func buildProxyOutbound(exit *Exit) map[string]interface{} {
-	switch exit.Type {
-	case ExitTypeTrojan:
-		if exit.TrojanServer == "" {
+func buildProxyOutbound(port *Port) map[string]interface{} {
+	switch port.Type {
+	case PortTypeTrojan:
+		if port.TrojanServer == "" {
 			return nil
 		}
 		return map[string]interface{}{
 			"type":        "trojan",
-			"tag":         "proxy-" + exit.ID,
-			"server":      exit.TrojanServer,
-			"server_port": exit.TrojanPort,
-			"password":    exit.TrojanPassword,
+			"tag":         "proxy-" + port.ID,
+			"server":      port.TrojanServer,
+			"server_port": port.TrojanPort,
+			"password":    port.TrojanPassword,
 			"tls": map[string]interface{}{
 				"enabled":     true,
-				"server_name": exit.TrojanSNI,
+				"server_name": port.TrojanSNI,
 			},
 		}
-	case ExitTypeShadowsocks:
-		if exit.SSServer == "" {
+	case PortTypeShadowsocks:
+		if port.SSServer == "" {
 			return nil
 		}
 		return map[string]interface{}{
 			"type":        "shadowsocks",
-			"tag":         "proxy-" + exit.ID,
-			"server":      exit.SSServer,
-			"server_port": exit.SSPort,
-			"method":      exit.SSMethod,
-			"password":    exit.SSPass,
+			"tag":         "proxy-" + port.ID,
+			"server":      port.SSServer,
+			"server_port": port.SSPort,
+			"method":      port.SSMethod,
+			"password":    port.SSPass,
 		}
-	case ExitTypeVMess:
-		if exit.VMessServer == "" {
+	case PortTypeVMess:
+		if port.VMessServer == "" {
 			return nil
 		}
 		return map[string]interface{}{
 			"type":        "vmess",
-			"tag":         "proxy-" + exit.ID,
-			"server":      exit.VMessServer,
-			"server_port": exit.VMessPort,
-			"uuid":        exit.VMessUUID,
-			"alter_id":    exit.VMessAltID,
+			"tag":         "proxy-" + port.ID,
+			"server":      port.VMessServer,
+			"server_port": port.VMessPort,
+			"uuid":        port.VMessUUID,
+			"alter_id":    port.VMessAltID,
 		}
 	}
 	return nil
