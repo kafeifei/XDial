@@ -24,8 +24,22 @@ final class GoEngine: ObservableObject {
     @Published var lastError: String?
     @Published private(set) var connectedAt: Date?
 
+    struct ParseResult: Decodable {
+        let ports: [Port]
+        let proxyGroups: [SubProxyGroup]?
+        let rules: [SubRule]?
+
+        enum CodingKeys: String, CodingKey {
+            case ports
+            case proxyGroups = "proxy_groups"
+            case rules
+        }
+    }
+
+    private var parseCallback: ((Result<ParseResult, Error>) -> Void)?
+
     var isConnected: Bool { status == "connected" }
-    var isBusy: Bool { status == "connecting" || status == "disconnecting" }
+    var isBusy: Bool { status == "connecting" || status == "disconnecting" || status == "reconnecting" }
 
     // MARK: - Public API
 
@@ -60,6 +74,39 @@ final class GoEngine: ObservableObject {
             status = "disconnected"
             connectedAt = nil
         }
+    }
+
+    func parseSubscription(url: String, content: String = "", format: String = "auto", completion: @escaping (Result<ParseResult, Error>) -> Void) {
+        Task.detached { [weak self] in
+            let ok = await self?.ensureHelperAsync() ?? false
+            await MainActor.run {
+                guard let self, ok else {
+                    completion(.failure(NSError(domain: "XDial", code: -1, userInfo: [NSLocalizedDescriptionKey: "Cannot connect to helper"])))
+                    return
+                }
+                guard self.ensureSocket() else {
+                    completion(.failure(NSError(domain: "XDial", code: -1, userInfo: [NSLocalizedDescriptionKey: "Socket not available"])))
+                    return
+                }
+                self.parseCallback = completion
+                self.sendSubCommand(url: url, content: content, format: format)
+            }
+        }
+    }
+
+    private func sendSubCommand(url: String, content: String, format: String) {
+        guard fd >= 0 else { return }
+        var obj: [String: String] = [
+            "cmd": "parse-subscription",
+            "sub_url": url,
+            "sub_format": format,
+        ]
+        if !content.isEmpty {
+            obj["sub_content"] = content
+        }
+        guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        data.append(UInt8(ascii: "\n"))
+        data.withUnsafeBytes { _ = write(fd, $0.baseAddress!, data.count) }
     }
 
     func syncStatus() {
@@ -230,7 +277,16 @@ final class GoEngine: ObservableObject {
                 sendCommand("status")
             }
         case "result":
-            if resp.ok != true {
+            if resp.cmd == "parse-subscription" {
+                if resp.ok == true, let raw = resp.data?.data(using: .utf8),
+                   let result = try? JSONDecoder().decode(ParseResult.self, from: raw) {
+                    parseCallback?(.success(result))
+                } else {
+                    let msg = resp.message ?? "parse failed"
+                    parseCallback?(.failure(NSError(domain: "XDial", code: -1, userInfo: [NSLocalizedDescriptionKey: msg])))
+                }
+                parseCallback = nil
+            } else if resp.ok != true {
                 lastError = resp.message
                 sendCommand("status")
             }

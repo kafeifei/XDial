@@ -28,6 +28,8 @@ final class AppState: ObservableObject {
 
     private let profileKey = "xdial.profile"
     private let keychainPrefix = "xdial-port-"
+    private let subKeychainPrefix = "xdial-sub-"
+    private var cachedVault: [String: String] = [:]
 
     func tr(_ zh: String, _ en: String) -> String {
         language == .zh ? zh : en
@@ -60,6 +62,7 @@ final class AppState: ObservableObject {
         case "connected": return "已连接"
         case "connecting": return "正在连接…"
         case "disconnecting": return "正在断开…"
+        case "reconnecting": return "正在重连…"
         default:
             if let err = engine.lastError { return err }
             return "未连接"
@@ -110,6 +113,7 @@ final class AppState: ObservableObject {
         guard engine.status == "connected" else { return }
         NetworkInfo.shared.probeAll(
             ports: profile.ports,
+            subscriptions: profile.subscriptions,
             helperConnected: true
         )
     }
@@ -131,7 +135,7 @@ final class AppState: ObservableObject {
 
     func uninstall(deleteData: Bool, completion: @escaping (Bool, String?) -> Void) {
         // 1. 断开连接
-        if engine.status == "connected" || engine.status == "connecting" {
+        if engine.status == "connected" || engine.status == "connecting" || engine.status == "reconnecting" {
             engine.stop()
         }
         // 2. 取消开机启动
@@ -148,13 +152,8 @@ final class AppState: ObservableObject {
             UserDefaults.standard.removeObject(forKey: profileKey)
             UserDefaults.standard.removeObject(forKey: "xdial.language")
             UserDefaults.standard.removeObject(forKey: "xdial.launchAtLogin")
-            // 删除 Keychain 里所有 xdial-port-* 项
-            for port in profile.ports {
-                KeychainStore.delete(account: keychainPrefix + port.id + "-vpn")
-                KeychainStore.delete(account: keychainPrefix + port.id + "-trojan")
-                KeychainStore.delete(account: keychainPrefix + port.id + "-ss")
-                KeychainStore.delete(account: keychainPrefix + port.id + "-vmess")
-            }
+            // 删除 vault
+            KeychainStore.saveVault([:])
         }
         helperInstalled = false
         completion(true, nil)
@@ -202,8 +201,10 @@ final class AppState: ObservableObject {
             try PrivilegeManager.install()
             helperInstalled = PrivilegeManager.isInstalled
             helperNeedsUpdate = false
+            appLog("installHelper: success, installed=\(helperInstalled)")
             if thenConnect && helperInstalled { connect() }
         } catch {
+            appLog("installHelper: FAILED: \(error.localizedDescription)")
             engine.lastError = error.localizedDescription
             helperInstalled = PrivilegeManager.isInstalled
         }
@@ -234,30 +235,53 @@ final class AppState: ObservableObject {
             profile.ports[i].verified = true
         }
 
-        // Profile 中的密码字段拷贝到 Keychain，存储时清空
+        // 所有密码收集到一个 vault dict，一次性存入 Keychain（只弹一次授权）
+        var vault = [String: String]()
         var sanitized = profile
+
         for i in sanitized.ports.indices {
             let id = sanitized.ports[i].id
             if !sanitized.ports[i].vpnPassword.isEmpty {
-                KeychainStore.save(password: sanitized.ports[i].vpnPassword,
-                                   account: keychainPrefix + id + "-vpn")
+                vault[id + "-vpn"] = sanitized.ports[i].vpnPassword
                 sanitized.ports[i].vpnPassword = ""
             }
             if !sanitized.ports[i].trojanPassword.isEmpty {
-                KeychainStore.save(password: sanitized.ports[i].trojanPassword,
-                                   account: keychainPrefix + id + "-trojan")
+                vault[id + "-trojan"] = sanitized.ports[i].trojanPassword
                 sanitized.ports[i].trojanPassword = ""
             }
             if !sanitized.ports[i].ssPassword.isEmpty {
-                KeychainStore.save(password: sanitized.ports[i].ssPassword,
-                                   account: keychainPrefix + id + "-ss")
+                vault[id + "-ss"] = sanitized.ports[i].ssPassword
                 sanitized.ports[i].ssPassword = ""
             }
             if !sanitized.ports[i].vmessUUID.isEmpty {
-                KeychainStore.save(password: sanitized.ports[i].vmessUUID,
-                                   account: keychainPrefix + id + "-vmess")
+                vault[id + "-vmess"] = sanitized.ports[i].vmessUUID
                 sanitized.ports[i].vmessUUID = ""
             }
+        }
+        for si in sanitized.subscriptions.indices {
+            let subID = sanitized.subscriptions[si].id
+            for pi in sanitized.subscriptions[si].ports.indices {
+                let portID = sanitized.subscriptions[si].ports[pi].id
+                let k = subID + "-" + portID
+                let port = sanitized.subscriptions[si].ports[pi]
+                if !port.trojanPassword.isEmpty {
+                    vault[k + "-trojan"] = port.trojanPassword
+                    sanitized.subscriptions[si].ports[pi].trojanPassword = ""
+                }
+                if !port.ssPassword.isEmpty {
+                    vault[k + "-ss"] = port.ssPassword
+                    sanitized.subscriptions[si].ports[pi].ssPassword = ""
+                }
+                if !port.vmessUUID.isEmpty {
+                    vault[k + "-vmess"] = port.vmessUUID
+                    sanitized.subscriptions[si].ports[pi].vmessUUID = ""
+                }
+            }
+        }
+
+        if vault != cachedVault {
+            KeychainStore.saveVault(vault)
+            cachedVault = vault
         }
 
         guard let data = try? JSONEncoder().encode(sanitized) else { return }
@@ -266,31 +290,67 @@ final class AppState: ObservableObject {
 
     private func loadSaved() {
         guard let data = UserDefaults.standard.data(forKey: profileKey) else {
+            appLog("loadSaved: no saved data, using bootstrap")
             return  // 第一次启动，保留 bootstrap
         }
+        appLog("loadSaved: found \(data.count) bytes")
         // 优先按新格式解析；失败再按旧格式迁移
         var loaded: Profile
-        if let p = try? JSONDecoder().decode(Profile.self, from: data) {
-            loaded = p
-        } else if let old = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let migrated = Self.migrate(oldProfile: old) {
-            loaded = migrated
-            appLog("Profile: migrated from old schema")
-        } else {
-            return
+        do {
+            loaded = try JSONDecoder().decode(Profile.self, from: data)
+            appLog("loadSaved: decoded OK, \(loaded.ports.count) ports, \(loaded.cruises.count) cruises")
+        } catch {
+            appLog("loadSaved: decode failed: \(error)")
+            if let old = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let migrated = Self.migrate(oldProfile: old) {
+                loaded = migrated
+                appLog("Profile: migrated from old schema")
+            } else {
+                appLog("loadSaved: migration also failed, using bootstrap")
+                return
+            }
         }
 
-        // 从 Keychain 恢复密码：先试新 prefix，再试旧 prefix（迁移）
-        let oldPrefixes = ["xdial-exit-"]  // 历史 prefix
+        // 从 vault（单条目）恢复密码，回退到旧的逐条方式（迁移）
+        var vault = KeychainStore.loadVault()
+        cachedVault = vault
+        var didMigrate = false
+        if vault.isEmpty {
+            didMigrate = true
+            // 迁移：从旧的逐条 Keychain 读取
+            let oldPrefixes = [keychainPrefix, "xdial-exit-"]
+            for port in loaded.ports {
+                for pfx in oldPrefixes {
+                    for suffix in ["vpn", "trojan", "ss", "vmess"] {
+                        if let v = KeychainStore.load(account: pfx + port.id + "-" + suffix), !v.isEmpty {
+                            vault[port.id + "-" + suffix] = v
+                        }
+                    }
+                }
+            }
+            appLog("loadSaved: migrated \(vault.count) passwords to vault")
+        }
+
         for i in loaded.ports.indices {
             let id = loaded.ports[i].id
-            loaded.ports[i].vpnPassword = loadKeychain(id: id, suffix: "vpn", oldPrefixes: oldPrefixes)
-            loaded.ports[i].trojanPassword = loadKeychain(id: id, suffix: "trojan", oldPrefixes: oldPrefixes)
-            loaded.ports[i].ssPassword = loadKeychain(id: id, suffix: "ss", oldPrefixes: oldPrefixes)
-            loaded.ports[i].vmessUUID = loadKeychain(id: id, suffix: "vmess", oldPrefixes: oldPrefixes)
+            if let v = vault[id + "-vpn"] { loaded.ports[i].vpnPassword = v }
+            if let v = vault[id + "-trojan"] { loaded.ports[i].trojanPassword = v }
+            if let v = vault[id + "-ss"] { loaded.ports[i].ssPassword = v }
+            if let v = vault[id + "-vmess"] { loaded.ports[i].vmessUUID = v }
         }
+        for si in loaded.subscriptions.indices {
+            let subID = loaded.subscriptions[si].id
+            for pi in loaded.subscriptions[si].ports.indices {
+                let portID = loaded.subscriptions[si].ports[pi].id
+                let k = subID + "-" + portID
+                if let v = vault[k + "-trojan"] { loaded.subscriptions[si].ports[pi].trojanPassword = v }
+                if let v = vault[k + "-ss"] { loaded.subscriptions[si].ports[pi].ssPassword = v }
+                if let v = vault[k + "-vmess"] { loaded.subscriptions[si].ports[pi].vmessUUID = v }
+            }
+        }
+
         self.profile = loaded
-        save()  // 保存为新格式
+        if didMigrate { save() }
     }
 
     private func loadKeychain(id: String, suffix: String, oldPrefixes: [String]) -> String {
@@ -354,6 +414,44 @@ final class AppState: ObservableObject {
     private func checkHelper() {
         helperInstalled = PrivilegeManager.isInstalled
         helperNeedsUpdate = PrivilegeManager.needsUpdate
+    }
+
+    // MARK: - Subscription Management
+
+    func addSubscription(name: String, url: String, format: String, strategy: String,
+                         ports: [Port], proxyGroups: [SubProxyGroup] = [], rules: [SubRule] = []) {
+        let sub = Subscription(
+            id: "sub-" + String(UUID().uuidString.prefix(8)).lowercased(),
+            name: name,
+            url: url,
+            format: format,
+            strategy: strategy,
+            ports: ports,
+            proxyGroups: proxyGroups,
+            rules: rules
+        )
+        profile.subscriptions.append(sub)
+        save()
+    }
+
+    func updateSubscription(_ id: String, with result: GoEngine.ParseResult) {
+        guard let idx = profile.subscriptions.firstIndex(where: { $0.id == id }) else { return }
+        profile.subscriptions[idx].ports = result.ports
+        profile.subscriptions[idx].proxyGroups = result.proxyGroups ?? []
+        profile.subscriptions[idx].rules = result.rules ?? []
+        profile.subscriptions[idx].updatedAt = Int(Date().timeIntervalSince1970)
+        save()  // vault 整体覆盖，旧条目自然消失
+    }
+
+    func deleteSubscription(_ id: String) {
+        profile.subscriptions.removeAll { $0.id == id }
+        for i in profile.cruises.indices {
+            profile.cruises[i].bindings.removeAll { $0.subscriptionID == id }
+            if profile.cruises[i].defaultSubscriptionID == id {
+                profile.cruises[i].defaultSubscriptionID = ""
+            }
+        }
+        save()
     }
 
     // MARK: - Cruise Management

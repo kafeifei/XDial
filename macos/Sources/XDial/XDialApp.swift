@@ -26,7 +26,7 @@ struct XDialApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let engine = GoEngine.shared
-        guard engine.status == "connected" || engine.status == "connecting" else {
+        guard engine.status == "connected" || engine.status == "connecting" || engine.status == "reconnecting" else {
             return .terminateNow
         }
         Task { @MainActor in

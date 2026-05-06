@@ -155,7 +155,10 @@ enum PrivilegeManager {
     private static func runAdminShell(_ shell: String) -> Bool {
         let script = "do shell script \(appleScriptQuote(shell)) with administrator privileges"
         var err: NSDictionary?
-        NSAppleScript(source: script)?.executeAndReturnError(&err)
+        let result = NSAppleScript(source: script)?.executeAndReturnError(&err)
+        if let err = err {
+            appLog("runAdminShell FAILED: \(err)")
+        }
         return err == nil
     }
 

@@ -30,8 +30,8 @@ final class NetworkInfo: ObservableObject {
     private let clashAPI = "http://127.0.0.1:9090"
     private var probeTask: Task<Void, Never>?
 
-    /// 启动一次完整探测：本地 IP + 每个出口的 IP 信息
-    func probeAll(ports: [Port], helperConnected: Bool) {
+    /// 启动一次完整探测：本地 IP + 每个出口的 IP 信息 + 订阅主策略组
+    func probeAll(ports: [Port], subscriptions: [Subscription] = [], helperConnected: Bool) {
         probeTask?.cancel()
         localIP = Self.getLocalIP() ?? ""
         appLog("NetworkInfo: localIP=\(localIP) helperConnected=\(helperConnected)")
@@ -52,7 +52,57 @@ final class NetworkInfo: ObservableObject {
                 if !canProbe { continue }
                 await probePort(port: port, helperConnected: helperConnected)
             }
+
+            // 探测订阅：通过主策略组测 IP
+            if helperConnected {
+                for sub in subscriptions where sub.enabled && !sub.ports.isEmpty {
+                    if Task.isCancelled { return }
+                    await probeSub(sub: sub)
+                }
+            }
         }
+    }
+
+    private func probeSub(sub: Subscription) async {
+        // 主策略组 tag（第一个策略组，或无策略组时的默认组）
+        let mainTag: String
+        if let first = sub.proxyGroups.first {
+            mainTag = "sub-" + sub.id + "-" + slugify(first.name)
+        } else {
+            mainTag = "sub-" + sub.id
+        }
+
+        appLog("NetworkInfo: probing sub \(sub.name) tag=\(mainTag)")
+        let ok = await switchSelector(to: mainTag)
+        if !ok {
+            await MainActor.run {
+                var info = PortNetInfo()
+                info.error = "无法切换出口"
+                info.probedAt = Date()
+                self.perPort[sub.id] = info
+            }
+            return
+        }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        let r = await fetchIPInfo()
+        await MainActor.run {
+            var info = PortNetInfo()
+            info.probedAt = Date()
+            info.ip = r.ip
+            info.region = r.region
+            info.error = r.error
+            self.perPort[sub.id] = info
+        }
+    }
+
+    private func slugify(_ s: String) -> String {
+        let r = s.map { c -> Character in
+            if c.isLetter || c.isNumber { return c }
+            return "-"
+        }
+        let result = String(r).lowercased()
+        return result.count > 16 ? String(result.prefix(16)) : result
     }
 
     /// 轮询 Clash API 直到就绪（最多 5 秒）

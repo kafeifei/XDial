@@ -66,26 +66,61 @@ type Cargo struct {
 	CIDRs   []string `json:"cidrs,omitempty"`
 }
 
-// Binding 邮轮中的一条绑定：货品→港口
+// Binding 邮轮中的一条绑定：货品→港口（或订阅）
 type Binding struct {
-	CargoID string `json:"cargo_id"`
-	PortID  string `json:"port_id"`
+	CargoID        string `json:"cargo_id"`
+	PortID         string `json:"port_id,omitempty"`
+	SubscriptionID string `json:"subscription_id,omitempty"`
 }
 
 // Cruise 邮轮：一组货品→港口的绑定
 type Cruise struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Bindings      []Binding `json:"bindings"`
-	DefaultPortID string    `json:"default_port_id"`
+	ID                    string    `json:"id"`
+	Name                  string    `json:"name"`
+	Bindings              []Binding `json:"bindings"`
+	DefaultPortID         string    `json:"default_port_id"`
+	DefaultSubscriptionID string    `json:"default_subscription_id,omitempty"`
+}
+
+// ProxyGroup 订阅内的策略组
+type ProxyGroup struct {
+	Name     string   `json:"name"`
+	Type     string   `json:"type"`                // select / urltest / fallback
+	Proxies  []string `json:"proxies"`             // 节点名或其他组名
+	URL      string   `json:"url,omitempty"`
+	Interval int      `json:"interval,omitempty"`
+}
+
+// SubscriptionRule 订阅内的规则
+type SubscriptionRule struct {
+	Type  string `json:"type"`   // RULE-SET / DOMAIN-SUFFIX / DOMAIN / IP-CIDR / GEOIP / FINAL
+	Value string `json:"value"`  // URL 或匹配值
+	Group string `json:"group"`  // 策略组名
+}
+
+// Subscription 订阅：通过 URL 批量导入的完整配置
+type Subscription struct {
+	ID           string             `json:"id"`
+	Name         string             `json:"name"`
+	URL          string             `json:"url"`
+	Format       string             `json:"format"`
+	Enabled      bool               `json:"enabled"`
+	Strategy     string             `json:"strategy"`
+	Ports        []Port             `json:"ports"`
+	ProxyGroups  []ProxyGroup       `json:"proxy_groups,omitempty"`
+	Rules        []SubscriptionRule `json:"rules,omitempty"`
+	UpdatedAt    int64              `json:"updated_at"`
+	TestURL      string             `json:"test_url,omitempty"`
+	TestInterval int                `json:"test_interval,omitempty"`
 }
 
 // Profile 完整配置
 type Profile struct {
-	Ports          []Port   `json:"ports"`
-	Cargoes        []Cargo  `json:"cargoes"`
-	Cruises        []Cruise `json:"cruises"`
-	ActiveCruiseID string   `json:"active_cruise_id"`
+	Ports          []Port         `json:"ports"`
+	Cargoes        []Cargo        `json:"cargoes"`
+	Cruises        []Cruise       `json:"cruises"`
+	Subscriptions  []Subscription `json:"subscriptions,omitempty"`
+	ActiveCruiseID string         `json:"active_cruise_id"`
 }
 
 func (p *Profile) ActiveCruise() *Cruise {
@@ -110,6 +145,15 @@ func (p *Profile) FindCargo(id string) *Cargo {
 	for i := range p.Cargoes {
 		if p.Cargoes[i].ID == id {
 			return &p.Cargoes[i]
+		}
+	}
+	return nil
+}
+
+func (p *Profile) FindSubscription(id string) *Subscription {
+	for i := range p.Subscriptions {
+		if p.Subscriptions[i].ID == id {
+			return &p.Subscriptions[i]
 		}
 	}
 	return nil
