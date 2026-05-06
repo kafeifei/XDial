@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/kafeifei/xdial/core/engine"
+	"github.com/kafeifei/xdial/core/subscription"
 )
 
 const defaultSocketPath = "/tmp/xdial.sock"
@@ -137,6 +139,15 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 
 		case "status":
 			client.Send(Response{Type: "status", Data: eng.Status()})
+
+		case "parse-subscription":
+			ports, err := subscription.Parse(req.SubURL, req.SubContent, req.SubFormat)
+			if err != nil {
+				client.Send(Response{Type: "result", Cmd: "parse-subscription", OK: false, Message: err.Error()})
+			} else {
+				data, _ := json.Marshal(ports)
+				client.Send(Response{Type: "result", Cmd: "parse-subscription", OK: true, Data: string(data)})
+			}
 
 		default:
 			client.Send(Response{Type: "error", Message: "unknown command: " + req.Cmd})

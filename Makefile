@@ -16,7 +16,7 @@ app: helper
 	@cp $(BUILD_DIR)/macos/debug/XDial "$(APP_BUNDLE)/Contents/MacOS/XDial"
 	@cp $(BUILD_DIR)/xdial-helper "$(APP_BUNDLE)/Contents/MacOS/xdial-helper"
 	@cp macos/Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
-	@touch "$(APP_BUNDLE)"
+	@codesign -s - -f "$(APP_BUNDLE)"
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @EnvironmentObject var state: AppState
@@ -147,6 +148,7 @@ struct GeneralTab: View {
 
 struct PortsTab: View {
     @EnvironmentObject var state: AppState
+    @State private var showAddSub = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -154,6 +156,9 @@ struct PortsTab: View {
                 VStack(spacing: 8) {
                     ForEach($state.profile.ports) { $port in
                         PortRow(port: $port, onDelete: { delete(port) })
+                    }
+                    ForEach($state.profile.subscriptions) { $sub in
+                        SubscriptionRow(sub: $sub, onDelete: { deleteSub(sub) })
                     }
                 }
                 .padding(10)
@@ -167,12 +172,19 @@ struct PortsTab: View {
                     Button("Trojan") { add(type: "trojan") }
                     Button("Shadowsocks") { add(type: "shadowsocks") }
                     Button("VMess") { add(type: "vmess") }
+                    Divider()
+                    Button(state.tr("从订阅导入…", "Import from subscription…")) {
+                        showAddSub = true
+                    }
                 } label: {
-                    Label("添加港口", systemImage: "plus")
+                    Label(state.tr("添加港口", "Add Port"), systemImage: "plus")
                 }
                 .menuStyle(.borderlessButton)
                 .padding(8)
             }
+        }
+        .sheet(isPresented: $showAddSub) {
+            AddSubscriptionSheet(isPresented: $showAddSub)
         }
     }
 
@@ -194,6 +206,10 @@ struct PortsTab: View {
         if port.type == "direct" { return }
         state.profile.ports.removeAll { $0.id == port.id }
         state.save()
+    }
+
+    private func deleteSub(_ sub: Subscription) {
+        state.deleteSubscription(sub.id)
     }
 }
 
@@ -689,8 +705,8 @@ struct StrategyEditor: View {
                             .font(.caption)
                             .frame(width: 200, alignment: .leading)
                         exitPicker(selectedID: SwiftUI.Binding(
-                            get: { strategy.defaultPortID },
-                            set: { strategy.defaultPortID = $0; state.save() }
+                            get: { strategy.defaultTargetID },
+                            set: { strategy.defaultTargetID = $0; state.save() }
                         ))
                     }
                 }
@@ -730,7 +746,7 @@ struct StrategyEditor: View {
             HStack {
                 Text(state.profile.cargoes.first(where: { $0.id == binding.cargoID })?.name ?? "（已删除）")
                     .frame(width: 200, alignment: .leading)
-                exitPicker(selectedID: $strategy.bindings[idx].portID)
+                exitPicker(selectedID: $strategy.bindings[idx].targetID)
                 Button {
                     strategy.bindings.removeAll { $0.cargoID == binding.cargoID }
                     state.save()
@@ -745,7 +761,13 @@ struct StrategyEditor: View {
     private func exitPicker(selectedID: SwiftUI.Binding<String>) -> some View {
         Picker("", selection: selectedID) {
             ForEach(state.profile.ports.filter { $0.enabled }) { e in
-                Text(e.name).tag(e.id)
+                Text(e.name).tag("port:\(e.id)")
+            }
+            if !state.profile.subscriptions.filter({ $0.enabled }).isEmpty {
+                Divider()
+                ForEach(state.profile.subscriptions.filter { $0.enabled }) { sub in
+                    Text("\(sub.name) (\(sub.ports.count))").tag("sub:\(sub.id)")
+                }
             }
         }
         .pickerStyle(.menu)
@@ -753,3 +775,361 @@ struct StrategyEditor: View {
         .onChange(of: selectedID.wrappedValue) { _, _ in state.save() }
     }
 }
+
+// MARK: - 订阅行
+
+struct SubscriptionRow: View {
+    @SwiftUI.Binding var sub: Subscription
+    var onDelete: () -> Void
+    @State private var expanded = false
+    @State private var refreshing = false
+    @State private var testing = false
+    @State private var delays: [String: Int] = [:]
+    @EnvironmentObject var state: AppState
+    @ObservedObject private var net = NetworkInfo.shared
+
+    private var groupCount: Int { sub.proxyGroups.count }
+    private var ruleCount: Int { sub.rules.count }
+    private var probeInfo: String {
+        guard let info = net.perPort[sub.id] else { return "" }
+        if !info.error.isEmpty { return info.error }
+        if info.ip.isEmpty { return "" }
+        var s = info.ip
+        if !info.region.isEmpty { s += " (\(info.region))" }
+        return s
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // 折叠头
+            HStack {
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 12)
+
+                Text(sub.name)
+                    .font(.system(size: 13, weight: .medium))
+
+                if !probeInfo.isEmpty {
+                    Text(probeInfo)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                } else {
+                    if groupCount > 0 {
+                        Text("\(groupCount)\(state.tr("组", "g"))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text("\(sub.ports.count)\(state.tr("节点", "n"))")
+                        .font(.caption).foregroundStyle(.secondary)
+
+                    if sub.updatedAt > 0 {
+                        Text(formatDate(sub.updatedAt))
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+
+                Spacer()
+
+                if refreshing {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button { refreshSub() } label: {
+                        Image(systemName: "arrow.clockwise").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(state.tr("刷新", "Refresh"))
+                }
+
+                Toggle("", isOn: $sub.enabled)
+                    .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+                    .onChange(of: sub.enabled) { _, _ in state.save() }
+
+                Button(action: onDelete) {
+                    Image(systemName: "trash").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { expanded.toggle() }
+
+            // 展开内容
+            if expanded {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
+                        TextField("", text: $sub.name)
+                            .textFieldStyle(.roundedBorder).font(.caption)
+                            .onChange(of: sub.name) { _, _ in state.save() }
+                    }
+                    HStack {
+                        Text("URL").font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
+                        TextField("", text: $sub.url)
+                            .textFieldStyle(.roundedBorder).font(.caption)
+                            .onChange(of: sub.url) { _, _ in state.save() }
+                    }
+
+                    // === 策略组面板 ===
+                    if !sub.proxyGroups.isEmpty {
+                        ForEach(Array(sub.proxyGroups.enumerated()), id: \.element.name) { idx, group in
+                            groupRow(group: group, idx: idx)
+                        }
+                    }
+
+                    // === 测速 ===
+                    if state.engine.isConnected {
+                        Divider()
+                        HStack {
+                            Button {
+                                testAllNodes()
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "bolt.fill").font(.caption2)
+                                    Text(state.tr("测速", "Test"))
+                                        .font(.caption)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(testing)
+
+                            if testing {
+                                ProgressView().controlSize(.small)
+                            }
+
+                            Spacer()
+                        }
+                    }
+                }
+                .padding(.leading, 18)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.08)))
+    }
+
+    @ViewBuilder
+    private func groupRow(group: SubProxyGroup, idx: Int) -> some View {
+        let selected = group.proxies.first ?? ""
+
+        HStack {
+            Text(group.name)
+                .font(.system(size: 12, weight: .medium))
+                .lineLimit(1)
+
+            Spacer()
+
+            MenuButton(selected, delays: delays, items: group.proxies) { _ in
+                // TODO: Clash API 切换
+            }
+            .frame(maxWidth: 180, alignment: .trailing)
+        }
+    }
+
+    private func groupTypeLabel(_ type: String) -> String {
+        switch type {
+        case "select", "selector": return "select"
+        case "url-test", "urltest": return "auto"
+        case "fallback": return "fallback"
+        case "load-balance": return "balance"
+        default: return type
+        }
+    }
+
+    private func delayLabel(_ name: String) -> String {
+        guard let ms = delays[name] else { return name }
+        if ms < 0 { return "\(name)  ⏱ timeout" }
+        return "\(name)  ⏱ \(ms)ms"
+    }
+
+    private func testAllNodes() {
+        guard state.engine.isConnected else { return }
+        testing = true
+        let base = "http://127.0.0.1:9090"
+        let testURL = "https://www.gstatic.com/generate_204"
+        let ports = sub.ports
+        let subID = sub.id
+
+        Task {
+            // 并行测所有节点
+            await withTaskGroup(of: (String, Int).self) { group in
+                for port in ports {
+                    let name = port.name
+                    let tag = "proxy-\(subID)-\(port.id)"
+                    group.addTask {
+                        guard let encoded = tag.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+                              let url = URL(string: "\(base)/proxies/\(encoded)/delay?url=\(testURL)&timeout=3000") else {
+                            return (name, -1)
+                        }
+                        do {
+                            let (data, _) = try await URLSession.shared.data(from: url)
+                            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                               let delay = json["delay"] as? Int {
+                                return (name, delay)
+                            }
+                        } catch {}
+                        return (name, -1)
+                    }
+                }
+                for await (name, ms) in group {
+                    await MainActor.run { delays[name] = ms }
+                }
+            }
+            await MainActor.run { testing = false }
+        }
+    }
+
+    private func refreshSub() {
+        refreshing = true
+        state.engine.parseSubscription(url: sub.url, format: sub.format) { result in
+            refreshing = false
+            switch result {
+            case .success(let r):
+                state.updateSubscription(sub.id, with: r)
+            case .failure(let err):
+                state.engine.lastError = err.localizedDescription
+            }
+        }
+    }
+
+    private func formatDate(_ ts: Int) -> String {
+        let date = Date(timeIntervalSince1970: TimeInterval(ts))
+        let fmt = RelativeDateTimeFormatter()
+        fmt.unitsStyle = .abbreviated
+        return fmt.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+struct AddSubscriptionSheet: View {
+    @SwiftUI.Binding var isPresented: Bool
+    @EnvironmentObject var state: AppState
+    @State private var name = ""
+    @State private var url = ""
+    @State private var fileContent = ""
+    @State private var format = "auto"
+    @State private var strategy = "urltest"
+    @State private var parsing = false
+    @State private var parsedResult: GoEngine.ParseResult?
+    @State private var parseError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(state.tr("添加订阅", "Add Subscription")).font(.headline)
+                Spacer()
+                Button(state.tr("取消", "Cancel")) { isPresented = false }
+            }
+
+            TextField(state.tr("名称", "Name"), text: $name)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                TextField(state.tr("订阅 URL 或本地文件", "URL or local file"), text: $url)
+                    .textFieldStyle(.roundedBorder)
+                Button(state.tr("选择文件", "File")) {
+                    pickFile()
+                }
+                .controlSize(.small)
+            }
+
+            HStack {
+                Text(state.tr("格式", "Format")).font(.caption)
+                Picker("", selection: $format) {
+                    Text(state.tr("自动", "Auto")).tag("auto")
+                    Text("Clash").tag("clash")
+                    Text("Surge").tag("surge")
+                    Text("Base64").tag("base64")
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+
+                Text(state.tr("策略", "Strategy")).font(.caption)
+                Picker("", selection: $strategy) {
+                    Text(state.tr("自动选优", "Auto Best")).tag("urltest")
+                    Text(state.tr("手动选择", "Manual")).tag("selector")
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+            }
+
+            if parsing {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(state.tr("正在解析…", "Parsing…")).font(.caption)
+                }
+            }
+
+            if let error = parseError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            if let r = parsedResult {
+                let summary = state.tr(
+                    "解析到 \(r.ports.count) 个节点、\(r.proxyGroups?.count ?? 0) 个策略组、\(r.rules?.count ?? 0) 条规则",
+                    "Found \(r.ports.count) nodes, \(r.proxyGroups?.count ?? 0) groups, \(r.rules?.count ?? 0) rules"
+                )
+                Text(summary)
+                    .font(.caption)
+                    .foregroundStyle(.green)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(r.ports) { port in
+                            HStack {
+                                Text(port.name).font(.caption)
+                                Spacer()
+                                Text(port.type).font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 150)
+
+                Button(state.tr("确认添加", "Add")) {
+                    let n = name.isEmpty ? (URL(string: url)?.host ?? "Subscription") : name
+                    state.addSubscription(name: n, url: url, format: format, strategy: strategy,
+                                          ports: r.ports, proxyGroups: r.proxyGroups ?? [], rules: r.rules ?? [])
+                    isPresented = false
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                Button(state.tr("解析", "Parse")) {
+                    doParse()
+                }
+                .disabled((url.isEmpty && fileContent.isEmpty) || parsing)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(16)
+        .frame(width: 420)
+    }
+
+    private func pickFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText, .yaml, .data]
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let fileURL = panel.url {
+            if let content = try? String(contentsOf: fileURL, encoding: .utf8) {
+                fileContent = content
+                url = fileURL.lastPathComponent
+            }
+        }
+    }
+
+    private func doParse() {
+        parsing = true
+        parseError = nil
+        parsedResult = nil
+
+        state.engine.parseSubscription(url: url, content: fileContent, format: format) { result in
+            parsing = false
+            switch result {
+            case .success(let r):
+                parsedResult = r
+            case .failure(let err):
+                parseError = err.localizedDescription
+            }
+        }
+    }
+}
+

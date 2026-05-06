@@ -92,6 +92,11 @@ struct MainPopover: View {
                         .tint(.red)
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
+                case "reconnecting":
+                    Button("重连中…") { state.disconnect() }
+                        .tint(.orange)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
                 case "disconnecting":
                     Button("断开中…") {}
                         .controlSize(.small)

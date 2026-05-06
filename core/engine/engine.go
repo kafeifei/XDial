@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/things-go/go-socks5"
 
@@ -16,17 +17,24 @@ import (
 	"sslcon/session"
 )
 
+const (
+	maxReconnectAttempts      = 3
+	stableConnectionThreshold = 60 * time.Second
+)
+
 type Engine struct {
-	mu       sync.Mutex
-	status   Status
-	vpn      *VPNClient
-	bridge   *VPNBridge
-	socks    *socks5.Server
-	socksLn  net.Listener
-	singbox  *SingBoxProcess
-	callback StatusCallback
-	cancel   context.CancelFunc
-	basePath string
+	mu             sync.Mutex
+	status         Status
+	vpn            *VPNClient
+	bridge         *VPNBridge
+	socks          *socks5.Server
+	socksLn        net.Listener
+	singbox        *SingBoxProcess
+	callback       StatusCallback
+	cancel         context.CancelFunc
+	basePath       string
+	profile        *config.Profile
+	reconnectCount int
 }
 
 func New(basePath string, cb StatusCallback) *Engine {
@@ -41,7 +49,7 @@ func (e *Engine) Start(profileJSON string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.status == StatusConnected || e.status == StatusConnecting {
+	if e.status == StatusConnected || e.status == StatusConnecting || e.status == StatusReconnecting {
 		return fmt.Errorf("already %s", e.status)
 	}
 
@@ -50,6 +58,8 @@ func (e *Engine) Start(profileJSON string) error {
 		return fmt.Errorf("parse profile: %w", err)
 	}
 
+	e.profile = &profile
+	e.reconnectCount = 0
 	e.setStatus(StatusConnecting)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -60,18 +70,21 @@ func (e *Engine) Start(profileJSON string) error {
 }
 
 func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
+	if err := e.connectInternal(ctx, profile); err != nil {
+		e.fail(err.Error())
+	}
+}
+
+func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) error {
 	vpnPort := profile.VPNPort()
 	if vpnPort == nil {
-		e.fail("没有配置 VPN 港口")
-		return
+		return fmt.Errorf("没有配置 VPN 港口")
 	}
 	if vpnPort.VPNServer == "" {
-		e.fail("VPN 服务器地址未填写")
-		return
+		return fmt.Errorf("VPN 服务器地址未填写")
 	}
 	if vpnPort.VPNUsername == "" || vpnPort.VPNPassword == "" {
-		e.fail("VPN 用户名或密码未填写")
-		return
+		return fmt.Errorf("VPN 用户名或密码未填写")
 	}
 
 	slog.Info("connecting to VPN", "server", vpnPort.VPNServer)
@@ -82,8 +95,12 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 		Password: vpnPort.VPNPassword,
 	})
 	if err != nil {
-		e.fail(humanizeVPNError(err, vpnPort.VPNServer))
-		return
+		return fmt.Errorf("%s", humanizeVPNError(err, vpnPort.VPNServer))
+	}
+
+	if ctx.Err() != nil {
+		e.vpn.Disconnect()
+		return ctx.Err()
 	}
 
 	slog.Info("VPN connected", "addr", vpnInfo.VPNAddress, "dns", vpnInfo.DNS)
@@ -91,16 +108,14 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 	bridge, err := NewVPNBridge(vpnInfo.VPNAddress, vpnInfo.MTU)
 	if err != nil {
 		e.vpn.Disconnect()
-		e.fail("VPN 隧道初始化失败")
-		return
+		return fmt.Errorf("VPN 隧道初始化失败")
 	}
 
 	cSess := e.vpn.Session()
 	if cSess == nil {
 		bridge.Close()
 		e.vpn.Disconnect()
-		e.fail("VPN 会话已断开")
-		return
+		return fmt.Errorf("VPN 会话已断开")
 	}
 	bridge.Start(cSess)
 
@@ -108,8 +123,7 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 	if err != nil {
 		bridge.Close()
 		e.vpn.Disconnect()
-		e.fail("本地代理启动失败")
-		return
+		return fmt.Errorf("本地代理启动失败")
 	}
 
 	slog.Info("SOCKS5 proxy ready", "addr", socksAddr)
@@ -128,6 +142,7 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 
 	closeCh := session.Sess.CloseChan
 	go e.monitorVPN(closeCh)
+	return nil
 }
 
 func (e *Engine) startSOCKS(bridge *VPNBridge) (string, error) {
@@ -167,7 +182,7 @@ func (e *Engine) Stop() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.status != StatusConnected && e.status != StatusConnecting {
+	if e.status != StatusConnected && e.status != StatusConnecting && e.status != StatusReconnecting {
 		return nil
 	}
 
@@ -176,6 +191,14 @@ func (e *Engine) Stop() error {
 	if e.cancel != nil {
 		e.cancel()
 	}
+	e.cleanupLocked()
+	e.vpn.Disconnect()
+
+	e.setStatus(StatusDisconnected)
+	return nil
+}
+
+func (e *Engine) cleanupLocked() {
 	if e.singbox != nil {
 		e.singbox.Stop()
 		e.singbox = nil
@@ -188,10 +211,6 @@ func (e *Engine) Stop() error {
 		e.bridge.Close()
 		e.bridge = nil
 	}
-	e.vpn.Disconnect()
-
-	e.setStatus(StatusDisconnected)
-	return nil
 }
 
 func (e *Engine) Status() string {
@@ -203,34 +222,83 @@ func (e *Engine) Status() string {
 }
 
 func (e *Engine) monitorVPN(closeCh chan struct{}) {
+	connectedAt := time.Now()
 	<-closeCh
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	if e.status != StatusConnected {
+		e.mu.Unlock()
 		return
 	}
 
 	slog.Warn("VPN session lost unexpectedly, cleaning up")
+	e.cleanupLocked()
 
-	if e.singbox != nil {
-		e.singbox.Stop()
-		e.singbox = nil
+	if time.Since(connectedAt) > stableConnectionThreshold {
+		e.reconnectCount = 0
 	}
-	if e.socksLn != nil {
-		e.socksLn.Close()
-		e.socksLn = nil
+
+	if e.reconnectCount >= maxReconnectAttempts {
+		slog.Error("giving up reconnect", "attempts", e.reconnectCount)
+		if e.callback != nil {
+			e.callback.OnError(2, "VPN 多次重连失败，已停止重试")
+		}
+		e.setStatus(StatusDisconnected)
+		e.mu.Unlock()
+		return
 	}
-	if e.bridge != nil {
-		e.bridge.Close()
-		e.bridge = nil
-	}
+
+	e.reconnectCount++
+	attempt := e.reconnectCount
+	e.setStatus(StatusReconnecting)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	e.cancel = cancel
+	profile := e.profile
+	e.mu.Unlock()
+
+	go e.reconnect(ctx, profile, attempt)
+}
+
+func (e *Engine) reconnect(ctx context.Context, profile *config.Profile, attempt int) {
+	delay := time.Duration(1<<attempt) * time.Second
+	slog.Info("reconnecting VPN", "attempt", attempt, "max", maxReconnectAttempts, "delay", delay)
 
 	if e.callback != nil {
-		e.callback.OnError(2, "VPN 连接意外断开")
+		e.callback.OnError(2, fmt.Sprintf("VPN 断开，%d秒后重连 (%d/%d)", int(delay.Seconds()), attempt, maxReconnectAttempts))
 	}
-	e.setStatus(StatusDisconnected)
+
+	select {
+	case <-time.After(delay):
+	case <-ctx.Done():
+		e.mu.Lock()
+		if e.status == StatusReconnecting {
+			e.setStatus(StatusDisconnected)
+		}
+		e.mu.Unlock()
+		return
+	}
+
+	e.mu.Lock()
+	if e.status != StatusReconnecting {
+		e.mu.Unlock()
+		return
+	}
+	e.setStatus(StatusConnecting)
+	e.mu.Unlock()
+
+	if err := e.connectInternal(ctx, profile); err != nil {
+		e.mu.Lock()
+		if e.status == StatusConnecting {
+			slog.Error("reconnect failed", "attempt", attempt, "err", err)
+			if e.callback != nil {
+				e.callback.OnError(2, "VPN 重连失败："+err.Error())
+			}
+			e.setStatus(StatusDisconnected)
+		}
+		e.mu.Unlock()
+	}
 }
 
 func (e *Engine) KillSession() {
@@ -248,7 +316,6 @@ func (e *Engine) setStatus(s Status) {
 	}
 }
 
-// humanizeVPNError 把底层错误翻译成给人看的提示
 func humanizeVPNError(err error, server string) string {
 	s := err.Error()
 	switch {
@@ -281,6 +348,5 @@ func (e *Engine) fail(msg string) {
 	if e.callback != nil {
 		e.callback.OnError(1, msg)
 	}
-	// 广播状态变化，让 UI 知道连接失败、可以重试
 	e.setStatus(StatusDisconnected)
 }

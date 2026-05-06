@@ -44,6 +44,42 @@ struct Port: Codable, Identifiable, Hashable {
         case vmessUUID = "vmess_uuid"
         case vmessAltID = "vmess_alt_id"
     }
+
+    init(id: String, name: String, type: String, enabled: Bool = true, verified: Bool = false,
+         vpnServer: String = "", vpnUsername: String = "", vpnPassword: String = "",
+         trojanServer: String = "", trojanPort: Int = 443, trojanPassword: String = "", trojanSNI: String = "",
+         ssServer: String = "", ssPort: Int = 8388, ssMethod: String = "aes-256-gcm", ssPassword: String = "",
+         vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0) {
+        self.id = id; self.name = name; self.type = type; self.enabled = enabled; self.verified = verified
+        self.vpnServer = vpnServer; self.vpnUsername = vpnUsername; self.vpnPassword = vpnPassword
+        self.trojanServer = trojanServer; self.trojanPort = trojanPort; self.trojanPassword = trojanPassword; self.trojanSNI = trojanSNI
+        self.ssServer = ssServer; self.ssPort = ssPort; self.ssMethod = ssMethod; self.ssPassword = ssPassword
+        self.vmessServer = vmessServer; self.vmessPort = vmessPort; self.vmessUUID = vmessUUID; self.vmessAltID = vmessAltID
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        type = try c.decode(String.self, forKey: .type)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        verified = try c.decodeIfPresent(Bool.self, forKey: .verified) ?? false
+        vpnServer = try c.decodeIfPresent(String.self, forKey: .vpnServer) ?? ""
+        vpnUsername = try c.decodeIfPresent(String.self, forKey: .vpnUsername) ?? ""
+        vpnPassword = try c.decodeIfPresent(String.self, forKey: .vpnPassword) ?? ""
+        trojanServer = try c.decodeIfPresent(String.self, forKey: .trojanServer) ?? ""
+        trojanPort = try c.decodeIfPresent(Int.self, forKey: .trojanPort) ?? 443
+        trojanPassword = try c.decodeIfPresent(String.self, forKey: .trojanPassword) ?? ""
+        trojanSNI = try c.decodeIfPresent(String.self, forKey: .trojanSNI) ?? ""
+        ssServer = try c.decodeIfPresent(String.self, forKey: .ssServer) ?? ""
+        ssPort = try c.decodeIfPresent(Int.self, forKey: .ssPort) ?? 8388
+        ssMethod = try c.decodeIfPresent(String.self, forKey: .ssMethod) ?? "aes-256-gcm"
+        ssPassword = try c.decodeIfPresent(String.self, forKey: .ssPassword) ?? ""
+        vmessServer = try c.decodeIfPresent(String.self, forKey: .vmessServer) ?? ""
+        vmessPort = try c.decodeIfPresent(Int.self, forKey: .vmessPort) ?? 443
+        vmessUUID = try c.decodeIfPresent(String.self, forKey: .vmessUUID) ?? ""
+        vmessAltID = try c.decodeIfPresent(Int.self, forKey: .vmessAltID) ?? 0
+    }
 }
 
 struct Cargo: Codable, Identifiable, Hashable {
@@ -59,13 +95,126 @@ struct Cargo: Codable, Identifiable, Hashable {
 
 struct CargoLink: Codable, Hashable, Identifiable {
     var cargoID: String
-    var portID: String
+    var portID: String = ""
+    var subscriptionID: String = ""
 
     var id: String { cargoID }
+
+    var targetID: String {
+        get { subscriptionID.isEmpty ? "port:\(portID)" : "sub:\(subscriptionID)" }
+        set {
+            if newValue.hasPrefix("sub:") {
+                subscriptionID = String(newValue.dropFirst(4)); portID = ""
+            } else {
+                portID = newValue.hasPrefix("port:") ? String(newValue.dropFirst(5)) : newValue
+                subscriptionID = ""
+            }
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
         case cargoID = "cargo_id"
         case portID = "port_id"
+        case subscriptionID = "subscription_id"
+    }
+
+    init(cargoID: String, portID: String = "", subscriptionID: String = "") {
+        self.cargoID = cargoID
+        self.portID = portID
+        self.subscriptionID = subscriptionID
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        cargoID = try c.decode(String.self, forKey: .cargoID)
+        portID = try c.decodeIfPresent(String.self, forKey: .portID) ?? ""
+        subscriptionID = try c.decodeIfPresent(String.self, forKey: .subscriptionID) ?? ""
+    }
+}
+
+struct SubProxyGroup: Codable, Hashable {
+    var name: String
+    var type: String
+    var proxies: [String] = []
+    var url: String = ""
+    var interval: Int = 0
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        type = try c.decode(String.self, forKey: .type)
+        proxies = try c.decodeIfPresent([String].self, forKey: .proxies) ?? []
+        url = try c.decodeIfPresent(String.self, forKey: .url) ?? ""
+        interval = try c.decodeIfPresent(Int.self, forKey: .interval) ?? 0
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name, type, proxies, url, interval
+    }
+}
+
+struct SubRule: Codable, Hashable {
+    var type: String
+    var value: String = ""
+    var group: String
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        type = try c.decode(String.self, forKey: .type)
+        value = try c.decodeIfPresent(String.self, forKey: .value) ?? ""
+        group = try c.decode(String.self, forKey: .group)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case type, value, group
+    }
+}
+
+struct Subscription: Codable, Identifiable, Hashable {
+    var id: String
+    var name: String
+    var url: String
+    var format: String = "auto"
+    var enabled: Bool = true
+    var strategy: String = "urltest"
+    var ports: [Port] = []
+    var proxyGroups: [SubProxyGroup] = []
+    var rules: [SubRule] = []
+    var updatedAt: Int = 0
+    var testURL: String = "https://www.gstatic.com/generate_204"
+    var testInterval: Int = 300
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, url, format, enabled, strategy, ports, rules
+        case proxyGroups = "proxy_groups"
+        case updatedAt = "updated_at"
+        case testURL = "test_url"
+        case testInterval = "test_interval"
+    }
+
+    init(id: String, name: String, url: String, format: String = "auto",
+         strategy: String = "urltest", ports: [Port] = [],
+         proxyGroups: [SubProxyGroup] = [], rules: [SubRule] = []) {
+        self.id = id; self.name = name; self.url = url; self.format = format
+        self.strategy = strategy; self.ports = ports
+        self.proxyGroups = proxyGroups; self.rules = rules
+        self.updatedAt = Int(Date().timeIntervalSince1970)
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        url = try c.decode(String.self, forKey: .url)
+        format = try c.decodeIfPresent(String.self, forKey: .format) ?? "auto"
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        strategy = try c.decodeIfPresent(String.self, forKey: .strategy) ?? "urltest"
+        ports = try c.decodeIfPresent([Port].self, forKey: .ports) ?? []
+        proxyGroups = try c.decodeIfPresent([SubProxyGroup].self, forKey: .proxyGroups) ?? []
+        rules = try c.decodeIfPresent([SubRule].self, forKey: .rules) ?? []
+        updatedAt = try c.decodeIfPresent(Int.self, forKey: .updatedAt) ?? 0
+        testURL = try c.decodeIfPresent(String.self, forKey: .testURL) ?? "https://www.gstatic.com/generate_204"
+        testInterval = try c.decodeIfPresent(Int.self, forKey: .testInterval) ?? 300
     }
 }
 
@@ -74,10 +223,38 @@ struct Cruise: Codable, Identifiable, Hashable {
     var name: String
     var bindings: [CargoLink] = []
     var defaultPortID: String = ""
+    var defaultSubscriptionID: String = ""
+
+    var defaultTargetID: String {
+        get { defaultSubscriptionID.isEmpty ? "port:\(defaultPortID)" : "sub:\(defaultSubscriptionID)" }
+        set {
+            if newValue.hasPrefix("sub:") {
+                defaultSubscriptionID = String(newValue.dropFirst(4)); defaultPortID = ""
+            } else {
+                defaultPortID = newValue.hasPrefix("port:") ? String(newValue.dropFirst(5)) : newValue
+                defaultSubscriptionID = ""
+            }
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
         case id, name, bindings
         case defaultPortID = "default_port_id"
+        case defaultSubscriptionID = "default_subscription_id"
+    }
+
+    init(id: String, name: String, bindings: [CargoLink] = [], defaultPortID: String = "", defaultSubscriptionID: String = "") {
+        self.id = id; self.name = name; self.bindings = bindings
+        self.defaultPortID = defaultPortID; self.defaultSubscriptionID = defaultSubscriptionID
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        bindings = try c.decodeIfPresent([CargoLink].self, forKey: .bindings) ?? []
+        defaultPortID = try c.decodeIfPresent(String.self, forKey: .defaultPortID) ?? ""
+        defaultSubscriptionID = try c.decodeIfPresent(String.self, forKey: .defaultSubscriptionID) ?? ""
     }
 }
 
@@ -85,11 +262,23 @@ struct Profile: Codable {
     var ports: [Port] = []
     var cargoes: [Cargo] = []
     var cruises: [Cruise] = []
+    var subscriptions: [Subscription] = []
     var activeCruiseID: String = ""
 
     enum CodingKeys: String, CodingKey {
-        case ports, cargoes, cruises
+        case ports, cargoes, cruises, subscriptions
         case activeCruiseID = "active_cruise_id"
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ports = try c.decodeIfPresent([Port].self, forKey: .ports) ?? []
+        cargoes = try c.decodeIfPresent([Cargo].self, forKey: .cargoes) ?? []
+        cruises = try c.decodeIfPresent([Cruise].self, forKey: .cruises) ?? []
+        subscriptions = try c.decodeIfPresent([Subscription].self, forKey: .subscriptions) ?? []
+        activeCruiseID = try c.decodeIfPresent(String.self, forKey: .activeCruiseID) ?? ""
     }
 }
 

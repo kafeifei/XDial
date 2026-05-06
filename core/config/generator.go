@@ -50,7 +50,22 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 		}
 	}
 
-	// selector 出口组：包含所有有效港口，App 通过 Clash API 切换以测试每个港口的真实 IP
+	// 订阅 outbound：节点 + 策略组（或默认 urltest/selector）
+	subTagMap := make(map[string]string)
+	subGroupTagMap := make(map[string]map[string]string) // subID -> groupName -> tag
+	for _, sub := range profile.Subscriptions {
+		if !sub.Enabled || len(sub.Ports) == 0 {
+			continue
+		}
+		obs, mainTag, groupTags := buildSubscriptionOutbounds(&sub)
+		if mainTag != "" {
+			outbounds = append(outbounds, obs...)
+			subTagMap[sub.ID] = mainTag
+			subGroupTagMap[sub.ID] = groupTags
+		}
+	}
+
+	// selector 出口组：包含所有有效港口和订阅组
 	selectorMembers := []string{"direct", "vpn"}
 	for _, ob := range outbounds {
 		tag, _ := ob["tag"].(string)
@@ -66,11 +81,37 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 		"default":   "direct",
 	})
 
-	routeRules := buildRouteRules(profile, cruise)
+	routeRules := buildRouteRules(profile, cruise, subTagMap)
 	ruleSets := collectRuleSets(profile, cruise)
 
+	// 订阅自带的规则追加到邮轮规则之后
+	for _, sub := range profile.Subscriptions {
+		if !sub.Enabled {
+			continue
+		}
+		groupTags := subGroupTagMap[sub.ID]
+		if groupTags == nil {
+			continue
+		}
+		subRules, subSets := buildSubscriptionRules(&sub, groupTags)
+		routeRules = append(routeRules, subRules...)
+		// rule_set 全局去重
+		for _, s := range subSets {
+			tag := s["tag"].(string)
+			dup := false
+			for _, existing := range ruleSets {
+				if existing["tag"].(string) == tag { dup = true; break }
+			}
+			if !dup { ruleSets = append(ruleSets, s) }
+		}
+	}
+
 	defaultTag := "direct"
-	if cruise.DefaultPortID != "" {
+	if cruise.DefaultSubscriptionID != "" {
+		if tag, ok := subTagMap[cruise.DefaultSubscriptionID]; ok {
+			defaultTag = tag
+		}
+	} else if cruise.DefaultPortID != "" {
 		if p := profile.FindPort(cruise.DefaultPortID); p != nil {
 			defaultTag = resolveOutboundTag(p)
 		}
@@ -132,7 +173,7 @@ func buildDNS() map[string]interface{} {
 	}
 }
 
-func buildRouteRules(profile *Profile, cruise *Cruise) []map[string]interface{} {
+func buildRouteRules(profile *Profile, cruise *Cruise, subTagMap map[string]string) []map[string]interface{} {
 	var rules []map[string]interface{}
 
 	rules = append(rules, map[string]interface{}{
@@ -153,12 +194,24 @@ func buildRouteRules(profile *Profile, cruise *Cruise) []map[string]interface{} 
 
 	for _, binding := range cruise.Bindings {
 		cargo := profile.FindCargo(binding.CargoID)
-		port := profile.FindPort(binding.PortID)
-		if cargo == nil || port == nil || !cargo.Enabled {
+		if cargo == nil || !cargo.Enabled {
 			continue
 		}
 
-		outTag := resolveOutboundTag(port)
+		var outTag string
+		if binding.SubscriptionID != "" {
+			outTag = subTagMap[binding.SubscriptionID]
+		} else {
+			port := profile.FindPort(binding.PortID)
+			if port == nil {
+				continue
+			}
+			outTag = resolveOutboundTag(port)
+		}
+		if outTag == "" {
+			continue
+		}
+
 		routeRule := buildRouteRule(cargo, outTag)
 		if routeRule != nil {
 			rules = append(rules, routeRule)
@@ -260,11 +313,221 @@ func resolveOutboundTag(port *Port) string {
 	}
 }
 
+// buildSubscriptionOutbounds 返回所有 outbound、主 tag、以及组名→tag 映射
+func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, string, map[string]string) {
+	prefix := sub.ID + "-"
+
+	// 1. 生成所有节点 outbound，建立 name→tag 映射
+	var nodeObs []map[string]interface{}
+	nameToTag := map[string]string{}
+	for _, port := range sub.Ports {
+		if !port.Enabled {
+			continue
+		}
+		portCopy := port
+		portCopy.ID = prefix + port.ID
+		ob := buildProxyOutbound(&portCopy)
+		if ob != nil {
+			tag := ob["tag"].(string)
+			nodeObs = append(nodeObs, ob)
+			nameToTag[port.Name] = tag
+		}
+	}
+	if len(nodeObs) == 0 {
+		return nil, "", nil
+	}
+
+	groupTags := map[string]string{} // groupName → tag
+	var groupObs []map[string]interface{}
+
+	if len(sub.ProxyGroups) > 0 {
+		// 2a. 有策略组：每个策略组生成一个 outbound
+		// 先注册所有组名 tag，以便组间互相引用
+		for _, g := range sub.ProxyGroups {
+			groupTags[g.Name] = "sub-" + prefix + slugify(g.Name)
+		}
+		// "DIRECT" / "Direct" 映射到内置 direct
+		nameToTag["DIRECT"] = "direct"
+		nameToTag["Direct"] = "direct"
+
+		for _, g := range sub.ProxyGroups {
+			var memberTags []string
+			for _, name := range g.Proxies {
+				if tag, ok := nameToTag[name]; ok {
+					memberTags = append(memberTags, tag)
+				} else if tag, ok := groupTags[name]; ok {
+					memberTags = append(memberTags, tag)
+				}
+			}
+			if len(memberTags) == 0 {
+				continue
+			}
+
+			ob := map[string]interface{}{
+				"tag":       groupTags[g.Name],
+				"outbounds": memberTags,
+			}
+			switch g.Type {
+			case "url-test", "urltest":
+				ob["type"] = "urltest"
+				url := g.URL
+				if url == "" {
+					url = "https://www.gstatic.com/generate_204"
+				}
+				ob["url"] = url
+				interval := g.Interval
+				if interval <= 0 {
+					interval = 300
+				}
+				if interval > 1800 {
+					interval = 1800
+				}
+				ob["interval"] = fmt.Sprintf("%ds", interval)
+			default:
+				ob["type"] = "selector"
+			}
+			groupObs = append(groupObs, ob)
+		}
+	} else {
+		// 2b. 无策略组：生成一个默认 group
+		var allTags []string
+		for _, ob := range nodeObs {
+			allTags = append(allTags, ob["tag"].(string))
+		}
+		groupTag := "sub-" + sub.ID
+		group := map[string]interface{}{
+			"tag":       groupTag,
+			"outbounds": allTags,
+		}
+		switch sub.Strategy {
+		case "selector":
+			group["type"] = "selector"
+		default:
+			group["type"] = "urltest"
+			url := sub.TestURL
+			if url == "" {
+				url = "https://www.gstatic.com/generate_204"
+			}
+			group["url"] = url
+			interval := sub.TestInterval
+			if interval <= 0 {
+				interval = 300
+			}
+			if interval > 1800 {
+				interval = 1800
+			}
+			group["interval"] = fmt.Sprintf("%ds", interval)
+		}
+		groupObs = append(groupObs, group)
+		groupTags["__default__"] = groupTag
+	}
+
+	// 主 tag：第一个策略组（通常是 "Proxies" / 全局选择组），或默认组
+	mainTag := ""
+	if len(sub.ProxyGroups) > 0 {
+		mainTag = groupTags[sub.ProxyGroups[0].Name]
+	} else {
+		mainTag = groupTags["__default__"]
+	}
+
+	all := append(nodeObs, groupObs...)
+	return all, mainTag, groupTags
+}
+
+// buildSubscriptionRules 将订阅的规则转换为 sing-box route rules 和 rule_sets
+func buildSubscriptionRules(sub *Subscription, groupTags map[string]string) ([]map[string]interface{}, []map[string]interface{}) {
+	var rules []map[string]interface{}
+	var sets []map[string]interface{}
+	seenGeoIP := map[string]bool{}
+
+	for _, r := range sub.Rules {
+		outTag := groupTags[r.Group]
+		if outTag == "" {
+			if r.Group == "DIRECT" || r.Group == "Direct" {
+				outTag = "direct"
+			} else {
+				continue
+			}
+		}
+
+		switch r.Type {
+		case "RULE-SET":
+			// Clash/Surge .list 格式与 sing-box rule-set 不兼容，跳过
+			// 后续可考虑下载解析后内联
+			continue
+		case "DOMAIN-SUFFIX":
+			rules = append(rules, map[string]interface{}{
+				"domain_suffix": []string{r.Value},
+				"outbound":      outTag,
+			})
+		case "DOMAIN":
+			rules = append(rules, map[string]interface{}{
+				"domain": []string{r.Value},
+				"outbound": outTag,
+			})
+		case "DOMAIN-KEYWORD":
+			rules = append(rules, map[string]interface{}{
+				"domain_keyword": []string{r.Value},
+				"outbound":       outTag,
+			})
+		case "IP-CIDR", "IP-CIDR6":
+			rules = append(rules, map[string]interface{}{
+				"ip_cidr":  []string{r.Value},
+				"outbound": outTag,
+			})
+		case "GEOIP":
+			// sing-box 1.12 移除了内置 geoip，转换为远程 rule-set
+			code := strings.ToLower(r.Value)
+			setTag := "sub-geoip-" + sub.ID + "-" + code
+			if !seenGeoIP[setTag] {
+				seenGeoIP[setTag] = true
+				sets = append(sets, map[string]interface{}{
+					"type":            "remote",
+					"tag":             setTag,
+					"format":          "binary",
+					"url":             "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geoip/geoip-" + code + ".srs",
+					"download_detour": "direct",
+				})
+			}
+			rules = append(rules, map[string]interface{}{
+				"rule_set": setTag,
+				"outbound": outTag,
+			})
+		case "FINAL":
+			// FINAL 不生成 route rule，由 sing-box 的 "final" 字段处理
+			continue
+		}
+	}
+	return rules, sets
+}
+
+func slugify(s string) string {
+	// 简单 slug：取前 16 字符，替换非字母数字为 -
+	r := strings.Map(func(c rune) rune {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			return c
+		}
+		return '-'
+	}, s)
+	if len(r) > 16 {
+		r = r[:16]
+	}
+	return strings.ToLower(r)
+}
+
 func buildProxyOutbound(port *Port) map[string]interface{} {
 	switch port.Type {
 	case PortTypeTrojan:
 		if port.TrojanServer == "" {
 			return nil
+		}
+		tls := map[string]interface{}{
+			"enabled":     true,
+			"server_name": port.TrojanSNI,
+		}
+		// SNI 和服务器不一致时需要跳过证书验证（伪装 SNI 场景）
+		if port.TrojanSNI != "" && port.TrojanSNI != port.TrojanServer {
+			tls["insecure"] = true
 		}
 		return map[string]interface{}{
 			"type":        "trojan",
@@ -272,10 +535,7 @@ func buildProxyOutbound(port *Port) map[string]interface{} {
 			"server":      port.TrojanServer,
 			"server_port": port.TrojanPort,
 			"password":    port.TrojanPassword,
-			"tls": map[string]interface{}{
-				"enabled":     true,
-				"server_name": port.TrojanSNI,
-			},
+			"tls":         tls,
 		}
 	case PortTypeShadowsocks:
 		if port.SSServer == "" {

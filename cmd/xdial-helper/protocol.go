@@ -9,8 +9,11 @@ import (
 )
 
 type Request struct {
-	Cmd     string `json:"cmd"`
-	Profile string `json:"profile,omitempty"`
+	Cmd        string `json:"cmd"`
+	Profile    string `json:"profile,omitempty"`
+	SubURL     string `json:"sub_url,omitempty"`
+	SubContent string `json:"sub_content,omitempty"`
+	SubFormat  string `json:"sub_format,omitempty"`
 }
 
 type Response struct {
@@ -46,7 +49,7 @@ func (c *Client) Close() {
 
 func ReadRequests(conn net.Conn, ch chan<- Request) {
 	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
 	for scanner.Scan() {
 		var req Request
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {

@@ -9,6 +9,7 @@ const (
 	StatusConnecting
 	StatusConnected
 	StatusDisconnecting
+	StatusReconnecting
 )
 
 func (s Status) String() string {
@@ -21,6 +22,8 @@ func (s Status) String() string {
 		return "connected"
 	case StatusDisconnecting:
 		return "disconnecting"
+	case StatusReconnecting:
+		return "reconnecting"
 	default:
 		return "unknown"
 	}
