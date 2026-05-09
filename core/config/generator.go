@@ -81,10 +81,10 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 		"default":   "direct",
 	})
 
-	routeRules := buildRouteRules(profile, cruise, subTagMap)
+	routeRules := buildSystemRouteRules()
 	ruleSets := collectRuleSets(profile, cruise)
 
-	// 订阅自带的规则追加到邮轮规则之后
+	// 订阅自带规则在邮轮规则之前（让订阅的分组规则优先匹配）
 	for _, sub := range profile.Subscriptions {
 		if !sub.Enabled {
 			continue
@@ -95,7 +95,6 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 		}
 		subRules, subSets := buildSubscriptionRules(&sub, groupTags)
 		routeRules = append(routeRules, subRules...)
-		// rule_set 全局去重
 		for _, s := range subSets {
 			tag := s["tag"].(string)
 			dup := false
@@ -105,6 +104,10 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 			if !dup { ruleSets = append(ruleSets, s) }
 		}
 	}
+
+	// 邮轮规则作为兜底
+	cruiseRules := buildCruiseRouteRules(profile, cruise, subTagMap)
+	routeRules = append(routeRules, cruiseRules...)
 
 	defaultTag := "direct"
 	if cruise.DefaultSubscriptionID != "" {
@@ -140,6 +143,10 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 			"clash_api": map[string]interface{}{
 				"external_controller": clashAPIController,
 			},
+			"cache_file": map[string]interface{}{
+				"enabled": true,
+				"path":    "cache.db",
+			},
 		},
 	}
 
@@ -173,24 +180,16 @@ func buildDNS() map[string]interface{} {
 	}
 }
 
-func buildRouteRules(profile *Profile, cruise *Cruise, subTagMap map[string]string) []map[string]interface{} {
+func buildSystemRouteRules() []map[string]interface{} {
+	return []map[string]interface{}{
+		{"action": "sniff"},
+		{"protocol": "dns", "action": "route", "outbound": "direct"},
+		{"domain_suffix": testDomains, "outbound": testSelectorTag},
+	}
+}
+
+func buildCruiseRouteRules(profile *Profile, cruise *Cruise, subTagMap map[string]string) []map[string]interface{} {
 	var rules []map[string]interface{}
-
-	rules = append(rules, map[string]interface{}{
-		"action": "sniff",
-	})
-
-	rules = append(rules, map[string]interface{}{
-		"protocol": "dns",
-		"action":   "route",
-		"outbound": "direct",
-	})
-
-	// 测试 IP 域名走 selector 出口组
-	rules = append(rules, map[string]interface{}{
-		"domain_suffix": testDomains,
-		"outbound":      testSelectorTag,
-	})
 
 	for _, binding := range cruise.Bindings {
 		cargo := profile.FindCargo(binding.CargoID)
@@ -515,6 +514,15 @@ func slugify(s string) string {
 	return strings.ToLower(r)
 }
 
+func applyTransport(ob map[string]interface{}, port *Port) {
+	if port.TFO {
+		ob["tcp_fast_open"] = true
+	}
+	if port.UDP {
+		ob["udp_over_tcp"] = true
+	}
+}
+
 func buildProxyOutbound(port *Port) map[string]interface{} {
 	switch port.Type {
 	case PortTypeTrojan:
@@ -529,7 +537,7 @@ func buildProxyOutbound(port *Port) map[string]interface{} {
 		if port.TrojanSNI != "" && port.TrojanSNI != port.TrojanServer {
 			tls["insecure"] = true
 		}
-		return map[string]interface{}{
+		ob := map[string]interface{}{
 			"type":        "trojan",
 			"tag":         "proxy-" + port.ID,
 			"server":      port.TrojanServer,
@@ -537,11 +545,13 @@ func buildProxyOutbound(port *Port) map[string]interface{} {
 			"password":    port.TrojanPassword,
 			"tls":         tls,
 		}
+		applyTransport(ob, port)
+		return ob
 	case PortTypeShadowsocks:
 		if port.SSServer == "" {
 			return nil
 		}
-		return map[string]interface{}{
+		ob := map[string]interface{}{
 			"type":        "shadowsocks",
 			"tag":         "proxy-" + port.ID,
 			"server":      port.SSServer,
@@ -549,11 +559,13 @@ func buildProxyOutbound(port *Port) map[string]interface{} {
 			"method":      port.SSMethod,
 			"password":    port.SSPass,
 		}
+		applyTransport(ob, port)
+		return ob
 	case PortTypeVMess:
 		if port.VMessServer == "" {
 			return nil
 		}
-		return map[string]interface{}{
+		ob := map[string]interface{}{
 			"type":        "vmess",
 			"tag":         "proxy-" + port.ID,
 			"server":      port.VMessServer,
@@ -561,6 +573,8 @@ func buildProxyOutbound(port *Port) map[string]interface{} {
 			"uuid":        port.VMessUUID,
 			"alter_id":    port.VMessAltID,
 		}
+		applyTransport(ob, port)
+		return ob
 	}
 	return nil
 }

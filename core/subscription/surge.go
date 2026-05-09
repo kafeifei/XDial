@@ -191,6 +191,11 @@ func surgeLineToPort(line string) (config.Port, bool) {
 		base.VMessServer = server
 		base.VMessPort = portNum
 		base.VMessUUID = kvs["username"]
+		if kvs["vmess-aead"] == "true" {
+			base.VMessAltID = 0
+		}
+		base.TFO = kvs["tfo"] == "true"
+		base.UDP = kvs["udp-relay"] == "true"
 		return base, true
 
 	case "trojan":
@@ -203,6 +208,8 @@ func surgeLineToPort(line string) (config.Port, bool) {
 			sni = server
 		}
 		base.TrojanSNI = sni
+		base.TFO = kvs["tfo"] == "true"
+		base.UDP = kvs["udp-relay"] == "true"
 		return base, true
 
 	default:

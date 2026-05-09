@@ -9,12 +9,15 @@ struct MainPopover: View {
             header
             Divider()
             strategyRow
+            if !state.profile.subscriptions.isEmpty && state.isConnected {
+                subscriptionSummary
+            }
             Divider()
             statusRow
             actionRow
         }
         .padding(12)
-        .frame(width: 260)
+        .frame(width: 300)
     }
 
     private var header: some View {
@@ -54,11 +57,41 @@ struct MainPopover: View {
         }
     }
 
+    @ObservedObject private var net = NetworkInfo.shared
+
+    private var subscriptionSummary: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(state.profile.subscriptions.filter { $0.enabled }) { sub in
+                HStack(spacing: 6) {
+                    Text("📡").font(.caption2)
+                    Text(sub.name)
+                        .font(.caption)
+                        .lineLimit(1)
+                    Spacer()
+                    if let info = net.perPort[sub.id] {
+                        if !info.ip.isEmpty {
+                            Text(info.summary)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        } else if !info.error.isEmpty {
+                            Text(info.error)
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private var statusRow: some View {
         HStack(spacing: 6) {
             Circle()
                 .fill(dotColor)
                 .frame(width: 8, height: 8)
+                .animation(.easeInOut(duration: 0.3), value: state.engine.status)
             Text(state.statusText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
