@@ -40,6 +40,10 @@ type Port struct {
 	VMessPort   int    `json:"vmess_port,omitempty"`
 	VMessUUID   string `json:"vmess_uuid,omitempty"`
 	VMessAltID  int    `json:"vmess_alt_id,omitempty"`
+
+	// 通用传输选项
+	TFO bool `json:"tfo,omitempty"` // TCP Fast Open
+	UDP bool `json:"udp,omitempty"` // UDP relay / over TCP
 }
 
 // CargoType 货品类型（流量匹配规则）

@@ -222,89 +222,39 @@ struct PortRow: View {
 
     private var isLocked: Bool { port.type == "direct" }
 
-    /// 当前是否为活跃出口：直连任何时候、VPN/SS 仅当连上且当前邮轮用到它时
-    private var isActive: Bool {
-        guard let s = state.activeCruise else { return false }
-        let usedIDs = Set(s.bindings.map { $0.portID } + [s.defaultPortID])
-        switch port.type {
-        case "direct":
-            // 没连上时 direct 才是真正活跃的（流量走真实网络）
-            return state.engine.status != "connected"
-        default:
-            return state.engine.status == "connected" && usedIDs.contains(port.id)
-        }
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                if !isLocked {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .foregroundStyle(.secondary)
-                        .frame(width: 12)
-                } else {
-                    Image(systemName: "lock.fill")
-                        .foregroundStyle(.secondary)
-                        .frame(width: 12)
-                }
-
-                // 验证状态：实心钩=已验证，空心钩=未验证。全灰度。
+        CollapsibleCard(
+            isExpanded: expanded,
+            locked: isLocked,
+            onToggle: { expanded.toggle() },
+            onDelete: isLocked ? nil : onDelete,
+            enabled: Binding(get: { port.enabled }, set: { if !isLocked { port.enabled = $0; state.save() } }),
+            header: {
                 Image(systemName: port.verified ? "checkmark.seal.fill" : "checkmark.seal")
                     .foregroundStyle(.secondary)
-                    .help(port.verified ? "已验证" : "未验证")
 
-                Text(port.name)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.primary)
+                Text(port.name).font(.system(size: 13, weight: .medium))
 
                 if !briefInfo.isEmpty {
-                    Text(briefInfo)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    Text(briefInfo).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
                 }
-
                 Spacer()
-
-                Text(typeLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                if !isLocked {
-                    Toggle("", isOn: $port.enabled)
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .labelsHidden()
-                        .onChange(of: port.enabled) { _, _ in state.save() }
-                    Button(action: onDelete) {
-                        Image(systemName: "trash").foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                if !isLocked { expanded.toggle() }
-            }
-
-            if expanded && !isLocked {
+                Text(typeLabel).font(.caption).foregroundStyle(.secondary)
+            },
+            detail: {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("名称").font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
                         TextField("名称", text: $port.name)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.caption)
+                            .textFieldStyle(.roundedBorder).font(.caption)
                             .onChange(of: port.name) { _, _ in state.save() }
                     }
                     detailFields
                 }
-                .padding(.leading, 18)
             }
-        }
-        .padding(8)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.08)))
-        .opacity(port.verified ? 1.0 : 0.55)
+        )
+        .opacity(isLocked ? 0.6 : (port.verified ? 1.0 : 0.7))
     }
 
     private var briefInfo: String {
@@ -478,39 +428,30 @@ struct CargoRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .foregroundStyle(.secondary)
-                    .onTapGesture { expanded.toggle() }
-                TextField("名称", text: $rule.name)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13, weight: .medium))
-                    .onChange(of: rule.name) { _, _ in state.save() }
+        CollapsibleCard(
+            isExpanded: expanded,
+            onToggle: { expanded.toggle() },
+            onDelete: onDelete,
+            enabled: Binding(get: { rule.enabled }, set: { rule.enabled = $0; state.save() }),
+            header: {
+                Text(rule.name).font(.system(size: 13, weight: .medium))
                 Spacer()
-                Text(rule.type == "url" ? "URL" : "手动")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Toggle("", isOn: $rule.enabled)
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
-                    .labelsHidden()
-                    .onChange(of: rule.enabled) { _, _ in state.save() }
-                Button(action: onDelete) {
-                    Image(systemName: "trash").foregroundStyle(.red)
-                }
-                .buttonStyle(.plain)
-            }
-            if expanded {
-                if rule.type == "url" {
-                    urlFields
-                } else {
-                    manualFields
+                Text(rule.type == "url" ? "URL" : state.tr("手动", "Manual"))
+                    .font(.caption).foregroundStyle(.secondary)
+            },
+            detail: {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
+                        TextField("", text: $rule.name)
+                            .textFieldStyle(.roundedBorder).font(.caption)
+                            .onChange(of: rule.name) { _, _ in state.save() }
+                    }
+                    if rule.type == "url" { urlFields }
+                    else { manualFields }
                 }
             }
-        }
-        .padding(8)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.08)))
+        )
     }
 
     private var urlFields: some View {
@@ -576,179 +517,154 @@ struct CruisesTab: View {
     @EnvironmentObject var state: AppState
     @State private var showTemplate = false
     @State private var newName = ""
+    @State private var expandedID: String? = nil
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                if state.profile.cruises.isEmpty {
-                    Text("还没有邮轮")
-                        .foregroundStyle(.secondary)
-                } else {
-                    Picker("当前编辑", selection: SwiftUI.Binding(
-                        get: { state.profile.activeCruiseID },
-                        set: { state.profile.activeCruiseID = $0; state.save() }
-                    )) {
-                        ForEach(state.profile.cruises) { s in
-                            Text(s.name).tag(s.id)
+            ScrollView {
+                VStack(spacing: 8) {
+                    ForEach($state.profile.cruises) { $cruise in
+                        CruiseRow(
+                            cruise: $cruise,
+                            isActive: cruise.id == state.profile.activeCruiseID,
+                            isExpanded: expandedID == cruise.id,
+                            onToggle: { expandedID = expandedID == cruise.id ? nil : cruise.id },
+                            onActivate: {
+                                state.profile.activeCruiseID = cruise.id
+                                state.save()
+                            },
+                            onDelete: { state.deleteCruise(cruise) }
+                        )
+                    }
+                }
+                .padding(10)
+            }
+            Divider()
+            AddBar {
+                Menu {
+                    ForEach(CruiseTemplate.allCases, id: \.self) { t in
+                        Button(t.displayName) {
+                            state.createCruise(from: t, named: t.displayName)
                         }
                     }
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: 200)
-                }
-                Spacer()
-                Button {
-                    showTemplate = true
                 } label: {
-                    Label("新建", systemImage: "plus")
+                    Label(state.tr("添加邮轮", "Add Cruise"), systemImage: "plus")
                 }
-                .sheet(isPresented: $showTemplate) {
-                    templatePicker
-                }
-            }
-            .padding(10)
-
-            Divider()
-
-            if let idx = state.profile.cruises.firstIndex(where: { $0.id == state.profile.activeCruiseID }) {
-                StrategyEditor(strategy: $state.profile.cruises[idx])
-            } else {
-                Spacer()
-                Text("点击「新建」创建邮轮")
-                    .foregroundStyle(.secondary)
-                Spacer()
             }
         }
     }
 
-    private var templatePicker: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("从模板创建邮轮").font(.headline)
-                Spacer()
-                Button("取消") { showTemplate = false }
-            }
-            TextField("邮轮名称", text: $newName)
-                .textFieldStyle(.roundedBorder)
-            ForEach(CruiseTemplate.allCases, id: \.self) { t in
-                Button {
-                    let name = newName.isEmpty ? t.displayName : newName
-                    state.createCruise(from: t, named: name)
-                    newName = ""
-                    showTemplate = false
-                } label: {
-                    HStack {
-                        Text(t.displayName).font(.system(size: 13, weight: .medium))
-                        Spacer()
-                        Text(templateDescription(t))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 4)
-                }
-                .buttonStyle(.bordered)
-            }
-        }
-        .padding(16)
-        .frame(width: 360)
-    }
-
-    private func templateDescription(_ t: CruiseTemplate) -> String {
-        switch t {
-        case .overseas: return "货品→VPN，其他→直连"
-        case .domestic: return "货品+GFW→VPN，其他→直连"
-        case .domesticSS: return "货品→VPN，GFW→SS，其他→直连"
-        case .blank: return "空白"
-        }
-    }
 }
 
-struct StrategyEditor: View {
-    @SwiftUI.Binding var strategy: Cruise
+struct CruiseRow: View {
+    @SwiftUI.Binding var cruise: Cruise
+    let isActive: Bool
+    let isExpanded: Bool
+    let onToggle: () -> Void
+    let onActivate: () -> Void
+    let onDelete: () -> Void
     @EnvironmentObject var state: AppState
 
+    private var bindingSummary: String {
+        let n = cruise.bindings.count
+        return n == 0 ? state.tr("无规则", "No rules") : "\(n) \(state.tr("条规则", "rules"))"
+    }
+
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("名称").font(.caption).foregroundStyle(.secondary)
-                TextField("", text: $strategy.name)
-                    .textFieldStyle(.roundedBorder)
-                    .onChange(of: strategy.name) { _, _ in state.save() }
-                Spacer()
-                Button {
-                    state.deleteCruise(strategy)
-                } label: {
-                    Image(systemName: "trash").foregroundStyle(.red)
+        CollapsibleCard(
+            isExpanded: isExpanded,
+            onToggle: onToggle,
+            onDelete: onDelete,
+            accentBar: isActive,
+            header: {
+                if isActive {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption).foregroundColor(.accentColor)
+                } else {
+                    Image(systemName: "circle")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .onTapGesture { onActivate() }
                 }
-                .buttonStyle(.plain)
-            }
-            .padding(10)
-
-            Divider()
-
-            ScrollView {
+                Text(cruise.name).font(.system(size: 13, weight: .medium))
+                Text(bindingSummary).font(.caption).foregroundStyle(.secondary)
+            },
+            detail: {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("货品").font(.caption).foregroundStyle(.secondary)
-                            .frame(width: 200, alignment: .leading)
-                        Text("港口").font(.caption).foregroundStyle(.secondary)
+                        Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
+                        TextField("", text: $cruise.name)
+                            .textFieldStyle(.roundedBorder).font(.caption)
+                            .onChange(of: cruise.name) { _, _ in state.save() }
                     }
 
-                    ForEach(strategy.bindings) { binding in
+                    Divider()
+
+                    HStack {
+                        Text(state.tr("货品", "Cargo")).font(.caption).foregroundStyle(.secondary)
+                            .frame(width: 200, alignment: .leading)
+                        Text(state.tr("港口", "Port")).font(.caption).foregroundStyle(.secondary)
+                    }
+
+                    ForEach(cruise.bindings) { binding in
                         bindingRow(binding)
                     }
 
                     Divider()
 
                     HStack {
-                        Text("其他流量")
+                        Text(state.tr("其他流量", "Other"))
                             .font(.caption)
                             .frame(width: 200, alignment: .leading)
                         exitPicker(selectedID: SwiftUI.Binding(
-                            get: { strategy.defaultTargetID },
-                            set: { strategy.defaultTargetID = $0; state.save() }
+                            get: { cruise.defaultTargetID },
+                            set: { cruise.defaultTargetID = $0; state.save() }
                         ))
                     }
-                }
-                .padding(10)
-            }
 
-            Divider()
-
-            HStack {
-                Spacer()
-                Menu {
-                    let usedIDs = Set(strategy.bindings.map { $0.cargoID })
-                    let available = state.profile.cargoes.filter { !usedIDs.contains($0.id) }
-                    if available.isEmpty {
-                        Button("（无可用货品）") {}.disabled(true)
-                    } else {
-                        ForEach(available) { rule in
-                            Button(rule.name) {
-                                let firstExit = state.profile.ports.first?.id ?? ""
-                                strategy.bindings.append(CargoLink(cargoID: rule.id, portID: firstExit))
-                                state.save()
+                    // 添加货品
+                    HStack {
+                        Spacer()
+                        Menu {
+                            let usedIDs = Set(cruise.bindings.map { $0.cargoID })
+                            let available = state.profile.cargoes.filter { !usedIDs.contains($0.id) }
+                            if available.isEmpty {
+                                Button(state.tr("（无可用货品）", "(No cargo available)")) {}.disabled(true)
+                            } else {
+                                ForEach(available) { rule in
+                                    Button(rule.name) {
+                                        let firstExit = state.profile.ports.first?.id ?? ""
+                                        cruise.bindings.append(CargoLink(cargoID: rule.id, portID: firstExit))
+                                        state.save()
+                                    }
+                                }
                             }
+                        } label: {
+                            Label(state.tr("添加货品", "Add Cargo"), systemImage: "plus")
                         }
+                        .menuStyle(.borderlessButton)
+                        .controlSize(.small)
                     }
-                } label: {
-                    Label("添加货品", systemImage: "plus")
                 }
-                .menuStyle(.borderlessButton)
-                .padding(8)
             }
-        }
+        )
     }
 
     @ViewBuilder
     private func bindingRow(_ binding: CargoLink) -> some View {
-        if let idx = strategy.bindings.firstIndex(where: { $0.cargoID == binding.cargoID }) {
+        if let idx = cruise.bindings.firstIndex(where: { $0.cargoID == binding.cargoID }) {
+            let isEmpty = binding.portID.isEmpty && binding.subscriptionID.isEmpty
             HStack {
-                Text(state.profile.cargoes.first(where: { $0.id == binding.cargoID })?.name ?? "（已删除）")
-                    .frame(width: 200, alignment: .leading)
-                exitPicker(selectedID: $strategy.bindings[idx].targetID)
+                HStack(spacing: 4) {
+                    if isEmpty {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption2).foregroundStyle(.orange)
+                    }
+                    Text(state.profile.cargoes.first(where: { $0.id == binding.cargoID })?.name ?? "（已删除）")
+                }
+                .frame(width: 200, alignment: .leading)
+                exitPicker(selectedID: $cruise.bindings[idx].targetID)
                 Button {
-                    strategy.bindings.removeAll { $0.cargoID == binding.cargoID }
+                    cruise.bindings.removeAll { $0.cargoID == binding.cargoID }
                     state.save()
                 } label: {
                     Image(systemName: "minus.circle").foregroundStyle(.red)
@@ -766,7 +682,8 @@ struct StrategyEditor: View {
             if !state.profile.subscriptions.filter({ $0.enabled }).isEmpty {
                 Divider()
                 ForEach(state.profile.subscriptions.filter { $0.enabled }) { sub in
-                    Text("\(sub.name) (\(sub.ports.count))").tag("sub:\(sub.id)")
+                    Label("\(sub.name) (\(sub.ports.count))", systemImage: "antenna.radiowaves.left.and.right")
+                        .tag("sub:\(sub.id)")
                 }
             }
         }
@@ -850,7 +767,7 @@ struct SubscriptionRow: View {
                 .buttonStyle(.plain)
             }
             .contentShape(Rectangle())
-            .onTapGesture { expanded.toggle() }
+            .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() } }
 
             // 展开内容
             if expanded {
@@ -868,43 +785,61 @@ struct SubscriptionRow: View {
                             .onChange(of: sub.url) { _, _ in state.save() }
                     }
 
-                    // === 策略组面板 ===
+                    // === 策略组 ===
                     if !sub.proxyGroups.isEmpty {
+                        Divider()
+                        Text(state.tr("策略组", "Groups"))
+                            .font(.caption2).foregroundStyle(.tertiary).textCase(.uppercase)
                         ForEach(Array(sub.proxyGroups.enumerated()), id: \.element.name) { idx, group in
                             groupRow(group: group, idx: idx)
                         }
                     }
 
                     // === 测速 ===
-                    if state.engine.isConnected {
-                        Divider()
-                        HStack {
-                            Button {
-                                testAllNodes()
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "bolt.fill").font(.caption2)
-                                    Text(state.tr("测速", "Test"))
-                                        .font(.caption)
-                                }
+                    Divider()
+                    HStack {
+                        Button {
+                            testAllNodes()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "bolt.fill").font(.caption2)
+                                Text(state.tr("测速", "Test")).font(.caption)
                             }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(testing)
-
-                            if testing {
-                                ProgressView().controlSize(.small)
-                            }
-
-                            Spacer()
                         }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(testing || !state.engine.isConnected)
+
+                        if testing {
+                            ProgressView().controlSize(.small)
+                            Text(state.tr("测速中…", "Testing…"))
+                                .font(.caption2).foregroundStyle(.secondary)
+                        } else if !delays.isEmpty {
+                            let ok = delays.values.filter { $0 > 0 }.count
+                            let fail = delays.values.filter { $0 < 0 }.count
+                            Text("\(ok) ✓  \(fail) ✗")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
                     }
                 }
                 .padding(.leading, 18)
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.08)))
+        .background(
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.06))
+                HStack(spacing: 0) {
+                    Color.accentColor.opacity(0.5)
+                        .frame(width: 3)
+                        .clipShape(RoundedRectangle(cornerRadius: 1.5))
+                    Spacer()
+                }
+                .padding(.vertical, 2)
+            }
+        )
     }
 
     @ViewBuilder

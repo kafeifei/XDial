@@ -5,6 +5,10 @@ import SwiftUI
 
 @MainActor
 final class AppState: ObservableObject {
+    #if DEBUG
+    static private(set) weak var current: AppState?
+    #endif
+
     @Published var profile: Profile
 
     @Published var helperInstalled: Bool = false
@@ -107,7 +111,15 @@ final class AppState: ObservableObject {
         if engine.status == "connected" {
             probeNetwork()
         }
+        #if DEBUG
+        Self.current = self
+        Self.debugServer.start()
+        #endif
     }
+
+    #if DEBUG
+    private static let debugServer = DebugServer()
+    #endif
 
     func probeNetwork() {
         guard engine.status == "connected" else { return }
@@ -298,7 +310,7 @@ final class AppState: ObservableObject {
         var loaded: Profile
         do {
             loaded = try JSONDecoder().decode(Profile.self, from: data)
-            appLog("loadSaved: decoded OK, \(loaded.ports.count) ports, \(loaded.cruises.count) cruises")
+            appLog("loadSaved: decoded OK, \(loaded.ports.count) ports, \(loaded.cruises.count) cruises, \(loaded.subscriptions.count) subs")
         } catch {
             appLog("loadSaved: decode failed: \(error)")
             if let old = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

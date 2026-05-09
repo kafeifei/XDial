@@ -145,6 +145,7 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 			if err != nil {
 				client.Send(Response{Type: "result", Cmd: "parse-subscription", OK: false, Message: err.Error()})
 			} else {
+				subscription.ExpandRulesets(ports)
 				data, _ := json.Marshal(ports)
 				client.Send(Response{Type: "result", Cmd: "parse-subscription", OK: true, Data: string(data)})
 			}

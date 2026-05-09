@@ -7,7 +7,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "XDial",
-            path: "Sources/XDial"
+            path: "Sources/XDial",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug)),
+            ]
         ),
     ]
 )

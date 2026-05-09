@@ -1,7 +1,13 @@
 BUILD_DIR := build
 APP_BUNDLE := $(BUILD_DIR)/XDial.app
 
-.PHONY: all helper app clean
+.PHONY: all helper app inspector clean test test-smoke
+
+test:
+	go test ./core/... -v -count=1
+
+test-smoke:
+	go test ./core/config/ -run TestSmoke -v -count=1 -timeout 120s
 
 all: helper app
 
@@ -16,7 +22,13 @@ app: helper
 	@cp $(BUILD_DIR)/macos/debug/XDial "$(APP_BUNDLE)/Contents/MacOS/XDial"
 	@cp $(BUILD_DIR)/xdial-helper "$(APP_BUNDLE)/Contents/MacOS/xdial-helper"
 	@cp macos/Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
+	@mkdir -p "$(APP_BUNDLE)/Contents/Resources"
+	@cp macos/AppIcon.icns "$(APP_BUNDLE)/Contents/Resources/AppIcon.icns"
 	@codesign -s - -f "$(APP_BUNDLE)"
+
+inspector:
+	@mkdir -p $(BUILD_DIR)
+	swiftc -O tools/inspector.swift -o $(BUILD_DIR)/xdial-inspector
 
 clean:
 	rm -rf $(BUILD_DIR)

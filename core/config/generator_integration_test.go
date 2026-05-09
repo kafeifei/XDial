@@ -126,6 +126,14 @@ func testSubscriptionNoGroups() Subscription {
 // 测试用例
 // =====================
 
+func vmessPort() Port {
+	return Port{
+		ID: "vmess-1", Name: "America VMess", Type: PortTypeVMess, Enabled: true,
+		VMessServer: "us.example.com", VMessPort: 443,
+		VMessUUID: "test-uuid", VMessAltID: 0,
+	}
+}
+
 // 1. 纯手动港口，无订阅（原有功能）
 func TestGenerate_ManualOnly(t *testing.T) {
 	p := &Profile{
@@ -143,6 +151,25 @@ func TestGenerate_ManualOnly(t *testing.T) {
 		ActiveCruiseID: "c1",
 	}
 	singboxCheck(t, p, "manual-only")
+}
+
+// 1b. 国内 IP 走 VMess（验证 cnip→vmess 分流正确）
+func TestGenerate_ManualOnlyVMess(t *testing.T) {
+	p := &Profile{
+		Ports:   []Port{directPort(), vpnPort(), vmessPort()},
+		Cargoes: []Cargo{internalCargo(), gfwCargo(), cnipCargo()},
+		Cruises: []Cruise{{
+			ID: "c1", Name: "国内",
+			Bindings: []Binding{
+				{CargoID: "internal", PortID: "vpn"},
+				{CargoID: "gfw", PortID: "direct"},
+				{CargoID: "cnip", PortID: "vmess-1"},
+			},
+			DefaultPortID: "direct",
+		}},
+		ActiveCruiseID: "c1",
+	}
+	singboxCheck(t, p, "manual-vmess")
 }
 
 // 2. 邮轮 binding 指向订阅整体
@@ -378,7 +405,7 @@ func TestGenerate_ContentVerification(t *testing.T) {
 		t.Errorf("final = %q, want sub-sub-test-proxies", final)
 	}
 
-	// 验证邮轮规则在订阅规则之前
+	// 验证订阅规则在邮轮规则之前
 	rules := route["rules"].([]interface{})
 	var internalIdx, netflixIdx int
 	for i, r := range rules {
@@ -402,8 +429,8 @@ func TestGenerate_ContentVerification(t *testing.T) {
 	if netflixIdx == 0 {
 		t.Error("netflix subscription rule not found")
 	}
-	if internalIdx > netflixIdx {
-		t.Errorf("cruise rule (idx=%d) should come before subscription rule (idx=%d)", internalIdx, netflixIdx)
+	if netflixIdx > internalIdx {
+		t.Errorf("subscription rule (idx=%d) should come before cruise rule (idx=%d)", netflixIdx, internalIdx)
 	}
 
 	t.Logf("Content verification: %d outbounds, %d rules, final=%s", len(outbounds), len(rules), final)
