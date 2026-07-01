@@ -98,10 +98,10 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 	for req := range reqCh {
 		switch req.Cmd {
 		case "start":
-			var profile config.Profile
-			if err := json.Unmarshal([]byte(req.Profile), &profile); err != nil {
+			profile, err := config.ParseProfile([]byte(req.Profile))
+			if err != nil {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
-			} else if err := eng.Start(&profile); err != nil {
+			} else if err := eng.Start(profile); err != nil {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
 			} else {
 				client.SendResponse(Response{ID: req.ID, OK: true})
@@ -122,12 +122,12 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 			client.SendResponse(Response{ID: req.ID, OK: true, Data: eng.Status()})
 
 		case "parse-sub":
-			ports, err := subscription.Parse(req.SubURL, req.SubContent, req.SubFormat)
+			result, err := subscription.Parse(req.SubURL, req.SubContent, req.SubFormat)
 			if err != nil {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
 			} else {
-				subscription.ExpandRulesets(ports)
-				data, _ := json.Marshal(ports)
+				subscription.ExpandRulesets(result)
+				data, _ := json.Marshal(result)
 				client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
 			}
 

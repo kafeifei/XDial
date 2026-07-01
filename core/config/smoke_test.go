@@ -193,13 +193,13 @@ func newSmokeRunner(t *testing.T, profile *Profile) *smokeRunner {
 			newOutbounds = append(newOutbounds, ob)
 		case typ == "selector":
 			newOutbounds = append(newOutbounds, ob)
-			case typ == "urltest":
-				ob["type"] = "selector"
-				delete(ob, "url")
-				delete(ob, "interval")
-				delete(ob, "tolerance")
-				newOutbounds = append(newOutbounds, ob)
-			default:
+		case typ == "urltest":
+			ob["type"] = "selector"
+			delete(ob, "url")
+			delete(ob, "interval")
+			delete(ob, "tolerance")
+			newOutbounds = append(newOutbounds, ob)
+		default:
 			fe, ok := runner.fakeExits[tag]
 			if !ok {
 				t.Fatalf("no fake exit for outbound tag %s", tag)
@@ -359,26 +359,26 @@ func (r *smokeRunner) requestAndAssert(targetHost string, expectTag string) {
 
 func TestSmoke_BasicSplit(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
-			{ID: "my-trojan", Type: PortTypeTrojan, Enabled: true,
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+			{ID: "my-trojan", Type: LineTypeTrojan, Enabled: true,
 				TrojanServer: "tr.example.com", TrojanPort: 443, TrojanPassword: "pass", TrojanSNI: "tr.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "corp", Name: "公司", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "corp", Name: "公司", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"corp.example.com", "internal.example.com"}},
-			{ID: "social", Name: "社交", Type: CargoTypeManual, Enabled: true,
+			{ID: "social", Name: "社交", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"twitter.com", "facebook.com"}},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "corp", PortID: "my-vpn"},
-				{CargoID: "social", PortID: "my-trojan"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "corp", LineID: "my-vpn"},
+				{RuleSetID: "social", LineID: "my-trojan"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -393,21 +393,21 @@ func TestSmoke_BasicSplit(t *testing.T) {
 
 func TestSmoke_DefaultVPN(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "gfw", Name: "GFW", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "gfw", PortID: "my-vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", LineID: "my-vpn"},
 			},
-			DefaultPortID: "my-vpn",
+			DefaultLineID: "my-vpn",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -417,28 +417,28 @@ func TestSmoke_DefaultVPN(t *testing.T) {
 	r.requestAndAssert("example.com", "vpn")
 }
 
-func TestSmoke_MultipleCargoes(t *testing.T) {
+func TestSmoke_MultipleRuleSets(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
-			{ID: "my-ss", Type: PortTypeShadowsocks, Enabled: true,
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+			{ID: "my-ss", Type: LineTypeShadowsocks, Enabled: true,
 				SSServer: "ss.example.com", SSPort: 8388, SSMethod: "aes-256-gcm", SSPass: "secret"},
 		},
-		Cargoes: []Cargo{
-			{ID: "corp", Name: "公司", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "corp", Name: "公司", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"corp.example.com"}, CIDRs: []string{"10.0.0.0/8"}},
-			{ID: "gfw", Name: "GFW", Type: CargoTypeManual, Enabled: true,
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com", "youtube.com"}},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "corp", PortID: "my-vpn"},
-				{CargoID: "gfw", PortID: "my-ss"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "corp", LineID: "my-vpn"},
+				{RuleSetID: "gfw", LineID: "my-ss"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -451,21 +451,21 @@ func TestSmoke_MultipleCargoes(t *testing.T) {
 
 func TestSmoke_OnlyCIDR(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "private", Name: "私有网段", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "private", Name: "私有网段", Type: RuleSetTypeManual, Enabled: true,
 				CIDRs: []string{"172.16.0.0/12"}},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "private", PortID: "my-vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "private", LineID: "my-vpn"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -474,22 +474,22 @@ func TestSmoke_OnlyCIDR(t *testing.T) {
 	r.requestAndAssert("example.com", "direct")
 }
 
-func TestSmoke_EmptyCargo(t *testing.T) {
+func TestSmoke_EmptyRuleSet(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "empty", Name: "空的", Type: CargoTypeManual, Enabled: true},
+		RuleSets: []RuleSet{
+			{ID: "empty", Name: "空的", Type: RuleSetTypeManual, Enabled: true},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "empty", PortID: "my-vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "empty", LineID: "my-vpn"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -498,23 +498,23 @@ func TestSmoke_EmptyCargo(t *testing.T) {
 	r.requestAndAssert("corp.example.com", "direct")
 }
 
-func TestSmoke_DisabledCargo(t *testing.T) {
+func TestSmoke_DisabledRuleSet(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "disabled", Name: "禁用的", Type: CargoTypeManual, Enabled: false,
+		RuleSets: []RuleSet{
+			{ID: "disabled", Name: "禁用的", Type: RuleSetTypeManual, Enabled: false,
 				Domains: []string{"should-not-match.com"}},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "disabled", PortID: "my-vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "disabled", LineID: "my-vpn"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -523,7 +523,7 @@ func TestSmoke_DisabledCargo(t *testing.T) {
 	r.requestAndAssert("should-not-match.com", "direct")
 }
 
-func TestSmoke_URLJsonCargo(t *testing.T) {
+func TestSmoke_URLJsonRuleSet(t *testing.T) {
 	ruleSetJSON := map[string]interface{}{
 		"version": 1,
 		"rules": []map[string]interface{}{
@@ -535,21 +535,21 @@ func TestSmoke_URLJsonCargo(t *testing.T) {
 	os.WriteFile(localRuleFile, ruleBytes, 0644)
 
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "gfw", Name: "GFW", Type: CargoTypeURL, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeURL, Enabled: true,
 				URL: "file://" + localRuleFile, Format: "json"},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "gfw", PortID: "my-vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", LineID: "my-vpn"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -560,24 +560,24 @@ func TestSmoke_URLJsonCargo(t *testing.T) {
 	r.requestAndAssert("normal.local", "direct")
 }
 
-func TestSmoke_URLSrsCargo(t *testing.T) {
+func TestSmoke_URLSrsRuleSet(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "gfw", Name: "GFW", Type: CargoTypeURL, Enabled: true,
-				URL: "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-gfw.srs",
+		RuleSets: []RuleSet{
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeURL, Enabled: true,
+				URL:    "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-gfw.srs",
 				Format: "srs"},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "gfw", PortID: "my-vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", LineID: "my-vpn"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -588,21 +588,21 @@ func TestSmoke_URLSrsCargo(t *testing.T) {
 
 func TestSmoke_URLJsonFormat(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "cnip", Name: "国内IP", Type: CargoTypeURL, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "cnip", Name: "国内IP", Type: RuleSetTypeURL, Enabled: true,
 				URL: "https://example.com/rule.json", Format: "json"},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "cnip", PortID: "my-vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "cnip", LineID: "my-vpn"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	raw, err := GenerateSingBox(profile, 0, "")
@@ -629,46 +629,46 @@ func TestSmoke_URLJsonFormat(t *testing.T) {
 }
 
 func TestSmoke_AutoFormat(t *testing.T) {
-	cargo := &Cargo{Format: "auto", URL: "https://example.com/geosite-gfw.srs"}
-	if f := resolveRuleSetFormat(cargo); f != "binary" {
+	ruleSet := &RuleSet{Format: "auto", URL: "https://example.com/geosite-gfw.srs"}
+	if f := sbResolveRuleSetFormat(ruleSet); f != "binary" {
 		t.Errorf("auto + .srs URL: expected binary, got %s", f)
 	}
-	cargo2 := &Cargo{Format: "auto", URL: "https://example.com/rule.json"}
-	if f := resolveRuleSetFormat(cargo2); f != "source" {
+	ruleSet2 := &RuleSet{Format: "auto", URL: "https://example.com/rule.json"}
+	if f := sbResolveRuleSetFormat(ruleSet2); f != "source" {
 		t.Errorf("auto + .json URL: expected source, got %s", f)
 	}
-	cargo3 := &Cargo{Format: "auto", URL: "https://example.com/rule.list"}
-	if f := resolveRuleSetFormat(cargo3); f != "binary" {
+	ruleSet3 := &RuleSet{Format: "auto", URL: "https://example.com/rule.list"}
+	if f := sbResolveRuleSetFormat(ruleSet3); f != "binary" {
 		t.Errorf("auto + .list URL: expected binary (default), got %s", f)
 	}
 }
 
 func TestSmoke_CustomFormat(t *testing.T) {
-	cargo := &Cargo{Format: "my-custom-format", URL: "https://example.com/rule.bin"}
-	if f := resolveRuleSetFormat(cargo); f != "my-custom-format" {
+	ruleSet := &RuleSet{Format: "my-custom-format", URL: "https://example.com/rule.bin"}
+	if f := sbResolveRuleSetFormat(ruleSet); f != "my-custom-format" {
 		t.Errorf("custom format: expected my-custom-format, got %s", f)
 	}
 }
 
 func TestSmoke_URLRuleSetDedup(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
-			{ID: "my-trojan", Type: PortTypeTrojan, Enabled: true,
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+			{ID: "my-trojan", Type: LineTypeTrojan, Enabled: true,
 				TrojanServer: "tr.example.com", TrojanPort: 443, TrojanPassword: "p", TrojanSNI: "tr.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "gfw", Name: "GFW", Type: CargoTypeURL, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeURL, Enabled: true,
 				URL: "https://example.com/geosite-gfw.srs", Format: "srs"},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "gfw", PortID: "my-vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", LineID: "my-vpn"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	raw, err := GenerateSingBox(profile, 0, "")
@@ -693,21 +693,21 @@ func TestSmoke_URLRuleSetDedup(t *testing.T) {
 
 func TestSmoke_DirectBinding(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "china", Name: "国内", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "china", Name: "国内", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"baidu.com", "qq.com"}},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "china", PortID: "direct"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "china", LineID: "direct"},
 			},
-			DefaultPortID: "my-vpn",
+			DefaultLineID: "my-vpn",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -720,23 +720,23 @@ func TestSmoke_DirectBinding(t *testing.T) {
 
 func TestSmoke_NonexistentBinding(t *testing.T) {
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "real", Name: "真实", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "real", Name: "真实", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"real.local"}},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "nonexistent-cargo", PortID: "my-vpn"},
-				{CargoID: "real", PortID: "nonexistent-port"},
-				{CargoID: "real", PortID: "my-vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "nonexistent-ruleset", LineID: "my-vpn"},
+				{RuleSetID: "real", LineID: "nonexistent-line"},
+				{RuleSetID: "real", LineID: "my-vpn"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -748,35 +748,35 @@ func TestSmoke_NonexistentBinding(t *testing.T) {
 // --- 订阅分流烟雾测试 ---
 
 func TestSmoke_SubscribeBasic(t *testing.T) {
-	// 货品绑定到订阅（无策略组），验证流量走订阅节点
+	// 规则绑定到订阅（无策略组），验证流量走订阅节点
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "gfw", Name: "GFW", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com", "youtube.com"}},
 		},
 		Subscriptions: []Subscription{{
 			ID: "sub1", Name: "MySub", URL: "https://example.com/sub",
 			Format: "surge", Enabled: true, Strategy: "selector",
-			Ports: []Port{
-				{ID: "n1", Name: "HK 01", Type: PortTypeTrojan, Enabled: true,
+			Lines: []Line{
+				{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "hk1.example.com", TrojanPort: 443,
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
-				{ID: "n2", Name: "US 01", Type: PortTypeTrojan, Enabled: true,
+				{ID: "n2", Name: "US 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "us1.example.com", TrojanPort: 443,
 					TrojanPassword: "p2", TrojanSNI: "us1.example.com"},
 			},
 		}},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "gfw", SubscriptionID: "sub1"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", SubscriptionID: "sub1"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -791,26 +791,26 @@ func TestSmoke_SubscribeBasic(t *testing.T) {
 func TestSmoke_SubscribeWithGroups(t *testing.T) {
 	// 订阅带策略组，验证流量通过策略组路由到正确节点
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "gfw", Name: "GFW", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
-			{ID: "streaming", Name: "流媒体", Type: CargoTypeManual, Enabled: true,
+			{ID: "streaming", Name: "流媒体", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"netflix.com"}},
 		},
 		Subscriptions: []Subscription{{
 			ID: "sub1", Name: "MySub", URL: "https://example.com/sub",
 			Format: "surge", Enabled: true, Strategy: "urltest",
-			Ports: []Port{
-				{ID: "n1", Name: "HK 01", Type: PortTypeTrojan, Enabled: true,
+			Lines: []Line{
+				{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "hk1.example.com", TrojanPort: 443,
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
-				{ID: "n2", Name: "US 01", Type: PortTypeTrojan, Enabled: true,
+				{ID: "n2", Name: "US 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "us1.example.com", TrojanPort: 443,
 					TrojanPassword: "p2", TrojanSNI: "us1.example.com"},
-				{ID: "n3", Name: "JP 01", Type: PortTypeTrojan, Enabled: true,
+				{ID: "n3", Name: "JP 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "jp1.example.com", TrojanPort: 443,
 					TrojanPassword: "p3", TrojanSNI: "jp1.example.com"},
 			},
@@ -823,15 +823,15 @@ func TestSmoke_SubscribeWithGroups(t *testing.T) {
 				{Type: "DOMAIN-SUFFIX", Value: "google.com", Group: "Proxies"},
 			},
 		}},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "gfw", SubscriptionID: "sub1"},
-				{CargoID: "streaming", SubscriptionID: "sub1"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", SubscriptionID: "sub1"},
+				{RuleSetID: "streaming", SubscriptionID: "sub1"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -844,37 +844,37 @@ func TestSmoke_SubscribeWithGroups(t *testing.T) {
 }
 
 func TestSmoke_SubscribeMixed(t *testing.T) {
-	// 同一邮轮混用手动港口和订阅
+	// 同一模式混用手动线路和订阅
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
-			{ID: "my-ss", Type: PortTypeShadowsocks, Enabled: true,
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+			{ID: "my-ss", Type: LineTypeShadowsocks, Enabled: true,
 				SSServer: "ss.example.com", SSPort: 8388, SSMethod: "aes-256-gcm", SSPass: "secret"},
 		},
-		Cargoes: []Cargo{
-			{ID: "corp", Name: "公司", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "corp", Name: "公司", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"corp.example.com"}},
-			{ID: "gfw", Name: "GFW", Type: CargoTypeManual, Enabled: true,
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
 		Subscriptions: []Subscription{{
 			ID: "sub1", Name: "MySub", URL: "https://example.com/sub",
 			Format: "surge", Enabled: true, Strategy: "selector",
-			Ports: []Port{
-				{ID: "n1", Name: "HK 01", Type: PortTypeTrojan, Enabled: true,
+			Lines: []Line{
+				{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "hk1.example.com", TrojanPort: 443,
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
 			},
 		}},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "corp", PortID: "my-vpn"},           // 手动港口
-				{CargoID: "gfw", SubscriptionID: "sub1"},      // 订阅
+			Bindings: []RuleBinding{
+				{RuleSetID: "corp", LineID: "my-vpn"},      // 手动线路
+				{RuleSetID: "gfw", SubscriptionID: "sub1"}, // 订阅
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -891,30 +891,30 @@ func TestSmoke_SubscribeMixed(t *testing.T) {
 func TestSmoke_SubscribeDefault(t *testing.T) {
 	// 默认出口指向订阅
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "corp", Name: "公司", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "corp", Name: "公司", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"corp.example.com"}},
 		},
 		Subscriptions: []Subscription{{
 			ID: "sub1", Name: "MySub", URL: "https://example.com/sub",
 			Format: "surge", Enabled: true, Strategy: "selector",
-			Ports: []Port{
-				{ID: "n1", Name: "HK 01", Type: PortTypeTrojan, Enabled: true,
+			Lines: []Line{
+				{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "hk1.example.com", TrojanPort: 443,
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
 			},
 		}},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "corp", PortID: "my-vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "corp", LineID: "my-vpn"},
 			},
 			DefaultSubscriptionID: "sub1",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -930,30 +930,30 @@ func TestSmoke_SubscribeDefault(t *testing.T) {
 func TestSmoke_SubscribeDisabled(t *testing.T) {
 	// 禁用的订阅不参与分流
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "gfw", Name: "GFW", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
 		Subscriptions: []Subscription{{
 			ID: "sub1", Name: "DisabledSub", URL: "https://example.com/sub",
 			Format: "surge", Enabled: false, Strategy: "selector",
-			Ports: []Port{
-				{ID: "n1", Name: "HK 01", Type: PortTypeTrojan, Enabled: true,
+			Lines: []Line{
+				{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "hk1.example.com", TrojanPort: 443,
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
 			},
 		}},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "gfw", SubscriptionID: "sub1"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", SubscriptionID: "sub1"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -966,25 +966,25 @@ func TestSmoke_SubscribeDisabled(t *testing.T) {
 func TestSmoke_SubscribeEmptyNodes(t *testing.T) {
 	// 订阅无有效节点时回退到 direct
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "gfw", Name: "GFW", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
 		Subscriptions: []Subscription{{
 			ID: "sub1", Name: "EmptySub", URL: "https://example.com/sub",
 			Format: "surge", Enabled: true, Strategy: "urltest",
 		}},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "gfw", SubscriptionID: "sub1"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", SubscriptionID: "sub1"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -996,21 +996,21 @@ func TestSmoke_SubscribeEmptyNodes(t *testing.T) {
 func TestSmoke_SubscribeMultiSubscription(t *testing.T) {
 	// 多个订阅共存，各自的绑定走各自的节点
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "gfw", Name: "GFW", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
-			{ID: "streaming", Name: "流媒体", Type: CargoTypeManual, Enabled: true,
+			{ID: "streaming", Name: "流媒体", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"netflix.com"}},
 		},
 		Subscriptions: []Subscription{
 			{
 				ID: "sub-a", Name: "SubA", URL: "https://a.example.com",
 				Format: "surge", Enabled: true, Strategy: "selector",
-				Ports: []Port{
-					{ID: "n1", Name: "A-HK", Type: PortTypeTrojan, Enabled: true,
+				Lines: []Line{
+					{ID: "n1", Name: "A-HK", Type: LineTypeTrojan, Enabled: true,
 						TrojanServer: "a-hk.example.com", TrojanPort: 443,
 						TrojanPassword: "p1", TrojanSNI: "a-hk.example.com"},
 				},
@@ -1018,22 +1018,22 @@ func TestSmoke_SubscribeMultiSubscription(t *testing.T) {
 			{
 				ID: "sub-b", Name: "SubB", URL: "https://b.example.com",
 				Format: "surge", Enabled: true, Strategy: "selector",
-				Ports: []Port{
-					{ID: "n1", Name: "B-US", Type: PortTypeShadowsocks, Enabled: true,
+				Lines: []Line{
+					{ID: "n1", Name: "B-US", Type: LineTypeShadowsocks, Enabled: true,
 						SSServer: "b-us.example.com", SSPort: 8388,
 						SSMethod: "aes-256-gcm", SSPass: "secret"},
 				},
 			},
 		},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "gfw", SubscriptionID: "sub-a"},
-				{CargoID: "streaming", SubscriptionID: "sub-b"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", SubscriptionID: "sub-a"},
+				{RuleSetID: "streaming", SubscriptionID: "sub-b"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -1047,34 +1047,34 @@ func TestSmoke_SubscribeMultiSubscription(t *testing.T) {
 func TestSmoke_SubscribeUrltest(t *testing.T) {
 	// urltest 策略：烟雾测试中 urltest 被转为 selector，默认选第一个节点
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "gfw", Name: "GFW", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
 		Subscriptions: []Subscription{{
 			ID: "sub1", Name: "UrlTest", URL: "https://example.com/sub",
 			Format: "surge", Enabled: true, Strategy: "urltest",
 			TestURL: "https://www.gstatic.com/generate_204", TestInterval: 300,
-			Ports: []Port{
-				{ID: "n1", Name: "HK 01", Type: PortTypeTrojan, Enabled: true,
+			Lines: []Line{
+				{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "hk1.example.com", TrojanPort: 443,
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
-				{ID: "n2", Name: "US 01", Type: PortTypeTrojan, Enabled: true,
+				{ID: "n2", Name: "US 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "us1.example.com", TrojanPort: 443,
 					TrojanPassword: "p2", TrojanSNI: "us1.example.com"},
 			},
 		}},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "gfw", SubscriptionID: "sub1"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", SubscriptionID: "sub1"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -1086,24 +1086,24 @@ func TestSmoke_SubscribeUrltest(t *testing.T) {
 func TestSmoke_SubscribeMultipleGroups(t *testing.T) {
 	// 订阅带多层策略组引用
 	profile := &Profile{
-		Ports: []Port{
-			{ID: "my-vpn", Type: PortTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
-		Cargoes: []Cargo{
-			{ID: "ai", Name: "AI服务", Type: CargoTypeManual, Enabled: true,
+		RuleSets: []RuleSet{
+			{ID: "ai", Name: "AI服务", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"openai.com", "claude.ai"}},
 		},
 		Subscriptions: []Subscription{{
 			ID: "sub1", Name: "MultiGroup", URL: "https://example.com/sub",
 			Format: "surge", Enabled: true, Strategy: "urltest",
-			Ports: []Port{
-				{ID: "n1", Name: "HK 01", Type: PortTypeTrojan, Enabled: true,
+			Lines: []Line{
+				{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "hk1.example.com", TrojanPort: 443,
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
-				{ID: "n2", Name: "US 01", Type: PortTypeTrojan, Enabled: true,
+				{ID: "n2", Name: "US 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "us1.example.com", TrojanPort: 443,
 					TrojanPassword: "p2", TrojanSNI: "us1.example.com"},
-				{ID: "n3", Name: "JP 01", Type: PortTypeTrojan, Enabled: true,
+				{ID: "n3", Name: "JP 01", Type: LineTypeTrojan, Enabled: true,
 					TrojanServer: "jp1.example.com", TrojanPort: 443,
 					TrojanPassword: "p3", TrojanSNI: "jp1.example.com"},
 			},
@@ -1114,20 +1114,20 @@ func TestSmoke_SubscribeMultipleGroups(t *testing.T) {
 				{Name: "Auto", Type: "url-test", Proxies: []string{"AI", "Proxies"}},
 			},
 		}},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "main",
-			Bindings: []Binding{
-				{CargoID: "ai", SubscriptionID: "sub1"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "ai", SubscriptionID: "sub1"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "main",
+		ActiveModeID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
 	defer r.stop()
 
-	// AI cargo 绑定到订阅，订阅规则中没有 AI 域名 → 走订阅默认（第一个策略组 Proxies）
+	// AI 规则绑定到订阅，订阅规则中没有 AI 域名 → 走订阅默认（第一个策略组 Proxies）
 	// Proxies 默认 → HK 01
 	r.requestAndAssert("openai.com", "proxy-sub1-n1")
 	r.requestAndAssert("claude.ai", "proxy-sub1-n1")

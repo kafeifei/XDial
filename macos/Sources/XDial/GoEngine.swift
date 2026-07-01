@@ -27,12 +27,12 @@ final class GoEngine: ObservableObject {
     @Published private(set) var connectedAt: Date?
 
     struct ParseResult: Decodable {
-        let ports: [Port]
+        let lines: [Line]
         let proxyGroups: [SubProxyGroup]?
         let rules: [SubRule]?
 
         enum CodingKeys: String, CodingKey {
-            case ports
+            case lines
             case proxyGroups = "proxy_groups"
             case rules
         }

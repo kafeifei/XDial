@@ -75,7 +75,7 @@ final class DebugServer {
                     "GET  /health",
                     "GET  /state",
                     "GET  /ax[?depth=N]",
-                    "POST /action  {action: connect|disconnect|select-cruise|ax-press|ax-set-value, ...}",
+                    "POST /action  {action: connect|disconnect|select-mode|ax-press|ax-set-value, ...}",
                     "GET  /action?action=...  (convenience alias for POST)",
                 ],
             ]))
@@ -90,9 +90,9 @@ final class DebugServer {
             return ["error": "AppState not initialized"]
         }
         let net = NetworkInfo.shared
-        var perPort: [String: Any] = [:]
-        for (k, v) in net.perPort {
-            perPort[k] = ["ip": v.ip, "region": v.region, "error": v.error, "summary": v.summary]
+        var perLine: [String: Any] = [:]
+        for (k, v) in net.perLine {
+            perLine[k] = ["ip": v.ip, "region": v.region, "error": v.error, "summary": v.summary]
         }
 
         var dict: [String: Any] = [:]
@@ -108,7 +108,7 @@ final class DebugServer {
         dict["statusText"] = s.statusText
         dict["language"] = s.language.rawValue
         dict["launchAtLogin"] = s.launchAtLogin
-        dict["activeCruiseID"] = s.profile.activeCruiseID
+        dict["activeModeID"] = s.profile.activeModeID
 
         if let d = try? JSONEncoder().encode(s.profile),
            let p = try? JSONSerialization.jsonObject(with: d) {
@@ -118,7 +118,7 @@ final class DebugServer {
         dict["network"] = [
             "localIP": net.localIP,
             "probing": net.probing,
-            "perPort": perPort,
+            "perLine": perLine,
         ] as [String: Any]
 
         dict["windows"] = NSApp.windows.map { w -> [String: Any] in
@@ -240,13 +240,13 @@ final class DebugServer {
         case "disconnect":
             state.disconnect()
             return ok(["ok": true])
-        case "select-cruise":
+        case "select-mode":
             guard let id = obj["id"] as? String else {
                 return ("400 Bad Request", json(["error": "missing 'id'"]))
             }
-            state.profile.activeCruiseID = id
+            state.profile.activeModeID = id
             state.save()
-            return ok(["ok": true, "activeCruiseID": id])
+            return ok(["ok": true, "activeModeID": id])
         case "open-settings":
             NSApp.activate(ignoringOtherApps: true)
             for w in NSApp.windows where w.title.contains("设置") || w.title.contains("Settings") {
@@ -260,7 +260,7 @@ final class DebugServer {
             return axSetValue(obj)
         default:
             return ("400 Bad Request", json(["error": "unknown action: \(action)",
-                "available": ["connect", "disconnect", "select-cruise", "open-settings",
+                "available": ["connect", "disconnect", "select-mode", "open-settings",
                               "ax-press", "ax-set-value"]]))
         }
     }

@@ -1,6 +1,6 @@
 import Foundation
 
-struct PortNetInfo: Codable, Equatable {
+struct LineNetInfo: Codable, Equatable {
     var ip: String = ""
     var region: String = ""
     var probedAt: Date?
@@ -21,7 +21,7 @@ final class NetworkInfo: ObservableObject {
     static let shared = NetworkInfo()
 
     @Published private(set) var localIP: String = ""
-    @Published private(set) var perPort: [String: PortNetInfo] = [:]
+    @Published private(set) var perLine: [String: LineNetInfo] = [:]
     @Published private(set) var probing: Bool = false
 
     /// 由 AppState 同步语言
@@ -30,8 +30,8 @@ final class NetworkInfo: ObservableObject {
     private let clashAPI = "http://127.0.0.1:9090"
     private var probeTask: Task<Void, Never>?
 
-    /// 启动一次完整探测：本地 IP + 每个出口的 IP 信息 + 订阅主策略组
-    func probeAll(ports: [Port], subscriptions: [Subscription] = [], helperConnected: Bool) {
+    /// 启动一次完整探测：本地 IP + 每条线路的 IP 信息 + 订阅主策略组
+    func probeAll(lines: [Line], subscriptions: [Subscription] = [], helperConnected: Bool) {
         probeTask?.cancel()
         localIP = Self.getLocalIP() ?? ""
         appLog("NetworkInfo: localIP=\(localIP) helperConnected=\(helperConnected)")
@@ -46,16 +46,16 @@ final class NetworkInfo: ObservableObject {
                 _ = await self.waitForClashAPI()
             }
 
-            for port in ports where port.enabled {
+            for line in lines where line.enabled {
                 if Task.isCancelled { return }
-                let canProbe = (port.type == "direct") || helperConnected
+                let canProbe = (line.type == "direct") || helperConnected
                 if !canProbe { continue }
-                await probePort(port: port, helperConnected: helperConnected)
+                await probeLine(line: line, helperConnected: helperConnected)
             }
 
             // 探测订阅：通过主策略组测 IP
             if helperConnected {
-                for sub in subscriptions where sub.enabled && !sub.ports.isEmpty {
+                for sub in subscriptions where sub.enabled && !sub.lines.isEmpty {
                     if Task.isCancelled { return }
                     await probeSub(sub: sub)
                 }
@@ -76,10 +76,10 @@ final class NetworkInfo: ObservableObject {
         let ok = await switchSelector(to: mainTag)
         if !ok {
             await MainActor.run {
-                var info = PortNetInfo()
+                var info = LineNetInfo()
                 info.error = "无法切换出口"
                 info.probedAt = Date()
-                self.perPort[sub.id] = info
+                self.perLine[sub.id] = info
             }
             return
         }
@@ -87,12 +87,12 @@ final class NetworkInfo: ObservableObject {
 
         let r = await fetchIPInfo()
         await MainActor.run {
-            var info = PortNetInfo()
+            var info = LineNetInfo()
             info.probedAt = Date()
             info.ip = r.ip
             info.region = r.region
             info.error = r.error
-            self.perPort[sub.id] = info
+            self.perLine[sub.id] = info
         }
     }
 
@@ -136,19 +136,19 @@ final class NetworkInfo: ObservableObject {
         return false
     }
 
-    private func probePort(port: Port, helperConnected: Bool) async {
-        let tag = outboundTag(for: port)
-        appLog("NetworkInfo: probing \(port.name) tag=\(tag)")
+    private func probeLine(line: Line, helperConnected: Bool) async {
+        let tag = outboundTag(for: line)
+        appLog("NetworkInfo: probing \(line.name) tag=\(tag)")
 
         // 通过 Clash API 切 selector 到目标出口（仅连接时）
         if helperConnected {
             let ok = await switchSelector(to: tag)
             if !ok {
                 await MainActor.run {
-                    var info = self.perPort[port.id] ?? PortNetInfo()
+                    var info = self.perLine[line.id] ?? LineNetInfo()
                     info.error = "无法切换出口"
                     info.probedAt = Date()
-                    self.perPort[port.id] = info
+                    self.perLine[line.id] = info
                 }
                 return
             }
@@ -158,12 +158,12 @@ final class NetworkInfo: ObservableObject {
 
         let r = await fetchIPInfo()
         await MainActor.run {
-            var info = PortNetInfo()
+            var info = LineNetInfo()
             info.probedAt = Date()
             info.ip = r.ip
             info.region = r.region
             info.error = r.error
-            self.perPort[port.id] = info
+            self.perLine[line.id] = info
         }
     }
 
@@ -246,11 +246,11 @@ final class NetworkInfo: ObservableObject {
     }
 
     /// 与 Go 侧 resolveOutboundTag 保持一致
-    private func outboundTag(for port: Port) -> String {
-        switch port.type {
+    private func outboundTag(for line: Line) -> String {
+        switch line.type {
         case "direct": return "direct"
         case "vpn": return "vpn"
-        default: return "proxy-" + port.id
+        default: return "proxy-" + line.id
         }
     }
 

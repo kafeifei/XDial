@@ -1,12 +1,12 @@
 import AppKit
 
 enum AppIcon {
-    /// 基础图标：蓝色渐变背景 + 🚢
+    /// 基础图标：蓝色渐变背景 + 🌐
     static func base(size: CGFloat) -> NSImage {
         let img = NSImage(size: NSSize(width: size, height: size))
         img.lockFocus()
         drawBackground(size: size)
-        drawShip(size: size)
+        drawGlobe(size: size)
         img.unlockFocus()
         return img
     }
@@ -16,21 +16,21 @@ enum AppIcon {
         let img = NSImage(size: NSSize(width: size, height: size))
         img.lockFocus()
         drawBackground(size: size)
-        drawShip(size: size)
+        drawGlobe(size: size)
         drawGear(size: size)
         img.unlockFocus()
         return img
     }
 
-    /// 菜单栏图标：小尺寸，纯 🚢 无背景（系统自动适配深浅模式）
+    /// 菜单栏图标：小尺寸，纯 🌐 无背景（系统自动适配深浅模式）
     static func menuBar() -> NSImage {
         let s: CGFloat = 18
         let img = NSImage(size: NSSize(width: s, height: s))
         img.lockFocus()
-        let ship = "🚢" as NSString
+        let globe = "🌐" as NSString
         let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 14)]
-        let sz = ship.size(withAttributes: attrs)
-        ship.draw(at: NSPoint(x: (s - sz.width) / 2, y: (s - sz.height) / 2), withAttributes: attrs)
+        let sz = globe.size(withAttributes: attrs)
+        globe.draw(at: NSPoint(x: (s - sz.width) / 2, y: (s - sz.height) / 2), withAttributes: attrs)
         img.unlockFocus()
         img.isTemplate = false
         return img
@@ -51,14 +51,13 @@ enum AppIcon {
                                end: CGPoint(x: 0, y: 0), options: [])
     }
 
-    private static func drawShip(size: CGFloat) {
-        let ship = "🚢" as NSString
+    private static func drawGlobe(size: CGFloat) {
+        let globe = "🌐" as NSString
         let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: size * 0.68)]
-        let sz = ship.size(withAttributes: attrs)
-        // 视觉居中：船顶烟囱高，整体略下移
+        let sz = globe.size(withAttributes: attrs)
         let x = (size - sz.width) / 2
         let y = (size - sz.height) / 2 - size * 0.02
-        ship.draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
+        globe.draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
     }
 
     private static func drawGear(size: CGFloat) {

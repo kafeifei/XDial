@@ -24,27 +24,68 @@ const (
 	clashAPIController = "127.0.0.1:9090"
 )
 
+// Platform 决定 sing-box 配置生成的目标运行环境。
+//
+// PlatformMacOS(零值)= 现有桌面场景:sing-box 作为外部子进程运行,靠 tun +
+// auto_route 抓包、auto_detect_interface 选物理网卡、clash_api 暴露 controller、
+// cache_file 用相对路径(子进程 cwd 下)。
+//
+// PlatformNE = tvOS/iOS 的 NetworkExtension 场景:sing-box 作为库跑在扩展进程内,
+// 无 root、无子进程、路由由 NEPacketTunnelNetworkSettings 在 Swift 侧接管,读包来源
+// 是系统 packetFlow。因此 tun inbound 只保留最小字段(type/address/mtu),不生成
+// auto_route/strict_route/stack/route_exclude_address/auto_detect_interface,也不开
+// clash_api;cache_file 必须用调用方传入的沙盒内绝对路径(basePath)。
+type Platform int
+
+const (
+	PlatformMacOS Platform = iota
+	PlatformNE
+)
+
+// GenerateSingBox 保留原有签名作为 macOS 模式的包装函数,现有调用方(如
+// core/engine.SingBoxProcess.Start)无需改动。
 func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byte, error) {
-	cruise := profile.ActiveCruise()
-	if cruise == nil {
-		return nil, fmt.Errorf("no active cruise")
+	return GenerateSingBoxFor(profile, socksPort, vpnServerIP, PlatformMacOS, "")
+}
+
+// GenerateSingBoxFor 生成 sing-box JSON 配置,platform 决定平台相关字段的取舍。
+//
+// basePath 仅在 PlatformNE 下使用,作为沙盒内绝对目录,用来拼出 cache_file 的绝对
+// 路径(basePath/cache.db)。PlatformMacOS 下 basePath 被忽略,cache_file 沿用现有
+// 相对路径 "cache.db"。
+func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, platform Platform, basePath string) ([]byte, error) {
+	mode := profile.ActiveMode()
+	if mode == nil {
+		return nil, fmt.Errorf("no active mode")
+	}
+
+	vpnOutbound := map[string]interface{}{
+		"type":        "socks",
+		"tag":         "vpn",
+		"server":      "127.0.0.1",
+		"server_port": socksPort,
+	}
+	if platform == PlatformNE {
+		// NE 模式下 sing-box 是库,跑在同一进程里,"vpn" 出口是
+		// core/libbox/vpn_outbound.go 注册的自研 outbound(直接拨
+		// VPNBridge,不经本地 SOCKS5 中转);macOS 模式下 sing-box 是
+		// 外部子进程,只能通过 127.0.0.1 socks 中转回 app 进程里的 VPNBridge。
+		vpnOutbound = map[string]interface{}{
+			"type": "vpn",
+			"tag":  "vpn",
+		}
 	}
 
 	outbounds := []map[string]interface{}{
 		{"type": "direct", "tag": "direct"},
-		{
-			"type":        "socks",
-			"tag":         "vpn",
-			"server":      "127.0.0.1",
-			"server_port": socksPort,
-		},
+		vpnOutbound,
 	}
 
-	for _, port := range profile.Ports {
-		if !port.Enabled || port.Type == PortTypeDirect || port.Type == PortTypeVPN {
+	for _, line := range profile.Lines {
+		if !line.Enabled || line.Type == LineTypeDirect || line.Type == LineTypeVPN {
 			continue
 		}
-		ob := buildProxyOutbound(&port)
+		ob := buildProxyOutbound(&line)
 		if ob != nil {
 			outbounds = append(outbounds, ob)
 		}
@@ -54,7 +95,7 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 	subTagMap := make(map[string]string)
 	subGroupTagMap := make(map[string]map[string]string) // subID -> groupName -> tag
 	for _, sub := range profile.Subscriptions {
-		if !sub.Enabled || len(sub.Ports) == 0 {
+		if !sub.Enabled || len(sub.Lines) == 0 {
 			continue
 		}
 		obs, mainTag, groupTags := buildSubscriptionOutbounds(&sub)
@@ -65,7 +106,7 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 		}
 	}
 
-	// selector 出口组：包含所有有效港口和订阅组
+	// selector 出口组：包含所有有效线路和订阅组
 	selectorMembers := []string{"direct", "vpn"}
 	for _, ob := range outbounds {
 		tag, _ := ob["tag"].(string)
@@ -90,9 +131,9 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 	}
 
 	routeRules := buildSystemRouteRules()
-	ruleSets := collectRuleSets(profile, cruise)
+	ruleSetResources := sbCollectRuleSets(profile, mode)
 
-	// 订阅自带规则在邮轮规则之前（让订阅的分组规则优先匹配）
+	// 订阅自带规则在模式规则之前（让订阅的分组规则优先匹配）
 	for _, sub := range profile.Subscriptions {
 		if !sub.Enabled {
 			continue
@@ -106,25 +147,30 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 		for _, s := range subSets {
 			tag := s["tag"].(string)
 			dup := false
-			for _, existing := range ruleSets {
-				if existing["tag"].(string) == tag { dup = true; break }
+			for _, existing := range ruleSetResources {
+				if existing["tag"].(string) == tag {
+					dup = true
+					break
+				}
 			}
-			if !dup { ruleSets = append(ruleSets, s) }
+			if !dup {
+				ruleSetResources = append(ruleSetResources, s)
+			}
 		}
 	}
 
-	// 邮轮规则作为兜底（引用不存在的 outbound 时跳过）
-	cruiseRules := buildCruiseRouteRules(profile, cruise, subTagMap, validTags)
-	routeRules = append(routeRules, cruiseRules...)
+	// 模式规则作为兜底（引用不存在的 outbound 时跳过）
+	modeRules := buildModeRouteRules(profile, mode, subTagMap, validTags)
+	routeRules = append(routeRules, modeRules...)
 
 	defaultTag := "direct"
-	if cruise.DefaultSubscriptionID != "" {
-		if tag, ok := subTagMap[cruise.DefaultSubscriptionID]; ok && validTags[tag] {
+	if mode.DefaultSubscriptionID != "" {
+		if tag, ok := subTagMap[mode.DefaultSubscriptionID]; ok && validTags[tag] {
 			defaultTag = tag
 		}
-	} else if cruise.DefaultPortID != "" {
-		if p := profile.FindPort(cruise.DefaultPortID); p != nil {
-			candidate := resolveOutboundTag(p)
+	} else if mode.DefaultLineID != "" {
+		if l := profile.FindLine(mode.DefaultLineID); l != nil {
+			candidate := resolveOutboundTag(l)
 			if validTags[candidate] {
 				defaultTag = candidate
 			}
@@ -132,12 +178,16 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 	}
 
 	route := map[string]interface{}{
-		"rules":                 routeRules,
-		"auto_detect_interface": true,
-		"final":                 defaultTag,
+		"rules": routeRules,
+		"final": defaultTag,
 	}
-	if len(ruleSets) > 0 {
-		route["rule_set"] = ruleSets
+	// auto_detect_interface 是桌面专属:选物理网卡。NE 模式下路由由平台层
+	// (NEPacketTunnelNetworkSettings)接管,不生成此字段。
+	if platform == PlatformMacOS {
+		route["auto_detect_interface"] = true
+	}
+	if len(ruleSetResources) > 0 {
+		route["rule_set"] = ruleSetResources
 	}
 
 	cfg := SingBoxConfig{
@@ -146,34 +196,56 @@ func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byt
 		},
 		DNS: buildDNS(),
 		Inbounds: []map[string]interface{}{
-			buildTUNInbound(vpnServerIP),
+			buildTUNInbound(vpnServerIP, platform),
 		},
-		Outbounds: outbounds,
-		Route:     route,
-		Experimental: map[string]interface{}{
-			"clash_api": map[string]interface{}{
-				"external_controller": clashAPIController,
-			},
-			"cache_file": map[string]interface{}{
-				"enabled": true,
-				"path":    "cache.db",
-			},
-		},
+		Outbounds:    outbounds,
+		Route:        route,
+		Experimental: buildExperimental(platform, basePath),
 	}
 
 	return json.MarshalIndent(cfg, "", "  ")
 }
 
-func buildTUNInbound(vpnServerIP string) map[string]interface{} {
-	inbound := map[string]interface{}{
-		"type":         "tun",
-		"tag":          "tun-in",
-		"address":      []string{"198.18.0.1/15"},
-		"mtu":          9000,
-		"auto_route":   true,
-		"strict_route": false,
-		"stack":        "system",
+// buildExperimental 组装 experimental 块。
+//
+// macOS 模式:clash_api(TCP controller)+ cache_file(相对路径,子进程 cwd 下)。
+// NE 模式:扩展进程内存预算极紧(~15MB),不开 clash_api;cache_file 用沙盒内绝对
+// 路径,库内运行没有子进程 cwd,相对路径会落到只读的 app bundle 目录。
+func buildExperimental(platform Platform, basePath string) map[string]interface{} {
+	cachePath := "cache.db"
+	if platform == PlatformNE {
+		cachePath = path.Join(basePath, "cache.db")
 	}
+	exp := map[string]interface{}{
+		"cache_file": map[string]interface{}{
+			"enabled": true,
+			"path":    cachePath,
+		},
+	}
+	if platform == PlatformMacOS {
+		exp["clash_api"] = map[string]interface{}{
+			"external_controller": clashAPIController,
+		}
+	}
+	return exp
+}
+
+func buildTUNInbound(vpnServerIP string, platform Platform) map[string]interface{} {
+	inbound := map[string]interface{}{
+		"type":    "tun",
+		"tag":     "tun-in",
+		"address": []string{"198.18.0.1/15"},
+		"mtu":     9000,
+	}
+	// NE 模式只保留最小 tun inbound(type/address/mtu);auto_route/strict_route/
+	// stack/route_exclude_address 都是桌面自建 tun 抓包才需要的,NE 下读包来源是
+	// 系统 packetFlow,路由控制交给平台层,不是这个函数的职责。
+	if platform == PlatformNE {
+		return inbound
+	}
+	inbound["auto_route"] = true
+	inbound["strict_route"] = false
+	inbound["stack"] = "system"
 	if vpnServerIP != "" {
 		inbound["route_exclude_address"] = []string{vpnServerIP + "/32"}
 	}
@@ -199,12 +271,12 @@ func buildSystemRouteRules() []map[string]interface{} {
 	}
 }
 
-func buildCruiseRouteRules(profile *Profile, cruise *Cruise, subTagMap map[string]string, validTags map[string]bool) []map[string]interface{} {
+func buildModeRouteRules(profile *Profile, mode *Mode, subTagMap map[string]string, validTags map[string]bool) []map[string]interface{} {
 	var rules []map[string]interface{}
 
-	for _, binding := range cruise.Bindings {
-		cargo := profile.FindCargo(binding.CargoID)
-		if cargo == nil || !cargo.Enabled {
+	for _, binding := range mode.Bindings {
+		ruleSet := profile.FindRuleSet(binding.RuleSetID)
+		if ruleSet == nil || !ruleSet.Enabled {
 			continue
 		}
 
@@ -212,17 +284,17 @@ func buildCruiseRouteRules(profile *Profile, cruise *Cruise, subTagMap map[strin
 		if binding.SubscriptionID != "" {
 			outTag = subTagMap[binding.SubscriptionID]
 		} else {
-			port := profile.FindPort(binding.PortID)
-			if port == nil {
+			line := profile.FindLine(binding.LineID)
+			if line == nil {
 				continue
 			}
-			outTag = resolveOutboundTag(port)
+			outTag = resolveOutboundTag(line)
 		}
 		if outTag == "" || !validTags[outTag] {
 			continue
 		}
 
-		routeRule := buildRouteRule(cargo, outTag)
+		routeRule := buildRouteRule(ruleSet, outTag)
 		if routeRule != nil {
 			rules = append(rules, routeRule)
 		}
@@ -231,17 +303,17 @@ func buildCruiseRouteRules(profile *Profile, cruise *Cruise, subTagMap map[strin
 	return rules
 }
 
-func buildRouteRule(c *Cargo, outTag string) map[string]interface{} {
+func buildRouteRule(c *RuleSet, outTag string) map[string]interface{} {
 	switch c.Type {
-	case CargoTypeURL:
+	case RuleSetTypeURL:
 		if c.URL == "" {
 			return nil
 		}
 		return map[string]interface{}{
-			"rule_set": ruleSetTag(c),
+			"rule_set": sbRuleSetTag(c),
 			"outbound": outTag,
 		}
-	case CargoTypeManual:
+	case RuleSetTypeManual:
 		rule := map[string]interface{}{
 			"outbound": outTag,
 		}
@@ -259,22 +331,29 @@ func buildRouteRule(c *Cargo, outTag string) map[string]interface{} {
 	return nil
 }
 
-func collectRuleSets(profile *Profile, cruise *Cruise) []map[string]interface{} {
+// sbCollectRuleSets 收集 sing-box 配置层的 rule_set 资源块（route.rule_set 数组里
+// 的 remote 规则集下载条目）。
+//
+// 命名前缀 sb 用来把这一层（sing-box 配置里的 rule_set，处理远程 .srs/.json
+// 下载资源）与新的数据模型层 RuleSet（本仓库自己的“规则”概念）区分开：二者
+// 语义不同，前者是 sing-box 协议字段，后者是我们的持久化数据类型。本函数遍历
+// 数据模型的 RuleSet（URL 类型），为每个生成一个 sing-box rule_set 资源。
+func sbCollectRuleSets(profile *Profile, mode *Mode) []map[string]interface{} {
 	seen := map[string]bool{}
 	var sets []map[string]interface{}
 
-	for _, binding := range cruise.Bindings {
-		c := profile.FindCargo(binding.CargoID)
-		if c == nil || !c.Enabled || c.Type != CargoTypeURL || c.URL == "" {
+	for _, binding := range mode.Bindings {
+		c := profile.FindRuleSet(binding.RuleSetID)
+		if c == nil || !c.Enabled || c.Type != RuleSetTypeURL || c.URL == "" {
 			continue
 		}
-		tag := ruleSetTag(c)
+		tag := sbRuleSetTag(c)
 		if seen[tag] {
 			continue
 		}
 		seen[tag] = true
 
-		format := resolveRuleSetFormat(c)
+		format := sbResolveRuleSetFormat(c)
 		sets = append(sets, map[string]interface{}{
 			"type":            "remote",
 			"tag":             tag,
@@ -286,11 +365,15 @@ func collectRuleSets(profile *Profile, cruise *Cruise) []map[string]interface{} 
 	return sets
 }
 
-func ruleSetTag(c *Cargo) string {
+// sbRuleSetTag 生成 sing-box rule_set 资源块（及引用它的 route rule）用的 tag。
+// sb 前缀表明这是 sing-box 配置层的 tag，不是数据模型 RuleSet 的字段。
+func sbRuleSetTag(c *RuleSet) string {
 	return "ruleset-" + c.ID
 }
 
-func resolveRuleSetFormat(c *Cargo) string {
+// sbResolveRuleSetFormat 推断 sing-box rule_set 资源的 format（binary/source）。
+// sb 前缀同上：处理的是 sing-box 配置层的 rule_set 下载格式。
+func sbResolveRuleSetFormat(c *RuleSet) string {
 	if c.Format != "" && c.Format != "auto" {
 		switch c.Format {
 		case "srs":
@@ -312,14 +395,14 @@ func resolveRuleSetFormat(c *Cargo) string {
 	}
 }
 
-func resolveOutboundTag(port *Port) string {
-	switch port.Type {
-	case PortTypeDirect:
+func resolveOutboundTag(line *Line) string {
+	switch line.Type {
+	case LineTypeDirect:
 		return "direct"
-	case PortTypeVPN:
+	case LineTypeVPN:
 		return "vpn"
 	default:
-		return "proxy-" + port.ID
+		return "proxy-" + line.ID
 	}
 }
 
@@ -330,17 +413,17 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 	// 1. 生成所有节点 outbound，建立 name→tag 映射
 	var nodeObs []map[string]interface{}
 	nameToTag := map[string]string{}
-	for _, port := range sub.Ports {
-		if !port.Enabled {
+	for _, line := range sub.Lines {
+		if !line.Enabled {
 			continue
 		}
-		portCopy := port
-		portCopy.ID = prefix + port.ID
-		ob := buildProxyOutbound(&portCopy)
+		lineCopy := line
+		lineCopy.ID = prefix + line.ID
+		ob := buildProxyOutbound(&lineCopy)
 		if ob != nil {
 			tag := ob["tag"].(string)
 			nodeObs = append(nodeObs, ob)
-			nameToTag[port.Name] = tag
+			nameToTag[line.Name] = tag
 		}
 	}
 	if len(nodeObs) == 0 {
@@ -480,7 +563,7 @@ func buildSubscriptionRules(sub *Subscription, groupTags map[string]string) ([]m
 			})
 		case "DOMAIN":
 			rules = append(rules, map[string]interface{}{
-				"domain": []string{r.Value},
+				"domain":   []string{r.Value},
 				"outbound": outTag,
 			})
 		case "DOMAIN-KEYWORD":
@@ -533,66 +616,66 @@ func slugify(s string) string {
 	return strings.ToLower(r)
 }
 
-func applyTransport(ob map[string]interface{}, port *Port) {
-	if port.TFO {
+func applyTransport(ob map[string]interface{}, line *Line) {
+	if line.TFO {
 		ob["tcp_fast_open"] = true
 	}
-	if port.UDP {
+	if line.UDP {
 		ob["udp_over_tcp"] = true
 	}
 }
 
-func buildProxyOutbound(port *Port) map[string]interface{} {
-	switch port.Type {
-	case PortTypeTrojan:
-		if port.TrojanServer == "" {
+func buildProxyOutbound(line *Line) map[string]interface{} {
+	switch line.Type {
+	case LineTypeTrojan:
+		if line.TrojanServer == "" {
 			return nil
 		}
 		tls := map[string]interface{}{
 			"enabled":     true,
-			"server_name": port.TrojanSNI,
+			"server_name": line.TrojanSNI,
 		}
 		// SNI 和服务器不一致时需要跳过证书验证（伪装 SNI 场景）
-		if port.TrojanSNI != "" && port.TrojanSNI != port.TrojanServer {
+		if line.TrojanSNI != "" && line.TrojanSNI != line.TrojanServer {
 			tls["insecure"] = true
 		}
 		ob := map[string]interface{}{
 			"type":        "trojan",
-			"tag":         "proxy-" + port.ID,
-			"server":      port.TrojanServer,
-			"server_port": port.TrojanPort,
-			"password":    port.TrojanPassword,
+			"tag":         "proxy-" + line.ID,
+			"server":      line.TrojanServer,
+			"server_port": line.TrojanPort,
+			"password":    line.TrojanPassword,
 			"tls":         tls,
 		}
-		applyTransport(ob, port)
+		applyTransport(ob, line)
 		return ob
-	case PortTypeShadowsocks:
-		if port.SSServer == "" {
+	case LineTypeShadowsocks:
+		if line.SSServer == "" {
 			return nil
 		}
 		ob := map[string]interface{}{
 			"type":        "shadowsocks",
-			"tag":         "proxy-" + port.ID,
-			"server":      port.SSServer,
-			"server_port": port.SSPort,
-			"method":      port.SSMethod,
-			"password":    port.SSPass,
+			"tag":         "proxy-" + line.ID,
+			"server":      line.SSServer,
+			"server_port": line.SSPort,
+			"method":      line.SSMethod,
+			"password":    line.SSPass,
 		}
-		applyTransport(ob, port)
+		applyTransport(ob, line)
 		return ob
-	case PortTypeVMess:
-		if port.VMessServer == "" {
+	case LineTypeVMess:
+		if line.VMessServer == "" {
 			return nil
 		}
 		ob := map[string]interface{}{
 			"type":        "vmess",
-			"tag":         "proxy-" + port.ID,
-			"server":      port.VMessServer,
-			"server_port": port.VMessPort,
-			"uuid":        port.VMessUUID,
-			"alter_id":    port.VMessAltID,
+			"tag":         "proxy-" + line.ID,
+			"server":      line.VMessServer,
+			"server_port": line.VMessPort,
+			"uuid":        line.VMessUUID,
+			"alter_id":    line.VMessAltID,
 		}
-		applyTransport(ob, port)
+		applyTransport(ob, line)
 		return ob
 	}
 	return nil

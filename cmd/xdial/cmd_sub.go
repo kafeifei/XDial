@@ -51,10 +51,10 @@ func runSubParseCmd(args []string) {
 		data, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(data))
 	} else {
-		fmt.Printf("Found %d port(s), %d group(s), %d rule(s)\n",
-			len(result.Ports), len(result.ProxyGroups), len(result.Rules))
-		for _, p := range result.Ports {
-			fmt.Printf("  %-20s %-15s\n", p.Name, string(p.Type))
+		fmt.Printf("Found %d line(s), %d group(s), %d rule(s)\n",
+			len(result.Lines), len(result.ProxyGroups), len(result.Rules))
+		for _, l := range result.Lines {
+			fmt.Printf("  %-20s %-15s\n", l.Name, string(l.Type))
 		}
 	}
 }

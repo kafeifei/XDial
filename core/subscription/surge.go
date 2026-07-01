@@ -17,14 +17,14 @@ func parseSurge(content string) (*ParseResult, error) {
 		return nil, fmt.Errorf("no [Proxy] section found")
 	}
 
-	var ports []config.Port
+	var results []config.Line
 	for _, line := range proxyLines {
-		port, ok := surgeLineToPort(line)
+		ln, ok := surgeLineToLine(line)
 		if ok {
-			ports = append(ports, port)
+			results = append(results, ln)
 		}
 	}
-	if len(ports) == 0 {
+	if len(results) == 0 {
 		return nil, fmt.Errorf("no supported proxies found")
 	}
 
@@ -44,7 +44,7 @@ func parseSurge(content string) (*ParseResult, error) {
 		}
 	}
 
-	return &ParseResult{Ports: ports, ProxyGroups: groups, Rules: rules}, nil
+	return &ParseResult{Lines: results, ProxyGroups: groups, Rules: rules}, nil
 }
 
 func extractSurgeSections(lines []string) map[string][]string {
@@ -141,24 +141,24 @@ func surgeLineToRule(line string) (config.SubscriptionRule, bool) {
 }
 
 // Surge format: Name = type, server, port, key=value, key=value, ...
-func surgeLineToPort(line string) (config.Port, bool) {
+func surgeLineToLine(line string) (config.Line, bool) {
 	eqIdx := strings.Index(line, "=")
 	if eqIdx < 0 {
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 	name := strings.TrimSpace(line[:eqIdx])
 	rest := strings.TrimSpace(line[eqIdx+1:])
 
 	parts := strings.SplitN(rest, ",", 4)
 	if len(parts) < 3 {
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 
 	typ := strings.TrimSpace(strings.ToLower(parts[0]))
 	server := strings.TrimSpace(parts[1])
 	portNum, err := strconv.Atoi(strings.TrimSpace(parts[2]))
 	if err != nil || server == "" {
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 
 	kvs := make(map[string]string)
@@ -171,7 +171,7 @@ func surgeLineToPort(line string) (config.Port, bool) {
 		}
 	}
 
-	base := config.Port{
+	base := config.Line{
 		ID:      shortID(),
 		Name:    name,
 		Enabled: true,
@@ -179,7 +179,7 @@ func surgeLineToPort(line string) (config.Port, bool) {
 
 	switch typ {
 	case "ss", "shadowsocks", "custom":
-		base.Type = config.PortTypeShadowsocks
+		base.Type = config.LineTypeShadowsocks
 		base.SSServer = server
 		base.SSPort = portNum
 		base.SSMethod = kvs["encrypt-method"]
@@ -187,7 +187,7 @@ func surgeLineToPort(line string) (config.Port, bool) {
 		return base, true
 
 	case "vmess":
-		base.Type = config.PortTypeVMess
+		base.Type = config.LineTypeVMess
 		base.VMessServer = server
 		base.VMessPort = portNum
 		base.VMessUUID = kvs["username"]
@@ -199,7 +199,7 @@ func surgeLineToPort(line string) (config.Port, bool) {
 		return base, true
 
 	case "trojan":
-		base.Type = config.PortTypeTrojan
+		base.Type = config.LineTypeTrojan
 		base.TrojanServer = server
 		base.TrojanPort = portNum
 		base.TrojanPassword = kvs["password"]
@@ -213,6 +213,6 @@ func surgeLineToPort(line string) (config.Port, bool) {
 		return base, true
 
 	default:
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 }

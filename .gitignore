@@ -4,3 +4,6 @@ macos/.build/
 /tmp/
 *.log
 .claude/worktrees/
+/libboxtest
+/xdial
+appletv/XDialTV.xcodeproj/

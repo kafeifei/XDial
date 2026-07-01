@@ -35,7 +35,7 @@ def make_profile(password: str) -> dict:
             {"id": "direct", "name": "直连", "type": "direct", "enabled": True},
             {"id": "vpn", "name": "VPN", "type": "vpn", "enabled": True,
              "vpn_server": "vpn.example.com:8443",
-             "vpn_username": "user",
+             "vpn_username": "kafeifei",
              "vpn_password": password},
         ],
         "cargoes": [

@@ -74,8 +74,8 @@ func runStartCmd(args []string) {
 		os.Exit(1)
 	}
 
-	var profile config.Profile
-	if err := json.Unmarshal(data, &profile); err != nil {
+	profile, err := config.ParseProfile(data)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing profile JSON: %s\n", err)
 		os.Exit(1)
 	}
@@ -88,7 +88,7 @@ func runStartCmd(args []string) {
 	cb := &cliCallback{jsonMode: *jsonOutput}
 	eng := engine.New(basePath, cb)
 
-	if err := eng.Start(&profile); err != nil {
+	if err := eng.Start(profile); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
 		os.Exit(1)
 	}
