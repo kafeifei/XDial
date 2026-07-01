@@ -45,7 +45,7 @@ func New(basePath string, cb StatusCallback) *Engine {
 	}
 }
 
-func (e *Engine) Start(profileJSON string) error {
+func (e *Engine) Start(profile *config.Profile) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -53,19 +53,14 @@ func (e *Engine) Start(profileJSON string) error {
 		return fmt.Errorf("already %s", e.status)
 	}
 
-	var profile config.Profile
-	if err := json.Unmarshal([]byte(profileJSON), &profile); err != nil {
-		return fmt.Errorf("parse profile: %w", err)
-	}
-
-	e.profile = &profile
+	e.profile = profile
 	e.reconnectCount = 0
 	e.setStatus(StatusConnecting)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	e.cancel = cancel
 
-	go e.connect(ctx, &profile)
+	go e.connect(ctx, profile)
 	return nil
 }
 
@@ -76,26 +71,26 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 }
 
 func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) error {
-	vpnPort := profile.VPNPort()
-	if vpnPort == nil {
-		return fmt.Errorf("没有配置 VPN 港口")
+	vpnLine := profile.VPNLine()
+	if vpnLine == nil {
+		return fmt.Errorf("没有配置 VPN 线路")
 	}
-	if vpnPort.VPNServer == "" {
+	if vpnLine.VPNServer == "" {
 		return fmt.Errorf("VPN 服务器地址未填写")
 	}
-	if vpnPort.VPNUsername == "" || vpnPort.VPNPassword == "" {
+	if vpnLine.VPNUsername == "" || vpnLine.VPNPassword == "" {
 		return fmt.Errorf("VPN 用户名或密码未填写")
 	}
 
-	slog.Info("connecting to VPN", "server", vpnPort.VPNServer)
+	slog.Info("connecting to VPN", "server", vpnLine.VPNServer)
 
 	vpnInfo, err := e.vpn.Connect(VPNConfig{
-		Server:   vpnPort.VPNServer,
-		Username: vpnPort.VPNUsername,
-		Password: vpnPort.VPNPassword,
+		Server:   vpnLine.VPNServer,
+		Username: vpnLine.VPNUsername,
+		Password: vpnLine.VPNPassword,
 	})
 	if err != nil {
-		return fmt.Errorf("%s", humanizeVPNError(err, vpnPort.VPNServer))
+		return fmt.Errorf("%s", humanizeVPNError(err, vpnLine.VPNServer))
 	}
 
 	if ctx.Err() != nil {

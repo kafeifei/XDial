@@ -8,7 +8,7 @@ struct MainPopover: View {
         VStack(alignment: .leading, spacing: 10) {
             header
             Divider()
-            strategyRow
+            modeRow
             if !state.profile.subscriptions.isEmpty && state.isConnected {
                 subscriptionSummary
             }
@@ -31,21 +31,21 @@ struct MainPopover: View {
         }
     }
 
-    private var strategyRow: some View {
+    private var modeRow: some View {
         HStack(spacing: 6) {
-            Text("🚢")
+            Text("🔀")
                 .font(.caption)
 
-            if state.profile.cruises.isEmpty {
+            if state.profile.modes.isEmpty {
                 Text("（请先在设置中创建）")
                     .font(.caption)
                     .foregroundStyle(.orange)
             } else {
                 Picker("", selection: SwiftUI.Binding(
-                    get: { state.profile.activeCruiseID },
-                    set: { state.profile.activeCruiseID = $0; state.save() }
+                    get: { state.profile.activeModeID },
+                    set: { state.profile.activeModeID = $0; state.save() }
                 )) {
-                    ForEach(state.profile.cruises) { s in
+                    ForEach(state.profile.modes) { s in
                         Text(s.name).tag(s.id)
                     }
                 }
@@ -68,7 +68,7 @@ struct MainPopover: View {
                         .font(.caption)
                         .lineLimit(1)
                     Spacer()
-                    if let info = net.perPort[sub.id] {
+                    if let info = net.perLine[sub.id] {
                         if !info.ip.isEmpty {
                             Text(info.summary)
                                 .font(.caption2)

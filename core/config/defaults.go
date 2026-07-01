@@ -1,49 +1,49 @@
 package config
 
-// 邮轮模板工厂函数
-// 用户从模板创建自己的邮轮后可任意修改
+// 模式模板工厂函数
+// 用户从模板创建自己的模式后可任意修改
 
-// TemplateOverseas 海外模式：自定义货品→VPN，其他→直连
-func TemplateOverseas(cargoIDs []string, vpnPortID, directPortID string) Cruise {
-	var bindings []Binding
-	for _, cid := range cargoIDs {
-		bindings = append(bindings, Binding{CargoID: cid, PortID: vpnPortID})
+// TemplateOverseas 海外模式：自定义规则→VPN，其他→直连
+func TemplateOverseas(ruleSetIDs []string, vpnLineID, directLineID string) Mode {
+	var bindings []RuleBinding
+	for _, rid := range ruleSetIDs {
+		bindings = append(bindings, RuleBinding{RuleSetID: rid, LineID: vpnLineID})
 	}
-	return Cruise{
+	return Mode{
 		Name:          "海外",
 		Bindings:      bindings,
-		DefaultPortID: directPortID,
+		DefaultLineID: directLineID,
 	}
 }
 
-// TemplateDomestic 国内模式：自定义货品→VPN，GFW→VPN，其他→直连
-func TemplateDomestic(domainCargoIDs []string, gfwCargoID, vpnPortID, directPortID string) Cruise {
-	var bindings []Binding
-	for _, cid := range domainCargoIDs {
-		bindings = append(bindings, Binding{CargoID: cid, PortID: vpnPortID})
+// TemplateDomestic 国内模式：自定义规则→VPN，GFW→VPN，其他→直连
+func TemplateDomestic(domainRuleSetIDs []string, gfwRuleSetID, vpnLineID, directLineID string) Mode {
+	var bindings []RuleBinding
+	for _, rid := range domainRuleSetIDs {
+		bindings = append(bindings, RuleBinding{RuleSetID: rid, LineID: vpnLineID})
 	}
-	if gfwCargoID != "" {
-		bindings = append(bindings, Binding{CargoID: gfwCargoID, PortID: vpnPortID})
+	if gfwRuleSetID != "" {
+		bindings = append(bindings, RuleBinding{RuleSetID: gfwRuleSetID, LineID: vpnLineID})
 	}
-	return Cruise{
+	return Mode{
 		Name:          "国内",
 		Bindings:      bindings,
-		DefaultPortID: directPortID,
+		DefaultLineID: directLineID,
 	}
 }
 
-// TemplateDomesticSS 国内+SS模式：自定义货品→VPN，GFW→SS，其他→直连
-func TemplateDomesticSS(domainCargoIDs []string, gfwCargoID, vpnPortID, ssPortID, directPortID string) Cruise {
-	var bindings []Binding
-	for _, cid := range domainCargoIDs {
-		bindings = append(bindings, Binding{CargoID: cid, PortID: vpnPortID})
+// TemplateDomesticSS 国内+SS模式：自定义规则→VPN，GFW→SS，其他→直连
+func TemplateDomesticSS(domainRuleSetIDs []string, gfwRuleSetID, vpnLineID, ssLineID, directLineID string) Mode {
+	var bindings []RuleBinding
+	for _, rid := range domainRuleSetIDs {
+		bindings = append(bindings, RuleBinding{RuleSetID: rid, LineID: vpnLineID})
 	}
-	if gfwCargoID != "" {
-		bindings = append(bindings, Binding{CargoID: gfwCargoID, PortID: ssPortID})
+	if gfwRuleSetID != "" {
+		bindings = append(bindings, RuleBinding{RuleSetID: gfwRuleSetID, LineID: ssLineID})
 	}
-	return Cruise{
+	return Mode{
 		Name:          "国内+SS",
 		Bindings:      bindings,
-		DefaultPortID: directPortID,
+		DefaultLineID: directLineID,
 	}
 }

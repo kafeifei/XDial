@@ -47,32 +47,13 @@ func (s *SingBoxProcess) Start(profile *config.Profile, socksAddr, vpnServerIP s
 		return err
 	}
 
-	r, w, err := os.Pipe()
+	cmd, pipeW, err := startSingBoxCmd(singboxBin, s.configPath, filepath.Dir(s.configPath))
 	if err != nil {
-		return fmt.Errorf("create pipe: %w", err)
+		return err
 	}
 
-	// 哨兵在后台监控 pipe 读端，helper 死时 OS 关闭写端，read 返回，杀 sing-box。
-	// exec 3>&- 关掉 sing-box 继承的 fd 3，只有哨兵持有。
-	// $$ 在解析时展开为 shell PID，exec 后该 PID 就是 sing-box。
-	wrapper := fmt.Sprintf(
-		`(read <&3; kill $$) & exec 3>&- '%s' run -c '%s' -D '%s'`,
-		singboxBin, s.configPath, filepath.Dir(s.configPath),
-	)
-
-	s.cmd = exec.Command("sh", "-c", wrapper)
-	s.cmd.ExtraFiles = []*os.File{r}
-	s.cmd.Stdout = os.Stdout
-	s.cmd.Stderr = os.Stderr
-
-	if err := s.cmd.Start(); err != nil {
-		r.Close()
-		w.Close()
-		return fmt.Errorf("start sing-box: %w", err)
-	}
-
-	r.Close()
-	s.pipeW = w
+	s.cmd = cmd
+	s.pipeW = pipeW
 
 	slog.Info("sing-box started", "pid", s.cmd.Process.Pid)
 	return nil
@@ -89,21 +70,4 @@ func (s *SingBoxProcess) Stop() {
 		s.pipeW = nil
 	}
 	os.Remove(s.configPath)
-}
-
-func findSingBox() (string, error) {
-	candidates := []string{
-		"/opt/homebrew/bin/sing-box",
-		"/usr/local/bin/sing-box",
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-	p, err := exec.LookPath("sing-box")
-	if err != nil {
-		return "", fmt.Errorf("sing-box not found; install with: brew install sing-box")
-	}
-	return p, nil
 }

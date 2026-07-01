@@ -20,14 +20,14 @@ func parseClash(content string) (*ParseResult, error) {
 		return nil, fmt.Errorf("yaml parse: %w", err)
 	}
 
-	var ports []config.Port
+	var lines []config.Line
 	for _, p := range cfg.Proxies {
-		port, ok := clashProxyToPort(p)
+		line, ok := clashProxyToLine(p)
 		if ok {
-			ports = append(ports, port)
+			lines = append(lines, line)
 		}
 	}
-	if len(ports) == 0 {
+	if len(lines) == 0 {
 		return nil, fmt.Errorf("no supported proxies found")
 	}
 
@@ -47,7 +47,7 @@ func parseClash(content string) (*ParseResult, error) {
 		}
 	}
 
-	return &ParseResult{Ports: ports, ProxyGroups: groups, Rules: rules}, nil
+	return &ParseResult{Lines: lines, ProxyGroups: groups, Rules: rules}, nil
 }
 
 func clashProxyGroup(g map[string]interface{}) (config.ProxyGroup, bool) {
@@ -94,17 +94,17 @@ func clashRule(line string) (config.SubscriptionRule, bool) {
 	}, true
 }
 
-func clashProxyToPort(p map[string]interface{}) (config.Port, bool) {
+func clashProxyToLine(p map[string]interface{}) (config.Line, bool) {
 	typ := strings.ToLower(getString(p, "type"))
 	name := getString(p, "name")
 	server := getString(p, "server")
 	port := getInt(p, "port")
 
 	if server == "" || port == 0 {
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 
-	base := config.Port{
+	base := config.Line{
 		ID:      shortID(),
 		Name:    name,
 		Enabled: true,
@@ -112,7 +112,7 @@ func clashProxyToPort(p map[string]interface{}) (config.Port, bool) {
 
 	switch typ {
 	case "ss", "shadowsocks":
-		base.Type = config.PortTypeShadowsocks
+		base.Type = config.LineTypeShadowsocks
 		base.SSServer = server
 		base.SSPort = port
 		base.SSMethod = getString(p, "cipher")
@@ -120,7 +120,7 @@ func clashProxyToPort(p map[string]interface{}) (config.Port, bool) {
 		return base, true
 
 	case "vmess":
-		base.Type = config.PortTypeVMess
+		base.Type = config.LineTypeVMess
 		base.VMessServer = server
 		base.VMessPort = port
 		base.VMessUUID = getString(p, "uuid")
@@ -128,7 +128,7 @@ func clashProxyToPort(p map[string]interface{}) (config.Port, bool) {
 		return base, true
 
 	case "trojan":
-		base.Type = config.PortTypeTrojan
+		base.Type = config.LineTypeTrojan
 		base.TrojanServer = server
 		base.TrojanPort = port
 		base.TrojanPassword = getString(p, "password")
@@ -140,7 +140,7 @@ func clashProxyToPort(p map[string]interface{}) (config.Port, bool) {
 		return base, true
 
 	default:
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 }
 

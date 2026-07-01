@@ -37,16 +37,16 @@ proxies:
 	if err != nil {
 		t.Fatalf("Parse clash: %v", err)
 	}
-	if len(r.Ports) != 3 {
-		t.Fatalf("expected 3 ports, got %d", len(r.Ports))
+	if len(r.Lines) != 3 {
+		t.Fatalf("expected 3 lines, got %d", len(r.Lines))
 	}
 
-	assertPort(t, r.Ports[0], "JP-SS", config.PortTypeShadowsocks, "jp.example.com", 8388)
-	assertPort(t, r.Ports[1], "US-VMess", config.PortTypeVMess, "us.example.com", 443)
-	assertPort(t, r.Ports[2], "HK-Trojan", config.PortTypeTrojan, "hk.example.com", 443)
+	assertLine(t, r.Lines[0], "JP-SS", config.LineTypeShadowsocks, "jp.example.com", 8388)
+	assertLine(t, r.Lines[1], "US-VMess", config.LineTypeVMess, "us.example.com", 443)
+	assertLine(t, r.Lines[2], "HK-Trojan", config.LineTypeTrojan, "hk.example.com", 443)
 
-	if r.Ports[0].SSMethod != "aes-256-gcm" {
-		t.Errorf("SS method = %q, want aes-256-gcm", r.Ports[0].SSMethod)
+	if r.Lines[0].SSMethod != "aes-256-gcm" {
+		t.Errorf("SS method = %q, want aes-256-gcm", r.Lines[0].SSMethod)
 	}
 }
 
@@ -73,10 +73,10 @@ FINAL,Auto
 	if err != nil {
 		t.Fatalf("Parse surge: %v", err)
 	}
-	if len(r.Ports) != 3 {
-		t.Fatalf("expected 3 ports, got %d", len(r.Ports))
+	if len(r.Lines) != 3 {
+		t.Fatalf("expected 3 lines, got %d", len(r.Lines))
 	}
-	assertPort(t, r.Ports[0], "JP-SS", config.PortTypeShadowsocks, "jp.example.com", 8388)
+	assertLine(t, r.Lines[0], "JP-SS", config.LineTypeShadowsocks, "jp.example.com", 8388)
 
 	if len(r.ProxyGroups) != 2 {
 		t.Fatalf("expected 2 groups, got %d", len(r.ProxyGroups))
@@ -108,10 +108,10 @@ func TestParseBase64(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse base64: %v", err)
 	}
-	if len(r.Ports) != 2 {
-		t.Fatalf("expected 2 ports, got %d", len(r.Ports))
+	if len(r.Lines) != 2 {
+		t.Fatalf("expected 2 lines, got %d", len(r.Lines))
 	}
-	assertPort(t, r.Ports[0], "JP-SS", config.PortTypeShadowsocks, "jp.example.com", 8388)
+	assertLine(t, r.Lines[0], "JP-SS", config.LineTypeShadowsocks, "jp.example.com", 8388)
 }
 
 func TestParseBase64VMess(t *testing.T) {
@@ -122,10 +122,10 @@ func TestParseBase64VMess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse base64 vmess: %v", err)
 	}
-	if len(r.Ports) != 1 {
-		t.Fatalf("expected 1 port, got %d", len(r.Ports))
+	if len(r.Lines) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(r.Lines))
 	}
-	assertPort(t, r.Ports[0], "US-VMess", config.PortTypeVMess, "us.example.com", 443)
+	assertLine(t, r.Lines[0], "US-VMess", config.LineTypeVMess, "us.example.com", 443)
 }
 
 func TestDetectFormat(t *testing.T) {
@@ -145,33 +145,33 @@ func TestDetectFormat(t *testing.T) {
 	}
 }
 
-func assertPort(t *testing.T, port config.Port, name string, typ config.PortType, server string, portNum int) {
+func assertLine(t *testing.T, line config.Line, name string, typ config.LineType, server string, portNum int) {
 	t.Helper()
-	if port.Name != name {
-		t.Errorf("port name = %q, want %q", port.Name, name)
+	if line.Name != name {
+		t.Errorf("line name = %q, want %q", line.Name, name)
 	}
-	if port.Type != typ {
-		t.Errorf("port %s type = %q, want %q", name, port.Type, typ)
+	if line.Type != typ {
+		t.Errorf("line %s type = %q, want %q", name, line.Type, typ)
 	}
 
 	var gotServer string
 	var gotPort int
 	switch typ {
-	case config.PortTypeShadowsocks:
-		gotServer = port.SSServer
-		gotPort = port.SSPort
-	case config.PortTypeVMess:
-		gotServer = port.VMessServer
-		gotPort = port.VMessPort
-	case config.PortTypeTrojan:
-		gotServer = port.TrojanServer
-		gotPort = port.TrojanPort
+	case config.LineTypeShadowsocks:
+		gotServer = line.SSServer
+		gotPort = line.SSPort
+	case config.LineTypeVMess:
+		gotServer = line.VMessServer
+		gotPort = line.VMessPort
+	case config.LineTypeTrojan:
+		gotServer = line.TrojanServer
+		gotPort = line.TrojanPort
 	}
 
 	if gotServer != server {
-		t.Errorf("port %s server = %q, want %q", name, gotServer, server)
+		t.Errorf("line %s server = %q, want %q", name, gotServer, server)
 	}
 	if gotPort != portNum {
-		t.Errorf("port %s port = %d, want %d", name, gotPort, portNum)
+		t.Errorf("line %s port = %d, want %d", name, gotPort, portNum)
 	}
 }

@@ -9,9 +9,9 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 Picker("", selection: $tab) {
-                    Text("⚓️ \(state.tr("港口", "Ports"))").tag(0)
-                    Text("📦 \(state.tr("货品", "Cargoes"))").tag(1)
-                    Text("🚢 \(state.tr("邮轮", "Cruises"))").tag(2)
+                    Text("📡 \(state.tr("线路", "Lines"))").tag(0)
+                    Text("📋 \(state.tr("规则", "Rules"))").tag(1)
+                    Text("🔀 \(state.tr("模式", "Modes"))").tag(2)
                 }
                 .pickerStyle(.segmented)
                 .frame(maxWidth: .infinity)
@@ -35,9 +35,9 @@ struct SettingsView: View {
             Divider()
 
             ZStack {
-                if tab == 0 { PortsTab() }
-                else if tab == 1 { CargoesTab() }
-                else if tab == 2 { CruisesTab() }
+                if tab == 0 { LinesTab() }
+                else if tab == 1 { RulesTab() }
+                else if tab == 2 { ModesTab() }
                 else { GeneralTab() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -122,8 +122,8 @@ struct GeneralTab: View {
             Button(state.tr("取消", "Cancel"), role: .cancel) {}
         } message: {
             Text(state.tr(
-                "「卸载并删除所有数据」会清除你保存的所有出口、规则、策略组和 Keychain 中的密码。",
-                "“Uninstall and delete all data” removes all your ports, cargoes, cruises, and Keychain passwords."
+                "「卸载并删除所有数据」会清除你保存的所有线路、规则、模式和 Keychain 中的密码。",
+                "“Uninstall and delete all data” removes all your lines, rules, modes, and Keychain passwords."
             ))
         }
     }
@@ -144,9 +144,9 @@ struct GeneralTab: View {
     }
 }
 
-// MARK: - 港口 Tab
+// MARK: - 线路 Tab
 
-struct PortsTab: View {
+struct LinesTab: View {
     @EnvironmentObject var state: AppState
     @State private var showAddSub = false
 
@@ -154,8 +154,8 @@ struct PortsTab: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 8) {
-                    ForEach($state.profile.ports) { $port in
-                        PortRow(port: $port, onDelete: { delete(port) })
+                    ForEach($state.profile.lines) { $line in
+                        LineRow(line: $line, onDelete: { delete(line) })
                     }
                     ForEach($state.profile.subscriptions) { $sub in
                         SubscriptionRow(sub: $sub, onDelete: { deleteSub(sub) })
@@ -177,7 +177,7 @@ struct PortsTab: View {
                         showAddSub = true
                     }
                 } label: {
-                    Label(state.tr("添加港口", "Add Port"), systemImage: "plus")
+                    Label(state.tr("添加线路", "Add Line"), systemImage: "plus")
                 }
                 .menuStyle(.borderlessButton)
                 .padding(8)
@@ -198,13 +198,13 @@ struct PortsTab: View {
         case "vmess": name = "VMess 节点"
         default: name = "节点"
         }
-        state.profile.ports.append(Port(id: id, name: name, type: type))
+        state.profile.lines.append(Line(id: id, name: name, type: type))
         state.save()
     }
 
-    private func delete(_ port: Port) {
-        if port.type == "direct" { return }
-        state.profile.ports.removeAll { $0.id == port.id }
+    private func delete(_ line: Line) {
+        if line.type == "direct" { return }
+        state.profile.lines.removeAll { $0.id == line.id }
         state.save()
     }
 
@@ -213,14 +213,14 @@ struct PortsTab: View {
     }
 }
 
-struct PortRow: View {
-    @SwiftUI.Binding var port: Port
+struct LineRow: View {
+    @SwiftUI.Binding var line: Line
     var onDelete: () -> Void
     @State private var expanded = false
     @EnvironmentObject var state: AppState
     @ObservedObject private var net = NetworkInfo.shared
 
-    private var isLocked: Bool { port.type == "direct" }
+    private var isLocked: Bool { line.type == "direct" }
 
     var body: some View {
         CollapsibleCard(
@@ -228,12 +228,12 @@ struct PortRow: View {
             locked: isLocked,
             onToggle: { expanded.toggle() },
             onDelete: isLocked ? nil : onDelete,
-            enabled: Binding(get: { port.enabled }, set: { if !isLocked { port.enabled = $0; state.save() } }),
+            enabled: Binding(get: { line.enabled }, set: { if !isLocked { line.enabled = $0; state.save() } }),
             header: {
-                Image(systemName: port.verified ? "checkmark.seal.fill" : "checkmark.seal")
+                Image(systemName: line.verified ? "checkmark.seal.fill" : "checkmark.seal")
                     .foregroundStyle(.secondary)
 
-                Text(port.name).font(.system(size: 13, weight: .medium))
+                Text(line.name).font(.system(size: 13, weight: .medium))
 
                 if !briefInfo.isEmpty {
                     Text(briefInfo).font(.caption).foregroundStyle(.secondary)
@@ -246,77 +246,77 @@ struct PortRow: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("名称").font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-                        TextField("名称", text: $port.name)
+                        TextField("名称", text: $line.name)
                             .textFieldStyle(.roundedBorder).font(.caption)
-                            .onChange(of: port.name) { _, _ in state.save() }
+                            .onChange(of: line.name) { _, _ in state.save() }
                     }
                     detailFields
                 }
             }
         )
-        .opacity(isLocked ? 0.6 : (port.verified ? 1.0 : 0.7))
+        .opacity(isLocked ? 0.6 : (line.verified ? 1.0 : 0.7))
     }
 
     private var briefInfo: String {
         // 已探测：显示真实出口 IP/地区
-        if let info = net.perPort[port.id], !info.summary.isEmpty {
+        if let info = net.perLine[line.id], !info.summary.isEmpty {
             return info.summary
         }
         // 仅启用且当前在探测时显示"检测中"
-        if net.probing && port.enabled {
+        if net.probing && line.enabled {
             return "检测中…"
         }
         // 未启用或已探测但无结果：显示静态配置
-        switch port.type {
+        switch line.type {
         case "vpn":
-            return port.vpnServer
+            return line.vpnServer
         case "trojan":
-            guard !port.trojanServer.isEmpty else { return "" }
-            return "\(port.trojanServer):\(port.trojanPort)"
+            guard !line.trojanServer.isEmpty else { return "" }
+            return "\(line.trojanServer):\(line.trojanPort)"
         case "shadowsocks":
-            guard !port.ssServer.isEmpty else { return "" }
-            return "\(port.ssServer):\(port.ssPort)"
+            guard !line.ssServer.isEmpty else { return "" }
+            return "\(line.ssServer):\(line.ssPort)"
         case "vmess":
-            guard !port.vmessServer.isEmpty else { return "" }
-            return "\(port.vmessServer):\(port.vmessPort)"
+            guard !line.vmessServer.isEmpty else { return "" }
+            return "\(line.vmessServer):\(line.vmessPort)"
         default:
             return ""
         }
     }
 
     private var typeLabel: String {
-        switch port.type {
+        switch line.type {
         case "direct": return "直连"
         case "vpn": return "VPN"
         case "trojan": return "Trojan"
         case "shadowsocks": return "SS"
         case "vmess": return "VMess"
-        default: return port.type
+        default: return line.type
         }
     }
 
     @ViewBuilder
     private var detailFields: some View {
-        switch port.type {
+        switch line.type {
         case "vpn":
-            field("服务器", $port.vpnServer, placeholder: "vpn.example.com:8443")
-            field("用户名", $port.vpnUsername)
-            secureField("密码", $port.vpnPassword)
+            field("服务器", $line.vpnServer, placeholder: "vpn.example.com:8443")
+            field("用户名", $line.vpnUsername)
+            secureField("密码", $line.vpnPassword)
         case "trojan":
-            field("服务器", $port.trojanServer)
-            intField("端口", $port.trojanPort)
-            field("SNI", $port.trojanSNI)
-            secureField("密码", $port.trojanPassword)
+            field("服务器", $line.trojanServer)
+            intField("端口", $line.trojanPort)
+            field("SNI", $line.trojanSNI)
+            secureField("密码", $line.trojanPassword)
         case "shadowsocks":
-            field("服务器", $port.ssServer)
-            intField("端口", $port.ssPort)
-            field("加密方法", $port.ssMethod)
-            secureField("密码", $port.ssPassword)
+            field("服务器", $line.ssServer)
+            intField("端口", $line.ssPort)
+            field("加密方法", $line.ssMethod)
+            secureField("密码", $line.ssPassword)
         case "vmess":
-            field("服务器", $port.vmessServer)
-            intField("端口", $port.vmessPort)
-            secureField("UUID", $port.vmessUUID)
-            intField("Alter ID", $port.vmessAltID)
+            field("服务器", $line.vmessServer)
+            intField("端口", $line.vmessPort)
+            secureField("UUID", $line.vmessUUID)
+            intField("Alter ID", $line.vmessAltID)
         default:
             EmptyView()
         }
@@ -329,7 +329,7 @@ struct PortRow: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .onChange(of: binding.wrappedValue) { _, _ in
-                    port.verified = false
+                    line.verified = false
                     state.save()
                 }
         }
@@ -342,7 +342,7 @@ struct PortRow: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .onChange(of: binding.wrappedValue) { _, _ in
-                    port.verified = false
+                    line.verified = false
                     state.save()
                 }
         }
@@ -355,24 +355,24 @@ struct PortRow: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .onChange(of: binding.wrappedValue) { _, _ in
-                    port.verified = false
+                    line.verified = false
                     state.save()
                 }
         }
     }
 }
 
-// MARK: - 货品 Tab
+// MARK: - 规则 Tab
 
-struct CargoesTab: View {
+struct RulesTab: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 8) {
-                    ForEach($state.profile.cargoes) { $rule in
-                        CargoRow(rule: $rule, onDelete: { delete(rule) })
+                    ForEach($state.profile.ruleSets) { $rule in
+                        RuleSetRow(rule: $rule, onDelete: { delete(rule) })
                     }
                 }
                 .padding(10)
@@ -381,10 +381,10 @@ struct CargoesTab: View {
             HStack {
                 Spacer()
                 Menu {
-                    Button("URL 货品") { add(type: "url") }
+                    Button("URL 规则") { add(type: "url") }
                     Button("手动域名/IP") { add(type: "manual") }
                 } label: {
-                    Label("添加货品", systemImage: "plus")
+                    Label("添加规则", systemImage: "plus")
                 }
                 .menuStyle(.borderlessButton)
                 .padding(8)
@@ -394,22 +394,22 @@ struct CargoesTab: View {
 
     private func add(type: String) {
         let id = "rule-" + String(UUID().uuidString.prefix(6))
-        let name = type == "url" ? "新 URL 货品" : "新手动货品"
-        state.profile.cargoes.append(Cargo(id: id, name: name, type: type))
+        let name = type == "url" ? "新 URL 规则" : "新手动规则"
+        state.profile.ruleSets.append(RuleSet(id: id, name: name, type: type))
         state.save()
     }
 
-    private func delete(_ rule: Cargo) {
-        state.profile.cargoes.removeAll { $0.id == rule.id }
-        for i in state.profile.cruises.indices {
-            state.profile.cruises[i].bindings.removeAll { $0.cargoID == rule.id }
+    private func delete(_ rule: RuleSet) {
+        state.profile.ruleSets.removeAll { $0.id == rule.id }
+        for i in state.profile.modes.indices {
+            state.profile.modes[i].bindings.removeAll { $0.ruleSetID == rule.id }
         }
         state.save()
     }
 }
 
-struct CargoRow: View {
-    @SwiftUI.Binding var rule: Cargo
+struct RuleSetRow: View {
+    @SwiftUI.Binding var rule: RuleSet
     var onDelete: () -> Void
     @State private var expanded = true
     @State private var domainsText = ""
@@ -511,9 +511,9 @@ struct CargoRow: View {
     }
 }
 
-// MARK: - 邮轮 Tab
+// MARK: - 模式 Tab
 
-struct CruisesTab: View {
+struct ModesTab: View {
     @EnvironmentObject var state: AppState
     @State private var showTemplate = false
     @State private var newName = ""
@@ -523,17 +523,17 @@ struct CruisesTab: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 8) {
-                    ForEach($state.profile.cruises) { $cruise in
-                        CruiseRow(
-                            cruise: $cruise,
-                            isActive: cruise.id == state.profile.activeCruiseID,
-                            isExpanded: expandedID == cruise.id,
-                            onToggle: { expandedID = expandedID == cruise.id ? nil : cruise.id },
+                    ForEach($state.profile.modes) { $mode in
+                        ModeRow(
+                            mode: $mode,
+                            isActive: mode.id == state.profile.activeModeID,
+                            isExpanded: expandedID == mode.id,
+                            onToggle: { expandedID = expandedID == mode.id ? nil : mode.id },
                             onActivate: {
-                                state.profile.activeCruiseID = cruise.id
+                                state.profile.activeModeID = mode.id
                                 state.save()
                             },
-                            onDelete: { state.deleteCruise(cruise) }
+                            onDelete: { state.deleteMode(mode) }
                         )
                     }
                 }
@@ -542,13 +542,13 @@ struct CruisesTab: View {
             Divider()
             AddBar {
                 Menu {
-                    ForEach(CruiseTemplate.allCases, id: \.self) { t in
+                    ForEach(ModeTemplate.allCases, id: \.self) { t in
                         Button(t.displayName) {
-                            state.createCruise(from: t, named: t.displayName)
+                            state.createMode(from: t, named: t.displayName)
                         }
                     }
                 } label: {
-                    Label(state.tr("添加邮轮", "Add Cruise"), systemImage: "plus")
+                    Label(state.tr("添加模式", "Add Mode"), systemImage: "plus")
                 }
             }
         }
@@ -556,8 +556,8 @@ struct CruisesTab: View {
 
 }
 
-struct CruiseRow: View {
-    @SwiftUI.Binding var cruise: Cruise
+struct ModeRow: View {
+    @SwiftUI.Binding var mode: Mode
     let isActive: Bool
     let isExpanded: Bool
     let onToggle: () -> Void
@@ -566,7 +566,7 @@ struct CruiseRow: View {
     @EnvironmentObject var state: AppState
 
     private var bindingSummary: String {
-        let n = cruise.bindings.count
+        let n = mode.bindings.count
         return n == 0 ? state.tr("无规则", "No rules") : "\(n) \(state.tr("条规则", "rules"))"
     }
 
@@ -585,27 +585,27 @@ struct CruiseRow: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .onTapGesture { onActivate() }
                 }
-                Text(cruise.name).font(.system(size: 13, weight: .medium))
+                Text(mode.name).font(.system(size: 13, weight: .medium))
                 Text(bindingSummary).font(.caption).foregroundStyle(.secondary)
             },
             detail: {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-                        TextField("", text: $cruise.name)
+                        TextField("", text: $mode.name)
                             .textFieldStyle(.roundedBorder).font(.caption)
-                            .onChange(of: cruise.name) { _, _ in state.save() }
+                            .onChange(of: mode.name) { _, _ in state.save() }
                     }
 
                     Divider()
 
                     HStack {
-                        Text(state.tr("货品", "Cargo")).font(.caption).foregroundStyle(.secondary)
+                        Text(state.tr("规则", "Rule")).font(.caption).foregroundStyle(.secondary)
                             .frame(width: 200, alignment: .leading)
-                        Text(state.tr("港口", "Port")).font(.caption).foregroundStyle(.secondary)
+                        Text(state.tr("线路", "Line")).font(.caption).foregroundStyle(.secondary)
                     }
 
-                    ForEach(cruise.bindings) { binding in
+                    ForEach(mode.bindings) { binding in
                         bindingRow(binding)
                     }
 
@@ -616,30 +616,30 @@ struct CruiseRow: View {
                             .font(.caption)
                             .frame(width: 200, alignment: .leading)
                         exitPicker(selectedID: SwiftUI.Binding(
-                            get: { cruise.defaultTargetID },
-                            set: { cruise.defaultTargetID = $0; state.save() }
+                            get: { mode.defaultTargetID },
+                            set: { mode.defaultTargetID = $0; state.save() }
                         ))
                     }
 
-                    // 添加货品
+                    // 添加规则
                     HStack {
                         Spacer()
                         Menu {
-                            let usedIDs = Set(cruise.bindings.map { $0.cargoID })
-                            let available = state.profile.cargoes.filter { !usedIDs.contains($0.id) }
+                            let usedIDs = Set(mode.bindings.map { $0.ruleSetID })
+                            let available = state.profile.ruleSets.filter { !usedIDs.contains($0.id) }
                             if available.isEmpty {
-                                Button(state.tr("（无可用货品）", "(No cargo available)")) {}.disabled(true)
+                                Button(state.tr("（无可用规则）", "(No rule available)")) {}.disabled(true)
                             } else {
                                 ForEach(available) { rule in
                                     Button(rule.name) {
-                                        let firstExit = state.profile.ports.first?.id ?? ""
-                                        cruise.bindings.append(CargoLink(cargoID: rule.id, portID: firstExit))
+                                        let firstExit = state.profile.lines.first?.id ?? ""
+                                        mode.bindings.append(RuleBinding(ruleSetID: rule.id, lineID: firstExit))
                                         state.save()
                                     }
                                 }
                             }
                         } label: {
-                            Label(state.tr("添加货品", "Add Cargo"), systemImage: "plus")
+                            Label(state.tr("添加规则", "Add Rule"), systemImage: "plus")
                         }
                         .menuStyle(.borderlessButton)
                         .controlSize(.small)
@@ -650,21 +650,21 @@ struct CruiseRow: View {
     }
 
     @ViewBuilder
-    private func bindingRow(_ binding: CargoLink) -> some View {
-        if let idx = cruise.bindings.firstIndex(where: { $0.cargoID == binding.cargoID }) {
-            let isEmpty = binding.portID.isEmpty && binding.subscriptionID.isEmpty
+    private func bindingRow(_ binding: RuleBinding) -> some View {
+        if let idx = mode.bindings.firstIndex(where: { $0.ruleSetID == binding.ruleSetID }) {
+            let isEmpty = binding.lineID.isEmpty && binding.subscriptionID.isEmpty
             HStack {
                 HStack(spacing: 4) {
                     if isEmpty {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.caption2).foregroundStyle(.orange)
                     }
-                    Text(state.profile.cargoes.first(where: { $0.id == binding.cargoID })?.name ?? "（已删除）")
+                    Text(state.profile.ruleSets.first(where: { $0.id == binding.ruleSetID })?.name ?? "（已删除）")
                 }
                 .frame(width: 200, alignment: .leading)
-                exitPicker(selectedID: $cruise.bindings[idx].targetID)
+                exitPicker(selectedID: $mode.bindings[idx].targetID)
                 Button {
-                    cruise.bindings.removeAll { $0.cargoID == binding.cargoID }
+                    mode.bindings.removeAll { $0.ruleSetID == binding.ruleSetID }
                     state.save()
                 } label: {
                     Image(systemName: "minus.circle").foregroundStyle(.red)
@@ -676,13 +676,13 @@ struct CruiseRow: View {
 
     private func exitPicker(selectedID: SwiftUI.Binding<String>) -> some View {
         Picker("", selection: selectedID) {
-            ForEach(state.profile.ports.filter { $0.enabled }) { e in
+            ForEach(state.profile.lines.filter { $0.enabled }) { e in
                 Text(e.name).tag("port:\(e.id)")
             }
             if !state.profile.subscriptions.filter({ $0.enabled }).isEmpty {
                 Divider()
                 ForEach(state.profile.subscriptions.filter { $0.enabled }) { sub in
-                    Label("\(sub.name) (\(sub.ports.count))", systemImage: "antenna.radiowaves.left.and.right")
+                    Label("\(sub.name) (\(sub.lines.count))", systemImage: "antenna.radiowaves.left.and.right")
                         .tag("sub:\(sub.id)")
                 }
             }
@@ -708,7 +708,7 @@ struct SubscriptionRow: View {
     private var groupCount: Int { sub.proxyGroups.count }
     private var ruleCount: Int { sub.rules.count }
     private var probeInfo: String {
-        guard let info = net.perPort[sub.id] else { return "" }
+        guard let info = net.perLine[sub.id] else { return "" }
         if !info.error.isEmpty { return info.error }
         if info.ip.isEmpty { return "" }
         var s = info.ip
@@ -736,7 +736,7 @@ struct SubscriptionRow: View {
                         Text("\(groupCount)\(state.tr("组", "g"))")
                             .font(.caption).foregroundStyle(.secondary)
                     }
-                    Text("\(sub.ports.count)\(state.tr("节点", "n"))")
+                    Text("\(sub.lines.count)\(state.tr("节点", "n"))")
                         .font(.caption).foregroundStyle(.secondary)
 
                     if sub.updatedAt > 0 {
@@ -790,7 +790,9 @@ struct SubscriptionRow: View {
                         Divider()
                         Text(state.tr("策略组", "Groups"))
                             .font(.caption2).foregroundStyle(.tertiary).textCase(.uppercase)
-                        ForEach(Array(sub.proxyGroups.enumerated()), id: \.element.name) { idx, group in
+                        // id 用 offset 而不是 name，订阅原始 YAML 里允许重名策略组，
+                        // 用 name 当 id 会导致 SwiftUI ForEach 重复 key 渲染错乱
+                        ForEach(Array(sub.proxyGroups.enumerated()), id: \.offset) { idx, group in
                             groupRow(group: group, idx: idx)
                         }
                     }
@@ -881,15 +883,15 @@ struct SubscriptionRow: View {
         testing = true
         let base = "http://127.0.0.1:9090"
         let testURL = "https://www.gstatic.com/generate_204"
-        let ports = sub.ports
+        let lines = sub.lines
         let subID = sub.id
 
         Task {
             // 并行测所有节点
             await withTaskGroup(of: (String, Int).self) { group in
-                for port in ports {
-                    let name = port.name
-                    let tag = "proxy-\(subID)-\(port.id)"
+                for line in lines {
+                    let name = line.name
+                    let tag = "proxy-\(subID)-\(line.id)"
                     group.addTask {
                         guard let encoded = tag.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
                               let url = URL(string: "\(base)/proxies/\(encoded)/delay?url=\(testURL)&timeout=3000") else {
@@ -1000,8 +1002,8 @@ struct AddSubscriptionSheet: View {
 
             if let r = parsedResult {
                 let summary = state.tr(
-                    "解析到 \(r.ports.count) 个节点、\(r.proxyGroups?.count ?? 0) 个策略组、\(r.rules?.count ?? 0) 条规则",
-                    "Found \(r.ports.count) nodes, \(r.proxyGroups?.count ?? 0) groups, \(r.rules?.count ?? 0) rules"
+                    "解析到 \(r.lines.count) 个节点、\(r.proxyGroups?.count ?? 0) 个策略组、\(r.rules?.count ?? 0) 条规则",
+                    "Found \(r.lines.count) nodes, \(r.proxyGroups?.count ?? 0) groups, \(r.rules?.count ?? 0) rules"
                 )
                 Text(summary)
                     .font(.caption)
@@ -1009,11 +1011,11 @@ struct AddSubscriptionSheet: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {
-                        ForEach(r.ports) { port in
+                        ForEach(r.lines) { line in
                             HStack {
-                                Text(port.name).font(.caption)
+                                Text(line.name).font(.caption)
                                 Spacer()
-                                Text(port.type).font(.caption2).foregroundStyle(.secondary)
+                                Text(line.type).font(.caption2).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -1023,7 +1025,7 @@ struct AddSubscriptionSheet: View {
                 Button(state.tr("确认添加", "Add")) {
                     let n = name.isEmpty ? (URL(string: url)?.host ?? "Subscription") : name
                     state.addSubscription(name: n, url: url, format: format, strategy: strategy,
-                                          ports: r.ports, proxyGroups: r.proxyGroups ?? [], rules: r.rules ?? [])
+                                          lines: r.lines, proxyGroups: r.proxyGroups ?? [], rules: r.rules ?? [])
                     isPresented = false
                 }
                 .buttonStyle(.borderedProminent)

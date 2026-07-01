@@ -32,47 +32,47 @@ func singboxCheck(t *testing.T, profile *Profile, label string) {
 	t.Logf("[%s] sing-box check OK", label)
 }
 
-// --- 基础港口 ---
+// --- 基础线路 ---
 
-func directPort() Port {
-	return Port{ID: "direct", Name: "直连", Type: PortTypeDirect, Enabled: true}
+func directLine() Line {
+	return Line{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true}
 }
 
-func vpnPort() Port {
-	return Port{
-		ID: "vpn", Name: "MyVPN", Type: PortTypeVPN, Enabled: true,
+func vpnLine() Line {
+	return Line{
+		ID: "vpn", Name: "MyVPN", Type: LineTypeVPN, Enabled: true,
 		VPNServer: "vpn.example.com", VPNUsername: "user", VPNPassword: "pass",
 	}
 }
 
-func trojanPort() Port {
-	return Port{
-		ID: "trojan-1", Name: "HK Trojan", Type: PortTypeTrojan, Enabled: true,
+func trojanLine() Line {
+	return Line{
+		ID: "trojan-1", Name: "HK Trojan", Type: LineTypeTrojan, Enabled: true,
 		TrojanServer: "hk.example.com", TrojanPort: 443,
 		TrojanPassword: "pass123", TrojanSNI: "hk.example.com",
 	}
 }
 
-// --- 基础货品 ---
+// --- 基础规则 ---
 
-func internalCargo() Cargo {
-	return Cargo{
-		ID: "internal", Name: "内部域名", Type: CargoTypeManual, Enabled: true,
+func internalRuleSet() RuleSet {
+	return RuleSet{
+		ID: "internal", Name: "内部域名", Type: RuleSetTypeManual, Enabled: true,
 		Domains: []string{"example.com", "svc.example.com"},
 	}
 }
 
-func gfwCargo() Cargo {
-	return Cargo{
-		ID: "gfw", Name: "GFWList", Type: CargoTypeURL, Enabled: true,
+func gfwRuleSet() RuleSet {
+	return RuleSet{
+		ID: "gfw", Name: "GFWList", Type: RuleSetTypeURL, Enabled: true,
 		URL:    "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-gfw.srs",
 		Format: "srs",
 	}
 }
 
-func cnipCargo() Cargo {
-	return Cargo{
-		ID: "cnip", Name: "国内IP", Type: CargoTypeURL, Enabled: true,
+func cnipRuleSet() RuleSet {
+	return RuleSet{
+		ID: "cnip", Name: "国内IP", Type: RuleSetTypeURL, Enabled: true,
 		URL:    "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geoip/geoip-cn.srs",
 		Format: "srs",
 	}
@@ -84,12 +84,12 @@ func testSubscription() Subscription {
 	return Subscription{
 		ID: "sub-test", Name: "TestSub", URL: "https://example.com/sub",
 		Format: "surge", Enabled: true, Strategy: "urltest",
-		Ports: []Port{
-			{ID: "n1", Name: "HK 01", Type: PortTypeTrojan, Enabled: true,
+		Lines: []Line{
+			{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
 				TrojanServer: "hk1.example.com", TrojanPort: 443, TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
-			{ID: "n2", Name: "US 01", Type: PortTypeTrojan, Enabled: true,
+			{ID: "n2", Name: "US 01", Type: LineTypeTrojan, Enabled: true,
 				TrojanServer: "us1.example.com", TrojanPort: 443, TrojanPassword: "p2", TrojanSNI: "us1.example.com"},
-			{ID: "n3", Name: "JP 01", Type: PortTypeTrojan, Enabled: true,
+			{ID: "n3", Name: "JP 01", Type: LineTypeTrojan, Enabled: true,
 				TrojanServer: "jp1.example.com", TrojanPort: 443, TrojanPassword: "p3", TrojanSNI: "jp1.example.com"},
 		},
 		ProxyGroups: []ProxyGroup{
@@ -103,7 +103,7 @@ func testSubscription() Subscription {
 			{Type: "DOMAIN-SUFFIX", Value: "netflix.com", Group: "Netflix"},
 			{Type: "DOMAIN-SUFFIX", Value: "openai.com", Group: "AI"},
 			{Type: "DOMAIN-KEYWORD", Value: "google", Group: "Proxies"},
-			{Type: "GEOIP", Value: "CN", Group: "Direct"},  // 应该被跳过
+			{Type: "GEOIP", Value: "CN", Group: "Direct"}, // 应该被跳过
 			{Type: "FINAL", Group: "Proxies"},
 		},
 	}
@@ -113,10 +113,10 @@ func testSubscriptionNoGroups() Subscription {
 	return Subscription{
 		ID: "sub-plain", Name: "PlainSub", URL: "https://example.com/plain",
 		Format: "base64", Enabled: true, Strategy: "urltest",
-		Ports: []Port{
-			{ID: "p1", Name: "Node A", Type: PortTypeShadowsocks, Enabled: true,
+		Lines: []Line{
+			{ID: "p1", Name: "Node A", Type: LineTypeShadowsocks, Enabled: true,
 				SSServer: "a.example.com", SSPort: 8388, SSMethod: "aes-256-gcm", SSPass: "pass"},
-			{ID: "p2", Name: "Node B", Type: PortTypeShadowsocks, Enabled: true,
+			{ID: "p2", Name: "Node B", Type: LineTypeShadowsocks, Enabled: true,
 				SSServer: "b.example.com", SSPort: 8388, SSMethod: "aes-256-gcm", SSPass: "pass"},
 		},
 	}
@@ -126,29 +126,29 @@ func testSubscriptionNoGroups() Subscription {
 // 测试用例
 // =====================
 
-func vmessPort() Port {
-	return Port{
-		ID: "vmess-1", Name: "America VMess", Type: PortTypeVMess, Enabled: true,
+func vmessLine() Line {
+	return Line{
+		ID: "vmess-1", Name: "America VMess", Type: LineTypeVMess, Enabled: true,
 		VMessServer: "us.example.com", VMessPort: 443,
 		VMessUUID: "test-uuid", VMessAltID: 0,
 	}
 }
 
-// 1. 纯手动港口，无订阅（原有功能）
+// 1. 纯手动线路，无订阅（原有功能）
 func TestGenerate_ManualOnly(t *testing.T) {
 	p := &Profile{
-		Ports:   []Port{directPort(), vpnPort(), trojanPort()},
-		Cargoes: []Cargo{internalCargo(), gfwCargo(), cnipCargo()},
-		Cruises: []Cruise{{
+		Lines:    []Line{directLine(), vpnLine(), trojanLine()},
+		RuleSets: []RuleSet{internalRuleSet(), gfwRuleSet(), cnipRuleSet()},
+		Modes: []Mode{{
 			ID: "c1", Name: "海外",
-			Bindings: []Binding{
-				{CargoID: "internal", PortID: "vpn"},
-				{CargoID: "gfw", PortID: "direct"},
-				{CargoID: "cnip", PortID: "trojan-1"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
+				{RuleSetID: "gfw", LineID: "direct"},
+				{RuleSetID: "cnip", LineID: "trojan-1"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "c1",
+		ActiveModeID: "c1",
 	}
 	singboxCheck(t, p, "manual-only")
 }
@@ -156,37 +156,37 @@ func TestGenerate_ManualOnly(t *testing.T) {
 // 1b. 国内 IP 走 VMess（验证 cnip→vmess 分流正确）
 func TestGenerate_ManualOnlyVMess(t *testing.T) {
 	p := &Profile{
-		Ports:   []Port{directPort(), vpnPort(), vmessPort()},
-		Cargoes: []Cargo{internalCargo(), gfwCargo(), cnipCargo()},
-		Cruises: []Cruise{{
+		Lines:    []Line{directLine(), vpnLine(), vmessLine()},
+		RuleSets: []RuleSet{internalRuleSet(), gfwRuleSet(), cnipRuleSet()},
+		Modes: []Mode{{
 			ID: "c1", Name: "国内",
-			Bindings: []Binding{
-				{CargoID: "internal", PortID: "vpn"},
-				{CargoID: "gfw", PortID: "direct"},
-				{CargoID: "cnip", PortID: "vmess-1"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
+				{RuleSetID: "gfw", LineID: "direct"},
+				{RuleSetID: "cnip", LineID: "vmess-1"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "c1",
+		ActiveModeID: "c1",
 	}
 	singboxCheck(t, p, "manual-vmess")
 }
 
-// 2. 邮轮 binding 指向订阅整体
+// 2. 模式 binding 指向订阅整体
 func TestGenerate_BindingToSubscription(t *testing.T) {
 	p := &Profile{
-		Ports:         []Port{directPort(), vpnPort()},
-		Cargoes:       []Cargo{internalCargo(), gfwCargo()},
+		Lines:         []Line{directLine(), vpnLine()},
+		RuleSets:      []RuleSet{internalRuleSet(), gfwRuleSet()},
 		Subscriptions: []Subscription{testSubscription()},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "c1", Name: "国内",
-			Bindings: []Binding{
-				{CargoID: "internal", PortID: "vpn"},
-				{CargoID: "gfw", SubscriptionID: "sub-test"}, // GFW → 订阅
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
+				{RuleSetID: "gfw", SubscriptionID: "sub-test"}, // GFW → 订阅
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "c1",
+		ActiveModeID: "c1",
 	}
 	singboxCheck(t, p, "binding-to-sub")
 }
@@ -194,37 +194,37 @@ func TestGenerate_BindingToSubscription(t *testing.T) {
 // 3. 默认出口指向订阅
 func TestGenerate_DefaultToSubscription(t *testing.T) {
 	p := &Profile{
-		Ports:         []Port{directPort(), vpnPort()},
-		Cargoes:       []Cargo{internalCargo()},
+		Lines:         []Line{directLine(), vpnLine()},
+		RuleSets:      []RuleSet{internalRuleSet()},
 		Subscriptions: []Subscription{testSubscription()},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "c1", Name: "全走订阅",
-			Bindings: []Binding{
-				{CargoID: "internal", PortID: "vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
 			},
 			DefaultSubscriptionID: "sub-test",
 		}},
-		ActiveCruiseID: "c1",
+		ActiveModeID: "c1",
 	}
 	singboxCheck(t, p, "default-to-sub")
 }
 
-// 4. 混合：手动港口 + 订阅
+// 4. 混合：手动线路 + 订阅
 func TestGenerate_Mixed(t *testing.T) {
 	p := &Profile{
-		Ports:         []Port{directPort(), vpnPort(), trojanPort()},
-		Cargoes:       []Cargo{internalCargo(), gfwCargo(), cnipCargo()},
+		Lines:         []Line{directLine(), vpnLine(), trojanLine()},
+		RuleSets:      []RuleSet{internalRuleSet(), gfwRuleSet(), cnipRuleSet()},
 		Subscriptions: []Subscription{testSubscription()},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "c1", Name: "混合",
-			Bindings: []Binding{
-				{CargoID: "internal", PortID: "vpn"},        // 手动
-				{CargoID: "gfw", SubscriptionID: "sub-test"}, // 订阅
-				{CargoID: "cnip", PortID: "trojan-1"},        // 手动
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},         // 手动
+				{RuleSetID: "gfw", SubscriptionID: "sub-test"}, // 订阅
+				{RuleSetID: "cnip", LineID: "trojan-1"},        // 手动
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "c1",
+		ActiveModeID: "c1",
 	}
 	singboxCheck(t, p, "mixed")
 }
@@ -232,17 +232,17 @@ func TestGenerate_Mixed(t *testing.T) {
 // 5. 纯节点订阅（无策略组，无规则）
 func TestGenerate_PlainSubscription(t *testing.T) {
 	p := &Profile{
-		Ports:         []Port{directPort()},
-		Cargoes:       []Cargo{gfwCargo()},
+		Lines:         []Line{directLine()},
+		RuleSets:      []RuleSet{gfwRuleSet()},
 		Subscriptions: []Subscription{testSubscriptionNoGroups()},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "c1", Name: "Plain",
-			Bindings: []Binding{
-				{CargoID: "gfw", SubscriptionID: "sub-plain"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", SubscriptionID: "sub-plain"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "c1",
+		ActiveModeID: "c1",
 	}
 	singboxCheck(t, p, "plain-sub")
 }
@@ -253,18 +253,18 @@ func TestGenerate_DisabledSubscription(t *testing.T) {
 	sub.Enabled = false
 
 	p := &Profile{
-		Ports:         []Port{directPort(), vpnPort()},
-		Cargoes:       []Cargo{internalCargo(), gfwCargo()},
+		Lines:         []Line{directLine(), vpnLine()},
+		RuleSets:      []RuleSet{internalRuleSet(), gfwRuleSet()},
 		Subscriptions: []Subscription{sub},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "c1", Name: "Disabled",
-			Bindings: []Binding{
-				{CargoID: "internal", PortID: "vpn"},
-				{CargoID: "gfw", SubscriptionID: "sub-test"}, // 订阅禁用，应跳过
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
+				{RuleSetID: "gfw", SubscriptionID: "sub-test"}, // 订阅禁用，应跳过
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "c1",
+		ActiveModeID: "c1",
 	}
 	singboxCheck(t, p, "disabled-sub")
 }
@@ -277,17 +277,17 @@ func TestGenerate_EmptySubscription(t *testing.T) {
 	}
 
 	p := &Profile{
-		Ports:         []Port{directPort()},
-		Cargoes:       []Cargo{gfwCargo()},
+		Lines:         []Line{directLine()},
+		RuleSets:      []RuleSet{gfwRuleSet()},
 		Subscriptions: []Subscription{sub},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "c1", Name: "Empty",
-			Bindings: []Binding{
-				{CargoID: "gfw", SubscriptionID: "sub-empty"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "gfw", SubscriptionID: "sub-empty"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "c1",
+		ActiveModeID: "c1",
 	}
 	singboxCheck(t, p, "empty-sub")
 }
@@ -298,8 +298,8 @@ func TestGenerate_MultipleSubscriptions(t *testing.T) {
 	sub2 := testSubscription()
 	sub2.ID = "sub-test2"
 	sub2.Name = "TestSub2"
-	sub2.Ports = []Port{
-		{ID: "m1", Name: "Node M1", Type: PortTypeVMess, Enabled: true,
+	sub2.Lines = []Line{
+		{ID: "m1", Name: "Node M1", Type: LineTypeVMess, Enabled: true,
 			VMessServer: "m1.example.com", VMessPort: 443, VMessUUID: "uuid-1"},
 	}
 	sub2.ProxyGroups = []ProxyGroup{
@@ -311,19 +311,158 @@ func TestGenerate_MultipleSubscriptions(t *testing.T) {
 	}
 
 	p := &Profile{
-		Ports:         []Port{directPort(), vpnPort()},
-		Cargoes:       []Cargo{internalCargo()},
+		Lines:         []Line{directLine(), vpnLine()},
+		RuleSets:      []RuleSet{internalRuleSet()},
 		Subscriptions: []Subscription{sub1, sub2},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "c1", Name: "Multi",
-			Bindings: []Binding{
-				{CargoID: "internal", PortID: "vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
 			},
-			DefaultPortID: "direct",
+			DefaultLineID: "direct",
 		}},
-		ActiveCruiseID: "c1",
+		ActiveModeID: "c1",
 	}
 	singboxCheck(t, p, "multi-sub")
+}
+
+// 8b. 引用被禁用 port 的 binding / 默认出口：必须 fallback，不能让 sing-box 配置非法
+func TestGenerate_DisabledPortReferences(t *testing.T) {
+	disabledTrojan := trojanLine()
+	disabledTrojan.ID = "trojan-disabled"
+	disabledTrojan.Enabled = false
+
+	p := &Profile{
+		Lines:    []Line{directLine(), vpnLine(), disabledTrojan},
+		RuleSets: []RuleSet{internalRuleSet(), gfwRuleSet()},
+		Modes: []Mode{{
+			ID: "c1", Name: "Disabled-Refs",
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
+				{RuleSetID: "gfw", LineID: "trojan-disabled"}, // 引用禁用 port，应跳过
+			},
+			DefaultLineID: "trojan-disabled", // 默认出口禁用，应 fallback 到 direct
+		}},
+		ActiveModeID: "c1",
+	}
+
+	data, err := GenerateSingBox(p, 10800, "")
+	if err != nil {
+		t.Fatalf("GenerateSingBox: %v", err)
+	}
+
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// 收集所有 outbound tag
+	tags := map[string]bool{}
+	for _, ob := range cfg["outbounds"].([]interface{}) {
+		tags[ob.(map[string]interface{})["tag"].(string)] = true
+	}
+
+	if tags["proxy-trojan-disabled"] {
+		t.Error("disabled port should not produce outbound")
+	}
+
+	route := cfg["route"].(map[string]interface{})
+	final := route["final"].(string)
+	if final == "proxy-trojan-disabled" {
+		t.Errorf("final must not reference disabled port, got %q", final)
+	}
+	if final != "direct" {
+		t.Errorf("final should fallback to direct, got %q", final)
+	}
+
+	// 模式规则里不应出现引用禁用 line 的规则
+	for _, r := range route["rules"].([]interface{}) {
+		rm := r.(map[string]interface{})
+		if outTag, ok := rm["outbound"].(string); ok && outTag == "proxy-trojan-disabled" {
+			t.Errorf("route rule references disabled port: %v", rm)
+		}
+	}
+
+	singboxCheck(t, p, "disabled-port-refs")
+}
+
+// 8c. 策略组成员全部失效：跳过的组不能成为 mainTag，subscription rule 也不能引用它
+func TestGenerate_DanglingGroupReferences(t *testing.T) {
+	// 第一个组 "Dead" 的所有 proxy 都指向不存在的节点 → 跳过 outbound 生成
+	// 第二个组 "Live" 有真实成员 → 应被选为 mainTag
+	sub := Subscription{
+		ID: "sub-dangle", Name: "DangleSub", URL: "https://example.com",
+		Format: "clash", Enabled: true, Strategy: "selector",
+		Lines: []Line{
+			{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
+				TrojanServer: "hk1.example.com", TrojanPort: 443, TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
+		},
+		ProxyGroups: []ProxyGroup{
+			{Name: "Dead", Type: "select", Proxies: []string{"ghost-1", "ghost-2"}}, // 全是无效引用
+			{Name: "Live", Type: "select", Proxies: []string{"HK 01"}},
+		},
+		Rules: []SubscriptionRule{
+			{Type: "DOMAIN-SUFFIX", Value: "example.org", Group: "Dead"}, // 应被跳过
+			{Type: "DOMAIN-SUFFIX", Value: "example.com", Group: "Live"}, // 应保留
+		},
+	}
+
+	p := &Profile{
+		Lines:         []Line{directLine(), vpnLine()},
+		RuleSets:      []RuleSet{internalRuleSet()},
+		Subscriptions: []Subscription{sub},
+		Modes: []Mode{{
+			ID: "c1", Name: "Dangle",
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
+			},
+			DefaultSubscriptionID: "sub-dangle",
+		}},
+		ActiveModeID: "c1",
+	}
+
+	data, err := GenerateSingBox(p, 10800, "")
+	if err != nil {
+		t.Fatalf("GenerateSingBox: %v", err)
+	}
+
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	tags := map[string]bool{}
+	for _, ob := range cfg["outbounds"].([]interface{}) {
+		tags[ob.(map[string]interface{})["tag"].(string)] = true
+	}
+
+	deadTag := "sub-sub-dangle-dead"
+	liveTag := "sub-sub-dangle-live"
+
+	if tags[deadTag] {
+		t.Errorf("dead group must not generate outbound, but tag %q exists", deadTag)
+	}
+	if !tags[liveTag] {
+		t.Errorf("live group missing outbound, tags=%v", tags)
+	}
+
+	route := cfg["route"].(map[string]interface{})
+	final := route["final"].(string)
+	if final == deadTag {
+		t.Errorf("final must not reference dead group, got %q", final)
+	}
+	if final != liveTag {
+		t.Errorf("final should fallback to first live group %q, got %q", liveTag, final)
+	}
+
+	for _, r := range route["rules"].([]interface{}) {
+		rm := r.(map[string]interface{})
+		if outTag, ok := rm["outbound"].(string); ok && outTag == deadTag {
+			t.Errorf("route rule references dead group: %v", rm)
+		}
+	}
+
+	singboxCheck(t, p, "dangling-group")
 }
 
 // 9. 用真实订阅数据（如果有）
@@ -351,17 +490,17 @@ func TestGenerate_RealSubscription(t *testing.T) {
 func TestGenerate_ContentVerification(t *testing.T) {
 	sub := testSubscription()
 	p := &Profile{
-		Ports:         []Port{directPort(), vpnPort()},
-		Cargoes:       []Cargo{internalCargo()},
+		Lines:         []Line{directLine(), vpnLine()},
+		RuleSets:      []RuleSet{internalRuleSet()},
 		Subscriptions: []Subscription{sub},
-		Cruises: []Cruise{{
+		Modes: []Mode{{
 			ID: "c1", Name: "Verify",
-			Bindings: []Binding{
-				{CargoID: "internal", PortID: "vpn"},
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
 			},
 			DefaultSubscriptionID: "sub-test",
 		}},
-		ActiveCruiseID: "c1",
+		ActiveModeID: "c1",
 	}
 
 	data, err := GenerateSingBox(p, 10800, "")
@@ -380,7 +519,7 @@ func TestGenerate_ContentVerification(t *testing.T) {
 		tags[tag] = true
 	}
 
-	// 手动港口
+	// 手动线路
 	if !tags["direct"] {
 		t.Error("missing direct outbound")
 	}
@@ -405,7 +544,7 @@ func TestGenerate_ContentVerification(t *testing.T) {
 		t.Errorf("final = %q, want sub-sub-test-proxies", final)
 	}
 
-	// 验证订阅规则在邮轮规则之前
+	// 验证订阅规则在模式规则之前
 	rules := route["rules"].([]interface{})
 	var internalIdx, netflixIdx int
 	for i, r := range rules {
@@ -430,7 +569,7 @@ func TestGenerate_ContentVerification(t *testing.T) {
 		t.Error("netflix subscription rule not found")
 	}
 	if netflixIdx > internalIdx {
-		t.Errorf("subscription rule (idx=%d) should come before cruise rule (idx=%d)", netflixIdx, internalIdx)
+		t.Errorf("subscription rule (idx=%d) should come before mode rule (idx=%d)", netflixIdx, internalIdx)
 	}
 
 	t.Logf("Content verification: %d outbounds, %d rules, final=%s", len(outbounds), len(rules), final)

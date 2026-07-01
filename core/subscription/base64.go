@@ -11,25 +11,25 @@ import (
 	"github.com/kafeifei/xdial/core/config"
 )
 
-func parseBase64(content string) ([]config.Port, error) {
+func parseBase64(content string) ([]config.Line, error) {
 	decoded := tryBase64Decode(strings.TrimSpace(content))
-	lines := strings.Split(decoded, "\n")
+	textLines := strings.Split(decoded, "\n")
 
-	var ports []config.Port
-	for _, line := range lines {
+	var results []config.Line
+	for _, line := range textLines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		port, ok := uriToPort(line)
+		ln, ok := uriToLine(line)
 		if ok {
-			ports = append(ports, port)
+			results = append(results, ln)
 		}
 	}
-	if len(ports) == 0 {
+	if len(results) == 0 {
 		return nil, fmt.Errorf("no supported URIs found")
 	}
-	return ports, nil
+	return results, nil
 }
 
 func tryBase64Decode(s string) string {
@@ -51,7 +51,7 @@ func tryBase64Decode(s string) string {
 	return s
 }
 
-func uriToPort(uri string) (config.Port, bool) {
+func uriToLine(uri string) (config.Line, bool) {
 	switch {
 	case strings.HasPrefix(uri, "ss://"):
 		return parseSS(uri)
@@ -60,13 +60,13 @@ func uriToPort(uri string) (config.Port, bool) {
 	case strings.HasPrefix(uri, "trojan://"):
 		return parseTrojan(uri)
 	default:
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 }
 
 // ss://base64(method:password)@server:port#name
 // or ss://base64(method:password@server:port)#name
-func parseSS(uri string) (config.Port, bool) {
+func parseSS(uri string) (config.Line, bool) {
 	uri = strings.TrimPrefix(uri, "ss://")
 
 	name := ""
@@ -83,7 +83,7 @@ func parseSS(uri string) (config.Port, bool) {
 		hostPort := uri[i+1:]
 		parts := strings.SplitN(userInfo, ":", 2)
 		if len(parts) != 2 {
-			return config.Port{}, false
+			return config.Line{}, false
 		}
 		method = parts[0]
 		password = parts[1]
@@ -93,27 +93,27 @@ func parseSS(uri string) (config.Port, bool) {
 		if i := strings.Index(decoded, "@"); i >= 0 {
 			parts := strings.SplitN(decoded[:i], ":", 2)
 			if len(parts) != 2 {
-				return config.Port{}, false
+				return config.Line{}, false
 			}
 			method = parts[0]
 			password = parts[1]
 			server, port = parseHostPort(decoded[i+1:])
 		} else {
-			return config.Port{}, false
+			return config.Line{}, false
 		}
 	}
 
 	if server == "" || port == 0 {
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 	if name == "" {
 		name = server
 	}
 
-	return config.Port{
+	return config.Line{
 		ID:       shortID(),
 		Name:     name,
-		Type:     config.PortTypeShadowsocks,
+		Type:     config.LineTypeShadowsocks,
 		Enabled:  true,
 		SSServer: server,
 		SSPort:   port,
@@ -124,13 +124,13 @@ func parseSS(uri string) (config.Port, bool) {
 
 // vmess://base64(json)
 // v2rayN format: {"v":"2","ps":"name","add":"server","port":"443","id":"uuid","aid":"0",...}
-func parseVMess(uri string) (config.Port, bool) {
+func parseVMess(uri string) (config.Line, bool) {
 	encoded := strings.TrimPrefix(uri, "vmess://")
 	decoded := tryBase64Decode(encoded)
 
 	var obj map[string]interface{}
 	if err := json.Unmarshal([]byte(decoded), &obj); err != nil {
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 
 	server := getString(obj, "add")
@@ -140,7 +140,7 @@ func parseVMess(uri string) (config.Port, bool) {
 
 	port, _ := strconv.Atoi(portStr)
 	if server == "" || port == 0 || uuid == "" {
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 	if name == "" {
 		name = server
@@ -148,10 +148,10 @@ func parseVMess(uri string) (config.Port, bool) {
 
 	aid, _ := strconv.Atoi(getString(obj, "aid"))
 
-	return config.Port{
+	return config.Line{
 		ID:          shortID(),
 		Name:        name,
-		Type:        config.PortTypeVMess,
+		Type:        config.LineTypeVMess,
 		Enabled:     true,
 		VMessServer: server,
 		VMessPort:   port,
@@ -161,10 +161,10 @@ func parseVMess(uri string) (config.Port, bool) {
 }
 
 // trojan://password@server:port?sni=xxx#name
-func parseTrojan(uri string) (config.Port, bool) {
+func parseTrojan(uri string) (config.Line, bool) {
 	u, err := url.Parse(uri)
 	if err != nil {
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 
 	password := u.User.Username()
@@ -174,7 +174,7 @@ func parseTrojan(uri string) (config.Port, bool) {
 	sni := u.Query().Get("sni")
 
 	if server == "" || port == 0 || password == "" {
-		return config.Port{}, false
+		return config.Line{}, false
 	}
 	if sni == "" {
 		sni = server
@@ -183,10 +183,10 @@ func parseTrojan(uri string) (config.Port, bool) {
 		name = server
 	}
 
-	return config.Port{
+	return config.Line{
 		ID:             shortID(),
 		Name:           name,
-		Type:           config.PortTypeTrojan,
+		Type:           config.LineTypeTrojan,
 		Enabled:        true,
 		TrojanServer:   server,
 		TrojanPort:     port,

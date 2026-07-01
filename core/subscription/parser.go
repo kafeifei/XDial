@@ -11,7 +11,7 @@ import (
 )
 
 type ParseResult struct {
-	Ports       []config.Port             `json:"ports"`
+	Lines       []config.Line             `json:"lines"`
 	ProxyGroups []config.ProxyGroup       `json:"proxy_groups,omitempty"`
 	Rules       []config.SubscriptionRule `json:"rules,omitempty"`
 }
@@ -38,11 +38,11 @@ func Parse(url, content, format string) (*ParseResult, error) {
 	case "surge":
 		return parseSurge(content)
 	case "base64":
-		ports, err := parseBase64(content)
+		lines, err := parseBase64(content)
 		if err != nil {
 			return nil, err
 		}
-		return &ParseResult{Ports: ports}, nil
+		return &ParseResult{Lines: lines}, nil
 	default:
 		return nil, fmt.Errorf("unknown format: %s", format)
 	}

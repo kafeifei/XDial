@@ -31,7 +31,7 @@ final class AppState: ObservableObject {
     private var engineSub: AnyCancellable?
 
     private let profileKey = "xdial.profile"
-    private let keychainPrefix = "xdial-port-"
+    private let keychainPrefix = "xdial-line-"
     private let subKeychainPrefix = "xdial-sub-"
     private var cachedVault: [String: String] = [:]
 
@@ -44,18 +44,18 @@ final class AppState: ObservableObject {
 
     var canConnect: Bool {
         guard helperInstalled, !isBusy else { return false }
-        guard let s = activeCruise else { return false }
-        // 必须有效的 VPN 凭据（如果策略用到 VPN）
+        guard let s = activeMode else { return false }
+        // 必须有效的 VPN 凭据（如果模式用到 VPN）
         for binding in s.bindings {
-            if let port = profile.ports.first(where: { $0.id == binding.portID }),
-               port.type == "vpn",
-               (port.vpnServer.isEmpty || port.vpnUsername.isEmpty || port.vpnPassword.isEmpty) {
+            if let line = profile.lines.first(where: { $0.id == binding.lineID }),
+               line.type == "vpn",
+               (line.vpnServer.isEmpty || line.vpnUsername.isEmpty || line.vpnPassword.isEmpty) {
                 return false
             }
         }
-        if let port = profile.ports.first(where: { $0.id == s.defaultPortID }),
-           port.type == "vpn",
-           (port.vpnServer.isEmpty || port.vpnUsername.isEmpty || port.vpnPassword.isEmpty) {
+        if let line = profile.lines.first(where: { $0.id == s.defaultLineID }),
+           line.type == "vpn",
+           (line.vpnServer.isEmpty || line.vpnUsername.isEmpty || line.vpnPassword.isEmpty) {
             return false
         }
         return true
@@ -63,18 +63,18 @@ final class AppState: ObservableObject {
 
     var statusText: String {
         switch engine.status {
-        case "connected": return "已连接"
-        case "connecting": return "正在连接…"
-        case "disconnecting": return "正在断开…"
-        case "reconnecting": return "正在重连…"
+        case "connected": return tr("已连接", "Connected")
+        case "connecting": return tr("正在连接…", "Connecting…")
+        case "disconnecting": return tr("正在断开…", "Disconnecting…")
+        case "reconnecting": return tr("正在重连…", "Reconnecting…")
         default:
             if let err = engine.lastError { return err }
-            return "未连接"
+            return tr("未连接", "Not Connected")
         }
     }
 
-    var activeCruise: Cruise? {
-        profile.cruises.first { $0.id == profile.activeCruiseID }
+    var activeMode: Mode? {
+        profile.modes.first { $0.id == profile.activeModeID }
     }
 
     init() {
@@ -99,7 +99,7 @@ final class AppState: ObservableObject {
             if cur != lastStatus && cur == "connected" {
                 lastStatus = cur
                 self.probeNetwork()
-                self.markUsedPortsVerified()
+                self.markUsedLinesVerified()
             } else if cur != lastStatus {
                 lastStatus = cur
             }
@@ -124,7 +124,7 @@ final class AppState: ObservableObject {
     func probeNetwork() {
         guard engine.status == "connected" else { return }
         NetworkInfo.shared.probeAll(
-            ports: profile.ports,
+            lines: profile.lines,
             subscriptions: profile.subscriptions,
             helperConnected: true
         )
@@ -173,19 +173,19 @@ final class AppState: ObservableObject {
 
     private var lastVerifiedAt: String = ""
 
-    private func markUsedPortsVerified() {
-        guard let s = activeCruise else { return }
+    private func markUsedLinesVerified() {
+        guard let s = activeMode else { return }
         let key = s.id
         if lastVerifiedAt == key { return }
         lastVerifiedAt = key
 
-        var usedIDs = Set(s.bindings.map { $0.portID })
-        if !s.defaultPortID.isEmpty { usedIDs.insert(s.defaultPortID) }
+        var usedIDs = Set(s.bindings.map { $0.lineID })
+        if !s.defaultLineID.isEmpty { usedIDs.insert(s.defaultLineID) }
 
         var changed = false
-        for i in profile.ports.indices where usedIDs.contains(profile.ports[i].id) {
-            if !profile.ports[i].verified {
-                profile.ports[i].verified = true
+        for i in profile.lines.indices where usedIDs.contains(profile.lines[i].id) {
+            if !profile.lines[i].verified {
+                profile.lines[i].verified = true
                 changed = true
             }
         }
@@ -226,67 +226,67 @@ final class AppState: ObservableObject {
 
     func save() {
         // 先把所有 ASCII 字段做一次全角→半角清洗（兜底）
-        for i in profile.ports.indices {
-            profile.ports[i].vpnServer = profile.ports[i].vpnServer.normalizedASCII()
-            profile.ports[i].vpnUsername = profile.ports[i].vpnUsername.normalizedASCII()
-            profile.ports[i].vpnPassword = profile.ports[i].vpnPassword.normalizedASCII()
-            profile.ports[i].trojanServer = profile.ports[i].trojanServer.normalizedASCII()
-            profile.ports[i].trojanPassword = profile.ports[i].trojanPassword.normalizedASCII()
-            profile.ports[i].trojanSNI = profile.ports[i].trojanSNI.normalizedASCII()
-            profile.ports[i].ssServer = profile.ports[i].ssServer.normalizedASCII()
-            profile.ports[i].ssMethod = profile.ports[i].ssMethod.normalizedASCII()
-            profile.ports[i].ssPassword = profile.ports[i].ssPassword.normalizedASCII()
-            profile.ports[i].vmessServer = profile.ports[i].vmessServer.normalizedASCII()
-            profile.ports[i].vmessUUID = profile.ports[i].vmessUUID.normalizedASCII()
+        for i in profile.lines.indices {
+            profile.lines[i].vpnServer = profile.lines[i].vpnServer.normalizedASCII()
+            profile.lines[i].vpnUsername = profile.lines[i].vpnUsername.normalizedASCII()
+            profile.lines[i].vpnPassword = profile.lines[i].vpnPassword.normalizedASCII()
+            profile.lines[i].trojanServer = profile.lines[i].trojanServer.normalizedASCII()
+            profile.lines[i].trojanPassword = profile.lines[i].trojanPassword.normalizedASCII()
+            profile.lines[i].trojanSNI = profile.lines[i].trojanSNI.normalizedASCII()
+            profile.lines[i].ssServer = profile.lines[i].ssServer.normalizedASCII()
+            profile.lines[i].ssMethod = profile.lines[i].ssMethod.normalizedASCII()
+            profile.lines[i].ssPassword = profile.lines[i].ssPassword.normalizedASCII()
+            profile.lines[i].vmessServer = profile.lines[i].vmessServer.normalizedASCII()
+            profile.lines[i].vmessUUID = profile.lines[i].vmessUUID.normalizedASCII()
         }
-        for i in profile.cargoes.indices {
-            profile.cargoes[i].url = profile.cargoes[i].url.normalizedASCII()
+        for i in profile.ruleSets.indices {
+            profile.ruleSets[i].url = profile.ruleSets[i].url.normalizedASCII()
         }
         // 直连恒为已验证
-        for i in profile.ports.indices where profile.ports[i].type == "direct" {
-            profile.ports[i].verified = true
+        for i in profile.lines.indices where profile.lines[i].type == "direct" {
+            profile.lines[i].verified = true
         }
 
         // 所有密码收集到一个 vault dict，一次性存入 Keychain（只弹一次授权）
         var vault = [String: String]()
         var sanitized = profile
 
-        for i in sanitized.ports.indices {
-            let id = sanitized.ports[i].id
-            if !sanitized.ports[i].vpnPassword.isEmpty {
-                vault[id + "-vpn"] = sanitized.ports[i].vpnPassword
-                sanitized.ports[i].vpnPassword = ""
+        for i in sanitized.lines.indices {
+            let id = sanitized.lines[i].id
+            if !sanitized.lines[i].vpnPassword.isEmpty {
+                vault[id + "-vpn"] = sanitized.lines[i].vpnPassword
+                sanitized.lines[i].vpnPassword = ""
             }
-            if !sanitized.ports[i].trojanPassword.isEmpty {
-                vault[id + "-trojan"] = sanitized.ports[i].trojanPassword
-                sanitized.ports[i].trojanPassword = ""
+            if !sanitized.lines[i].trojanPassword.isEmpty {
+                vault[id + "-trojan"] = sanitized.lines[i].trojanPassword
+                sanitized.lines[i].trojanPassword = ""
             }
-            if !sanitized.ports[i].ssPassword.isEmpty {
-                vault[id + "-ss"] = sanitized.ports[i].ssPassword
-                sanitized.ports[i].ssPassword = ""
+            if !sanitized.lines[i].ssPassword.isEmpty {
+                vault[id + "-ss"] = sanitized.lines[i].ssPassword
+                sanitized.lines[i].ssPassword = ""
             }
-            if !sanitized.ports[i].vmessUUID.isEmpty {
-                vault[id + "-vmess"] = sanitized.ports[i].vmessUUID
-                sanitized.ports[i].vmessUUID = ""
+            if !sanitized.lines[i].vmessUUID.isEmpty {
+                vault[id + "-vmess"] = sanitized.lines[i].vmessUUID
+                sanitized.lines[i].vmessUUID = ""
             }
         }
         for si in sanitized.subscriptions.indices {
             let subID = sanitized.subscriptions[si].id
-            for pi in sanitized.subscriptions[si].ports.indices {
-                let portID = sanitized.subscriptions[si].ports[pi].id
-                let k = subID + "-" + portID
-                let port = sanitized.subscriptions[si].ports[pi]
-                if !port.trojanPassword.isEmpty {
-                    vault[k + "-trojan"] = port.trojanPassword
-                    sanitized.subscriptions[si].ports[pi].trojanPassword = ""
+            for pi in sanitized.subscriptions[si].lines.indices {
+                let lineID = sanitized.subscriptions[si].lines[pi].id
+                let k = subID + "-" + lineID
+                let line = sanitized.subscriptions[si].lines[pi]
+                if !line.trojanPassword.isEmpty {
+                    vault[k + "-trojan"] = line.trojanPassword
+                    sanitized.subscriptions[si].lines[pi].trojanPassword = ""
                 }
-                if !port.ssPassword.isEmpty {
-                    vault[k + "-ss"] = port.ssPassword
-                    sanitized.subscriptions[si].ports[pi].ssPassword = ""
+                if !line.ssPassword.isEmpty {
+                    vault[k + "-ss"] = line.ssPassword
+                    sanitized.subscriptions[si].lines[pi].ssPassword = ""
                 }
-                if !port.vmessUUID.isEmpty {
-                    vault[k + "-vmess"] = port.vmessUUID
-                    sanitized.subscriptions[si].ports[pi].vmessUUID = ""
+                if !line.vmessUUID.isEmpty {
+                    vault[k + "-vmess"] = line.vmessUUID
+                    sanitized.subscriptions[si].lines[pi].vmessUUID = ""
                 }
             }
         }
@@ -306,11 +306,30 @@ final class AppState: ObservableObject {
             return  // 第一次启动，保留 bootstrap
         }
         appLog("loadSaved: found \(data.count) bytes")
-        // 优先按新格式解析；失败再按旧格式迁移
+
+        // 先把原始 JSON 解成字典，做「旧命名 → 新命名」的精确 key 重写：
+        // 比喻命名时代（ports/cargoes/cruises/active_cruise_id/cargo_id/port_id/
+        // default_port_id）持久化的 profile，key 与新 CodingKeys 不一致。由于 Profile
+        // 的所有 key 都是 decodeIfPresent，直接解码旧数据不会抛错、而是静默得到空 profile，
+        // 因此必须在解码前把旧 key 改写成新 key（严格精确匹配，绝不子串替换，避免误伤
+        // trojan_port / default_subscription_id 等含 "port" 子串的字段）。
+        var rewrittenData = data
+        var didKeyRewrite = false
+        if let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           Self.hasLegacyMetaphorKeys(raw) {
+            let migrated = Self.rewriteLegacyMetaphorKeys(raw)
+            if let d = try? JSONSerialization.data(withJSONObject: migrated) {
+                rewrittenData = d
+                didKeyRewrite = true
+                appLog("loadSaved: rewrote legacy metaphor keys → new schema")
+            }
+        }
+
+        // 优先按新格式解析；失败再按更旧格式（v0.2 exits/rules/strategies）迁移
         var loaded: Profile
         do {
-            loaded = try JSONDecoder().decode(Profile.self, from: data)
-            appLog("loadSaved: decoded OK, \(loaded.ports.count) ports, \(loaded.cruises.count) cruises, \(loaded.subscriptions.count) subs")
+            loaded = try JSONDecoder().decode(Profile.self, from: rewrittenData)
+            appLog("loadSaved: decoded OK, \(loaded.lines.count) lines, \(loaded.modes.count) modes, \(loaded.subscriptions.count) subs")
         } catch {
             appLog("loadSaved: decode failed: \(error)")
             if let old = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -326,16 +345,16 @@ final class AppState: ObservableObject {
         // 从 vault（单条目）恢复密码，回退到旧的逐条方式（迁移）
         var vault = KeychainStore.loadVault()
         cachedVault = vault
-        var didMigrate = false
+        var didMigrate = didKeyRewrite
         if vault.isEmpty {
             didMigrate = true
-            // 迁移：从旧的逐条 Keychain 读取
-            let oldPrefixes = [keychainPrefix, "xdial-exit-"]
-            for port in loaded.ports {
+            // 迁移：从旧的逐条 Keychain 读取（含旧的 "xdial-port-" 前缀）
+            let oldPrefixes = [keychainPrefix, "xdial-port-", "xdial-exit-"]
+            for line in loaded.lines {
                 for pfx in oldPrefixes {
                     for suffix in ["vpn", "trojan", "ss", "vmess"] {
-                        if let v = KeychainStore.load(account: pfx + port.id + "-" + suffix), !v.isEmpty {
-                            vault[port.id + "-" + suffix] = v
+                        if let v = KeychainStore.load(account: pfx + line.id + "-" + suffix), !v.isEmpty {
+                            vault[line.id + "-" + suffix] = v
                         }
                     }
                 }
@@ -343,26 +362,103 @@ final class AppState: ObservableObject {
             appLog("loadSaved: migrated \(vault.count) passwords to vault")
         }
 
-        for i in loaded.ports.indices {
-            let id = loaded.ports[i].id
-            if let v = vault[id + "-vpn"] { loaded.ports[i].vpnPassword = v }
-            if let v = vault[id + "-trojan"] { loaded.ports[i].trojanPassword = v }
-            if let v = vault[id + "-ss"] { loaded.ports[i].ssPassword = v }
-            if let v = vault[id + "-vmess"] { loaded.ports[i].vmessUUID = v }
+        for i in loaded.lines.indices {
+            let id = loaded.lines[i].id
+            if let v = vault[id + "-vpn"] { loaded.lines[i].vpnPassword = v }
+            if let v = vault[id + "-trojan"] { loaded.lines[i].trojanPassword = v }
+            if let v = vault[id + "-ss"] { loaded.lines[i].ssPassword = v }
+            if let v = vault[id + "-vmess"] { loaded.lines[i].vmessUUID = v }
         }
         for si in loaded.subscriptions.indices {
             let subID = loaded.subscriptions[si].id
-            for pi in loaded.subscriptions[si].ports.indices {
-                let portID = loaded.subscriptions[si].ports[pi].id
-                let k = subID + "-" + portID
-                if let v = vault[k + "-trojan"] { loaded.subscriptions[si].ports[pi].trojanPassword = v }
-                if let v = vault[k + "-ss"] { loaded.subscriptions[si].ports[pi].ssPassword = v }
-                if let v = vault[k + "-vmess"] { loaded.subscriptions[si].ports[pi].vmessUUID = v }
+            for pi in loaded.subscriptions[si].lines.indices {
+                let lineID = loaded.subscriptions[si].lines[pi].id
+                let k = subID + "-" + lineID
+                if let v = vault[k + "-trojan"] { loaded.subscriptions[si].lines[pi].trojanPassword = v }
+                if let v = vault[k + "-ss"] { loaded.subscriptions[si].lines[pi].ssPassword = v }
+                if let v = vault[k + "-vmess"] { loaded.subscriptions[si].lines[pi].vmessUUID = v }
             }
         }
 
         self.profile = loaded
         if didMigrate { save() }
+    }
+
+    // MARK: - Legacy 命名 key 迁移（比喻命名 → 正式命名）
+    //
+    // 只做「精确 key 匹配」的重写，绝不做字符串子串替换 —— 否则会误伤 trojan_port、
+    // default_subscription_id、vpn_server 这类含 "port"/"cargo"/"cruise" 子串的合法字段。
+
+    /// 判断字典里是否存在任一比喻命名时代的顶层/内嵌 key（用于决定是否需要重写）。
+    private static func hasLegacyMetaphorKeys(_ dict: [String: Any]) -> Bool {
+        if dict["ports"] != nil || dict["cargoes"] != nil || dict["cruises"] != nil
+            || dict["active_cruise_id"] != nil {
+            return true
+        }
+        // 内嵌：cruises[].bindings[].{cargo_id,port_id}、cruises[].default_port_id、
+        // subscriptions[].ports。逐层精确探测。
+        if let cruises = dict["cruises"] as? [[String: Any]] {
+            for c in cruises {
+                if c["default_port_id"] != nil { return true }
+                if let bs = c["bindings"] as? [[String: Any]] {
+                    for b in bs where b["cargo_id"] != nil || b["port_id"] != nil { return true }
+                }
+            }
+        }
+        if let subs = dict["subscriptions"] as? [[String: Any]] {
+            for s in subs where s["ports"] != nil { return true }
+        }
+        return false
+    }
+
+    /// 把一份比喻命名的 profile 字典按对照表精确重写成正式命名字典。
+    /// 顶层：ports→lines、cargoes→rule_sets、cruises→modes、active_cruise_id→active_mode_id。
+    /// mode 内嵌：default_port_id→default_line_id；binding 内嵌：cargo_id→rule_set_id、port_id→line_id。
+    /// subscription 内嵌：ports→lines（其内部 Line 字段如 trojan_port 保持不变）。
+    private static func rewriteLegacyMetaphorKeys(_ dict: [String: Any]) -> [String: Any] {
+        var out = dict
+
+        // 顶层 lines
+        if let v = out.removeValue(forKey: "ports") { out["lines"] = v }
+        // 顶层 rule_sets
+        if let v = out.removeValue(forKey: "cargoes") { out["rule_sets"] = v }
+        // 顶层 active_mode_id
+        if let v = out.removeValue(forKey: "active_cruise_id") { out["active_mode_id"] = v }
+
+        // 顶层 modes（含其内嵌 bindings / default_port_id 重写）
+        if let cruises = out.removeValue(forKey: "cruises") as? [[String: Any]] {
+            out["modes"] = cruises.map { rewriteLegacyMode($0) }
+        } else if let cruises = out["cruises"] {
+            // 类型不是 [[String:Any]]（异常数据）也搬过去，避免丢数据
+            out.removeValue(forKey: "cruises")
+            out["modes"] = cruises
+        }
+
+        // subscriptions 内嵌 ports → lines
+        if let subs = out["subscriptions"] as? [[String: Any]] {
+            out["subscriptions"] = subs.map { sub -> [String: Any] in
+                var ns = sub
+                if let v = ns.removeValue(forKey: "ports") { ns["lines"] = v }
+                return ns
+            }
+        }
+
+        return out
+    }
+
+    /// 重写单个 mode 字典：default_port_id → default_line_id，bindings 逐条重写。
+    private static func rewriteLegacyMode(_ dict: [String: Any]) -> [String: Any] {
+        var m = dict
+        if let v = m.removeValue(forKey: "default_port_id") { m["default_line_id"] = v }
+        if let bindings = m["bindings"] as? [[String: Any]] {
+            m["bindings"] = bindings.map { b -> [String: Any] in
+                var nb = b
+                if let v = nb.removeValue(forKey: "cargo_id") { nb["rule_set_id"] = v }
+                if let v = nb.removeValue(forKey: "port_id") { nb["line_id"] = v }
+                return nb
+            }
+        }
+        return m
     }
 
     private func loadKeychain(id: String, suffix: String, oldPrefixes: [String]) -> String {
@@ -378,49 +474,49 @@ final class AppState: ObservableObject {
         return ""
     }
 
-    /// 把旧格式 profile (v0.2: exits/rules/strategies) 迁移到新格式 (ports/cargoes/cruises)
+    /// 把旧格式 profile (v0.2: exits/rules/strategies) 迁移到新格式 (lines/rule_sets/modes)
     static func migrate(oldProfile: [String: Any]) -> Profile? {
         var p = Profile()
         // 旧版本的 v0.2 里是 exits/rules/strategies
         if let oldExits = oldProfile["exits"] as? [[String: Any]] {
-            p.ports = oldExits.compactMap { dict -> Port? in
+            p.lines = oldExits.compactMap { dict -> Line? in
                 guard let data = try? JSONSerialization.data(withJSONObject: dict),
-                      let port = try? JSONDecoder().decode(Port.self, from: data) else { return nil }
-                return port
+                      let line = try? JSONDecoder().decode(Line.self, from: data) else { return nil }
+                return line
             }
         }
         if let oldRules = oldProfile["rules"] as? [[String: Any]] {
-            p.cargoes = oldRules.compactMap { dict -> Cargo? in
+            p.ruleSets = oldRules.compactMap { dict -> RuleSet? in
                 guard let data = try? JSONSerialization.data(withJSONObject: dict),
-                      let c = try? JSONDecoder().decode(Cargo.self, from: data) else { return nil }
+                      let c = try? JSONDecoder().decode(RuleSet.self, from: data) else { return nil }
                 return c
             }
         }
         if let oldStrategies = oldProfile["strategies"] as? [[String: Any]] {
-            p.cruises = oldStrategies.compactMap { dict -> Cruise? in
+            p.modes = oldStrategies.compactMap { dict -> Mode? in
                 // 旧 strategy.bindings 用 rule_id/exit_id；旧 default_exit_id
                 var fixed = dict
                 if let oldBindings = dict["bindings"] as? [[String: Any]] {
                     fixed["bindings"] = oldBindings.map { b -> [String: Any] in
                         var nb = b
-                        if let r = b["rule_id"] { nb["cargo_id"] = r; nb.removeValue(forKey: "rule_id") }
-                        if let e = b["exit_id"] { nb["port_id"] = e; nb.removeValue(forKey: "exit_id") }
+                        if let r = b["rule_id"] { nb["rule_set_id"] = r; nb.removeValue(forKey: "rule_id") }
+                        if let e = b["exit_id"] { nb["line_id"] = e; nb.removeValue(forKey: "exit_id") }
                         return nb
                     }
                 }
                 if let de = dict["default_exit_id"] {
-                    fixed["default_port_id"] = de
+                    fixed["default_line_id"] = de
                     fixed.removeValue(forKey: "default_exit_id")
                 }
                 guard let data = try? JSONSerialization.data(withJSONObject: fixed),
-                      let c = try? JSONDecoder().decode(Cruise.self, from: data) else { return nil }
+                      let c = try? JSONDecoder().decode(Mode.self, from: data) else { return nil }
                 return c
             }
         }
         if let active = oldProfile["active_strategy_id"] as? String {
-            p.activeCruiseID = active
+            p.activeModeID = active
         }
-        return p.ports.isEmpty && p.cargoes.isEmpty && p.cruises.isEmpty ? nil : p
+        return p.lines.isEmpty && p.ruleSets.isEmpty && p.modes.isEmpty ? nil : p
     }
 
     private func checkHelper() {
@@ -431,14 +527,14 @@ final class AppState: ObservableObject {
     // MARK: - Subscription Management
 
     func addSubscription(name: String, url: String, format: String, strategy: String,
-                         ports: [Port], proxyGroups: [SubProxyGroup] = [], rules: [SubRule] = []) {
+                         lines: [Line], proxyGroups: [SubProxyGroup] = [], rules: [SubRule] = []) {
         let sub = Subscription(
             id: "sub-" + String(UUID().uuidString.prefix(8)).lowercased(),
             name: name,
             url: url,
             format: format,
             strategy: strategy,
-            ports: ports,
+            lines: lines,
             proxyGroups: proxyGroups,
             rules: rules
         )
@@ -448,7 +544,7 @@ final class AppState: ObservableObject {
 
     func updateSubscription(_ id: String, with result: GoEngine.ParseResult) {
         guard let idx = profile.subscriptions.firstIndex(where: { $0.id == id }) else { return }
-        profile.subscriptions[idx].ports = result.ports
+        profile.subscriptions[idx].lines = result.lines
         profile.subscriptions[idx].proxyGroups = result.proxyGroups ?? []
         profile.subscriptions[idx].rules = result.rules ?? []
         profile.subscriptions[idx].updatedAt = Int(Date().timeIntervalSince1970)
@@ -457,66 +553,66 @@ final class AppState: ObservableObject {
 
     func deleteSubscription(_ id: String) {
         profile.subscriptions.removeAll { $0.id == id }
-        for i in profile.cruises.indices {
-            profile.cruises[i].bindings.removeAll { $0.subscriptionID == id }
-            if profile.cruises[i].defaultSubscriptionID == id {
-                profile.cruises[i].defaultSubscriptionID = ""
+        for i in profile.modes.indices {
+            profile.modes[i].bindings.removeAll { $0.subscriptionID == id }
+            if profile.modes[i].defaultSubscriptionID == id {
+                profile.modes[i].defaultSubscriptionID = ""
             }
         }
         save()
     }
 
-    // MARK: - Cruise Management
+    // MARK: - Mode Management
 
-    func createCruise(from template: CruiseTemplate, named name: String) {
-        let direct = profile.ports.first(where: { $0.type == "direct" })?.id ?? "direct"
-        let vpn = profile.ports.first(where: { $0.type == "vpn" })?.id ?? "vpn"
-        let ss = profile.ports.first(where: { $0.type != "direct" && $0.type != "vpn" })?.id ?? "ss"
+    func createMode(from template: ModeTemplate, named name: String) {
+        let direct = profile.lines.first(where: { $0.type == "direct" })?.id ?? "direct"
+        let vpn = profile.lines.first(where: { $0.type == "vpn" })?.id ?? "vpn"
+        let ss = profile.lines.first(where: { $0.type != "direct" && $0.type != "vpn" })?.id ?? "ss"
 
-        let manualRules = profile.cargoes
+        let manualRules = profile.ruleSets
             .filter { $0.type == "manual" && $0.enabled }
             .map { $0.id }
-        let gfwRule = profile.cargoes
+        let gfwRule = profile.ruleSets
             .first(where: { $0.type == "url" && $0.enabled })?.id ?? ""
 
-        var s: Cruise
+        var s: Mode
         switch template {
         case .overseas:
             s = Profile.templateOverseas(
-                cargoIDs: manualRules,
-                vpnPortID: vpn,
-                directPortID: direct
+                ruleSetIDs: manualRules,
+                vpnLineID: vpn,
+                directLineID: direct
             )
         case .domestic:
             s = Profile.templateDomestic(
-                cargoIDs: manualRules,
-                gfwCargoID: gfwRule,
-                vpnPortID: vpn,
-                directPortID: direct
+                ruleSetIDs: manualRules,
+                gfwRuleSetID: gfwRule,
+                vpnLineID: vpn,
+                directLineID: direct
             )
         case .domesticSS:
             s = Profile.templateDomesticSS(
-                cargoIDs: manualRules,
-                gfwCargoID: gfwRule,
-                vpnPortID: vpn,
-                ssPortID: ss,
-                directPortID: direct
+                ruleSetIDs: manualRules,
+                gfwRuleSetID: gfwRule,
+                vpnLineID: vpn,
+                ssLineID: ss,
+                directLineID: direct
             )
         case .blank:
-            s = Cruise(id: UUID().uuidString, name: name, defaultPortID: direct)
+            s = Mode(id: UUID().uuidString, name: name, defaultLineID: direct)
         }
         s.name = name
-        profile.cruises.append(s)
-        if profile.activeCruiseID.isEmpty {
-            profile.activeCruiseID = s.id
+        profile.modes.append(s)
+        if profile.activeModeID.isEmpty {
+            profile.activeModeID = s.id
         }
         save()
     }
 
-    func deleteCruise(_ s: Cruise) {
-        profile.cruises.removeAll { $0.id == s.id }
-        if profile.activeCruiseID == s.id {
-            profile.activeCruiseID = profile.cruises.first?.id ?? ""
+    func deleteMode(_ s: Mode) {
+        profile.modes.removeAll { $0.id == s.id }
+        if profile.activeModeID == s.id {
+            profile.activeModeID = profile.modes.first?.id ?? ""
         }
         save()
     }
@@ -529,7 +625,7 @@ final class AppState: ObservableObject {
     }
 }
 
-enum CruiseTemplate: String, CaseIterable {
+enum ModeTemplate: String, CaseIterable {
     case overseas, domestic, domesticSS, blank
 
     var displayName: String {
