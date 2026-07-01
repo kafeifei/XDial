@@ -17,7 +17,7 @@ func TestParseRealSurge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse failed: %v", err)
 	}
-	t.Logf("parsed %d ports, %d groups, %d rules", len(r.Ports), len(r.ProxyGroups), len(r.Rules))
+	t.Logf("parsed %d lines, %d groups, %d rules", len(r.Lines), len(r.ProxyGroups), len(r.Rules))
 	for i, g := range r.ProxyGroups {
 		if i > 5 {
 			break

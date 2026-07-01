@@ -6,9 +6,12 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 )
 
+// Request is a command from client to daemon.
 type Request struct {
+	ID         string `json:"id"`
 	Cmd        string `json:"cmd"`
 	Profile    string `json:"profile,omitempty"`
 	SubURL     string `json:"sub_url,omitempty"`
@@ -16,37 +19,61 @@ type Request struct {
 	SubFormat  string `json:"sub_format,omitempty"`
 }
 
+// Response is a direct reply to a Request (carries the same ID).
 type Response struct {
-	Type    string `json:"type"`
-	Cmd     string `json:"cmd,omitempty"`
-	OK      bool   `json:"ok,omitempty"`
+	ID      string `json:"id"`
+	OK      bool   `json:"ok"`
 	Message string `json:"message,omitempty"`
 	Data    string `json:"data,omitempty"`
 }
 
+// Event is a daemon-initiated push (status change, error).
+type Event struct {
+	Event string `json:"event"`
+	Data  string `json:"data,omitempty"`
+}
+
+var requestSeq atomic.Uint64
+
+func nextRequestID() string {
+	n := requestSeq.Add(1)
+	buf := make([]byte, 0, 8)
+	for n > 0 {
+		buf = append(buf, byte('0'+n%10))
+		n /= 10
+	}
+	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
+		buf[i], buf[j] = buf[j], buf[i]
+	}
+	return string(buf)
+}
+
+// Client represents one connected client.
 type Client struct {
-	conn    net.Conn
-	encoder *json.Encoder
-	mu      sync.Mutex
+	conn net.Conn
+	enc  *json.Encoder
+	mu   sync.Mutex
 }
 
 func NewClient(conn net.Conn) *Client {
-	return &Client{
-		conn:    conn,
-		encoder: json.NewEncoder(conn),
-	}
+	return &Client{conn: conn, enc: json.NewEncoder(conn)}
 }
 
-func (c *Client) Send(resp Response) error {
+func (c *Client) SendResponse(r Response) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.encoder.Encode(resp)
+	return c.enc.Encode(r)
 }
 
-func (c *Client) Close() {
-	c.conn.Close()
+func (c *Client) SendEvent(e Event) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.enc.Encode(e)
 }
 
+func (c *Client) Close() { c.conn.Close() }
+
+// ReadRequests reads newline-delimited JSON requests from conn.
 func ReadRequests(conn net.Conn, ch chan<- Request) {
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
@@ -60,6 +87,7 @@ func ReadRequests(conn net.Conn, ch chan<- Request) {
 	close(ch)
 }
 
+// ClientSet manages connected clients.
 type ClientSet struct {
 	mu      sync.Mutex
 	clients map[*Client]struct{}
@@ -81,13 +109,11 @@ func (cs *ClientSet) Remove(c *Client) {
 	cs.mu.Unlock()
 }
 
-func (cs *ClientSet) Broadcast(resp Response) {
+func (cs *ClientSet) BroadcastEvent(e Event) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	for c := range cs.clients {
-		if err := c.Send(resp); err != nil {
-			continue
-		}
+		c.SendEvent(e)
 	}
 }
 

@@ -19,24 +19,24 @@ final class GoEngine: ObservableObject {
     private var fd: Int32 = -1
     private var readSource: DispatchSourceRead?
     private var readBuffer = Data()
+    private var requestSeq: UInt64 = 0
+    private var pendingCallbacks: [String: (DaemonResponse) -> Void] = [:]
 
     @Published private(set) var status: String = "disconnected"
     @Published var lastError: String?
     @Published private(set) var connectedAt: Date?
 
     struct ParseResult: Decodable {
-        let ports: [Port]
+        let lines: [Line]
         let proxyGroups: [SubProxyGroup]?
         let rules: [SubRule]?
 
         enum CodingKeys: String, CodingKey {
-            case ports
+            case lines
             case proxyGroups = "proxy_groups"
             case rules
         }
     }
-
-    private var parseCallback: ((Result<ParseResult, Error>) -> Void)?
 
     var isConnected: Bool { status == "connected" }
     var isBusy: Bool { status == "connecting" || status == "disconnecting" || status == "reconnecting" }
@@ -56,7 +56,7 @@ final class GoEngine: ObservableObject {
                     self.status = "disconnected"
                     return
                 }
-                self.sendCommand("start", profile: json)
+                self.sendRequest(cmd: "start", profile: json)
             }
         }
     }
@@ -69,35 +69,97 @@ final class GoEngine: ObservableObject {
             connectedAt = nil
             return
         }
-        if !sendCommand("stop") {
-            appLog("stop: sendCommand failed")
-            status = "disconnected"
-            connectedAt = nil
-        }
-    }
-
-    func parseSubscription(url: String, content: String = "", format: String = "auto", completion: @escaping (Result<ParseResult, Error>) -> Void) {
-        Task.detached { [weak self] in
-            let ok = await self?.ensureHelperAsync() ?? false
-            await MainActor.run {
-                guard let self, ok else {
-                    completion(.failure(NSError(domain: "XDial", code: -1, userInfo: [NSLocalizedDescriptionKey: "Cannot connect to helper"])))
-                    return
-                }
-                guard self.ensureSocket() else {
-                    completion(.failure(NSError(domain: "XDial", code: -1, userInfo: [NSLocalizedDescriptionKey: "Socket not available"])))
-                    return
-                }
-                self.parseCallback = completion
-                self.sendSubCommand(url: url, content: content, format: format)
+        sendRequest(cmd: "stop") { [weak self] resp in
+            if resp.ok != true {
+                self?.lastError = resp.message
             }
         }
     }
 
-    private func sendSubCommand(url: String, content: String, format: String) {
+    func parseSubscription(url: String, content: String = "", format: String = "auto",
+                           completion: @escaping (Result<ParseResult, Error>) -> Void) {
+        Task.detached { [weak self] in
+            let ok = await self?.ensureHelperAsync() ?? false
+            await MainActor.run {
+                guard let self, ok else {
+                    completion(.failure(NSError(domain: "XDial", code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Cannot connect to helper"])))
+                    return
+                }
+                guard self.ensureSocket() else {
+                    completion(.failure(NSError(domain: "XDial", code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Socket not available"])))
+                    return
+                }
+                self.sendSubRequest(url: url, content: content, format: format, completion: completion)
+            }
+        }
+    }
+
+    func syncStatus() {
+        closeSocket()
+        guard PrivilegeManager.isHelperRunning, openSocket() else { return }
+        sendRequest(cmd: "status") { [weak self] resp in
+            if resp.ok == true, let data = resp.data {
+                self?.applyStatusData(data)
+            }
+        }
+    }
+
+    // MARK: - Request sending
+
+    private func nextID() -> String {
+        requestSeq += 1
+        return String(requestSeq)
+    }
+
+    @discardableResult
+    private func sendRequest(cmd: String, profile: String? = nil,
+                             callback: ((DaemonResponse) -> Void)? = nil) -> Bool {
+        guard fd >= 0 else {
+            appLog("sendRequest(\(cmd)): fd < 0")
+            return false
+        }
+
+        let reqID = nextID()
+        var obj: [String: String] = ["id": reqID, "cmd": cmd]
+        if let profile { obj["profile"] = profile }
+
+        guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return false }
+        data.append(UInt8(ascii: "\n"))
+
+        if let callback {
+            pendingCallbacks[reqID] = callback
+        }
+
+        let written = data.withUnsafeBytes { write(fd, $0.baseAddress!, data.count) }
+        if written >= 0 {
+            appLog("sendRequest(\(cmd) id=\(reqID)): wrote \(written) bytes")
+            return true
+        }
+
+        appLog("sendRequest(\(cmd)): write failed errno=\(errno), reconnecting")
+        pendingCallbacks.removeValue(forKey: reqID)
+        closeSocket()
+        guard openSocket() else {
+            appLog("sendRequest(\(cmd)): reconnect failed")
+            return false
+        }
+        if let callback {
+            pendingCallbacks[reqID] = callback
+        }
+        let retry = data.withUnsafeBytes { write(fd, $0.baseAddress!, data.count) }
+        appLog("sendRequest(\(cmd)): retry wrote \(retry) bytes")
+        return retry >= 0
+    }
+
+    private func sendSubRequest(url: String, content: String, format: String,
+                                completion: @escaping (Result<ParseResult, Error>) -> Void) {
         guard fd >= 0 else { return }
+        let reqID = nextID()
         var obj: [String: String] = [
-            "cmd": "parse-subscription",
+            "id": reqID,
+            "cmd": "parse-sub",
             "sub_url": url,
             "sub_format": format,
         ]
@@ -106,13 +168,19 @@ final class GoEngine: ObservableObject {
         }
         guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return }
         data.append(UInt8(ascii: "\n"))
-        data.withUnsafeBytes { _ = write(fd, $0.baseAddress!, data.count) }
-    }
 
-    func syncStatus() {
-        closeSocket()
-        guard PrivilegeManager.isHelperRunning, openSocket() else { return }
-        sendCommand("status")
+        pendingCallbacks[reqID] = { resp in
+            if resp.ok == true, let raw = resp.data?.data(using: .utf8),
+               let result = try? JSONDecoder().decode(ParseResult.self, from: raw) {
+                completion(.success(result))
+            } else {
+                let msg = resp.message ?? "parse failed"
+                completion(.failure(NSError(domain: "XDial", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: msg])))
+            }
+        }
+
+        data.withUnsafeBytes { _ = write(fd, $0.baseAddress!, data.count) }
     }
 
     // MARK: - Helper lifecycle
@@ -188,6 +256,7 @@ final class GoEngine: ObservableObject {
     }
 
     private func closeSocket() {
+        pendingCallbacks.removeAll()
         if let source = readSource {
             readSource = nil
             source.cancel()
@@ -198,34 +267,6 @@ final class GoEngine: ObservableObject {
         readBuffer = Data()
     }
 
-    @discardableResult
-    private func sendCommand(_ cmd: String, profile: String? = nil) -> Bool {
-        guard fd >= 0 else {
-            appLog("sendCommand(\(cmd)): fd < 0")
-            return false
-        }
-        var obj: [String: String] = ["cmd": cmd]
-        if let profile { obj["profile"] = profile }
-        guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return false }
-        data.append(UInt8(ascii: "\n"))
-
-        let written = data.withUnsafeBytes { write(fd, $0.baseAddress!, data.count) }
-        if written >= 0 {
-            appLog("sendCommand(\(cmd)): wrote \(written) bytes")
-            return true
-        }
-
-        appLog("sendCommand(\(cmd)): write failed errno=\(errno), reconnecting")
-        closeSocket()
-        guard openSocket() else {
-            appLog("sendCommand(\(cmd)): reconnect failed")
-            return false
-        }
-        let retry = data.withUnsafeBytes { write(fd, $0.baseAddress!, data.count) }
-        appLog("sendCommand(\(cmd)): retry wrote \(retry) bytes")
-        return retry >= 0
-    }
-
     private func readAvailable() {
         var buf = [UInt8](repeating: 0, count: 4096)
         let n = read(fd, &buf, buf.count)
@@ -234,10 +275,13 @@ final class GoEngine: ObservableObject {
             processLines()
             return
         }
-        // EOF or error: socket broken, reconnect and query real status
         closeSocket()
         if openSocket() {
-            sendCommand("status")
+            sendRequest(cmd: "status") { [weak self] resp in
+                if resp.ok == true, let data = resp.data {
+                    self?.applyStatusData(data)
+                }
+            }
         } else {
             status = "disconnected"
             connectedAt = nil
@@ -249,59 +293,73 @@ final class GoEngine: ObservableObject {
             let line = readBuffer[readBuffer.startIndex..<idx]
             readBuffer = Data(readBuffer[(idx + 1)...])
             guard let resp = try? JSONDecoder().decode(DaemonResponse.self, from: line) else { continue }
-            handleResponse(resp)
+            handleMessage(resp)
         }
     }
 
-    private func handleResponse(_ resp: DaemonResponse) {
-        appLog("handleResponse: type=\(resp.type) ok=\(String(describing: resp.ok)) data=\(resp.data ?? "")")
-        switch resp.type {
+    // MARK: - Message handling
+
+    private func handleMessage(_ msg: DaemonResponse) {
+        if let event = msg.event {
+            handleEvent(event: event, data: msg.data)
+        } else if let id = msg.id {
+            handleResponse(id: id, msg: msg)
+        }
+    }
+
+    private func handleEvent(event: String, data: String?) {
+        appLog("event: \(event) data=\(data ?? "")")
+        switch event {
         case "status":
-            if let data = resp.data?.data(using: .utf8),
-               let msg = try? JSONDecoder().decode(EngineStatus.self, from: data) {
-                let old = status
-                status = msg.status
-                if msg.status == "connected" && old != "connected" {
-                    connectedAt = Date()
-                    lastError = nil
-                } else if msg.status == "disconnected" {
-                    connectedAt = nil
-                }
-                if let e = msg.error, !e.isEmpty {
-                    lastError = e
-                }
+            if let data {
+                applyStatusData(data)
             }
         case "error":
-            lastError = resp.message
+            lastError = data
             if status == "connecting" || status == "disconnecting" {
-                sendCommand("status")
-            }
-        case "result":
-            if resp.cmd == "parse-subscription" {
-                if resp.ok == true, let raw = resp.data?.data(using: .utf8),
-                   let result = try? JSONDecoder().decode(ParseResult.self, from: raw) {
-                    parseCallback?(.success(result))
-                } else {
-                    let msg = resp.message ?? "parse failed"
-                    parseCallback?(.failure(NSError(domain: "XDial", code: -1, userInfo: [NSLocalizedDescriptionKey: msg])))
+                sendRequest(cmd: "status") { [weak self] resp in
+                    if resp.ok == true, let data = resp.data {
+                        self?.applyStatusData(data)
+                    }
                 }
-                parseCallback = nil
-            } else if resp.ok != true {
-                lastError = resp.message
-                sendCommand("status")
             }
         default:
             break
         }
     }
+
+    private func handleResponse(id: String, msg: DaemonResponse) {
+        appLog("response: id=\(id) ok=\(String(describing: msg.ok)) data=\(msg.data ?? "")")
+        if let callback = pendingCallbacks.removeValue(forKey: id) {
+            callback(msg)
+        } else if msg.ok != true {
+            lastError = msg.message
+        }
+    }
+
+    private func applyStatusData(_ dataStr: String) {
+        guard let data = dataStr.data(using: .utf8),
+              let msg = try? JSONDecoder().decode(EngineStatus.self, from: data) else { return }
+        let old = status
+        status = msg.status
+        if msg.status == "connected" && old != "connected" {
+            connectedAt = Date()
+            lastError = nil
+        } else if msg.status == "disconnected" {
+            connectedAt = nil
+        }
+        if let e = msg.error, !e.isEmpty {
+            lastError = e
+        }
+    }
 }
 
 private struct DaemonResponse: Decodable {
-    let type: String
-    let cmd: String?
+    let id: String?
     let ok: Bool?
     let message: String?
     let data: String?
+    let event: String?
 }
 
 struct EngineStatus: Decodable {

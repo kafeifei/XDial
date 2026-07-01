@@ -1,0 +1,62 @@
+name: XDialTV
+options:
+  bundleIdPrefix: com.kafeifei
+  deploymentTarget:
+    tvOS: "17.0"
+configs:
+  Debug: debug
+  Release: release
+
+targets:
+  XDialTVTunnel:
+    type: app-extension
+    platform: tvOS
+    sources:
+      - XDialTVTunnel
+    info:
+      path: XDialTVTunnel/Info.plist
+      properties:
+        CFBundleDisplayName: XDial Tunnel
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+    entitlements:
+      path: XDialTVTunnel/XDialTVTunnel.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
+        com.apple.security.application-groups:
+          - group.com.kafeifei.xdialtv
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdialtv.tunnel
+        SWIFT_VERSION: "6.0"
+    dependencies:
+      - framework: ../build/Libbox.xcframework
+        embed: false
+      - sdk: libresolv.tbd
+
+  XDialTV:
+    type: application
+    platform: tvOS
+    sources:
+      - XDialTV
+    entitlements:
+      path: XDialTV/XDialTV.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.kafeifei.xdialtv
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdialtv
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
+        ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
+        ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME: LaunchImage
+    dependencies:
+      - target: XDialTVTunnel
+        embed: true
+      - framework: ../build/Libbox.xcframework
+        embed: false
+      - sdk: libresolv.tbd

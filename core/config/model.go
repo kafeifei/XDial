@@ -1,21 +1,25 @@
 package config
 
-// PortType 港口类型（流量出口）
-type PortType string
-
-const (
-	PortTypeDirect      PortType = "direct"
-	PortTypeVPN         PortType = "vpn"
-	PortTypeTrojan      PortType = "trojan"
-	PortTypeShadowsocks PortType = "shadowsocks"
-	PortTypeVMess       PortType = "vmess"
+import (
+	"encoding/json"
 )
 
-// Port 港口：流量从哪个通道出去
-type Port struct {
+// LineType 线路类型（流量出口）
+type LineType string
+
+const (
+	LineTypeDirect      LineType = "direct"
+	LineTypeVPN         LineType = "vpn"
+	LineTypeTrojan      LineType = "trojan"
+	LineTypeShadowsocks LineType = "shadowsocks"
+	LineTypeVMess       LineType = "vmess"
+)
+
+// Line 线路：流量从哪个通道出去
+type Line struct {
 	ID      string   `json:"id"`
 	Name    string   `json:"name"`
-	Type    PortType `json:"type"`
+	Type    LineType `json:"type"`
 	Enabled bool     `json:"enabled"`
 
 	// VPN (AnyConnect via sslcon)
@@ -46,60 +50,60 @@ type Port struct {
 	UDP bool `json:"udp,omitempty"` // UDP relay / over TCP
 }
 
-// CargoType 货品类型（流量匹配规则）
-type CargoType string
+// RuleSetType 规则类型（流量匹配规则）
+type RuleSetType string
 
 const (
-	CargoTypeURL    CargoType = "url"
-	CargoTypeManual CargoType = "manual"
+	RuleSetTypeURL    RuleSetType = "url"
+	RuleSetTypeManual RuleSetType = "manual"
 )
 
-// Cargo 货品：匹配哪些流量
-type Cargo struct {
-	ID      string    `json:"id"`
-	Name    string    `json:"name"`
-	Type    CargoType `json:"type"`
-	Enabled bool      `json:"enabled"`
+// RuleSet 规则：匹配哪些流量
+type RuleSet struct {
+	ID      string      `json:"id"`
+	Name    string      `json:"name"`
+	Type    RuleSetType `json:"type"`
+	Enabled bool        `json:"enabled"`
 
-	// URL 货品（远程规则集）
+	// URL 规则（远程规则集）
 	URL    string `json:"url,omitempty"`
 	Format string `json:"format,omitempty"`
 
-	// 手动货品
+	// 手动规则
 	Domains []string `json:"domains,omitempty"`
 	CIDRs   []string `json:"cidrs,omitempty"`
 }
 
-// Binding 邮轮中的一条绑定：货品→港口（或订阅）
-type Binding struct {
-	CargoID        string `json:"cargo_id"`
-	PortID         string `json:"port_id,omitempty"`
+// RuleBinding 模式中的一条绑定：规则→线路（或订阅）
+type RuleBinding struct {
+	RuleSetID      string `json:"rule_set_id"`
+	LineID         string `json:"line_id,omitempty"`
 	SubscriptionID string `json:"subscription_id,omitempty"`
 }
 
-// Cruise 邮轮：一组货品→港口的绑定
-type Cruise struct {
-	ID                    string    `json:"id"`
-	Name                  string    `json:"name"`
-	Bindings              []Binding `json:"bindings"`
-	DefaultPortID         string    `json:"default_port_id"`
-	DefaultSubscriptionID string    `json:"default_subscription_id,omitempty"`
+// Mode 模式：一组规则→线路的绑定
+type Mode struct {
+	ID                    string        `json:"id"`
+	Name                  string        `json:"name"`
+	Bindings              []RuleBinding `json:"bindings"`
+	DefaultLineID         string        `json:"default_line_id"`
+	DefaultSubscriptionID string        `json:"default_subscription_id,omitempty"`
 }
 
 // ProxyGroup 订阅内的策略组
 type ProxyGroup struct {
 	Name     string   `json:"name"`
-	Type     string   `json:"type"`                // select / urltest / fallback
-	Proxies  []string `json:"proxies"`             // 节点名或其他组名
+	Type     string   `json:"type"`    // select / urltest / fallback
+	Proxies  []string `json:"proxies"` // 节点名或其他组名
 	URL      string   `json:"url,omitempty"`
 	Interval int      `json:"interval,omitempty"`
 }
 
 // SubscriptionRule 订阅内的规则
 type SubscriptionRule struct {
-	Type  string `json:"type"`   // RULE-SET / DOMAIN-SUFFIX / DOMAIN / IP-CIDR / GEOIP / FINAL
-	Value string `json:"value"`  // URL 或匹配值
-	Group string `json:"group"`  // 策略组名
+	Type  string `json:"type"`  // RULE-SET / DOMAIN-SUFFIX / DOMAIN / IP-CIDR / GEOIP / FINAL
+	Value string `json:"value"` // URL 或匹配值
+	Group string `json:"group"` // 策略组名
 }
 
 // Subscription 订阅：通过 URL 批量导入的完整配置
@@ -110,7 +114,7 @@ type Subscription struct {
 	Format       string             `json:"format"`
 	Enabled      bool               `json:"enabled"`
 	Strategy     string             `json:"strategy"`
-	Ports        []Port             `json:"ports"`
+	Lines        []Line             `json:"lines"`
 	ProxyGroups  []ProxyGroup       `json:"proxy_groups,omitempty"`
 	Rules        []SubscriptionRule `json:"rules,omitempty"`
 	UpdatedAt    int64              `json:"updated_at"`
@@ -120,35 +124,65 @@ type Subscription struct {
 
 // Profile 完整配置
 type Profile struct {
-	Ports          []Port         `json:"ports"`
-	Cargoes        []Cargo        `json:"cargoes"`
-	Cruises        []Cruise       `json:"cruises"`
-	Subscriptions  []Subscription `json:"subscriptions,omitempty"`
-	ActiveCruiseID string         `json:"active_cruise_id"`
+	Lines         []Line         `json:"lines"`
+	RuleSets      []RuleSet      `json:"rule_sets"`
+	Modes         []Mode         `json:"modes"`
+	Subscriptions []Subscription `json:"subscriptions,omitempty"`
+	ActiveModeID  string         `json:"active_mode_id"`
 }
 
-func (p *Profile) ActiveCruise() *Cruise {
-	for i := range p.Cruises {
-		if p.Cruises[i].ID == p.ActiveCruiseID {
-			return &p.Cruises[i]
+// UnmarshalJSON 让 Profile 解码时兼容旧比喻命名的 JSON key
+// （ports/cargoes/cruises/active_cruise_id/cargo_id/port_id/default_port_id），
+// 使 Go 侧无论收到新格式还是旧格式的 profileJSON 都能正确解码。
+// 规范化通过 normalizeProfileKeys 递归重写 key 完成，然后用别名类型
+// （profileAlias，无自定义 UnmarshalJSON）解码，避免无限递归。
+func (p *Profile) UnmarshalJSON(data []byte) error {
+	normalized, err := normalizeProfileKeys(data)
+	if err != nil {
+		return err
+	}
+	type profileAlias Profile
+	var alias profileAlias
+	if err := json.Unmarshal(normalized, &alias); err != nil {
+		return err
+	}
+	*p = Profile(alias)
+	return nil
+}
+
+// ParseProfile 从 JSON 解码 Profile，兼容新旧两种 key 命名。
+// 是所有 profileJSON 解码入口的推荐调用点（等价于 json.Unmarshal 到 *Profile，
+// 因为 Profile 已实现兼容旧 key 的 UnmarshalJSON）。
+func ParseProfile(data []byte) (*Profile, error) {
+	var p Profile
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (p *Profile) ActiveMode() *Mode {
+	for i := range p.Modes {
+		if p.Modes[i].ID == p.ActiveModeID {
+			return &p.Modes[i]
 		}
 	}
 	return nil
 }
 
-func (p *Profile) FindPort(id string) *Port {
-	for i := range p.Ports {
-		if p.Ports[i].ID == id {
-			return &p.Ports[i]
+func (p *Profile) FindLine(id string) *Line {
+	for i := range p.Lines {
+		if p.Lines[i].ID == id {
+			return &p.Lines[i]
 		}
 	}
 	return nil
 }
 
-func (p *Profile) FindCargo(id string) *Cargo {
-	for i := range p.Cargoes {
-		if p.Cargoes[i].ID == id {
-			return &p.Cargoes[i]
+func (p *Profile) FindRuleSet(id string) *RuleSet {
+	for i := range p.RuleSets {
+		if p.RuleSets[i].ID == id {
+			return &p.RuleSets[i]
 		}
 	}
 	return nil
@@ -163,11 +197,11 @@ func (p *Profile) FindSubscription(id string) *Subscription {
 	return nil
 }
 
-// VPNPort 返回第一个 VPN 类型的港口（用于获取 VPN 服务器地址）
-func (p *Profile) VPNPort() *Port {
-	for i := range p.Ports {
-		if p.Ports[i].Type == PortTypeVPN {
-			return &p.Ports[i]
+// VPNLine 返回第一个 VPN 类型的线路（用于获取 VPN 服务器地址）
+func (p *Profile) VPNLine() *Line {
+	for i := range p.Lines {
+		if p.Lines[i].Type == LineTypeVPN {
+			return &p.Lines[i]
 		}
 	}
 	return nil

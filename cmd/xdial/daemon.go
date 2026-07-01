@@ -5,16 +5,14 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 
+	"github.com/kafeifei/xdial/core/config"
 	"github.com/kafeifei/xdial/core/engine"
 	"github.com/kafeifei/xdial/core/subscription"
 )
-
-const defaultSocketPath = "/tmp/xdial.sock"
 
 type daemonCallback struct {
 	clients *ClientSet
@@ -22,23 +20,15 @@ type daemonCallback struct {
 
 func (d *daemonCallback) OnStatusChanged(statusJSON string) {
 	slog.Info("status", "data", statusJSON)
-	d.clients.Broadcast(Response{Type: "status", Data: statusJSON})
+	d.clients.BroadcastEvent(Event{Event: "status", Data: statusJSON})
 }
 
 func (d *daemonCallback) OnError(code int, message string) {
 	slog.Error("engine", "code", code, "msg", message)
-	d.clients.Broadcast(Response{
-		Type:    "error",
-		Message: message,
-	})
+	d.clients.BroadcastEvent(Event{Event: "error", Data: message})
 }
 
-func main() {
-	socketPath := defaultSocketPath
-	if len(os.Args) > 1 {
-		socketPath = os.Args[1]
-	}
-
+func runDaemon(socketPath string) {
 	if isAlreadyRunning(socketPath) {
 		slog.Info("another instance is already running, exiting")
 		os.Exit(0)
@@ -83,15 +73,6 @@ func main() {
 	os.Remove(socketPath)
 }
 
-func killOrphanSingBox() {
-	out, err := exec.Command("pgrep", "-f", "sing-box run.*xdial-engine").Output()
-	if err != nil || len(out) == 0 {
-		return
-	}
-	slog.Info("killing orphan sing-box processes")
-	exec.Command("pkill", "-f", "sing-box run.*xdial-engine").Run()
-}
-
 func isAlreadyRunning(socketPath string) bool {
 	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
@@ -109,10 +90,7 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 		client.Close()
 	}()
 
-	client.Send(Response{
-		Type: "status",
-		Data: eng.Status(),
-	})
+	client.SendEvent(Event{Event: "status", Data: eng.Status()})
 
 	reqCh := make(chan Request)
 	go ReadRequests(conn, reqCh)
@@ -120,38 +98,41 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 	for req := range reqCh {
 		switch req.Cmd {
 		case "start":
-			if err := eng.Start(req.Profile); err != nil {
-				client.Send(Response{Type: "result", Cmd: "start", OK: false, Message: err.Error()})
+			profile, err := config.ParseProfile([]byte(req.Profile))
+			if err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
+			} else if err := eng.Start(profile); err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
 			} else {
-				client.Send(Response{Type: "result", Cmd: "start", OK: true})
+				client.SendResponse(Response{ID: req.ID, OK: true})
 			}
 
 		case "stop":
 			if err := eng.Stop(); err != nil {
-				client.Send(Response{Type: "result", Cmd: "stop", OK: false, Message: err.Error()})
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
 			} else {
-				client.Send(Response{Type: "result", Cmd: "stop", OK: true})
+				client.SendResponse(Response{ID: req.ID, OK: true})
 			}
 
 		case "kill-session":
 			eng.KillSession()
-			client.Send(Response{Type: "result", Cmd: "kill-session", OK: true})
+			client.SendResponse(Response{ID: req.ID, OK: true})
 
 		case "status":
-			client.Send(Response{Type: "status", Data: eng.Status()})
+			client.SendResponse(Response{ID: req.ID, OK: true, Data: eng.Status()})
 
-		case "parse-subscription":
-			ports, err := subscription.Parse(req.SubURL, req.SubContent, req.SubFormat)
+		case "parse-sub":
+			result, err := subscription.Parse(req.SubURL, req.SubContent, req.SubFormat)
 			if err != nil {
-				client.Send(Response{Type: "result", Cmd: "parse-subscription", OK: false, Message: err.Error()})
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
 			} else {
-				subscription.ExpandRulesets(ports)
-				data, _ := json.Marshal(ports)
-				client.Send(Response{Type: "result", Cmd: "parse-subscription", OK: true, Data: string(data)})
+				subscription.ExpandRulesets(result)
+				data, _ := json.Marshal(result)
+				client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
 			}
 
 		default:
-			client.Send(Response{Type: "error", Message: "unknown command: " + req.Cmd})
+			client.SendResponse(Response{ID: req.ID, OK: false, Message: "unknown command: " + req.Cmd})
 		}
 	}
 }

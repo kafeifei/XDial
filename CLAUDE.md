@@ -33,12 +33,12 @@ curl -X POST localhost:19876/action -d '{"action":"ax-press","title":"连接"}'
 curl -X POST localhost:19876/action -d '{"action":"ax-set-value","title":"字段当前值","value":"新值"}'
 
 # 切换 tab
-curl -X POST localhost:19876/action -d '{"action":"ax-press","title":"📦 货品"}'
+curl -X POST localhost:19876/action -d '{"action":"ax-press","title":"📋 规则"}'
 
 # 应用级操作
 curl -X POST localhost:19876/action -d '{"action":"connect"}'
 curl -X POST localhost:19876/action -d '{"action":"disconnect"}'
-curl -X POST localhost:19876/action -d '{"action":"select-cruise","id":"cruise-id"}'
+curl -X POST localhost:19876/action -d '{"action":"select-mode","id":"mode-id"}'
 ```
 
 ### 调试流程
@@ -52,7 +52,7 @@ curl -X POST localhost:19876/action -d '{"action":"select-cruise","id":"cruise-i
 
 - 服务器只在 debug build 存在（`#if DEBUG`），release build 自动排除
 - `localhost` 偶尔因 IPv6 解析失败，用 `127.0.0.1:19876` 更可靠
-- popover 需要先点菜单栏图标（`ax-press` title `🚢`）才能在 AX 树中可见
+- popover 需要先点菜单栏图标（`ax-press` title `🌐`）才能在 AX 树中可见
 - 设置窗口需要先点齿轮按钮（`ax-press` title `gearshape`）才能打开
 
 ## 项目结构

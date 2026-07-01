@@ -45,7 +45,7 @@ enum PrivilegeManager {
         let helperSource = helperSourcePath()
         guard FileManager.default.fileExists(atPath: helperSource) else {
             throw NSError(domain: "XDial", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "找不到 xdial-helper 二进制: \(helperSource)"])
+                userInfo: [NSLocalizedDescriptionKey: "找不到 xdial 二进制: \(helperSource)"])
         }
 
         let tmpPlist = "/tmp/xdial-daemon.plist"
@@ -79,7 +79,7 @@ enum PrivilegeManager {
     static func uninstall() throws {
         let shell = """
         launchctl bootout system/\(label) 2>/dev/null || true
-        rm -f '\(plistPath)' '\(helperPath)' '\(socketPath)' '/tmp/xdial-helper.log' '/tmp/xdial-app.log'
+        rm -f '\(plistPath)' '\(helperPath)' '\(socketPath)' '/tmp/xdial.log' '/tmp/xdial-app.log'
         rm -rf '/tmp/xdial-engine'
         rm -f '/etc/sudoers.d/xdial'
         """
@@ -102,6 +102,8 @@ enum PrivilegeManager {
             <key>ProgramArguments</key>
             <array>
                 <string>\(helperPath)</string>
+                <string>daemon</string>
+                <string>--socket</string>
                 <string>\(socketPath)</string>
             </array>
             <key>KeepAlive</key>
@@ -109,9 +111,9 @@ enum PrivilegeManager {
             <key>RunAtLoad</key>
             <true/>
             <key>StandardOutPath</key>
-            <string>/tmp/xdial-helper.log</string>
+            <string>/tmp/xdial.log</string>
             <key>StandardErrorPath</key>
-            <string>/tmp/xdial-helper.log</string>
+            <string>/tmp/xdial.log</string>
         </dict>
         </plist>
         """
@@ -138,17 +140,17 @@ enum PrivilegeManager {
     }
 
     static func helperSourcePath() -> String {
-        let bundle = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/xdial-helper").path
+        let bundle = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/xdial-daemon").path
         if FileManager.default.fileExists(atPath: bundle) {
             return bundle
         }
         let dev = Bundle.main.bundleURL
             .deletingLastPathComponent()
-            .appendingPathComponent("xdial-helper").path
+            .appendingPathComponent("xdial-daemon").path
         if FileManager.default.fileExists(atPath: dev) {
             return dev
         }
-        return "\(NSHomeDirectory())/Codes/Vibe/XDial/build/xdial-helper"
+        return "\(NSHomeDirectory())/Codes/Vibe/XDial/build/xdial"
     }
 
     @discardableResult
