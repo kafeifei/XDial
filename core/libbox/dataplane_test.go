@@ -1,4 +1,4 @@
-//go:build with_gvisor
+//go:build with_gvisor && !windows
 
 // dataplane_test.go 是 core/libbox 的离线数据面集成测试。
 //

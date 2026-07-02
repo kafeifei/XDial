@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(sudo:*)",
+      "Bash(rm -rf /:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"tool_input\",{}).get(\"file_path\",\"\"))'); case \"$f\" in */third_party/*) ;; *.go) command -v gofmt >/dev/null && gofmt -w \"$f\" ;; esac; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}

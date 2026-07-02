@@ -36,7 +36,9 @@ func (s *SingBoxProcess) Start(profile *config.Profile, socksAddr, vpnServerIP s
 		return fmt.Errorf("generate config: %w", err)
 	}
 
-	if err := os.WriteFile(s.configPath, cfgData, 0644); err != nil {
+	// 0600：配置内含订阅节点的明文密码，且由同一 root 进程写入并启动 sing-box，
+	// 无需他人可读
+	if err := os.WriteFile(s.configPath, cfgData, 0600); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 

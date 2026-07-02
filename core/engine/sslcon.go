@@ -11,9 +11,10 @@ import (
 )
 
 type VPNConfig struct {
-	Server   string
-	Username string
-	Password string
+	Server        string
+	Username      string
+	Password      string
+	AllowInsecure bool // true 时跳过服务器证书验证（自签场景 opt-in）
 }
 
 type VPNInfo struct {
@@ -38,7 +39,7 @@ func (c *VPNClient) Connect(cfg VPNConfig) (*VPNInfo, error) {
 	defer c.mu.Unlock()
 
 	base.Cfg.NoTUN = true
-	base.Cfg.InsecureSkipVerify = true
+	base.Cfg.InsecureSkipVerify = cfg.AllowInsecure // 默认 false=验证证书，自签需显式 opt-in
 	base.Cfg.CiscoCompat = true
 	base.Cfg.LogLevel = "Info"
 	base.InitLog()

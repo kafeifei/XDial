@@ -26,8 +26,12 @@ struct Line: Codable, Identifiable, Hashable {
     var vmessUUID: String = ""
     var vmessAltID: Int = 0
 
+    // 跳过 TLS 证书验证（自签场景显式开启）。默认 false=验证证书。
+    var allowInsecure: Bool = false
+
     enum CodingKeys: String, CodingKey {
         case id, name, type, enabled, verified
+        case allowInsecure = "allow_insecure"
         case vpnServer = "vpn_server"
         case vpnUsername = "vpn_username"
         case vpnPassword = "vpn_password"
@@ -49,12 +53,14 @@ struct Line: Codable, Identifiable, Hashable {
          vpnServer: String = "", vpnUsername: String = "", vpnPassword: String = "",
          trojanServer: String = "", trojanPort: Int = 443, trojanPassword: String = "", trojanSNI: String = "",
          ssServer: String = "", ssPort: Int = 8388, ssMethod: String = "aes-256-gcm", ssPassword: String = "",
-         vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0) {
+         vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0,
+         allowInsecure: Bool = false) {
         self.id = id; self.name = name; self.type = type; self.enabled = enabled; self.verified = verified
         self.vpnServer = vpnServer; self.vpnUsername = vpnUsername; self.vpnPassword = vpnPassword
         self.trojanServer = trojanServer; self.trojanPort = trojanPort; self.trojanPassword = trojanPassword; self.trojanSNI = trojanSNI
         self.ssServer = ssServer; self.ssPort = ssPort; self.ssMethod = ssMethod; self.ssPassword = ssPassword
         self.vmessServer = vmessServer; self.vmessPort = vmessPort; self.vmessUUID = vmessUUID; self.vmessAltID = vmessAltID
+        self.allowInsecure = allowInsecure
     }
 
     init(from decoder: Decoder) throws {
@@ -79,6 +85,7 @@ struct Line: Codable, Identifiable, Hashable {
         vmessPort = try c.decodeIfPresent(Int.self, forKey: .vmessPort) ?? 443
         vmessUUID = try c.decodeIfPresent(String.self, forKey: .vmessUUID) ?? ""
         vmessAltID = try c.decodeIfPresent(Int.self, forKey: .vmessAltID) ?? 0
+        allowInsecure = try c.decodeIfPresent(Bool.self, forKey: .allowInsecure) ?? false
     }
 }
 

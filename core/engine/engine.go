@@ -66,6 +66,10 @@ func (e *Engine) Start(profile *config.Profile) error {
 
 func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 	if err := e.connectInternal(ctx, profile); err != nil {
+		// ctx 被取消 = 用户主动断开，Stop 已把状态置为 Disconnected，不再报错
+		if ctx.Err() != nil {
+			return
+		}
 		e.fail(err.Error())
 	}
 }
@@ -85,9 +89,10 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 	slog.Info("connecting to VPN", "server", vpnLine.VPNServer)
 
 	vpnInfo, err := e.vpn.Connect(VPNConfig{
-		Server:   vpnLine.VPNServer,
-		Username: vpnLine.VPNUsername,
-		Password: vpnLine.VPNPassword,
+		Server:        vpnLine.VPNServer,
+		Username:      vpnLine.VPNUsername,
+		Password:      vpnLine.VPNPassword,
+		AllowInsecure: vpnLine.AllowInsecure,
 	})
 	if err != nil {
 		return fmt.Errorf("%s", humanizeVPNError(err, vpnLine.VPNServer))
@@ -131,11 +136,20 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 	e.mu.Lock()
 	e.bridge = bridge
 	e.singbox = singbox
+	// 提交前在锁内复查取消信号：连接建立期间用户可能已点断开（Stop 持锁 cancel(ctx)
+	// 并把 status 置 Disconnected）。若不复查就 setStatus(Connected)，会把状态踩回已连接，
+	// 进而触发 monitorVPN 自动重连——表现为"用户断开后 VPN 自己又连上"。setStatus 也一并
+	// 移进锁内，保证"复查 ctx + 写 Connected"相对 Stop 原子。
+	if ctx.Err() != nil {
+		e.cleanupLocked() // 清理刚建立的 bridge/singbox/socks，避免泄漏
+		e.mu.Unlock()
+		e.vpn.Disconnect()
+		return ctx.Err()
+	}
+	closeCh := session.Sess.CloseChan
+	e.setStatus(StatusConnected)
 	e.mu.Unlock()
 
-	e.setStatus(StatusConnected)
-
-	closeCh := session.Sess.CloseChan
 	go e.monitorVPN(closeCh)
 	return nil
 }
@@ -330,7 +344,7 @@ func humanizeVPNError(err error, server string) string {
 		return "网络不通，请检查网络连接"
 	case strings.Contains(s, "certificate") ||
 		strings.Contains(s, "x509"):
-		return "服务器证书验证失败"
+		return "服务器证书验证失败（若为自签证书，请在该 VPN 线路里开启\"跳过证书验证\"）"
 	default:
 		return "VPN 连接失败：" + s
 	}

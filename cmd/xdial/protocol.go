@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -115,8 +114,4 @@ func (cs *ClientSet) BroadcastEvent(e Event) {
 	for c := range cs.clients {
 		c.SendEvent(e)
 	}
-}
-
-func drainConn(conn net.Conn) {
-	io.Copy(io.Discard, conn)
 }

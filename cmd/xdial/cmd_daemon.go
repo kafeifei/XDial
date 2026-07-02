@@ -14,5 +14,7 @@ func runDaemonCmd(args []string) {
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
+	rejectLeftoverArgs(fs)
+	checkSocketPath(*socketPath)
 	runDaemon(*socketPath)
 }

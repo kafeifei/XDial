@@ -16,6 +16,8 @@ func runStatusCmd(args []string) {
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
+	rejectLeftoverArgs(fs)
+	checkSocketPath(*socketPath)
 
 	req := Request{ID: nextRequestID(), Cmd: "status"}
 	resp, err := sendCommand(*socketPath, req)

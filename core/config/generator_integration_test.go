@@ -574,3 +574,195 @@ func TestGenerate_ContentVerification(t *testing.T) {
 
 	t.Logf("Content verification: %d outbounds, %d rules, final=%s", len(outbounds), len(rules), final)
 }
+
+// 10. REJECT 规则应翻译成 action:reject，而非被静默丢弃
+func TestGenerate_RejectRuleTranslated(t *testing.T) {
+	sub := Subscription{
+		ID: "sub-rj", Name: "RejectSub", URL: "https://example.com", Format: "clash",
+		Enabled: true, Strategy: "selector",
+		Lines: []Line{
+			{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
+				TrojanServer: "hk1.example.com", TrojanPort: 443, TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
+		},
+		ProxyGroups: []ProxyGroup{
+			{Name: "Proxies", Type: "select", Proxies: []string{"HK 01"}},
+		},
+		Rules: []SubscriptionRule{
+			{Type: "DOMAIN-SUFFIX", Value: "ads.example.com", Group: "REJECT"},
+			{Type: "DOMAIN-SUFFIX", Value: "site.example.com", Group: "Proxies"},
+		},
+	}
+	p := &Profile{
+		Lines:         []Line{directLine(), vpnLine()},
+		Subscriptions: []Subscription{sub},
+		Modes:         []Mode{{ID: "m1", Name: "M", DefaultSubscriptionID: "sub-rj"}},
+		ActiveModeID:  "m1",
+	}
+	data, err := GenerateSingBox(p, 1080, "")
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	route := cfg["route"].(map[string]interface{})
+	found := false
+	for _, r := range route["rules"].([]interface{}) {
+		rm := r.(map[string]interface{})
+		ds, _ := rm["domain_suffix"].([]interface{})
+		if len(ds) == 1 && ds[0].(string) == "ads.example.com" {
+			found = true
+			if rm["action"] != "reject" {
+				t.Errorf("REJECT rule should carry action:reject, got %v", rm)
+			}
+			if _, has := rm["outbound"]; has {
+				t.Errorf("reject rule must not carry outbound: %v", rm)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("REJECT rule was dropped, rules=%v", route["rules"])
+	}
+	// 哨兵值绝不能作为 outbound tag 泄漏
+	for _, ob := range cfg["outbounds"].([]interface{}) {
+		if ob.(map[string]interface{})["tag"].(string) == rejectTag {
+			t.Error("sentinel rejectTag leaked as outbound tag")
+		}
+	}
+}
+
+// 11. 纯 REJECT 组（proxies:[REJECT]）：不生成 outbound，指向它的规则翻译成 action:reject
+func TestGenerate_PureRejectGroup(t *testing.T) {
+	sub := Subscription{
+		ID: "sub-adblock", Name: "AdblockSub", URL: "https://example.com", Format: "clash",
+		Enabled: true, Strategy: "selector",
+		Lines: []Line{
+			{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
+				TrojanServer: "hk1.example.com", TrojanPort: 443, TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
+		},
+		ProxyGroups: []ProxyGroup{
+			{Name: "Proxies", Type: "select", Proxies: []string{"HK 01"}},
+			{Name: "AdBlock", Type: "select", Proxies: []string{"REJECT"}},
+		},
+		Rules: []SubscriptionRule{
+			{Type: "DOMAIN-SUFFIX", Value: "ads.example.com", Group: "AdBlock"},
+		},
+	}
+	p := &Profile{
+		Lines:         []Line{directLine(), vpnLine()},
+		Subscriptions: []Subscription{sub},
+		Modes:         []Mode{{ID: "m1", Name: "M", DefaultSubscriptionID: "sub-adblock"}},
+		ActiveModeID:  "m1",
+	}
+	data, err := GenerateSingBox(p, 1080, "")
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, ob := range cfg["outbounds"].([]interface{}) {
+		tag := ob.(map[string]interface{})["tag"].(string)
+		if tag == "sub-sub-adblock-adblock" {
+			t.Error("pure reject group must not generate an outbound")
+		}
+		if tag == rejectTag {
+			t.Error("sentinel leaked as outbound tag")
+		}
+	}
+	route := cfg["route"].(map[string]interface{})
+	found := false
+	for _, r := range route["rules"].([]interface{}) {
+		rm := r.(map[string]interface{})
+		ds, _ := rm["domain_suffix"].([]interface{})
+		if len(ds) == 1 && ds[0].(string) == "ads.example.com" {
+			found = true
+			if rm["action"] != "reject" {
+				t.Errorf("rule to pure-reject group should be action:reject, got %v", rm)
+			}
+		}
+	}
+	if !found {
+		t.Error("rule pointing at pure reject group was dropped")
+	}
+	if route["final"].(string) == rejectTag {
+		t.Error("final must not be the sentinel")
+	}
+}
+
+// 12. 中文同长组名 slugify 撞车 → 必须生成唯一 outbound tag（否则 sing-box 拒启动）
+func TestGenerate_DuplicateChineseGroupTags(t *testing.T) {
+	sub := Subscription{
+		ID: "sub-cn", Name: "CNSub", URL: "https://example.com", Format: "clash",
+		Enabled: true, Strategy: "selector",
+		Lines: []Line{
+			{ID: "n1", Name: "N1", Type: LineTypeTrojan, Enabled: true,
+				TrojanServer: "a.example.com", TrojanPort: 443, TrojanPassword: "p1", TrojanSNI: "a.example.com"},
+			{ID: "n2", Name: "N2", Type: LineTypeTrojan, Enabled: true,
+				TrojanServer: "b.example.com", TrojanPort: 443, TrojanPassword: "p2", TrojanSNI: "b.example.com"},
+		},
+		ProxyGroups: []ProxyGroup{
+			{Name: "香港节点", Type: "select", Proxies: []string{"N1"}},
+			{Name: "台湾节点", Type: "select", Proxies: []string{"N2"}},
+		},
+		Rules: []SubscriptionRule{
+			{Type: "DOMAIN-SUFFIX", Value: "hk.example.com", Group: "香港节点"},
+			{Type: "DOMAIN-SUFFIX", Value: "tw.example.com", Group: "台湾节点"},
+		},
+	}
+	p := &Profile{
+		Lines:         []Line{directLine(), vpnLine()},
+		Subscriptions: []Subscription{sub},
+		Modes:         []Mode{{ID: "m1", Name: "M", DefaultSubscriptionID: "sub-cn"}},
+		ActiveModeID:  "m1",
+	}
+	data, err := GenerateSingBox(p, 1080, "")
+	if err != nil {
+		t.Fatalf("generate failed (duplicate tag collision?): %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, ob := range cfg["outbounds"].([]interface{}) {
+		tag := ob.(map[string]interface{})["tag"].(string)
+		if seen[tag] {
+			t.Errorf("duplicate outbound tag: %q", tag)
+		}
+		seen[tag] = true
+	}
+	// 第一个组保留无后缀 base（Swift NetworkInfo 只按第一个组算 tag，须兼容）
+	base := "sub-" + sub.ID + "-" + slugify("香港节点")
+	if !seen[base] {
+		t.Errorf("first group must keep base tag %q, tags=%v", base, seen)
+	}
+	// 撞车的第二个组拿到 -N 后缀
+	if !seen[base+"-2"] {
+		t.Errorf("colliding second group must get -N suffix, tags=%v", seen)
+	}
+	// 两条规则都保留且指向不同出口
+	route := cfg["route"].(map[string]interface{})
+	hk, tw := "", ""
+	for _, r := range route["rules"].([]interface{}) {
+		rm := r.(map[string]interface{})
+		ds, _ := rm["domain_suffix"].([]interface{})
+		if len(ds) != 1 {
+			continue
+		}
+		switch ds[0].(string) {
+		case "hk.example.com":
+			hk, _ = rm["outbound"].(string)
+		case "tw.example.com":
+			tw, _ = rm["outbound"].(string)
+		}
+	}
+	if hk == "" || tw == "" {
+		t.Errorf("both group rules must survive, hk=%q tw=%q", hk, tw)
+	}
+	if hk == tw {
+		t.Errorf("colliding groups must map to distinct outbounds, both=%q", hk)
+	}
+}

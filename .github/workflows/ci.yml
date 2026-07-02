@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    name: Go (lint + vet + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt gate
+        run: |
+          unformatted=$(gofmt -l core/ cmd/)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未 gofmt:" && echo "$unformatted" && exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test
+        run: go test -tags with_gvisor ./core/... -count=1 -timeout 10m
+
+  macos:
+    name: macOS (swift build + bundle)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: make app (debug)
+        run: make app
+      - name: make release
+        run: make release

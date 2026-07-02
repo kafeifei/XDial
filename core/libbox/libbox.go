@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Package libbox 是 XDial tvOS 自研引擎的进程内门面:
 // sslcon(AnyConnect) + gVisor 用户态栈 + sing-box(库,非外置进程)整合成
 // 单个 gomobile 可绑定的 API,供 NEPacketTunnelProvider(Swift)调用。

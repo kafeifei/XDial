@@ -122,8 +122,8 @@ struct GeneralTab: View {
             Button(state.tr("取消", "Cancel"), role: .cancel) {}
         } message: {
             Text(state.tr(
-                "「卸载并删除所有数据」会清除你保存的所有线路、规则、模式和 Keychain 中的密码。",
-                "“Uninstall and delete all data” removes all your lines, rules, modes, and Keychain passwords."
+                "「卸载并删除所有数据」会清除你保存的所有线路、规则、模式，以及 ~/.xdial 中保存的密码。",
+                "“Uninstall and delete all data” removes all your lines, rules, modes, and the passwords saved in ~/.xdial."
             ))
         }
     }
@@ -302,11 +302,13 @@ struct LineRow: View {
             field("服务器", $line.vpnServer, placeholder: "vpn.example.com:8443")
             field("用户名", $line.vpnUsername)
             secureField("密码", $line.vpnPassword)
+            insecureToggle
         case "trojan":
             field("服务器", $line.trojanServer)
             intField("端口", $line.trojanPort)
             field("SNI", $line.trojanSNI)
             secureField("密码", $line.trojanPassword)
+            insecureToggle
         case "shadowsocks":
             field("服务器", $line.ssServer)
             intField("端口", $line.ssPort)
@@ -319,6 +321,19 @@ struct LineRow: View {
             intField("Alter ID", $line.vmessAltID)
         default:
             EmptyView()
+        }
+    }
+
+    private var insecureToggle: some View {
+        HStack(alignment: .top) {
+            Text("跳过证书验证").font(.caption).foregroundStyle(.secondary)
+                .frame(width: 60, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Toggle("", isOn: $line.allowInsecure).labelsHidden()
+                Text("仅自签证书的服务器才需要开启；开启后无法防中间人窃取凭据")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer()
         }
     }
 

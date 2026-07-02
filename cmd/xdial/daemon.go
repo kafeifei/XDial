@@ -37,7 +37,7 @@ func runDaemon(socketPath string) {
 	killOrphanSingBox()
 
 	basePath := filepath.Join(os.TempDir(), "xdial-engine")
-	os.MkdirAll(basePath, 0755)
+	os.MkdirAll(basePath, 0700) // 内含明文节点密码的 sing-box.json，收紧目录权限
 
 	clients := NewClientSet()
 	cb := &daemonCallback{clients: clients}
@@ -49,6 +49,10 @@ func runDaemon(socketPath string) {
 		slog.Error("listen failed", "path", socketPath, "err", err)
 		os.Exit(1)
 	}
+	// 之前 0666 且无任何校验：任意本地用户/进程都能指挥这个 root daemon（含 parse-sub
+	// 让 root 抓取任意 URL）。授权改由每个连接的对端凭据决定（peerAllowed），只放行 root
+	// 和当前登录用户；用文件权限做校验会碰上"开机 daemon 先于登录启动、此刻拿不到 console
+	// 用户"的时序问题，而 peerAllowed 在连接发生时（已登录）才判断，天然避开该竞态。
 	os.Chmod(socketPath, 0666)
 
 	slog.Info("daemon started", "socket", socketPath, "pid", os.Getpid())
@@ -58,6 +62,11 @@ func runDaemon(socketPath string) {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
+			}
+			if !peerAllowed(conn) {
+				slog.Warn("rejected unauthorized socket peer")
+				conn.Close()
+				continue
 			}
 			go handleClient(conn, eng, clients)
 		}

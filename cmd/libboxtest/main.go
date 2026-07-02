@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Command libboxtest 是 core/libbox 的手测工具(非 tvOS,跑在桌面 macOS 上)。
 //
 // 验证目标:不需要 NE/真机/Apple 账号,先把"sslcon 拨号 + gVisor 网桥 +

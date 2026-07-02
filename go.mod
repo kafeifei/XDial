@@ -92,4 +92,4 @@ require (
 	lukechampine.com/blake3 v1.3.0 // indirect
 )
 
-replace sslcon => ../sslcon
+replace sslcon => ./third_party/sslcon

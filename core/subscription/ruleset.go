@@ -6,29 +6,33 @@ import (
 	"github.com/kafeifei/xdial/core/config"
 )
 
-// ExpandRulesets 下载并展开所有 RULE-SET 规则为内联规则。
-// 原始 RULE-SET 保留不动（buildSubscriptionRules 中 continue），
-// 展开后的规则追加到 Rules 末尾。
+// ExpandRulesets 下载并就地展开所有 RULE-SET 规则为内联规则。
+// 每条 RULE-SET 在其原始位置被替换为展开后的规则，保持分流规则的首匹配优先级
+// （之前是把展开结果追加到 Rules 末尾，导致排在 RULE-SET 之后的规则反而先匹配）。
+// 下载失败的 RULE-SET 保留原始占位（generator 的 buildSubscriptionRules 会跳过），
+// 不改变后续规则的相对顺序。
 func ExpandRulesets(result *ParseResult) {
 	if result == nil {
 		return
 	}
-	var expanded []config.SubscriptionRule
+	out := make([]config.SubscriptionRule, 0, len(result.Rules))
 	for _, rule := range result.Rules {
 		if rule.Type != "RULE-SET" {
+			out = append(out, rule)
 			continue
 		}
 		lines, err := fetchRuleSetContent(rule.Value)
 		if err != nil {
+			out = append(out, rule) // 保留占位，不丢位置
 			continue
 		}
 		for _, line := range lines {
 			if r, ok := ruleSetLineToRule(line, rule.Group); ok {
-				expanded = append(expanded, r)
+				out = append(out, r)
 			}
 		}
 	}
-	result.Rules = append(result.Rules, expanded...)
+	result.Rules = out
 }
 
 func fetchRuleSetContent(url string) ([]string, error) {
