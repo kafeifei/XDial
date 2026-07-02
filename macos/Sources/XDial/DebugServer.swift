@@ -11,9 +11,11 @@ final class DebugServer {
     func start() {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        guard let nwPort = NWEndpoint.Port(rawValue: port),
-              let l = try? NWListener(using: params, on: nwPort) else {
-            DispatchQueue.main.async { appLog("DebugServer: cannot bind :\(self.port)") }
+        // 只绑回环：调试服务器绝不能暴露到局域网
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: nwPort)
+        guard let l = try? NWListener(using: params) else {
+            DispatchQueue.main.async { appLog("DebugServer: cannot bind 127.0.0.1:\(self.port)") }
             return
         }
         listener = l
@@ -35,7 +37,7 @@ final class DebugServer {
             }
             Task { @MainActor in
                 let (code, body) = Self.route(raw)
-                let header = "HTTP/1.1 \(code)\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                let header = "HTTP/1.1 \(code)\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\n\r\n"
                 conn.send(content: (header + body).data(using: .utf8),
                           completion: .contentProcessed { _ in conn.cancel() })
             }
@@ -47,6 +49,12 @@ final class DebugServer {
     @MainActor
     private static func route(_ raw: String) -> (String, String) {
         let req = parseHTTP(raw)
+        // 防 DNS rebinding：浏览器带任意 Host 打到 127.0.0.1 时拒绝。
+        // 必须精确匹配主机名——用 hasPrefix 会被 localhost.evil.com / 127.0.0.1.evil.com
+        // 这类"解析到回环但前缀相同"的域名绕过。
+        guard isAllowedHost(req.host) else {
+            return ("403 Forbidden", json(["error": "bad host"]))
+        }
         switch (req.method, req.path) {
         case ("GET", "/health"):
             return ok(["ok": true, "pid": getpid()])
@@ -57,17 +65,6 @@ final class DebugServer {
             return ok(buildAXTree(maxDepth: depth))
         case ("POST", "/action"):
             return handleAction(req.body)
-        case ("GET", "/action"):
-            let action = req.query["action"] ?? ""
-            let fakeBody: [String: Any] = {
-                var d: [String: Any] = ["action": action]
-                for (k, v) in req.query where k != "action" { d[k] = v }
-                return d
-            }()
-            if let data = try? JSONSerialization.data(withJSONObject: fakeBody) {
-                return handleAction(String(data: data, encoding: .utf8) ?? "")
-            }
-            return ("400 Bad Request", json(["error": "bad query"]))
         default:
             return ("404 Not Found", json([
                 "error": "not found",
@@ -76,10 +73,29 @@ final class DebugServer {
                     "GET  /state",
                     "GET  /ax[?depth=N]",
                     "POST /action  {action: connect|disconnect|select-mode|ax-press|ax-set-value, ...}",
-                    "GET  /action?action=...  (convenience alias for POST)",
                 ],
             ]))
         }
+    }
+
+    // 只放行回环主机名：去掉端口后精确匹配（IPv6 保留 [] 包裹）。空 Host 放行（部分裸 TCP 客户端不带）。
+    private static func isAllowedHost(_ rawHost: String) -> Bool {
+        let host = rawHost.lowercased()
+        if host.isEmpty { return true }
+        let hostNoPort: String
+        if host.hasPrefix("[") {
+            // [::1] 或 [::1]:port —— 取到 ] 为止
+            if let end = host.firstIndex(of: "]") {
+                hostNoPort = String(host[...end])
+            } else {
+                hostNoPort = host
+            }
+        } else if let colon = host.firstIndex(of: ":") {
+            hostNoPort = String(host[..<colon])
+        } else {
+            hostNoPort = host
+        }
+        return hostNoPort == "127.0.0.1" || hostNoPort == "localhost" || hostNoPort == "[::1]"
     }
 
     // MARK: - State Snapshot
@@ -112,7 +128,7 @@ final class DebugServer {
 
         if let d = try? JSONEncoder().encode(s.profile),
            let p = try? JSONSerialization.jsonObject(with: d) {
-            dict["profile"] = p
+            dict["profile"] = redactSecrets(p)
         }
 
         dict["network"] = [
@@ -133,6 +149,32 @@ final class DebugServer {
             ]
         }
         return dict
+    }
+
+    // 密码/凭据字段一律打码；订阅 url 内嵌 token，同样按凭据处理
+    private static let secretKeys: Set<String> = [
+        "vpn_password", "trojan_password", "ss_password", "vmess_uuid",
+    ]
+
+    private static func redactSecrets(_ value: Any) -> Any {
+        if var dict = value as? [String: Any] {
+            // Subscription 对象（有 lines + url）的 url 是带 token 的机场地址
+            let isSubscription = dict["lines"] != nil && dict["url"] != nil
+            for (k, v) in dict {
+                if secretKeys.contains(k), let s = v as? String, !s.isEmpty {
+                    dict[k] = "***"
+                } else if k == "url", isSubscription, let s = v as? String, !s.isEmpty {
+                    dict[k] = "***"
+                } else {
+                    dict[k] = redactSecrets(v)
+                }
+            }
+            return dict
+        }
+        if let arr = value as? [Any] {
+            return arr.map { redactSecrets($0) }
+        }
+        return value
     }
 
     // MARK: - AX Tree
@@ -336,12 +378,21 @@ final class DebugServer {
 
     // MARK: - HTTP Parsing
 
-    private static func parseHTTP(_ raw: String) -> (method: String, path: String, query: [String: String], body: String) {
+    private static func parseHTTP(_ raw: String) -> (method: String, path: String, query: [String: String], body: String, host: String) {
         let headerEnd = raw.range(of: "\r\n\r\n")
         let body = headerEnd.map { String(raw[$0.upperBound...]) } ?? ""
+        let headerBlock = headerEnd.map { String(raw[raw.startIndex..<$0.lowerBound]) } ?? raw
+        var host = ""
+        for line in headerBlock.split(separator: "\r\n").dropFirst() {
+            let kv = line.split(separator: ":", maxSplits: 1)
+            if kv.count == 2, kv[0].trimmingCharacters(in: .whitespaces).lowercased() == "host" {
+                host = kv[1].trimmingCharacters(in: .whitespaces)
+                break
+            }
+        }
         let firstLine = String(raw.prefix(while: { $0 != "\r" && $0 != "\n" }))
         let parts = firstLine.split(separator: " ")
-        guard parts.count >= 2 else { return ("GET", "/", [:], body) }
+        guard parts.count >= 2 else { return ("GET", "/", [:], body, host) }
         let method = String(parts[0])
         let fullPath = String(parts[1])
 
@@ -358,7 +409,7 @@ final class DebugServer {
                 }
             }
         }
-        return (method, path, query, body)
+        return (method, path, query, body, host)
     }
 
     // MARK: - JSON Helpers

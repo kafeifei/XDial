@@ -122,10 +122,15 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 		"default":   "direct",
 	})
 
-	// 收集所有已生成的 outbound tag，规则引用前要校验，避免引用不存在 tag 导致 sing-box 启动失败
+	// 收集所有已生成的 outbound tag，规则引用前要校验，避免引用不存在 tag 导致 sing-box 启动失败。
+	// 顺带做唯一性断言：重复 tag 会让 sing-box 在解析阶段直接拒绝启动（而 helper 只确认
+	// 进程 spawn 成功，用户看到"已连接但流量全断"的假连接），故在生成阶段就 fail-fast。
 	validTags := map[string]bool{}
 	for _, ob := range outbounds {
 		if tag, _ := ob["tag"].(string); tag != "" {
+			if validTags[tag] {
+				return nil, fmt.Errorf("duplicate outbound tag: %q", tag)
+			}
 			validTags[tag] = true
 		}
 	}
@@ -406,6 +411,19 @@ func resolveOutboundTag(line *Line) string {
 	}
 }
 
+// rejectTag 是 groupTags 里的哨兵值：不是真实 outbound tag（含 NUL 保证永不与
+// slugify 产物撞车），表示"指向该组/规则应生成 action:reject 而非 outbound 引用"。
+const rejectTag = "\x00reject"
+
+// isRejectName 判断订阅规则/组成员里的名字是否为拦截策略（Clash/Surge 内置）。
+func isRejectName(name string) bool {
+	switch strings.ToUpper(name) {
+	case "REJECT", "REJECT-DROP", "REJECT-TINYGIF", "BLOCK":
+		return true
+	}
+	return false
+}
+
 // buildSubscriptionOutbounds 返回所有 outbound、主 tag、以及组名→tag 映射
 func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, string, map[string]string) {
 	prefix := sub.ID + "-"
@@ -435,9 +453,23 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 
 	if len(sub.ProxyGroups) > 0 {
 		// 2a. 有策略组：每个策略组生成一个 outbound
-		// 先注册所有组名 tag，以便组间互相引用
+		// 先注册所有组名 tag，以便组间互相引用。
+		// slugify 把非 ASCII 全映射为 '-'，中文组名（香港节点/台湾节点→"----"）会
+		// 撞成同一 tag，导致 sing-box 因 duplicate outbound tag 拒绝启动（表现为假连接）。
+		// 去重：首个组保留无后缀 base（Swift NetworkInfo 只按第一个组算 tag，保持兼容），
+		// 撞车/同名组追加 -N。
+		usedTags := map[string]bool{}
 		for _, g := range sub.ProxyGroups {
-			groupTags[g.Name] = "sub-" + prefix + slugify(g.Name)
+			if _, exists := groupTags[g.Name]; exists {
+				continue // 同名组只保留第一个
+			}
+			base := "sub-" + prefix + slugify(g.Name)
+			tag := base
+			for i := 2; usedTags[tag]; i++ {
+				tag = fmt.Sprintf("%s-%d", base, i)
+			}
+			usedTags[tag] = true
+			groupTags[g.Name] = tag
 		}
 		// "DIRECT" / "Direct" 映射到内置 direct
 		nameToTag["DIRECT"] = "direct"
@@ -445,17 +477,30 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 
 		for _, g := range sub.ProxyGroups {
 			var memberTags []string
+			hasReject := false
 			for _, name := range g.Proxies {
+				if isRejectName(name) {
+					// REJECT 是拦截策略，不是 outbound，不能作 selector 成员；
+					// 记下拦截意图，供纯拦截组保留 rejectTag 哨兵用
+					hasReject = true
+					continue
+				}
 				if tag, ok := nameToTag[name]; ok {
 					memberTags = append(memberTags, tag)
-				} else if tag, ok := groupTags[name]; ok {
+				} else if tag, ok := groupTags[name]; ok && tag != rejectTag {
 					memberTags = append(memberTags, tag)
 				}
 			}
 			if len(memberTags) == 0 {
-				// 没有任何有效成员就不生成 outbound，同时从 groupTags 移除，
-				// 避免 mainTag / subscription rules 后续引用一个不存在的 tag
-				delete(groupTags, g.Name)
+				if hasReject {
+					// 纯拦截组（如广告组 proxies:[REJECT]）：不生成 outbound，但保留
+					// 组名→哨兵映射，让指向它的订阅规则翻译成 action:reject 而非被丢弃
+					groupTags[g.Name] = rejectTag
+				} else {
+					// 没有任何有效成员就不生成 outbound，同时从 groupTags 移除，
+					// 避免 mainTag / subscription rules 后续引用一个不存在的 tag
+					delete(groupTags, g.Name)
+				}
 				continue
 			}
 
@@ -522,7 +567,7 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 	mainTag := ""
 	if len(sub.ProxyGroups) > 0 {
 		for _, g := range sub.ProxyGroups {
-			if tag, ok := groupTags[g.Name]; ok {
+			if tag, ok := groupTags[g.Name]; ok && tag != rejectTag {
 				mainTag = tag
 				break
 			}
@@ -544,38 +589,31 @@ func buildSubscriptionRules(sub *Subscription, groupTags map[string]string) ([]m
 	for _, r := range sub.Rules {
 		outTag := groupTags[r.Group]
 		if outTag == "" {
-			if r.Group == "DIRECT" || r.Group == "Direct" {
+			// 组名解析不到时：DIRECT→直连，REJECT 系→拦截哨兵，其余（含引用了被删的
+			// 空组）才丢弃。此前 REJECT 走 else 分支被静默丢弃，广告/追踪拦截规则整体失效。
+			switch strings.ToUpper(r.Group) {
+			case "DIRECT":
 				outTag = "direct"
-			} else {
+			case "REJECT", "REJECT-DROP", "REJECT-TINYGIF", "BLOCK":
+				outTag = rejectTag
+			default:
 				continue
 			}
 		}
 
 		switch r.Type {
 		case "RULE-SET":
-			// Clash/Surge .list 格式与 sing-box rule-set 不兼容，跳过
-			// 后续可考虑下载解析后内联
+			// 原始未展开的 RULE-SET 占位（真正的展开在 subscription.ExpandRulesets
+			// 解析期就地完成）。这里出现的都是残留占位，跳过。
 			continue
 		case "DOMAIN-SUFFIX":
-			rules = append(rules, map[string]interface{}{
-				"domain_suffix": []string{r.Value},
-				"outbound":      outTag,
-			})
+			rules = append(rules, subRouteRule("domain_suffix", []string{r.Value}, outTag))
 		case "DOMAIN":
-			rules = append(rules, map[string]interface{}{
-				"domain":   []string{r.Value},
-				"outbound": outTag,
-			})
+			rules = append(rules, subRouteRule("domain", []string{r.Value}, outTag))
 		case "DOMAIN-KEYWORD":
-			rules = append(rules, map[string]interface{}{
-				"domain_keyword": []string{r.Value},
-				"outbound":       outTag,
-			})
+			rules = append(rules, subRouteRule("domain_keyword", []string{r.Value}, outTag))
 		case "IP-CIDR", "IP-CIDR6":
-			rules = append(rules, map[string]interface{}{
-				"ip_cidr":  []string{r.Value},
-				"outbound": outTag,
-			})
+			rules = append(rules, subRouteRule("ip_cidr", []string{r.Value}, outTag))
 		case "GEOIP":
 			// sing-box 1.12 移除了内置 geoip，转换为远程 rule-set
 			code := strings.ToLower(r.Value)
@@ -590,16 +628,25 @@ func buildSubscriptionRules(sub *Subscription, groupTags map[string]string) ([]m
 					"download_detour": "direct",
 				})
 			}
-			rules = append(rules, map[string]interface{}{
-				"rule_set": setTag,
-				"outbound": outTag,
-			})
+			rules = append(rules, subRouteRule("rule_set", setTag, outTag))
 		case "FINAL":
 			// FINAL 不生成 route rule，由 sing-box 的 "final" 字段处理
 			continue
 		}
 	}
 	return rules, sets
+}
+
+// subRouteRule 组装单条订阅 route rule。outTag 为拦截哨兵时生成 action:reject
+// （sing-box 1.11+ 的现代拦截做法），否则生成常规 outbound 引用。
+func subRouteRule(matchKey string, values interface{}, outTag string) map[string]interface{} {
+	rule := map[string]interface{}{matchKey: values}
+	if outTag == rejectTag {
+		rule["action"] = "reject"
+	} else {
+		rule["outbound"] = outTag
+	}
+	return rule
 }
 
 func slugify(s string) string {
@@ -635,8 +682,9 @@ func buildProxyOutbound(line *Line) map[string]interface{} {
 			"enabled":     true,
 			"server_name": line.TrojanSNI,
 		}
-		// SNI 和服务器不一致时需要跳过证书验证（伪装 SNI 场景）
-		if line.TrojanSNI != "" && line.TrojanSNI != line.TrojanServer {
+		// sing-box 用 server_name(SNI) 做证书校验，SNI 与连接地址不同是正常场景，
+		// 不该据此关闭校验。仅在用户/订阅显式 opt-in（自签节点）时才跳过。
+		if line.AllowInsecure {
 			tls["insecure"] = true
 		}
 		ob := map[string]interface{}{

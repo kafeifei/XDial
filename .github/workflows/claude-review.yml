@@ -1,0 +1,35 @@
+name: Claude PR Review
+
+# 全 AI 生成代码库，Swift 侧无单测——PR 自动 review 是主要的质量闸门之一。
+# 需要在仓库 Settings → Secrets 配置 ANTHROPIC_API_KEY 才会生效。
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            对这个 PR 做 code review，用中文，重点：
+            1. 正确性 bug（空指针/越界/竞态/资源泄漏/错误的 API 假设）
+            2. 安全问题（凭据落盘/注入/权限面），这是个管理 VPN 凭据的特权 app
+            3. Swift 侧没有单测，逻辑改动要人肉推演执行路径
+            只报告有把握的问题，不要泛泛的风格意见。用 gh pr comment 发表评论。
+          claude_args: |
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"

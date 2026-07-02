@@ -14,6 +14,8 @@ func runStopCmd(args []string) {
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
+	rejectLeftoverArgs(fs)
+	checkSocketPath(*socketPath)
 
 	req := Request{ID: nextRequestID(), Cmd: "stop"}
 	resp, err := sendCommand(*socketPath, req)

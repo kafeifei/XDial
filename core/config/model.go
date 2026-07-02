@@ -48,6 +48,11 @@ type Line struct {
 	// 通用传输选项
 	TFO bool `json:"tfo,omitempty"` // TCP Fast Open
 	UDP bool `json:"udp,omitempty"` // UDP relay / over TCP
+
+	// AllowInsecure 跳过 TLS 证书验证（自签场景显式 opt-in）。默认 false=验证：
+	// 之前 VPN 硬编码跳过验证、trojan 按 SNI!=server 启发式跳过，都是不安全默认，
+	// 公开仓库里对全世界暴露 MITM 窃取凭据的面。
+	AllowInsecure bool `json:"allow_insecure,omitempty"`
 }
 
 // RuleSetType 规则类型（流量匹配规则）

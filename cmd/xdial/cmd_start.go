@@ -62,6 +62,7 @@ func runStartCmd(args []string) {
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
+	rejectLeftoverArgs(fs)
 
 	if *profilePath == "" {
 		fs.Usage()

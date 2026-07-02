@@ -48,19 +48,21 @@ enum PrivilegeManager {
                 userInfo: [NSLocalizedDescriptionKey: "找不到 xdial 二进制: \(helperSource)"])
         }
 
-        let tmpPlist = "/tmp/xdial-daemon.plist"
-        try buildPlist().write(toFile: tmpPlist, atomically: true, encoding: .utf8)
-
+        // plist 直接在 root shell 内用带引号的 heredoc 生成到目标路径，不经世界可写的
+        // /tmp 中转——旧做法先写 /tmp/xdial-daemon.plist 再 root cp，存在 TOCTOU 提权窗口
+        // （攻击者在窗口期替换该文件即可让 root 加载任意 LaunchDaemon）。
+        // 分隔符加引号（<<'XDIAL_PLIST_EOF'）禁止 shell 展开；plist 内容全是 app 常量，无注入面。
         let shell = """
         set -eu
         mkdir -p '\(helperDir)'
         cp '\(helperSource)' '\(helperPath)'
         chown root:wheel '\(helperPath)'
         chmod 0755 '\(helperPath)'
-        cp '\(tmpPlist)' '\(plistPath)'
+        cat > '\(plistPath)' <<'XDIAL_PLIST_EOF'
+        \(buildPlist())
+        XDIAL_PLIST_EOF
         chown root:wheel '\(plistPath)'
         chmod 0644 '\(plistPath)'
-        rm -f '\(tmpPlist)'
         launchctl bootout system/\(label) 2>/dev/null || true
         launchctl bootstrap system '\(plistPath)'
         """

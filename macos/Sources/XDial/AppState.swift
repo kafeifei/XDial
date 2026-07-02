@@ -164,8 +164,9 @@ final class AppState: ObservableObject {
             UserDefaults.standard.removeObject(forKey: profileKey)
             UserDefaults.standard.removeObject(forKey: "xdial.language")
             UserDefaults.standard.removeObject(forKey: "xdial.launchAtLogin")
-            // 删除 vault
-            KeychainStore.saveVault([:])
+            // 彻底删除 ~/.xdial（明文密码所在）+ Keychain 旧数据，而不只是把 vault 覆盖成空
+            KeychainStore.deleteVault()
+            try? FileManager.default.removeItem(atPath: appLogPath())
         }
         helperInstalled = false
         completion(true, nil)

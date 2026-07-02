@@ -137,6 +137,9 @@ func clashProxyToLine(p map[string]interface{}) (config.Line, bool) {
 			sni = server
 		}
 		base.TrojanSNI = sni
+		// Clash 用 skip-cert-verify 表达"跳过证书校验"，映射过来保留订阅原意，
+		// 否则默认走校验（生成器不再按 SNI!=server 启发式关闭校验）
+		base.AllowInsecure = getBool(p, "skip-cert-verify")
 		return base, true
 
 	default:
@@ -170,4 +173,14 @@ func getInt(m map[string]interface{}, key string) int {
 		return int(n)
 	}
 	return 0
+}
+
+func getBool(m map[string]interface{}, key string) bool {
+	switch v := m[key].(type) {
+	case bool:
+		return v
+	case string:
+		return v == "true" || v == "1"
+	}
+	return false
 }

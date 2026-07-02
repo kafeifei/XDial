@@ -1,13 +1,25 @@
 import Foundation
 
+// 日志放到用户私有目录并以 0600 创建；之前写 /tmp/xdial-app.log（世界可读），
+// 会把 parse-sub 响应里的节点密码等敏感内容暴露给同机任意用户。
+func appLogPath() -> String {
+    let dir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/XDial")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("xdial-app.log").path
+}
+
 func appLog(_ msg: String) {
     let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
-    if let fh = FileHandle(forWritingAtPath: "/tmp/xdial-app.log") {
+    let path = appLogPath()
+    if let fh = FileHandle(forWritingAtPath: path) {
         fh.seekToEndOfFile()
         fh.write(line.data(using: .utf8)!)
         fh.closeFile()
     } else {
-        FileManager.default.createFile(atPath: "/tmp/xdial-app.log", contents: line.data(using: .utf8))
+        FileManager.default.createFile(
+            atPath: path, contents: line.data(using: .utf8),
+            attributes: [.posixPermissions: 0o600])
     }
 }
 
@@ -329,7 +341,8 @@ final class GoEngine: ObservableObject {
     }
 
     private func handleResponse(id: String, msg: DaemonResponse) {
-        appLog("response: id=\(id) ok=\(String(describing: msg.ok)) data=\(msg.data ?? "")")
+        // 不记录 data 正文：parse-sub 等响应含节点明文密码/订阅 token，只记长度
+        appLog("response: id=\(id) ok=\(String(describing: msg.ok)) dataLen=\(msg.data?.count ?? 0)")
         if let callback = pendingCallbacks.removeValue(forKey: id) {
             callback(msg)
         } else if msg.ok != true {
