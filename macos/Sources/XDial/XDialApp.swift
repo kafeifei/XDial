@@ -11,6 +11,7 @@ struct XDialApp: App {
                 .environmentObject(state)
         } label: {
             Image(nsImage: AppIcon.menuBar())
+                .accessibilityLabel("XDial")
         }
         .menuBarExtraStyle(.window)
 
