@@ -22,18 +22,21 @@ enum AppIcon {
         return img
     }
 
-    /// 菜单栏图标：小尺寸，纯 🌐 无背景（系统自动适配深浅模式）
+    /// 菜单栏使用透明背景的轮船 Emoji。
     static func menuBar() -> NSImage {
-        let s: CGFloat = 18
-        let img = NSImage(size: NSSize(width: s, height: s))
-        img.lockFocus()
-        let globe = "🌐" as NSString
-        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 14)]
-        let sz = globe.size(withAttributes: attrs)
-        globe.draw(at: NSPoint(x: (s - sz.width) / 2, y: (s - sz.height) / 2), withAttributes: attrs)
-        img.unlockFocus()
-        img.isTemplate = false
-        return img
+        let size: CGFloat = 18
+        let image = NSImage(size: NSSize(width: size, height: size))
+        image.lockFocus()
+        let ship = "🚢" as NSString
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 15)]
+        let shipSize = ship.size(withAttributes: attributes)
+        ship.draw(
+            at: NSPoint(x: (size - shipSize.width) / 2, y: (size - shipSize.height) / 2),
+            withAttributes: attributes
+        )
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
     }
 
     // MARK: - 内部绘制
