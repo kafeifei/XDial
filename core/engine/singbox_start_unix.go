@@ -4,12 +4,13 @@ package engine
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 )
 
 // startSingBoxCmd launches sing-box with a pipe sentinel that kills it if the parent dies.
-func startSingBoxCmd(singboxBin, configPath, workDir string) (*exec.Cmd, *os.File, error) {
+func startSingBoxCmd(singboxBin, configPath, workDir string, output io.Writer) (*exec.Cmd, *os.File, error) {
 	r, w, err := os.Pipe()
 	if err != nil {
 		return nil, nil, fmt.Errorf("create pipe: %w", err)
@@ -27,8 +28,8 @@ func startSingBoxCmd(singboxBin, configPath, workDir string) (*exec.Cmd, *os.Fil
 		"WD="+workDir,
 	)
 	cmd.ExtraFiles = []*os.File{r}
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = output
+	cmd.Stderr = output
 
 	if err := cmd.Start(); err != nil {
 		r.Close()
