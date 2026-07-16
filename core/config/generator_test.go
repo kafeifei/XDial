@@ -365,14 +365,67 @@ func TestGenerateTailscaleEndpoint(t *testing.T) {
 			t.Fatal("tailscale-only profile must not generate VPN outbound")
 		}
 	}
-	rules := cfg.Route["rules"].([]interface{})
-	preferred := rules[1].(map[string]interface{})
-	if preferred["preferred_by"] != "tailscale-../../work" || preferred["outbound"] != "tailscale-../../work" {
-		t.Fatalf("tailscale preferred route missing: %v", preferred)
+	preferredFound := false
+	for _, rawRule := range cfg.Route["rules"].([]interface{}) {
+		rule := rawRule.(map[string]interface{})
+		if rule["preferred_by"] == "tailscale-../../work" && rule["outbound"] == "tailscale-../../work" {
+			preferredFound = true
+			break
+		}
+	}
+	if !preferredFound {
+		t.Fatal("tailscale preferred route missing")
 	}
 	servers := cfg.DNS["servers"].([]interface{})
 	if len(servers) != 2 || servers[1].(map[string]interface{})["type"] != "tailscale" {
 		t.Fatalf("tailscale DNS missing: %v", servers)
+	}
+}
+
+func TestGenerateExplicitModeRuleBeforeTailscalePreferredRoute(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{
+			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
+			{ID: "vpn", Name: "VPN", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com:8443"},
+			{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true, TailscaleExitNode: "exit-node"},
+		},
+		RuleSets: []RuleSet{
+			{ID: "internal", Name: "内部域名", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"corp.example.com"}},
+		},
+		Modes: []Mode{{
+			ID: "split", Name: "分流",
+			Bindings:      []RuleBinding{{RuleSetID: "internal", LineID: "vpn"}},
+			DefaultLineID: "direct",
+		}},
+		ActiveModeID: "split",
+	}
+
+	data, err := GenerateSingBoxFor(p, 10800, "", PlatformMacOS, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	explicitIndex, preferredIndex := -1, -1
+	for i, rawRule := range cfg.Route["rules"].([]interface{}) {
+		rule := rawRule.(map[string]interface{})
+		if rule["outbound"] == "vpn" {
+			if domains, ok := rule["domain_suffix"].([]interface{}); ok && len(domains) == 1 && domains[0] == "corp.example.com" {
+				explicitIndex = i
+			}
+		}
+		if rule["preferred_by"] == "tailscale-ts" {
+			preferredIndex = i
+		}
+	}
+	if explicitIndex < 0 || preferredIndex < 0 {
+		t.Fatalf("expected explicit VPN and Tailscale preferred rules, got %v", cfg.Route["rules"])
+	}
+	if explicitIndex >= preferredIndex {
+		t.Fatalf("explicit VPN rule at %d must precede Tailscale preferred route at %d", explicitIndex, preferredIndex)
 	}
 }
 

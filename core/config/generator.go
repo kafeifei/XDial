@@ -160,7 +160,7 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 		}
 	}
 
-	routeRules := buildSystemRouteRules(tailscaleTags)
+	routeRules := buildSystemRouteRules()
 	ruleSetResources := sbCollectRuleSets(profile, mode)
 
 	// 订阅自带规则在模式规则之前（让订阅的分组规则优先匹配）
@@ -192,6 +192,11 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 	// 模式规则作为兜底（引用不存在的 outbound 时跳过）
 	modeRules := buildModeRouteRules(profile, mode, subTagMap, validTags)
 	routeRules = append(routeRules, modeRules...)
+
+	// Tailscale 的 preferred_by 会包含出口节点发布的默认路由。它必须排在
+	// 用户显式配置的订阅/模式规则之后，否则 0.0.0.0/0 会抢走所有流量，
+	// 例如本应命中企业域名 → VPN 的请求会提前走 Tailscale 出口。
+	routeRules = append(routeRules, buildTailscalePreferredRouteRules(tailscaleTags)...)
 
 	defaultTag := "direct"
 	if mode.DefaultSubscriptionID != "" {
@@ -304,8 +309,16 @@ func buildDNS(tailscaleTag string) map[string]interface{} {
 	}
 }
 
-func buildSystemRouteRules(tailscaleTags []string) []map[string]interface{} {
-	rules := []map[string]interface{}{{"action": "sniff"}}
+func buildSystemRouteRules() []map[string]interface{} {
+	return []map[string]interface{}{
+		{"action": "sniff"},
+		{"protocol": "dns", "action": "route", "outbound": "direct"},
+		{"domain_suffix": testDomains, "outbound": testSelectorTag},
+	}
+}
+
+func buildTailscalePreferredRouteRules(tailscaleTags []string) []map[string]interface{} {
+	var rules []map[string]interface{}
 	for _, tag := range tailscaleTags {
 		rules = append(rules, map[string]interface{}{
 			"preferred_by": tag,
@@ -313,10 +326,7 @@ func buildSystemRouteRules(tailscaleTags []string) []map[string]interface{} {
 			"outbound":     tag,
 		})
 	}
-	return append(rules,
-		map[string]interface{}{"protocol": "dns", "action": "route", "outbound": "direct"},
-		map[string]interface{}{"domain_suffix": testDomains, "outbound": testSelectorTag},
-	)
+	return rules
 }
 
 func buildModeRouteRules(profile *Profile, mode *Mode, subTagMap map[string]string, validTags map[string]bool) []map[string]interface{} {
