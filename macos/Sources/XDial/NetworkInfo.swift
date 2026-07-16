@@ -48,6 +48,8 @@ final class NetworkInfo: ObservableObject {
 
             for line in lines where line.enabled {
                 if Task.isCancelled { return }
+                // Tailnet-only 线路没有公网出口 IP；只有配置了 Exit Node 才做公网探测。
+                if line.type == "tailscale" && line.tailscaleExitNode.isEmpty { continue }
                 let canProbe = (line.type == "direct") || helperConnected
                 if !canProbe { continue }
                 await probeLine(line: line, helperConnected: helperConnected)
@@ -250,6 +252,7 @@ final class NetworkInfo: ObservableObject {
         switch line.type {
         case "direct": return "direct"
         case "vpn": return "vpn"
+        case "tailscale": return "tailscale-" + line.id
         default: return "proxy-" + line.id
         }
     }

@@ -13,6 +13,7 @@ type Request struct {
 	ID         string `json:"id"`
 	Cmd        string `json:"cmd"`
 	Profile    string `json:"profile,omitempty"`
+	LineID     string `json:"line_id,omitempty"`
 	SubURL     string `json:"sub_url,omitempty"`
 	SubContent string `json:"sub_content,omitempty"`
 	SubFormat  string `json:"sub_format,omitempty"`

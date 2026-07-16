@@ -10,6 +10,7 @@ import (
 type SingBoxConfig struct {
 	Log          map[string]interface{}   `json:"log"`
 	DNS          map[string]interface{}   `json:"dns"`
+	Endpoints    []map[string]interface{} `json:"endpoints,omitempty"`
 	Inbounds     []map[string]interface{} `json:"inbounds"`
 	Outbounds    []map[string]interface{} `json:"outbounds"`
 	Route        map[string]interface{}   `json:"route"`
@@ -59,30 +60,45 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 		return nil, fmt.Errorf("no active mode")
 	}
 
-	vpnOutbound := map[string]interface{}{
-		"type":        "socks",
-		"tag":         "vpn",
-		"server":      "127.0.0.1",
-		"server_port": socksPort,
+	outbounds := []map[string]interface{}{{"type": "direct", "tag": "direct"}}
+	if profile.ActiveVPNLine() != nil {
+		vpnOutbound := map[string]interface{}{
+			"type":        "socks",
+			"tag":         "vpn",
+			"server":      "127.0.0.1",
+			"server_port": socksPort,
+		}
+		if platform == PlatformNE {
+			// NE 模式下 sing-box 是库,跑在同一进程里,"vpn" 出口是
+			// core/libbox/vpn_outbound.go 注册的自研 outbound(直接拨
+			// VPNBridge,不经本地 SOCKS5 中转);macOS 模式下 sing-box 是
+			// 外部子进程,只能通过 127.0.0.1 socks 中转回 app 进程里的 VPNBridge。
+			vpnOutbound = map[string]interface{}{
+				"type": "vpn",
+				"tag":  "vpn",
+			}
+		}
+		outbounds = append(outbounds, vpnOutbound)
 	}
-	if platform == PlatformNE {
-		// NE 模式下 sing-box 是库,跑在同一进程里,"vpn" 出口是
-		// core/libbox/vpn_outbound.go 注册的自研 outbound(直接拨
-		// VPNBridge,不经本地 SOCKS5 中转);macOS 模式下 sing-box 是
-		// 外部子进程,只能通过 127.0.0.1 socks 中转回 app 进程里的 VPNBridge。
-		vpnOutbound = map[string]interface{}{
-			"type": "vpn",
-			"tag":  "vpn",
+
+	var endpoints []map[string]interface{}
+	var tailscaleTags []string
+	if platform == PlatformMacOS {
+		for _, line := range profile.Lines {
+			if !line.Enabled || line.Type != LineTypeTailscale {
+				continue
+			}
+			endpoint, err := buildTailscaleEndpoint(&line, basePath)
+			if err != nil {
+				return nil, err
+			}
+			endpoints = append(endpoints, endpoint)
+			tailscaleTags = append(tailscaleTags, tailscaleEndpointTag(&line))
 		}
 	}
 
-	outbounds := []map[string]interface{}{
-		{"type": "direct", "tag": "direct"},
-		vpnOutbound,
-	}
-
 	for _, line := range profile.Lines {
-		if !line.Enabled || line.Type == LineTypeDirect || line.Type == LineTypeVPN {
+		if !line.Enabled || line.Type == LineTypeDirect || line.Type == LineTypeVPN || line.Type == LineTypeTailscale {
 			continue
 		}
 		ob := buildProxyOutbound(&line)
@@ -107,14 +123,15 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 	}
 
 	// selector 出口组：包含所有有效线路和订阅组
-	selectorMembers := []string{"direct", "vpn"}
+	selectorMembers := []string{"direct"}
 	for _, ob := range outbounds {
 		tag, _ := ob["tag"].(string)
-		if tag == "direct" || tag == "vpn" {
+		if tag == "direct" {
 			continue
 		}
 		selectorMembers = append(selectorMembers, tag)
 	}
+	selectorMembers = append(selectorMembers, tailscaleTags...)
 	outbounds = append(outbounds, map[string]interface{}{
 		"type":      "selector",
 		"tag":       testSelectorTag,
@@ -134,8 +151,16 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 			validTags[tag] = true
 		}
 	}
+	for _, endpoint := range endpoints {
+		if tag, _ := endpoint["tag"].(string); tag != "" {
+			if validTags[tag] {
+				return nil, fmt.Errorf("duplicate outbound tag: %q", tag)
+			}
+			validTags[tag] = true
+		}
+	}
 
-	routeRules := buildSystemRouteRules()
+	routeRules := buildSystemRouteRules(tailscaleTags)
 	ruleSetResources := sbCollectRuleSets(profile, mode)
 
 	// 订阅自带规则在模式规则之前（让订阅的分组规则优先匹配）
@@ -186,6 +211,9 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 		"rules": routeRules,
 		"final": defaultTag,
 	}
+	if len(tailscaleTags) > 0 {
+		route["default_domain_resolver"] = "system"
+	}
 	// auto_detect_interface 是桌面专属:选物理网卡。NE 模式下路由由平台层
 	// (NEPacketTunnelNetworkSettings)接管,不生成此字段。
 	if platform == PlatformMacOS {
@@ -199,7 +227,8 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 		Log: map[string]interface{}{
 			"level": "info",
 		},
-		DNS: buildDNS(),
+		DNS:       buildDNS(firstString(tailscaleTags)),
+		Endpoints: endpoints,
 		Inbounds: []map[string]interface{}{
 			buildTUNInbound(vpnServerIP, platform),
 		},
@@ -257,23 +286,37 @@ func buildTUNInbound(vpnServerIP string, platform Platform) map[string]interface
 	return inbound
 }
 
-func buildDNS() map[string]interface{} {
+func buildDNS(tailscaleTag string) map[string]interface{} {
+	servers := []map[string]interface{}{{"tag": "system", "type": "local"}}
+	if tailscaleTag == "" {
+		return map[string]interface{}{"servers": servers}
+	}
+	servers = append(servers, map[string]interface{}{
+		"type":     "tailscale",
+		"tag":      "tailscale-dns",
+		"endpoint": tailscaleTag,
+	})
 	return map[string]interface{}{
-		"servers": []map[string]interface{}{
-			{
-				"tag":  "system",
-				"type": "local",
-			},
+		"servers": servers,
+		"rules": []map[string]interface{}{
+			{"ip_accept_any": true, "server": "tailscale-dns"},
 		},
 	}
 }
 
-func buildSystemRouteRules() []map[string]interface{} {
-	return []map[string]interface{}{
-		{"action": "sniff"},
-		{"protocol": "dns", "action": "route", "outbound": "direct"},
-		{"domain_suffix": testDomains, "outbound": testSelectorTag},
+func buildSystemRouteRules(tailscaleTags []string) []map[string]interface{} {
+	rules := []map[string]interface{}{{"action": "sniff"}}
+	for _, tag := range tailscaleTags {
+		rules = append(rules, map[string]interface{}{
+			"preferred_by": tag,
+			"action":       "route",
+			"outbound":     tag,
+		})
 	}
+	return append(rules,
+		map[string]interface{}{"protocol": "dns", "action": "route", "outbound": "direct"},
+		map[string]interface{}{"domain_suffix": testDomains, "outbound": testSelectorTag},
+	)
 }
 
 func buildModeRouteRules(profile *Profile, mode *Mode, subTagMap map[string]string, validTags map[string]bool) []map[string]interface{} {
@@ -406,9 +449,22 @@ func resolveOutboundTag(line *Line) string {
 		return "direct"
 	case LineTypeVPN:
 		return "vpn"
+	case LineTypeTailscale:
+		return tailscaleEndpointTag(line)
 	default:
 		return "proxy-" + line.ID
 	}
+}
+
+func tailscaleEndpointTag(line *Line) string {
+	return "tailscale-" + line.ID
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }
 
 // rejectTag 是 groupTags 里的哨兵值：不是真实 outbound tag（含 NUL 保证永不与

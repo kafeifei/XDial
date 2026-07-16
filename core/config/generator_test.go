@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -320,5 +321,83 @@ func TestGenerateMacOSModeUnchanged(t *testing.T) {
 	tun := cfg.Inbounds[0]
 	if tun["auto_route"] != true || tun["stack"] != "system" {
 		t.Error("macOS tun should keep auto_route/stack")
+	}
+}
+
+func TestGenerateTailscaleEndpoint(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{
+			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
+			{
+				ID: "../../work", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
+				TailscaleHostname: "xdial-mac", TailscaleAcceptRoutes: true,
+			},
+		},
+		Modes:        []Mode{{ID: "tailnet", Name: "Tailnet", DefaultLineID: "direct"}},
+		ActiveModeID: "tailnet",
+	}
+
+	data, err := GenerateSingBoxFor(p, 0, "", PlatformMacOS, "/Library/Application Support/XDial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Endpoints) != 1 {
+		t.Fatalf("expected one tailscale endpoint, got %d", len(cfg.Endpoints))
+	}
+	endpoint := cfg.Endpoints[0]
+	if endpoint["type"] != "tailscale" || endpoint["tag"] != "tailscale-../../work" {
+		t.Fatalf("unexpected endpoint: %v", endpoint)
+	}
+	if endpoint["hostname"] != "xdial-mac" || endpoint["accept_routes"] != true {
+		t.Fatalf("tailscale options missing: %v", endpoint)
+	}
+	stateDirectory, _ := endpoint["state_directory"].(string)
+	if !strings.HasPrefix(stateDirectory, "/Library/Application Support/XDial/tailscale/") || strings.Contains(stateDirectory, "..") {
+		t.Fatalf("unsafe tailscale state directory: %q", stateDirectory)
+	}
+
+	for _, outbound := range cfg.Outbounds {
+		if outbound["tag"] == "vpn" {
+			t.Fatal("tailscale-only profile must not generate VPN outbound")
+		}
+	}
+	rules := cfg.Route["rules"].([]interface{})
+	preferred := rules[1].(map[string]interface{})
+	if preferred["preferred_by"] != "tailscale-../../work" || preferred["outbound"] != "tailscale-../../work" {
+		t.Fatalf("tailscale preferred route missing: %v", preferred)
+	}
+	servers := cfg.DNS["servers"].([]interface{})
+	if len(servers) != 2 || servers[1].(map[string]interface{})["type"] != "tailscale" {
+		t.Fatalf("tailscale DNS missing: %v", servers)
+	}
+}
+
+func TestGenerateTailscaleExitNodeAsDefault(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{
+			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
+			{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true, TailscaleExitNode: "exit-node"},
+		},
+		Modes:        []Mode{{ID: "exit", Name: "Exit", DefaultLineID: "ts"}},
+		ActiveModeID: "exit",
+	}
+
+	data, err := GenerateSingBoxFor(p, 0, "", PlatformMacOS, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Route["final"] != "tailscale-ts" {
+		t.Fatalf("tailscale should be final outbound, got %v", cfg.Route["final"])
+	}
+	if cfg.Endpoints[0]["exit_node"] != "exit-node" {
+		t.Fatalf("exit node missing: %v", cfg.Endpoints[0])
 	}
 }

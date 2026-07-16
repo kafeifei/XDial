@@ -123,8 +123,15 @@ final class AppState: ObservableObject {
 
     func probeNetwork() {
         guard engine.status == "connected" else { return }
+        var usedIDs = Set(activeMode?.bindings.map { $0.lineID } ?? [])
+        if let defaultLineID = activeMode?.defaultLineID, !defaultLineID.isEmpty {
+            usedIDs.insert(defaultLineID)
+        }
+        let activeLines = profile.lines.filter {
+            usedIDs.contains($0.id) || ($0.enabled && $0.type == "tailscale")
+        }
         NetworkInfo.shared.probeAll(
-            lines: profile.lines,
+            lines: activeLines,
             subscriptions: profile.subscriptions,
             helperConnected: true
         )
@@ -154,7 +161,7 @@ final class AppState: ObservableObject {
         if launchAtLogin { launchAtLogin = false }
         // 3. 卸载 LaunchDaemon + helper（admin 权限）
         do {
-            try PrivilegeManager.uninstall()
+            try PrivilegeManager.uninstall(deleteData: deleteData)
         } catch {
             completion(false, error.localizedDescription)
             return
@@ -209,6 +216,24 @@ final class AppState: ObservableObject {
         engine.stop()
     }
 
+    func loginTailscale(lineID: String) {
+        save()
+        if !helperInstalled || helperNeedsUpdate {
+            installHelper()
+        }
+        guard helperInstalled, !helperNeedsUpdate else { return }
+        engine.loginTailscale(lineID: lineID, profileJSON: buildProfileJSON())
+    }
+
+    func refreshTailscaleExitNodes(lineID: String) {
+        save()
+        if !helperInstalled || helperNeedsUpdate {
+            installHelper()
+        }
+        guard helperInstalled, !helperNeedsUpdate else { return }
+        engine.refreshTailscaleExitNodes(lineID: lineID, profileJSON: buildProfileJSON())
+    }
+
     func installHelper(thenConnect: Bool = false) {
         do {
             try PrivilegeManager.install()
@@ -239,6 +264,8 @@ final class AppState: ObservableObject {
             profile.lines[i].ssPassword = profile.lines[i].ssPassword.normalizedASCII()
             profile.lines[i].vmessServer = profile.lines[i].vmessServer.normalizedASCII()
             profile.lines[i].vmessUUID = profile.lines[i].vmessUUID.normalizedASCII()
+            profile.lines[i].tailscaleHostname = profile.lines[i].tailscaleHostname.normalizedASCII()
+            profile.lines[i].tailscaleExitNode = profile.lines[i].tailscaleExitNode.normalizedASCII()
         }
         for i in profile.ruleSets.indices {
             profile.ruleSets[i].url = profile.ruleSets[i].url.normalizedASCII()

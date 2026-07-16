@@ -13,6 +13,7 @@ const (
 	LineTypeTrojan      LineType = "trojan"
 	LineTypeShadowsocks LineType = "shadowsocks"
 	LineTypeVMess       LineType = "vmess"
+	LineTypeTailscale   LineType = "tailscale"
 )
 
 // Line 线路：流量从哪个通道出去
@@ -44,6 +45,11 @@ type Line struct {
 	VMessPort   int    `json:"vmess_port,omitempty"`
 	VMessUUID   string `json:"vmess_uuid,omitempty"`
 	VMessAltID  int    `json:"vmess_alt_id,omitempty"`
+
+	// Tailscale
+	TailscaleHostname     string `json:"tailscale_hostname,omitempty"`
+	TailscaleAcceptRoutes bool   `json:"tailscale_accept_routes,omitempty"`
+	TailscaleExitNode     string `json:"tailscale_exit_node,omitempty"`
 
 	// 通用传输选项
 	TFO bool `json:"tfo,omitempty"` // TCP Fast Open
@@ -208,6 +214,25 @@ func (p *Profile) VPNLine() *Line {
 		if p.Lines[i].Type == LineTypeVPN {
 			return &p.Lines[i]
 		}
+	}
+	return nil
+}
+
+// ActiveVPNLine 返回活动模式实际引用的 VPN 线路。
+func (p *Profile) ActiveVPNLine() *Line {
+	mode := p.ActiveMode()
+	if mode == nil {
+		return nil
+	}
+	for _, binding := range mode.Bindings {
+		line := p.FindLine(binding.LineID)
+		if line != nil && line.Enabled && line.Type == LineTypeVPN {
+			return line
+		}
+	}
+	line := p.FindLine(mode.DefaultLineID)
+	if line != nil && line.Enabled && line.Type == LineTypeVPN {
+		return line
 	}
 	return nil
 }

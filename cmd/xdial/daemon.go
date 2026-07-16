@@ -28,6 +28,18 @@ func (d *daemonCallback) OnError(code int, message string) {
 	d.clients.BroadcastEvent(Event{Event: "error", Data: message})
 }
 
+func (d *daemonCallback) OnAuthRequired(authURL string) {
+	d.clients.BroadcastEvent(Event{Event: "tailscale-auth-required", Data: authURL})
+}
+
+func (d *daemonCallback) OnTailscaleExitNodes(lineID string, nodes []engine.TailscaleExitNode) {
+	data, _ := json.Marshal(struct {
+		LineID string                     `json:"line_id"`
+		Nodes  []engine.TailscaleExitNode `json:"nodes"`
+	}{LineID: lineID, Nodes: nodes})
+	d.clients.BroadcastEvent(Event{Event: "tailscale-exit-nodes", Data: string(data)})
+}
+
 func runDaemon(socketPath string) {
 	if isAlreadyRunning(socketPath) {
 		slog.Info("another instance is already running, exiting")
@@ -38,10 +50,15 @@ func runDaemon(socketPath string) {
 
 	basePath := filepath.Join(os.TempDir(), "xdial-engine")
 	os.MkdirAll(basePath, 0700) // 内含明文节点密码的 sing-box.json，收紧目录权限
+	statePath := filepath.Join("/Library", "Application Support", "XDial")
+	if err := os.MkdirAll(statePath, 0700); err != nil {
+		slog.Error("create state directory failed", "path", statePath, "err", err)
+		os.Exit(1)
+	}
 
 	clients := NewClientSet()
 	cb := &daemonCallback{clients: clients}
-	eng := engine.New(basePath, cb)
+	eng := engine.New(basePath, statePath, cb)
 
 	os.Remove(socketPath)
 	ln, err := net.Listen("unix", socketPath)
@@ -121,6 +138,45 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
 			} else {
 				client.SendResponse(Response{ID: req.ID, OK: true})
+			}
+
+		case "tailscale-auth":
+			profile, err := config.ParseProfile([]byte(req.Profile))
+			if err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
+				continue
+			}
+			line := profile.FindLine(req.LineID)
+			if line == nil || line.Type != config.LineTypeTailscale {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: "Tailscale 线路不存在"})
+				continue
+			}
+			if err := eng.StartTailscaleAuth(line); err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+			} else {
+				client.SendResponse(Response{ID: req.ID, OK: true})
+			}
+
+		case "tailscale-exit-nodes":
+			profile, err := config.ParseProfile([]byte(req.Profile))
+			if err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
+				continue
+			}
+			line := profile.FindLine(req.LineID)
+			if line == nil || line.Type != config.LineTypeTailscale {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: "Tailscale 线路不存在"})
+				continue
+			}
+			nodes, err := eng.TailscaleExitNodes(line)
+			if err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+			} else {
+				data, _ := json.Marshal(struct {
+					LineID string                     `json:"line_id"`
+					Nodes  []engine.TailscaleExitNode `json:"nodes"`
+				}{LineID: line.ID, Nodes: nodes})
+				client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
 			}
 
 		case "kill-session":

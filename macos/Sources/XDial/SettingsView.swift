@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -122,8 +123,8 @@ struct GeneralTab: View {
             Button(state.tr("取消", "Cancel"), role: .cancel) {}
         } message: {
             Text(state.tr(
-                "「卸载并删除所有数据」会清除你保存的所有线路、规则、模式，以及 ~/.xdial 中保存的密码。",
-                "“Uninstall and delete all data” removes all your lines, rules, modes, and the passwords saved in ~/.xdial."
+                "「卸载并删除所有数据」会清除线路、规则、模式、钥匙串密码和 Tailscale 登录状态。",
+                "“Uninstall and delete all data” removes lines, rules, modes, Keychain passwords, and Tailscale login state."
             ))
         }
     }
@@ -172,6 +173,7 @@ struct LinesTab: View {
                     Button("Trojan") { add(type: "trojan") }
                     Button("Shadowsocks") { add(type: "shadowsocks") }
                     Button("VMess") { add(type: "vmess") }
+                    Button("Tailscale") { add(type: "tailscale") }
                     Divider()
                     Button(state.tr("从订阅导入…", "Import from subscription…")) {
                         showAddSub = true
@@ -196,6 +198,7 @@ struct LinesTab: View {
         case "trojan": name = "Trojan 节点"
         case "shadowsocks": name = "SS 节点"
         case "vmess": name = "VMess 节点"
+        case "tailscale": name = "Tailscale"
         default: name = "节点"
         }
         state.profile.lines.append(Line(id: id, name: name, type: type))
@@ -233,7 +236,12 @@ struct LineRow: View {
                 Image(systemName: line.verified ? "checkmark.seal.fill" : "checkmark.seal")
                     .foregroundStyle(.secondary)
 
-                Text(line.name).font(.system(size: 13, weight: .medium))
+                Text(line.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityAction {
+                        if !isLocked { expanded.toggle() }
+                    }
 
                 if !briefInfo.isEmpty {
                     Text(briefInfo).font(.caption).foregroundStyle(.secondary)
@@ -254,10 +262,14 @@ struct LineRow: View {
                 }
             }
         )
-        .opacity(isLocked ? 0.6 : (line.verified ? 1.0 : 0.7))
+        .opacity(isLocked ? 0.6 : (line.verified || line.type == "tailscale" ? 1.0 : 0.7))
     }
 
     private var briefInfo: String {
+        if line.type == "tailscale", state.engine.tailscaleAuthLineID == line.id,
+           state.engine.tailscaleAuthURL != nil {
+            return state.tr("授权页已打开", "Login page opened")
+        }
         // 已探测：显示真实出口 IP/地区
         if let info = net.perLine[line.id], !info.summary.isEmpty {
             return info.summary
@@ -279,6 +291,18 @@ struct LineRow: View {
         case "vmess":
             guard !line.vmessServer.isEmpty else { return "" }
             return "\(line.vmessServer):\(line.vmessPort)"
+        case "tailscale":
+            if !line.tailscaleExitNode.isEmpty {
+                let selected = state.engine.tailscaleExitNodes[line.id]?.first {
+                    $0.ip == line.tailscaleExitNode
+                }
+                return "Exit: \(selected?.name ?? line.tailscaleExitNode)"
+            }
+            if let nodes = state.engine.tailscaleExitNodes[line.id] {
+                let onlineCount = nodes.filter(\.online).count
+                return state.tr("\(onlineCount) 个可用出口", "\(onlineCount) exits available")
+            }
+            return line.tailscaleHostname.isEmpty ? "Tailnet" : line.tailscaleHostname
         default:
             return ""
         }
@@ -291,6 +315,7 @@ struct LineRow: View {
         case "trojan": return "Trojan"
         case "shadowsocks": return "SS"
         case "vmess": return "VMess"
+        case "tailscale": return "Tailscale"
         default: return line.type
         }
     }
@@ -319,6 +344,39 @@ struct LineRow: View {
             intField("端口", $line.vmessPort)
             secureField("UUID", $line.vmessUUID)
             intField("Alter ID", $line.vmessAltID)
+        case "tailscale":
+            field("设备名", $line.tailscaleHostname, placeholder: "xdial-mac")
+            tailscaleExitNodePicker
+            toggleField("子网路由", $line.tailscaleAcceptRoutes)
+            HStack {
+                Spacer().frame(width: 60)
+                Button(state.engine.tailscaleAuthInProgress && state.engine.tailscaleAuthLineID == line.id
+                       ? state.tr("正在启动登录…", "Starting login…")
+                       : state.tr("登录 Tailscale", "Login to Tailscale")) {
+                    state.loginTailscale(lineID: line.id)
+                }
+                .controlSize(.small)
+                .disabled(state.engine.isBusy || state.engine.isConnected || state.engine.tailscaleAuthInProgress)
+                if state.engine.tailscaleAuthLineID == line.id,
+                   let authURL = state.engine.tailscaleAuthURL {
+                    Button(state.tr("打开 Tailscale 登录页", "Open Tailscale Login")) {
+                        NSWorkspace.shared.open(authURL)
+                    }
+                    .controlSize(.small)
+                }
+                Spacer()
+            }
+            Text(state.tr(
+                state.engine.isConnected
+                    ? "请先断开 XDial，再在这里完成 Tailscale 登录。"
+                    : "登录后从已批准的出口节点中选择；连接后会自动接管 Tailnet 设备和 MagicDNS。",
+                state.engine.isConnected
+                    ? "Disconnect XDial before signing in to Tailscale here."
+                    : "Sign in, then select an approved exit node. Tailnet peers and MagicDNS are routed automatically after connecting."
+            ))
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .padding(.leading, 64)
         default:
             EmptyView()
         }
@@ -334,6 +392,40 @@ struct LineRow: View {
                     .font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
+        }
+    }
+
+    private var tailscaleExitNodePicker: some View {
+        let nodes = state.engine.tailscaleExitNodes[line.id] ?? []
+        let selectedMissing = !line.tailscaleExitNode.isEmpty && !nodes.contains { $0.ip == line.tailscaleExitNode }
+        let loading = state.engine.tailscaleExitNodesLoading.contains(line.id)
+        return HStack {
+            Text("出口节点").font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
+            Picker("", selection: $line.tailscaleExitNode) {
+                Text(state.tr("不使用出口节点", "No exit node")).tag("")
+                if selectedMissing {
+                    Text(state.tr("当前：\(line.tailscaleExitNode)", "Current: \(line.tailscaleExitNode)"))
+                        .tag(line.tailscaleExitNode)
+                }
+                ForEach(nodes) { node in
+                    Text("\(node.name) · \(node.ip)\(node.online ? "" : state.tr("（离线）", " (offline)"))")
+                        .tag(node.ip)
+                        .disabled(!node.online)
+                }
+            }
+            .labelsHidden()
+            .onChange(of: line.tailscaleExitNode) { _, _ in
+                line.verified = false
+                state.save()
+            }
+            Button {
+                state.refreshTailscaleExitNodes(lineID: line.id)
+            } label: {
+                Image(systemName: loading ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+            }
+            .buttonStyle(.borderless)
+            .help(state.tr("刷新出口节点", "Refresh exit nodes"))
+            .disabled(state.engine.isBusy || state.engine.isConnected || loading || state.engine.tailscaleAuthInProgress)
         }
     }
 
@@ -373,6 +465,19 @@ struct LineRow: View {
                     line.verified = false
                     state.save()
                 }
+        }
+    }
+
+    private func toggleField(_ label: String, _ binding: SwiftUI.Binding<Bool>) -> some View {
+        HStack {
+            Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
+            Toggle("", isOn: binding)
+                .labelsHidden()
+                .onChange(of: binding.wrappedValue) { _, _ in
+                    line.verified = false
+                    state.save()
+                }
+            Spacer()
         }
     }
 }
@@ -1084,4 +1189,3 @@ struct AddSubscriptionSheet: View {
         }
     }
 }
-

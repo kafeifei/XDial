@@ -134,6 +134,24 @@ func vmessLine() Line {
 	}
 }
 
+func tailscaleLine() Line {
+	return Line{
+		ID: "tailscale-1", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
+		TailscaleHostname: "xdial-test", TailscaleAcceptRoutes: true,
+	}
+}
+
+func TestGenerate_Tailscale(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{directLine(), tailscaleLine()},
+		Modes: []Mode{{
+			ID: "tailnet", Name: "Tailnet", DefaultLineID: "direct",
+		}},
+		ActiveModeID: "tailnet",
+	}
+	singboxCheck(t, p, "tailscale")
+}
+
 // 1. 纯手动线路，无订阅（原有功能）
 func TestGenerate_ManualOnly(t *testing.T) {
 	p := &Profile{

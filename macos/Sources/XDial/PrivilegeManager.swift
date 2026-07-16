@@ -78,11 +78,13 @@ enum PrivilegeManager {
         }
     }
 
-    static func uninstall() throws {
+    static func uninstall(deleteData: Bool = false) throws {
+        let removeState = deleteData ? "rm -rf '/Library/Application Support/XDial'" : ""
         let shell = """
         launchctl bootout system/\(label) 2>/dev/null || true
         rm -f '\(plistPath)' '\(helperPath)' '\(socketPath)' '/tmp/xdial.log' '/tmp/xdial-app.log'
         rm -rf '/tmp/xdial-engine'
+        \(removeState)
         rm -f '/etc/sudoers.d/xdial'
         """
         if !runAdminShell(shell) {

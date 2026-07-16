@@ -30,18 +30,21 @@ type Engine struct {
 	socks          *socks5.Server
 	socksLn        net.Listener
 	singbox        *SingBoxProcess
+	tailscaleAuth  *TailscaleSession
 	callback       StatusCallback
 	cancel         context.CancelFunc
 	basePath       string
+	statePath      string
 	profile        *config.Profile
 	reconnectCount int
 }
 
-func New(basePath string, cb StatusCallback) *Engine {
+func New(basePath, statePath string, cb StatusCallback) *Engine {
 	return &Engine{
-		vpn:      NewVPNClient(),
-		callback: cb,
-		basePath: basePath,
+		vpn:       NewVPNClient(),
+		callback:  cb,
+		basePath:  basePath,
+		statePath: statePath,
 	}
 }
 
@@ -51,6 +54,10 @@ func (e *Engine) Start(profile *config.Profile) error {
 
 	if e.status == StatusConnected || e.status == StatusConnecting || e.status == StatusReconnecting {
 		return fmt.Errorf("already %s", e.status)
+	}
+	if e.tailscaleAuth != nil {
+		e.tailscaleAuth.Close()
+		e.tailscaleAuth = nil
 	}
 
 	e.profile = profile
@@ -64,6 +71,55 @@ func (e *Engine) Start(profile *config.Profile) error {
 	return nil
 }
 
+func (e *Engine) StartTailscaleAuth(line *config.Line) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.status != StatusDisconnected {
+		return fmt.Errorf("请先断开 XDial，再登录 Tailscale")
+	}
+	if e.tailscaleAuth != nil {
+		e.tailscaleAuth.Close()
+	}
+
+	lineID := line.ID
+	authSession, err := NewTailscaleSession(e.statePath, line, e.notifyAuthRequired, func(nodes []TailscaleExitNode) {
+		e.notifyTailscaleExitNodes(lineID, nodes)
+	})
+	if err != nil {
+		e.tailscaleAuth = nil
+		return err
+	}
+	e.tailscaleAuth = authSession
+	return nil
+}
+
+func (e *Engine) TailscaleExitNodes(line *config.Line) ([]TailscaleExitNode, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.status != StatusDisconnected {
+		return nil, fmt.Errorf("请先断开 XDial，再刷新出口节点")
+	}
+	if e.tailscaleAuth == nil || e.tailscaleAuth.LineID() != line.ID {
+		if e.tailscaleAuth != nil {
+			e.tailscaleAuth.Close()
+		}
+		lineID := line.ID
+		session, err := NewTailscaleSession(e.statePath, line, e.notifyAuthRequired, func(nodes []TailscaleExitNode) {
+			e.notifyTailscaleExitNodes(lineID, nodes)
+		})
+		if err != nil {
+			e.tailscaleAuth = nil
+			return nil, err
+		}
+		e.tailscaleAuth = session
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return e.tailscaleAuth.ExitNodes(ctx)
+}
+
 func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 	if err := e.connectInternal(ctx, profile); err != nil {
 		// ctx 被取消 = 用户主动断开，Stop 已把状态置为 Disconnected，不再报错
@@ -75,62 +131,71 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 }
 
 func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) error {
-	vpnLine := profile.VPNLine()
-	if vpnLine == nil {
-		return fmt.Errorf("没有配置 VPN 线路")
+	vpnLine := profile.ActiveVPNLine()
+	var bridge *VPNBridge
+	var socksAddr string
+	var vpnServerIP string
+	var closeCh chan struct{}
+
+	if vpnLine != nil {
+		if vpnLine.VPNServer == "" {
+			return fmt.Errorf("VPN 服务器地址未填写")
+		}
+		if vpnLine.VPNUsername == "" || vpnLine.VPNPassword == "" {
+			return fmt.Errorf("VPN 用户名或密码未填写")
+		}
+
+		slog.Info("connecting to VPN", "server", vpnLine.VPNServer)
+		vpnInfo, err := e.vpn.Connect(VPNConfig{
+			Server:        vpnLine.VPNServer,
+			Username:      vpnLine.VPNUsername,
+			Password:      vpnLine.VPNPassword,
+			AllowInsecure: vpnLine.AllowInsecure,
+		})
+		if err != nil {
+			return fmt.Errorf("%s", humanizeVPNError(err, vpnLine.VPNServer))
+		}
+		if ctx.Err() != nil {
+			e.vpn.Disconnect()
+			return ctx.Err()
+		}
+
+		slog.Info("VPN connected", "addr", vpnInfo.VPNAddress, "dns", vpnInfo.DNS)
+		bridge, err = NewVPNBridge(vpnInfo.VPNAddress, vpnInfo.MTU)
+		if err != nil {
+			e.vpn.Disconnect()
+			return fmt.Errorf("VPN 隧道初始化失败")
+		}
+		cSess := e.vpn.Session()
+		if cSess == nil {
+			bridge.Close()
+			e.vpn.Disconnect()
+			return fmt.Errorf("VPN 会话已断开")
+		}
+		bridge.Start(cSess)
+		closeCh = cSess.CloseChan
+
+		socksAddr, err = e.startSOCKS(bridge)
+		if err != nil {
+			bridge.Close()
+			e.vpn.Disconnect()
+			return fmt.Errorf("本地代理启动失败")
+		}
+		vpnServerIP = vpnInfo.ServerAddr
+		slog.Info("SOCKS5 proxy ready", "addr", socksAddr)
 	}
-	if vpnLine.VPNServer == "" {
-		return fmt.Errorf("VPN 服务器地址未填写")
-	}
-	if vpnLine.VPNUsername == "" || vpnLine.VPNPassword == "" {
-		return fmt.Errorf("VPN 用户名或密码未填写")
-	}
 
-	slog.Info("connecting to VPN", "server", vpnLine.VPNServer)
-
-	vpnInfo, err := e.vpn.Connect(VPNConfig{
-		Server:        vpnLine.VPNServer,
-		Username:      vpnLine.VPNUsername,
-		Password:      vpnLine.VPNPassword,
-		AllowInsecure: vpnLine.AllowInsecure,
-	})
-	if err != nil {
-		return fmt.Errorf("%s", humanizeVPNError(err, vpnLine.VPNServer))
-	}
-
-	if ctx.Err() != nil {
-		e.vpn.Disconnect()
-		return ctx.Err()
-	}
-
-	slog.Info("VPN connected", "addr", vpnInfo.VPNAddress, "dns", vpnInfo.DNS)
-
-	bridge, err := NewVPNBridge(vpnInfo.VPNAddress, vpnInfo.MTU)
-	if err != nil {
-		e.vpn.Disconnect()
-		return fmt.Errorf("VPN 隧道初始化失败")
-	}
-
-	cSess := e.vpn.Session()
-	if cSess == nil {
-		bridge.Close()
-		e.vpn.Disconnect()
-		return fmt.Errorf("VPN 会话已断开")
-	}
-	bridge.Start(cSess)
-
-	socksAddr, err := e.startSOCKS(bridge)
-	if err != nil {
-		bridge.Close()
-		e.vpn.Disconnect()
-		return fmt.Errorf("本地代理启动失败")
-	}
-
-	slog.Info("SOCKS5 proxy ready", "addr", socksAddr)
-
-	singbox := NewSingBoxProcess(e.basePath)
-	if err := singbox.Start(profile, socksAddr, vpnInfo.ServerAddr); err != nil {
-		slog.Warn("sing-box not started (TUN routing unavailable)", "err", err)
+	singbox := NewSingBoxProcess(e.basePath, e.statePath, e.notifyAuthRequired)
+	if err := singbox.Start(profile, socksAddr, vpnServerIP); err != nil {
+		if e.socksLn != nil {
+			e.socksLn.Close()
+			e.socksLn = nil
+		}
+		if bridge != nil {
+			bridge.Close()
+			e.vpn.Disconnect()
+		}
+		return fmt.Errorf("sing-box 启动失败: %w", err)
 	}
 
 	e.mu.Lock()
@@ -146,12 +211,25 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 		e.vpn.Disconnect()
 		return ctx.Err()
 	}
-	closeCh := session.Sess.CloseChan
 	e.setStatus(StatusConnected)
 	e.mu.Unlock()
 
-	go e.monitorVPN(closeCh)
+	if closeCh != nil {
+		go e.monitorVPN(closeCh)
+	}
 	return nil
+}
+
+func (e *Engine) notifyAuthRequired(authURL string) {
+	if callback, ok := e.callback.(AuthCallback); ok {
+		callback.OnAuthRequired(authURL)
+	}
+}
+
+func (e *Engine) notifyTailscaleExitNodes(lineID string, nodes []TailscaleExitNode) {
+	if callback, ok := e.callback.(TailscaleExitNodesCallback); ok {
+		callback.OnTailscaleExitNodes(lineID, nodes)
+	}
 }
 
 func (e *Engine) startSOCKS(bridge *VPNBridge) (string, error) {
@@ -192,6 +270,10 @@ func (e *Engine) Stop() error {
 	defer e.mu.Unlock()
 
 	if e.status != StatusConnected && e.status != StatusConnecting && e.status != StatusReconnecting {
+		if e.tailscaleAuth != nil {
+			e.tailscaleAuth.Close()
+			e.tailscaleAuth = nil
+		}
 		return nil
 	}
 
@@ -208,6 +290,10 @@ func (e *Engine) Stop() error {
 }
 
 func (e *Engine) cleanupLocked() {
+	if e.tailscaleAuth != nil {
+		e.tailscaleAuth.Close()
+		e.tailscaleAuth = nil
+	}
 	if e.singbox != nil {
 		e.singbox.Stop()
 		e.singbox = nil

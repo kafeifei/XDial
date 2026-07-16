@@ -43,6 +43,14 @@ type StatusCallback interface {
 	OnError(code int, message string)
 }
 
+type AuthCallback interface {
+	OnAuthRequired(url string)
+}
+
+type TailscaleExitNodesCallback interface {
+	OnTailscaleExitNodes(lineID string, nodes []TailscaleExitNode)
+}
+
 func newStatusMessage(s Status) StatusMessage {
 	msg := StatusMessage{Status: s.String()}
 	if s == StatusConnected {

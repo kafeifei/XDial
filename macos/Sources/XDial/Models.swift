@@ -3,7 +3,7 @@ import Foundation
 struct Line: Codable, Identifiable, Hashable {
     var id: String
     var name: String
-    var type: String  // direct / vpn / trojan / shadowsocks / vmess
+    var type: String  // direct / vpn / trojan / shadowsocks / vmess / tailscale
     var enabled: Bool = true
     var verified: Bool = false
 
@@ -26,6 +26,10 @@ struct Line: Codable, Identifiable, Hashable {
     var vmessUUID: String = ""
     var vmessAltID: Int = 0
 
+    var tailscaleHostname: String = ""
+    var tailscaleAcceptRoutes: Bool = true
+    var tailscaleExitNode: String = ""
+
     // 跳过 TLS 证书验证（自签场景显式开启）。默认 false=验证证书。
     var allowInsecure: Bool = false
 
@@ -47,6 +51,9 @@ struct Line: Codable, Identifiable, Hashable {
         case vmessPort = "vmess_port"
         case vmessUUID = "vmess_uuid"
         case vmessAltID = "vmess_alt_id"
+        case tailscaleHostname = "tailscale_hostname"
+        case tailscaleAcceptRoutes = "tailscale_accept_routes"
+        case tailscaleExitNode = "tailscale_exit_node"
     }
 
     init(id: String, name: String, type: String, enabled: Bool = true, verified: Bool = false,
@@ -54,12 +61,16 @@ struct Line: Codable, Identifiable, Hashable {
          trojanServer: String = "", trojanPort: Int = 443, trojanPassword: String = "", trojanSNI: String = "",
          ssServer: String = "", ssPort: Int = 8388, ssMethod: String = "aes-256-gcm", ssPassword: String = "",
          vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0,
+         tailscaleHostname: String = "", tailscaleAcceptRoutes: Bool = true, tailscaleExitNode: String = "",
          allowInsecure: Bool = false) {
         self.id = id; self.name = name; self.type = type; self.enabled = enabled; self.verified = verified
         self.vpnServer = vpnServer; self.vpnUsername = vpnUsername; self.vpnPassword = vpnPassword
         self.trojanServer = trojanServer; self.trojanPort = trojanPort; self.trojanPassword = trojanPassword; self.trojanSNI = trojanSNI
         self.ssServer = ssServer; self.ssPort = ssPort; self.ssMethod = ssMethod; self.ssPassword = ssPassword
         self.vmessServer = vmessServer; self.vmessPort = vmessPort; self.vmessUUID = vmessUUID; self.vmessAltID = vmessAltID
+        self.tailscaleHostname = tailscaleHostname
+        self.tailscaleAcceptRoutes = tailscaleAcceptRoutes
+        self.tailscaleExitNode = tailscaleExitNode
         self.allowInsecure = allowInsecure
     }
 
@@ -85,6 +96,9 @@ struct Line: Codable, Identifiable, Hashable {
         vmessPort = try c.decodeIfPresent(Int.self, forKey: .vmessPort) ?? 443
         vmessUUID = try c.decodeIfPresent(String.self, forKey: .vmessUUID) ?? ""
         vmessAltID = try c.decodeIfPresent(Int.self, forKey: .vmessAltID) ?? 0
+        tailscaleHostname = try c.decodeIfPresent(String.self, forKey: .tailscaleHostname) ?? ""
+        tailscaleAcceptRoutes = try c.decodeIfPresent(Bool.self, forKey: .tailscaleAcceptRoutes) ?? true
+        tailscaleExitNode = try c.decodeIfPresent(String.self, forKey: .tailscaleExitNode) ?? ""
         allowInsecure = try c.decodeIfPresent(Bool.self, forKey: .allowInsecure) ?? false
     }
 }
