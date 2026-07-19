@@ -1,11 +1,12 @@
 import Combine
 import Foundation
+import os.log
 import SwiftUI
 
-// MARK: - Engine / Tunnel abstraction (tvOS)
+// MARK: - Engine / Tunnel abstraction (iOS / tvOS)
 //
 // macOS 版 AppState 直接依赖 `GoEngine.shared`（通过 UNIX socket 与特权 helper 通信）
-// 和 `PrivilegeManager`（安装/校验 LaunchDaemon + helper）。tvOS 上没有特权进程概念，
+// 和 `PrivilegeManager`（安装/校验 LaunchDaemon + helper）。iOS / tvOS 上没有特权进程概念，
 // VPN 通过 NETunnelProviderManager / Packet Tunnel 扩展实现。
 //
 // 为了不和「引擎层」这个并行任务硬耦合，这里用两个最小协议做占位：
@@ -54,6 +55,10 @@ protocol TunnelManaging: AnyObject {
     /// VPN Profile 是否已安装并可用（对应 macOS 的 helperInstalled 语义）。
     var isProfileInstalled: Bool { get }
 
+    /// 从系统偏好重新读取 VPN Profile 状态。首次安装时尚未存在 Profile，
+    /// 但这不妨碍用户点击连接；真正的 Profile 会在 startTunnel 里创建。
+    func refreshProfileStatus(completion: @escaping @Sendable (Bool) -> Void)
+
     /// 把当前 profile 转成 NE 模式配置、连同 AnyConnect 凭据一起交给系统拉起隧道
     /// （NETunnelProviderManager.saveToPreferences + startVPNTunnel）。
     /// 这是唯一真正触发系统级连接的入口——`TunnelEngine.start(profileJSON:)`
@@ -65,9 +70,10 @@ protocol TunnelManaging: AnyObject {
     func stopTunnel()
 }
 
-// 轻量的日志占位。macOS 版的 appLog 写 /tmp/xdial-app.log（沙盒外），
-// tvOS 沙盒下不适用，这里降级为 print，等有需要再接真实日志。
+private let appOSLog = OSLog(subsystem: "com.kafeifei.xdial.mobile", category: "app")
+
 func appLog(_ msg: String) {
+    os_log("%{public}@", log: appOSLog, type: .info, msg)
     #if DEBUG
     print("[xdial] \(msg)")
     #endif
@@ -102,7 +108,7 @@ final class AppState: ObservableObject {
     @Published var profile: Profile
 
     /// VPN Profile 是否已安装并可用（对应 macOS 的 helperInstalled）。
-    /// 现在是占位，等 tunnelManager 接入后由 checkHelper() 刷新为真实状态。
+    /// 由 tunnelManager.refreshProfileStatus() 刷新为真实系统状态。
     @Published var helperInstalled: Bool = false
 
     @Published var language: Lang {
@@ -131,9 +137,11 @@ final class AppState: ObservableObject {
     var isConnected: Bool { engine.isConnected }
     var isBusy: Bool { engine.isBusy }
 
-    var canConnect: Bool {
-        guard helperInstalled, !isBusy else { return false }
+    var isConnectionConfigured: Bool {
+        guard tunnelManager != nil else { return false }
         guard let s = activeMode else { return false }
+        if !unsupportedActiveLineNames.isEmpty { return false }
+        guard activeVPNCredentials() != nil else { return false }
         // 必须有效的 VPN 凭据（如果模式用到 VPN）
         for binding in s.bindings {
             if let line = profile.lines.first(where: { $0.id == binding.lineID }),
@@ -150,10 +158,26 @@ final class AppState: ObservableObject {
         return true
     }
 
+    var canConnect: Bool {
+        !isBusy && isConnectionConfigured
+    }
+
+    /// 移动端 libbox 当前尚未注册 Tailscale endpoint。保留配置兼容性，
+    /// 但在真实数据面接入前不能让包含 Tailscale 的模式误显示为可连接。
+    var unsupportedActiveLineNames: [String] {
+        guard let mode = activeMode else { return [] }
+        var ids = Set(mode.bindings.map(\.lineID))
+        if !mode.defaultLineID.isEmpty { ids.insert(mode.defaultLineID) }
+        return profile.lines
+            .filter { ids.contains($0.id) && $0.type == "tailscale" }
+            .map(\.name)
+    }
+
     var statusText: String {
         switch engine.status {
         case "connected": return tr("已连接", "Connected")
         case "connecting": return tr("正在连接…", "Connecting…")
+        case "checking": return tr("正在验证数据链路…", "Checking data path…")
         case "disconnecting": return tr("正在断开…", "Disconnecting…")
         case "reconnecting": return tr("正在重连…", "Reconnecting…")
         default:
@@ -195,7 +219,7 @@ final class AppState: ObservableObject {
             }
         }
         loadSaved()
-        checkHelper()
+        refreshTunnelProfileStatus()
         engine.syncStatus()
     }
 
@@ -242,6 +266,7 @@ final class AppState: ObservableObject {
                 guard let self else { return }
                 switch result {
                 case .success:
+                    self.helperInstalled = true
                     self.engine.syncStatus()
                 case .failure(let error):
                     self.engine.lastError = error.localizedDescription
@@ -290,6 +315,8 @@ final class AppState: ObservableObject {
             profile.lines[i].ssPassword = profile.lines[i].ssPassword.normalizedASCII()
             profile.lines[i].vmessServer = profile.lines[i].vmessServer.normalizedASCII()
             profile.lines[i].vmessUUID = profile.lines[i].vmessUUID.normalizedASCII()
+            profile.lines[i].tailscaleHostname = profile.lines[i].tailscaleHostname.normalizedASCII()
+            profile.lines[i].tailscaleExitNode = profile.lines[i].tailscaleExitNode.normalizedASCII()
         }
         for i in profile.ruleSets.indices {
             profile.ruleSets[i].url = profile.ruleSets[i].url.normalizedASCII()
@@ -420,6 +447,10 @@ final class AppState: ObservableObject {
             if let v = vault[id + "-trojan"] { loaded.lines[i].trojanPassword = v }
             if let v = vault[id + "-ss"] { loaded.lines[i].ssPassword = v }
             if let v = vault[id + "-vmess"] { loaded.lines[i].vmessUUID = v }
+            if loaded.lines[i].type == "vpn", loaded.lines[i].name == "VPN" {
+                loaded.lines[i].name = "AnyConnect"
+                didMigrate = true
+            }
         }
         for si in loaded.subscriptions.indices {
             let subID = loaded.subscriptions[si].id
@@ -571,11 +602,16 @@ final class AppState: ObservableObject {
         return p.lines.isEmpty && p.ruleSets.isEmpty && p.modes.isEmpty ? nil : p
     }
 
-    private func checkHelper() {
-        // TODO: 等 NETunnelProviderManager 管理层实现后在这里对接真实状态查询
-        // （例如查询 VPN Profile 是否已 saveToPreferences 且可用）。
-        // 现在先取占位管理层的值，未注入时默认 false。
-        helperInstalled = tunnelManager?.isProfileInstalled ?? false
+    func refreshTunnelProfileStatus() {
+        guard let tunnelManager else {
+            helperInstalled = false
+            return
+        }
+        tunnelManager.refreshProfileStatus { [weak self] installed in
+            Task { @MainActor in
+                self?.helperInstalled = installed
+            }
+        }
     }
 
     // MARK: - Subscription Management

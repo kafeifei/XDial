@@ -3,12 +3,14 @@ module github.com/kafeifei/xdial
 go 1.24.7
 
 require (
+	github.com/sagernet/gvisor v0.0.0-20250811.0-sing-box-mod.1
 	github.com/sagernet/sing v0.8.9
 	github.com/sagernet/sing-box v1.13.11
 	github.com/sagernet/sing-tun v0.8.9
 	github.com/sagernet/tailscale v1.92.4-sing-box-1.13-mod.7
 	github.com/things-go/go-socks5 v0.1.1
 	golang.org/x/net v0.50.0
+	golang.org/x/sys v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
 	gvisor.dev/gvisor v0.0.0-20230916030846-1d82564559db
 	sslcon v0.0.0
@@ -78,7 +80,6 @@ require (
 	github.com/sagernet/bbolt v0.0.0-20231014093535-ea5cb2fe9f0a // indirect
 	github.com/sagernet/fswatch v0.1.2 // indirect
 	github.com/sagernet/gomobile v0.1.13 // indirect
-	github.com/sagernet/gvisor v0.0.0-20250811.0-sing-box-mod.1 // indirect
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a // indirect
 	github.com/sagernet/nftables v0.3.0-mod.2 // indirect
 	github.com/sagernet/sing-mux v0.3.4 // indirect
@@ -113,7 +114,6 @@ require (
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/term v0.40.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 	golang.org/x/time v0.11.0 // indirect

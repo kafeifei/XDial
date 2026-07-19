@@ -3,6 +3,10 @@
 package libbox
 
 import (
+	"net"
+	"net/netip"
+	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -12,7 +16,6 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/x/list"
-	"net/netip"
 )
 
 // platform.go 把 XDial 的进程内 sing-box 接到 tvOS NetworkExtension 的 packetFlow。
@@ -23,12 +26,10 @@ import (
 // 描述符交给 sing-box。macOS 版是外置进程 + 本地 TUN,不需要这条;tvOS 版扩展进程
 // 内没有权限自己开 utun,只能复用 NE 给的 fd,所以必须实现这个接口。
 //
-// 这里刻意做成"最小可用":除 OpenInterface 外的方法几乎全部返回零值/false/nil,
-// 因为 XDial 的出站流量走 vpnOutbound(sslcon + gVisor)而非依赖平台的接口监控/
-// WiFi/连接归属等能力。唯一必须给出真实对象的是 CreateDefaultInterfaceMonitor:
-// route.NetworkManager 在 platformInterface 非 nil 时会无条件调用它并立刻
-// RegisterCallback(见 sing-box route/network.go),返回 nil 会直接 panic,所以这里
-// 返回一个不会 panic、Start() 返回 nil 的 stub 监控器。
+// 除 OpenInterface 外，默认物理接口也必须是真实值。NE 把设备默认路由送进 utun 后，
+// sing-box 的 direct/DNS 出站仍要知道当前 Wi-Fi/蜂窝接口；若这里返回 nil，控制面虽能
+// 启动，数据面却可能没有可用出口。Swift 的 NWPathMonitor 通过 SetDefaultInterface
+// 把接口名/索引喂进来，本文件负责向 sing-box 转发并处理网络切换。
 
 // TunOpener 是"打开 TUN 设备"这一步的可替换缝隙。
 //
@@ -52,6 +53,15 @@ type xdPlatformInterface struct {
 	tunFD int
 	// opener 是可替换的 TUN 打开器;nil 时用 defaultTunOpener(真实 dup+tun.New)。
 	opener TunOpener
+
+	mu               sync.Mutex
+	networkManager   adapter.NetworkManager
+	defaultInterface *control.Interface
+	monitor          *platformInterfaceMonitor
+	tunInPackets     atomic.Uint64
+	tunInBytes       atomic.Uint64
+	tunOutPackets    atomic.Uint64
+	tunOutBytes      atomic.Uint64
 }
 
 var _ adapter.PlatformInterface = (*xdPlatformInterface)(nil)
@@ -74,22 +84,56 @@ func (p *xdPlatformInterface) defaultTunOpener(options *tun.Options, _ option.Tu
 	if p.tunFD <= 0 {
 		return nil, E.New("platform: tun fd not set (call Libbox.SetTunFD with the NE packetFlow fd before Start)")
 	}
+	// sing-tun 会按值复制 options。真实接口名必须在 tun.New 之前写入，否则其内部
+	// 会一直保留占位名 "utun"，Start 时再把接口监控器覆盖成错误名称。
+	name, err := tunnelNameFromFileDescriptor(p.tunFD)
+	if err != nil {
+		return nil, E.Cause(err, "query tun name")
+	}
+	if name != "" {
+		options.Name = name
+		if options.InterfaceMonitor != nil {
+			options.InterfaceMonitor.RegisterMyInterface(name)
+		}
+	}
 	dupFd, err := syscall.Dup(p.tunFD)
 	if err != nil {
 		return nil, E.Cause(err, "dup tun file descriptor")
 	}
 	options.FileDescriptor = dupFd
-	return tun.New(*options)
+	device, err := tun.New(*options)
+	if err != nil {
+		_ = syscall.Close(dupFd)
+		return nil, err
+	}
+	// 非 Darwin 平台没有通用的 fd→名称查询；保留原来的创建后读取作为回退。
+	if name == "" {
+		name, err = device.Name()
+		if err != nil {
+			_ = device.Close()
+			return nil, E.Cause(err, "read tun interface name")
+		}
+		options.Name = name
+		if options.InterfaceMonitor != nil {
+			options.InterfaceMonitor.RegisterMyInterface(name)
+		}
+	}
+	return wrapTunWithDiagnostics(device, p), nil
 }
 
 // UnderNetworkExtension 返回 true:XDial tvOS 引擎始终跑在 NEPacketTunnelProvider 里。
 // sing-box 据此把 MTU 默认收敛到 4064 等 NE 友好参数。
 func (p *xdPlatformInterface) UnderNetworkExtension() bool { return true }
 
-// 以下方法对 XDial 均无实际意义(出站走 vpnOutbound,不依赖平台的接口/WiFi/进程归属
-// 能力),统一返回"平台不提供该能力"的零值,让 sing-box 回退到其内置的通用逻辑。
+// 默认接口/接口列表用于 direct 与 DNS 出站；其余 Wi-Fi 详情、进程归属、通知等
+// 非数据面能力暂不提供，让 sing-box 回退到通用逻辑。
 
-func (p *xdPlatformInterface) Initialize(networkManager adapter.NetworkManager) error { return nil }
+func (p *xdPlatformInterface) Initialize(networkManager adapter.NetworkManager) error {
+	p.mu.Lock()
+	p.networkManager = networkManager
+	p.mu.Unlock()
+	return nil
+}
 
 func (p *xdPlatformInterface) UsePlatformAutoDetectInterfaceControl() bool { return false }
 
@@ -97,16 +141,33 @@ func (p *xdPlatformInterface) AutoDetectInterfaceControl(fd int) error { return 
 
 func (p *xdPlatformInterface) UsePlatformDefaultInterfaceMonitor() bool { return true }
 
-// CreateDefaultInterfaceMonitor 必须返回非 nil:见文件头注释,NetworkManager 会
-// 无条件在返回值上调 RegisterCallback。返回一个纯 stub。
+// CreateDefaultInterfaceMonitor 必须返回非 nil:NetworkManager 会在返回值上注册
+// 回调。monitor 的初始值及后续更新来自 Swift NWPathMonitor。
 func (p *xdPlatformInterface) CreateDefaultInterfaceMonitor(logger logger.Logger) tun.DefaultInterfaceMonitor {
-	return &stubInterfaceMonitor{}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.monitor == nil {
+		p.monitor = &platformInterfaceMonitor{platform: p, logger: logger}
+	}
+	return p.monitor
 }
 
-func (p *xdPlatformInterface) UsePlatformNetworkInterfaces() bool { return false }
+func (p *xdPlatformInterface) UsePlatformNetworkInterfaces() bool { return true }
 
 func (p *xdPlatformInterface) NetworkInterfaces() ([]adapter.NetworkInterface, error) {
-	return nil, nil
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]adapter.NetworkInterface, 0, len(interfaces))
+	for _, netInterface := range interfaces {
+		controlInterface, interfaceErr := control.InterfaceFromNet(netInterface)
+		if interfaceErr != nil {
+			continue
+		}
+		result = append(result, adapter.NetworkInterface{Interface: controlInterface})
+	}
+	return result, nil
 }
 
 func (p *xdPlatformInterface) NetworkExtensionIncludeAllNetworks() bool { return false }
@@ -133,34 +194,145 @@ func (p *xdPlatformInterface) SendNotification(notification *adapter.Notificatio
 
 func (p *xdPlatformInterface) MyInterfaceAddress() []netip.Addr { return nil }
 
-// stubInterfaceMonitor 满足 tun.DefaultInterfaceMonitor,但不做任何真实监控:
-// NE 场景下默认接口固定为隧道自身,不需要监听系统网络变化。所有回调注册都进一个
-// 本地 list(保证 RegisterCallback/UnregisterCallback 不 panic),Start/Close 返回 nil
-// (返回 error 会让 NetworkManager 启动失败)。
-type stubInterfaceMonitor struct {
-	callbacks list.List[tun.DefaultInterfaceUpdateCallback]
+// platformInterfaceMonitor 把 Swift NWPathMonitor 报告的真实 Wi-Fi/蜂窝接口桥接给
+// sing-box。它必须在 Start 时先刷新接口列表，再发布初始接口，否则
+// auto_detect_interface 会看到 "no available network interface"。
+type platformInterfaceMonitor struct {
+	platform    *xdPlatformInterface
+	logger      logger.Logger
+	mu          sync.Mutex
+	callbacks   list.List[tun.DefaultInterfaceUpdateCallback]
+	myInterface string
 }
 
-var _ tun.DefaultInterfaceMonitor = (*stubInterfaceMonitor)(nil)
+var _ tun.DefaultInterfaceMonitor = (*platformInterfaceMonitor)(nil)
 
-func (m *stubInterfaceMonitor) Start() error { return nil }
+func (m *platformInterfaceMonitor) Start() error {
+	m.platform.mu.Lock()
+	networkManager := m.platform.networkManager
+	defaultInterface := cloneInterface(m.platform.defaultInterface)
+	m.platform.mu.Unlock()
+	if networkManager != nil {
+		if err := networkManager.UpdateInterfaces(); err != nil {
+			return E.Cause(err, "update platform interfaces")
+		}
+	}
+	if defaultInterface == nil {
+		return E.New("platform: default physical interface not set")
+	}
+	m.notify(defaultInterface)
+	return nil
+}
 
-func (m *stubInterfaceMonitor) Close() error { return nil }
+func (m *platformInterfaceMonitor) Close() error { return nil }
 
-func (m *stubInterfaceMonitor) DefaultInterface() *control.Interface { return nil }
+func (m *platformInterfaceMonitor) DefaultInterface() *control.Interface {
+	m.platform.mu.Lock()
+	defer m.platform.mu.Unlock()
+	return cloneInterface(m.platform.defaultInterface)
+}
 
-func (m *stubInterfaceMonitor) OverrideAndroidVPN() bool { return false }
+func (m *platformInterfaceMonitor) OverrideAndroidVPN() bool { return false }
 
-func (m *stubInterfaceMonitor) AndroidVPNEnabled() bool { return false }
+func (m *platformInterfaceMonitor) AndroidVPNEnabled() bool { return false }
 
-func (m *stubInterfaceMonitor) RegisterCallback(callback tun.DefaultInterfaceUpdateCallback) *list.Element[tun.DefaultInterfaceUpdateCallback] {
+func (m *platformInterfaceMonitor) RegisterCallback(callback tun.DefaultInterfaceUpdateCallback) *list.Element[tun.DefaultInterfaceUpdateCallback] {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.callbacks.PushBack(callback)
 }
 
-func (m *stubInterfaceMonitor) UnregisterCallback(element *list.Element[tun.DefaultInterfaceUpdateCallback]) {
+func (m *platformInterfaceMonitor) UnregisterCallback(element *list.Element[tun.DefaultInterfaceUpdateCallback]) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.callbacks.Remove(element)
 }
 
-func (m *stubInterfaceMonitor) RegisterMyInterface(interfaceName string) {}
+func (m *platformInterfaceMonitor) RegisterMyInterface(interfaceName string) {
+	m.mu.Lock()
+	m.myInterface = interfaceName
+	m.mu.Unlock()
+}
 
-func (m *stubInterfaceMonitor) MyInterface() string { return "" }
+func (m *platformInterfaceMonitor) MyInterface() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.myInterface
+}
+
+func (m *platformInterfaceMonitor) notify(defaultInterface *control.Interface) {
+	m.mu.Lock()
+	callbacks := m.callbacks.Array()
+	m.mu.Unlock()
+	for _, callback := range callbacks {
+		callback(defaultInterface, 0)
+	}
+}
+
+func (p *xdPlatformInterface) setDefaultInterface(name string, index int) {
+	var updated *control.Interface
+	if name != "" && index > 0 {
+		updated = &control.Interface{Name: name, Index: index}
+	}
+	p.mu.Lock()
+	old := p.defaultInterface
+	if old != nil && updated != nil && old.Name == updated.Name && old.Index == updated.Index {
+		p.mu.Unlock()
+		return
+	}
+	p.defaultInterface = updated
+	networkManager := p.networkManager
+	monitor := p.monitor
+	p.mu.Unlock()
+
+	if networkManager != nil {
+		if err := networkManager.UpdateInterfaces(); err != nil && monitor != nil && monitor.logger != nil {
+			monitor.logger.Error(E.Cause(err, "update platform interfaces"))
+		}
+	}
+	if monitor != nil {
+		monitor.notify(cloneInterface(updated))
+	}
+}
+
+func cloneInterface(value *control.Interface) *control.Interface {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+type platformDiagnostics struct {
+	TunFD                 int
+	TunName               string
+	DefaultInterfaceName  string
+	DefaultInterfaceIndex int
+	TunInPackets          uint64
+	TunInBytes            uint64
+	TunOutPackets         uint64
+	TunOutBytes           uint64
+}
+
+func (p *xdPlatformInterface) diagnostics() platformDiagnostics {
+	p.mu.Lock()
+	defaultInterface := cloneInterface(p.defaultInterface)
+	monitor := p.monitor
+	p.mu.Unlock()
+
+	result := platformDiagnostics{
+		TunFD:         p.tunFD,
+		TunInPackets:  p.tunInPackets.Load(),
+		TunInBytes:    p.tunInBytes.Load(),
+		TunOutPackets: p.tunOutPackets.Load(),
+		TunOutBytes:   p.tunOutBytes.Load(),
+	}
+	if defaultInterface != nil {
+		result.DefaultInterfaceName = defaultInterface.Name
+		result.DefaultInterfaceIndex = defaultInterface.Index
+	}
+	if monitor != nil {
+		result.TunName = monitor.MyInterface()
+	}
+	return result
+}

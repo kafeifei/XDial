@@ -16,12 +16,14 @@ package libbox
 
 import (
 	"context"
+	stdjson "encoding/json"
 	"fmt"
 	"sync"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
+	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 
@@ -50,13 +52,14 @@ const (
 )
 
 type Libbox struct {
-	mu       sync.Mutex
-	cb       Callback
-	vpn      *engine.VPNClient
-	bridge   *engine.VPNBridge
-	box      *box.Box
-	running  bool
-	platform *xdPlatformInterface
+	mu        sync.Mutex
+	cb        Callback
+	vpn       *engine.VPNClient
+	bridge    *engine.VPNBridge
+	box       *box.Box
+	running   bool
+	platform  *xdPlatformInterface
+	lastError string
 }
 
 func New(cb Callback) *Libbox {
@@ -79,6 +82,12 @@ func (l *Libbox) SetTunFD(fd int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.platform.tunFD = fd
+}
+
+// SetDefaultInterface 接收 Swift NWPathMonitor 报告的真实物理出口。
+// 必须在 Start 前至少调用一次；网络从 Wi-Fi/蜂窝之间切换时继续调用即可。
+func (l *Libbox) SetDefaultInterface(name string, index int) {
+	l.platform.setDefaultInterface(name, index)
 }
 
 // SetTunOpener 替换 TUN 打开器(默认走 dup(tunFD)+tun.New 的真实路径)。
@@ -110,9 +119,59 @@ func (l *Libbox) Status() string {
 	return `{"running":false}`
 }
 
+type diagnostics struct {
+	Running               bool                  `json:"running"`
+	GVisorCompiled        bool                  `json:"gvisor_compiled"`
+	SelectedStack         string                `json:"selected_stack"`
+	TunFDReady            bool                  `json:"tun_fd_ready"`
+	TunName               string                `json:"tun_name,omitempty"`
+	DefaultInterfaceName  string                `json:"default_interface_name,omitempty"`
+	DefaultInterfaceIndex int                   `json:"default_interface_index,omitempty"`
+	HandshakeCompleted    bool                  `json:"handshake_completed"`
+	TunInPackets          uint64                `json:"tun_in_packets"`
+	TunInBytes            uint64                `json:"tun_in_bytes"`
+	TunOutPackets         uint64                `json:"tun_out_packets"`
+	TunOutBytes           uint64                `json:"tun_out_bytes"`
+	Bridge                engine.VPNBridgeStats `json:"bridge"`
+	LastError             string                `json:"last_error,omitempty"`
+}
+
+// Diagnostics 返回不含凭据和服务器地址的运行快照，供 NetworkExtension 在发布版
+// 出现数据链路故障时回传给主 App。字段只描述阶段、接口和收发计数。
+func (l *Libbox) Diagnostics() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	platform := l.platform.diagnostics()
+	result := diagnostics{
+		Running:               l.running,
+		GVisorCompiled:        tun.WithGVisor,
+		SelectedStack:         "gvisor",
+		TunFDReady:            platform.TunFD > 0,
+		TunName:               platform.TunName,
+		DefaultInterfaceName:  platform.DefaultInterfaceName,
+		DefaultInterfaceIndex: platform.DefaultInterfaceIndex,
+		HandshakeCompleted:    l.bridge != nil,
+		TunInPackets:          platform.TunInPackets,
+		TunInBytes:            platform.TunInBytes,
+		TunOutPackets:         platform.TunOutPackets,
+		TunOutBytes:           platform.TunOutBytes,
+		LastError:             l.lastError,
+	}
+	if l.bridge != nil {
+		result.Bridge = l.bridge.Stats()
+	}
+	data, err := stdjson.Marshal(result)
+	if err != nil {
+		return `{"running":false,"last_error":"diagnostics encoding failed"}`
+	}
+	return string(data)
+}
+
 // fail 在返回 error 前把结构化错误(分类码 + 文本)推给 Swift 侧,
 // 再原样返回同一个 error 给 Go 调用方。集中一处,避免每条错误路径重复两行。
 func (l *Libbox) fail(code int, err error) error {
+	l.lastError = err.Error()
 	if l.cb != nil {
 		l.cb.OnError(code, err.Error())
 	}
@@ -125,17 +184,30 @@ func (l *Libbox) fail(code int, err error) error {
 // inbound 段在 Phase 2 改为 NE 模式),outbounds 里 "vpn" 类型的条目会
 // 路由到本次连接建立的 VPNBridge。
 func (l *Libbox) Start(server, username, password, configJSON string) error {
+	return l.start(server, "", username, password, configJSON)
+}
+
+// StartResolved is the NetworkExtension-safe Start variant. dialAddress must
+// be the numeric IPv4 resolved before the system default route enters the TUN;
+// server is retained separately for TLS certificate validation and HTTP Host.
+func (l *Libbox) StartResolved(server, dialAddress, username, password, configJSON string) error {
+	return l.start(server, dialAddress, username, password, configJSON)
+}
+
+func (l *Libbox) start(server, dialAddress, username, password, configJSON string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if l.running {
 		return l.fail(ErrCodeState, fmt.Errorf("already running"))
 	}
+	l.lastError = ""
 
 	vpnInfo, err := l.vpn.Connect(engine.VPNConfig{
-		Server:   server,
-		Username: username,
-		Password: password,
+		Server:      server,
+		DialAddress: dialAddress,
+		Username:    username,
+		Password:    password,
 	})
 	if err != nil {
 		return l.fail(ErrCodeNetwork, fmt.Errorf("anyconnect dial: %w", err))

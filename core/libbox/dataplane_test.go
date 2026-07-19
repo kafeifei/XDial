@@ -34,6 +34,7 @@ package libbox
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -321,6 +322,13 @@ func startBoxOffline(t *testing.T, configJSON []byte, bridge *engine.VPNBridge) 
 			return fakeTun, nil
 		},
 	}
+	// 生产环境由 Swift NWPathMonitor 在 Start 前注入真实 Wi-Fi/蜂窝接口。
+	// 离线测试没有 Swift 层，选宿主机任一已知接口作为等价启动前置条件。
+	interfaces, err := net.Interfaces()
+	if err != nil || len(interfaces) == 0 {
+		t.Fatalf("discover test interface: %v", err)
+	}
+	platform.setDefaultInterface(interfaces[0].Name, interfaces[0].Index)
 
 	ctx := boxContext(context.Background())
 	ctx = service.ContextWith[*engine.VPNBridge](ctx, bridge)

@@ -12,6 +12,7 @@ import (
 
 type VPNConfig struct {
 	Server        string
+	DialAddress   string // optional numeric socket target; Server remains TLS SNI / HTTP identity
 	Username      string
 	Password      string
 	AllowInsecure bool // true 时跳过服务器证书验证（自签场景 opt-in）
@@ -45,6 +46,7 @@ func (c *VPNClient) Connect(cfg VPNConfig) (*VPNInfo, error) {
 	base.InitLog()
 
 	auth.Prof.Host = cfg.Server
+	auth.Prof.DialAddress = cfg.DialAddress
 	auth.Prof.Username = cfg.Username
 	auth.Prof.Password = cfg.Password
 
