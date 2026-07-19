@@ -9,3 +9,4 @@ macos/.build/
 /libboxtest
 /xdial
 appletv/XDialTV.xcodeproj/
+ios/XDialIOS.xcodeproj/

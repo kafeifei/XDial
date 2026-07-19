@@ -251,7 +251,7 @@ func TestGenerateNEMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// tun inbound 只保留最小字段,不含桌面专属的路由字段。
+	// tun inbound 保留最小字段并明确使用 gVisor，不含桌面专属的路由字段。
 	tun := cfg.Inbounds[0]
 	if tun["type"] != "tun" {
 		t.Errorf("expected tun inbound, got %v", tun["type"])
@@ -262,15 +262,17 @@ func TestGenerateNEMode(t *testing.T) {
 	if _, ok := tun["mtu"]; !ok {
 		t.Error("NE tun should keep mtu")
 	}
-	for _, k := range []string{"auto_route", "strict_route", "stack", "route_exclude_address"} {
+	for _, k := range []string{"auto_route", "strict_route", "route_exclude_address"} {
 		if _, ok := tun[k]; ok {
 			t.Errorf("NE tun should not have %q, got %v", k, tun[k])
 		}
 	}
+	if tun["stack"] != "gvisor" {
+		t.Errorf("NE tun stack = %v, want gvisor", tun["stack"])
+	}
 
-	// route 不含 auto_detect_interface。
-	if _, ok := cfg.Route["auto_detect_interface"]; ok {
-		t.Error("NE route should not have auto_detect_interface")
+	if cfg.Route["auto_detect_interface"] != true {
+		t.Error("NE route should auto-detect the physical interface")
 	}
 
 	// experimental 不含 clash_api;cache_file 用绝对路径。

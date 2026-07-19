@@ -1,10 +1,10 @@
 import Combine
 import Foundation
 
-// MARK: - GoEngine (tvOS)
+// MARK: - GoEngine (iOS / tvOS)
 //
 // macOS 版 GoEngine 通过 AF_UNIX socket 跟本地特权 daemon 进程收发 JSON 请求/响应。
-// tvOS 上没有特权进程,VPN 逻辑跑在 NEPacketTunnelProvider 扩展进程里,App 与扩展
+// iOS / tvOS 上没有特权进程,VPN 逻辑跑在 NEPacketTunnelProvider 扩展进程里,App 与扩展
 // 之间用 NEVPNConnection.sendProviderMessage(_:responseHandler:) 通信。
 //
 // 这次移植只换「传输层」,不动「协议内容」:
@@ -54,7 +54,10 @@ final class GoEngine: ObservableObject, TunnelEngine {
     // AppState.updateSubscription(_:with:),不再需要第二份等价定义。
 
     var isConnected: Bool { status == "connected" }
-    var isBusy: Bool { status == "connecting" || status == "disconnecting" || status == "reconnecting" }
+    var isBusy: Bool {
+        status == "connecting" || status == "checking" ||
+        status == "disconnecting" || status == "reconnecting"
+    }
 
     // MARK: - Public API
 
@@ -62,7 +65,7 @@ final class GoEngine: ObservableObject, TunnelEngine {
         lastError = nil
         status = "connecting"
         guard session != nil else {
-            lastError = "VPN 隧道不可用(扩展未启动)"
+            lastError = "系统隧道不可用(扩展未启动)"
             status = "disconnected"
             return
         }
@@ -77,6 +80,7 @@ final class GoEngine: ObservableObject, TunnelEngine {
             connectedAt = nil
             return
         }
+        status = "disconnecting"
         sendRequest(cmd: "stop") { [weak self] resp in
             if resp.ok != true {
                 self?.lastError = resp.message
@@ -108,6 +112,21 @@ final class GoEngine: ObservableObject, TunnelEngine {
             if resp.ok == true, let data = resp.data {
                 self?.applyStatusData(data)
             }
+        }
+    }
+
+    /// NETunnelProviderManager 的系统连接状态是移动端 UI 的事实源。
+    /// provider message 只补充引擎内部错误，不能替代 connecting/reasserting 等系统状态。
+    func applySystemStatus(_ newStatus: String, connectedAt date: Date? = nil) {
+        status = newStatus
+        switch newStatus {
+        case "connected":
+            connectedAt = date ?? connectedAt ?? Date()
+            lastError = nil
+        case "disconnected":
+            connectedAt = nil
+        default:
+            break
         }
     }
 
@@ -279,14 +298,9 @@ final class GoEngine: ObservableObject, TunnelEngine {
     private func applyStatusData(_ dataStr: String) {
         guard let data = dataStr.data(using: .utf8),
               let msg = try? JSONDecoder().decode(EngineStatus.self, from: data) else { return }
-        let old = status
-        status = msg.status
-        if msg.status == "connected" && old != "connected" {
-            connectedAt = Date()
-            lastError = nil
-        } else if msg.status == "disconnected" {
-            connectedAt = nil
-        }
+        // provider 的 "connected" 只表示 Go/sing-box 已启动，不能证明真实流量可用。
+        // 移动端 UI 状态只由 TunnelManager 的系统状态 + 主 App 数据链路探测推进；
+        // 这里仅吸收扩展内部错误，避免再次把控制面启动误报为链路已连接。
         if let e = msg.error, !e.isEmpty {
             lastError = e
         }

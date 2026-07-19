@@ -34,7 +34,7 @@ const (
 // PlatformNE = tvOS/iOS 的 NetworkExtension 场景:sing-box 作为库跑在扩展进程内,
 // 无 root、无子进程、路由由 NEPacketTunnelNetworkSettings 在 Swift 侧接管,读包来源
 // 是系统 packetFlow。因此 tun inbound 只保留最小字段(type/address/mtu),不生成
-// auto_route/strict_route/stack/route_exclude_address/auto_detect_interface,也不开
+// auto_route/strict_route/stack/route_exclude_address,也不开
 // clash_api;cache_file 必须用调用方传入的沙盒内绝对路径(basePath)。
 type Platform int
 
@@ -219,11 +219,10 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 	if len(tailscaleTags) > 0 {
 		route["default_domain_resolver"] = "system"
 	}
-	// auto_detect_interface 是桌面专属:选物理网卡。NE 模式下路由由平台层
-	// (NEPacketTunnelNetworkSettings)接管,不生成此字段。
-	if platform == PlatformMacOS {
-		route["auto_detect_interface"] = true
-	}
+	// 两个平台都必须选择真实物理出口。NE 只接管“哪些设备流量进 utun”，并不会
+	// 替 sing-box 的 direct/DNS 出站选择 Wi-Fi/蜂窝接口；移动端由 NWPathMonitor
+	// 经 PlatformInterface 提供接口信息。
+	route["auto_detect_interface"] = true
 	if len(ruleSetResources) > 0 {
 		route["rule_set"] = ruleSetResources
 	}
@@ -276,10 +275,11 @@ func buildTUNInbound(vpnServerIP string, platform Platform) map[string]interface
 		"address": []string{"198.18.0.1/15"},
 		"mtu":     9000,
 	}
-	// NE 模式只保留最小 tun inbound(type/address/mtu);auto_route/strict_route/
-	// stack/route_exclude_address 都是桌面自建 tun 抓包才需要的,NE 下读包来源是
-	// 系统 packetFlow,路由控制交给平台层,不是这个函数的职责。
+	// NE 模式由 gVisor 在进程内终止来自 packetFlow 的连接。明确指定 stack，确保
+	// 发布包若漏掉 with_gvisor 构建标签会在启动阶段直接失败，而不是静默退回到
+	// 依赖系统接口名称的 system stack 后假连接。
 	if platform == PlatformNE {
+		inbound["stack"] = "gvisor"
 		return inbound
 	}
 	inbound["auto_route"] = true

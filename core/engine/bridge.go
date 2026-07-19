@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync/atomic"
 
 	"sslcon/proto"
 	"sslcon/session"
@@ -23,9 +24,20 @@ import (
 const nicID = 1
 
 type VPNBridge struct {
-	s    *stack.Stack
-	ep   *channel.Endpoint
-	addr netip.Addr
+	s           *stack.Stack
+	ep          *channel.Endpoint
+	addr        netip.Addr
+	upPackets   atomic.Uint64
+	upBytes     atomic.Uint64
+	downPackets atomic.Uint64
+	downBytes   atomic.Uint64
+}
+
+type VPNBridgeStats struct {
+	UpPackets   uint64 `json:"up_packets"`
+	UpBytes     uint64 `json:"up_bytes"`
+	DownPackets uint64 `json:"down_packets"`
+	DownBytes   uint64 `json:"down_bytes"`
 }
 
 func NewVPNBridge(vpnAddr string, mtu int) (*VPNBridge, error) {
@@ -75,6 +87,8 @@ func (b *VPNBridge) vpnToStack(cSess *session.ConnSession) {
 			if pl.Type != 0x00 || len(pl.Data) == 0 {
 				continue
 			}
+			b.downPackets.Add(1)
+			b.downBytes.Add(uint64(len(pl.Data)))
 			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				Payload: buffer.MakeWithData(pl.Data),
 			})
@@ -100,6 +114,8 @@ func (b *VPNBridge) stackToVPN(cSess *session.ConnSession) {
 		pkt.DecRef()
 
 		pl := &proto.Payload{Type: 0x00, Data: data}
+		b.upPackets.Add(1)
+		b.upBytes.Add(uint64(len(data)))
 
 		if cSess.DtlsConnected.Load() {
 			select {
@@ -113,6 +129,15 @@ func (b *VPNBridge) stackToVPN(cSess *session.ConnSession) {
 				return
 			}
 		}
+	}
+}
+
+func (b *VPNBridge) Stats() VPNBridgeStats {
+	return VPNBridgeStats{
+		UpPackets:   b.upPackets.Load(),
+		UpBytes:     b.upBytes.Load(),
+		DownPackets: b.downPackets.Load(),
+		DownBytes:   b.downBytes.Load(),
 	}
 }
 

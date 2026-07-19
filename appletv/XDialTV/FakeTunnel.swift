@@ -4,7 +4,7 @@ import Foundation
 
 // MARK: - Fake Tunnel (Simulator 演示层)
 //
-// 这是**只在 tvOS Simulator 里编译**的演示隧道层（整个文件被
+// 这是**只在 iOS / tvOS Simulator 里编译**的演示隧道层（整个文件被
 // `#if targetEnvironment(simulator)` 包裹，真机 / Release 构建不包含）。
 //
 // 目的：让 app 在没有 NetworkExtension entitlement、没有真机的情况下，也能在
@@ -121,6 +121,10 @@ final class FakeTunnelManager: TunnelManaging, ObservableObject {
         self.engine = engine
     }
 
+    func refreshProfileStatus(completion: @escaping @Sendable (Bool) -> Void) {
+        completion(true)
+    }
+
     /// 记录一条日志（server/username，**不打印密码**），0.3s 后回调成功，
     /// 并立即驱动引擎进入 connecting→connected。
     func startTunnel(profile: Profile, server: String, username: String, password: String,
@@ -208,7 +212,7 @@ extension AppState {
             save()
             // save() 只改 profile / Keychain，不刷新 helperInstalled；
             // 真正的 helperInstalled 由注入的 FakeTunnelManager.isProfileInstalled=true 决定，
-            // 已在 AppState.init 的 checkHelper() 里读到，这里无需再动。
+            // 已在 AppState.init 的 refreshTunnelProfileStatus() 里读到，这里无需再动。
         }
     }
 }

@@ -6,7 +6,7 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PLIST_VERSION := $(patsubst v%,%,$(VERSION))
 GO_LDFLAGS := -X main.version=$(VERSION)
 
-.PHONY: all cli app release restart inspector clean test test-smoke libbox-xcframework appletv
+.PHONY: all cli app release restart inspector clean test test-smoke libbox-xcframework libbox-ios-xcframework appletv ios
 
 # 组装 .app bundle。$(1)=swift 产物目录(debug/release) $(2)=bundle 路径
 define assemble_app
@@ -71,7 +71,19 @@ inspector:
 libbox-xcframework:
 	@mkdir -p $(BUILD_DIR)
 	rm -rf $(BUILD_DIR)/Libbox.xcframework
-	PATH="$(PATH):$(GOBIN)" GOFLAGS=-mod=mod gomobile bind -target=tvos -o $(BUILD_DIR)/Libbox.xcframework ./core/libbox
+	PATH="$(PATH):$(GOBIN)" GOFLAGS=-mod=mod gomobile bind -tags with_gvisor -target=tvos -o $(BUILD_DIR)/Libbox.xcframework ./core/libbox
+	@if find $(BUILD_DIR)/Libbox.xcframework -type f -name Libbox -exec strings {} \; | grep -Fq 'gVisor is not included in this build'; then \
+		echo 'error: Libbox was built without the gVisor data stack'; exit 1; \
+	fi
+
+# iOS 使用独立 XCFramework，避免 iOS/tvOS slice 互相覆盖。
+libbox-ios-xcframework:
+	@mkdir -p $(BUILD_DIR)/frameworks/ios
+	rm -rf $(BUILD_DIR)/frameworks/ios/Libbox.xcframework
+	PATH="$(PATH):$(GOBIN)" GOFLAGS=-mod=mod gomobile bind -tags with_gvisor -target=ios -o $(BUILD_DIR)/frameworks/ios/Libbox.xcframework ./core/libbox
+	@if find $(BUILD_DIR)/frameworks/ios/Libbox.xcframework -type f -name Libbox -exec strings {} \; | grep -Fq 'gVisor is not included in this build'; then \
+		echo 'error: Libbox was built without the gVisor data stack'; exit 1; \
+	fi
 
 # 构建 tvOS app(appletv/ 下的 xcodegen 工程,双 target:app + NE 扩展)。
 # 依赖 libbox-xcframework 先产出 build/Libbox.xcframework(project.yml 引用路径)。
@@ -81,6 +93,12 @@ appletv: libbox-xcframework
 	@command -v xcodegen >/dev/null 2>&1 || { echo "error: xcodegen not found. Install it with: brew install xcodegen"; exit 1; }
 	cd appletv && xcodegen generate
 	cd appletv && xcodebuild -project XDialTV.xcodeproj -scheme XDialTV -sdk appletvsimulator -configuration Debug CODE_SIGNING_ALLOWED=NO build
+
+# 构建 iOS App + Packet Tunnel Extension。模拟器走 FakeTunnel，真机由 Xcode 自动签名。
+ios: libbox-ios-xcframework
+	@command -v xcodegen >/dev/null 2>&1 || { echo "error: xcodegen not found. Install it with: brew install xcodegen"; exit 1; }
+	cd ios && xcodegen generate
+	xcodebuild -project ios/XDialIOS.xcodeproj -scheme XDialIOS -sdk iphonesimulator -configuration Debug -destination 'generic/platform=iOS Simulator' -derivedDataPath $(BUILD_DIR)/ios CODE_SIGNING_ALLOWED=NO build
 
 clean:
 	rm -rf $(BUILD_DIR)

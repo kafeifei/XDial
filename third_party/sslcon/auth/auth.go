@@ -30,18 +30,23 @@ var (
 
 // Profile 模板变量字段必须导出，虽然全局，但每次连接都被重置
 type Profile struct {
-	Host      string `json:"host"`
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	Group     string `json:"group"`
-	SecretKey string `json:"secret"`
+	Host string `json:"host"`
+	// DialAddress is an optional numeric socket target. Host remains the
+	// certificate/HTTP identity when this is populated by NetworkExtension.
+	DialAddress string
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	Group       string `json:"group"`
+	SecretKey   string `json:"secret"`
 
 	Initialized bool
 	AppVersion  string // for report to server in xml
 
-	HostWithPort string
-	Scheme       string
-	AuthPath     string
+	HostWithPort     string
+	DialHostWithPort string
+	TLSServerName    string
+	Scheme           string
+	AuthPath         string
 
 	MacAddress  string
 	TunnelGroup string
@@ -74,9 +79,14 @@ func InitAuth() error {
 	// https://github.com/mwitkow/go-http-dialer
 	config := tls.Config{
 		InsecureSkipVerify: base.Cfg.InsecureSkipVerify,
+		ServerName:         Prof.TLSServerName,
+	}
+	dialTarget := Prof.DialHostWithPort
+	if dialTarget == "" {
+		dialTarget = Prof.HostWithPort
 	}
 	var err error
-	Conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 6 * time.Second}, "tcp4", Prof.HostWithPort, &config)
+	Conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 6 * time.Second}, "tcp4", dialTarget, &config)
 	if err != nil {
 		return err
 	}

@@ -1,0 +1,119 @@
+name: XDialIOS
+options:
+  bundleIdPrefix: com.kafeifei
+  deploymentTarget:
+    iOS: "17.0"
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: UVZM439VGU
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+
+schemes:
+  XDialIOS:
+    shared: true
+    build:
+      targets:
+        XDialIOS: all
+    test:
+      targets:
+        - XDialIOSTests
+        - XDialIOSUITests
+
+targets:
+  XDialIOSTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ../appletv/XDialTVTunnel/PacketTunnelProvider.swift
+    info:
+      path: XDialIOSTunnel/Info.plist
+      properties:
+        CFBundleDisplayName: XDial Tunnel
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        ITSAppUsesNonExemptEncryption: false
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+    entitlements:
+      path: XDialIOSTunnel/XDialIOSTunnel.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
+        com.apple.security.application-groups:
+          - group.com.kafeifei.xdial.ios
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ios.tunnel
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "6"
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true
+    dependencies:
+      - framework: ../build/frameworks/ios/Libbox.xcframework
+        embed: false
+      - sdk: libresolv.tbd
+
+  XDialIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: XDialIOS
+      - path: ../appletv/XDialTV/AppState.swift
+      - path: ../appletv/XDialTV/FakeTunnel.swift
+      - path: ../appletv/XDialTV/GoEngine.swift
+      - path: ../appletv/XDialTV/KeychainStore.swift
+      - path: ../appletv/XDialTV/Localization.swift
+      - path: ../appletv/XDialTV/Models.swift
+      - path: ../appletv/XDialTV/TunnelManager.swift
+    entitlements:
+      path: XDialIOS/XDialIOS.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
+        com.apple.security.application-groups:
+          - group.com.kafeifei.xdial.ios
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ios
+        PRODUCT_NAME: XDial
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "6"
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_KEY_CFBundleDisplayName: XDial
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: false
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - target: XDialIOSTunnel
+        embed: true
+      - framework: ../build/frameworks/ios/Libbox.xcframework
+        embed: false
+      - sdk: libresolv.tbd
+
+  XDialIOSTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: XDialIOSTests
+    dependencies:
+      - target: XDialIOS
+    settings:
+      base:
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/XDial.app/XDial
+        BUNDLE_LOADER: $(TEST_HOST)
+
+  XDialIOSUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: XDialIOSUITests
+    dependencies:
+      - target: XDialIOS
