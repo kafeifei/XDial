@@ -46,7 +46,7 @@ func (s *SingBoxProcess) Start(profile *config.Profile, socksAddr, vpnServerIP s
 		}
 	}
 	if profile.ActiveVPNLine() != nil && port == 0 {
-		return fmt.Errorf("active VPN line requires a SOCKS address")
+		return fmt.Errorf("active AnyConnect line requires a SOCKS address")
 	}
 
 	cfgData, err := config.GenerateSingBoxFor(profile, port, vpnServerIP, config.PlatformMacOS, s.statePath)

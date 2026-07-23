@@ -3,6 +3,8 @@ package vpn
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"time"
@@ -16,11 +18,10 @@ import (
 // 新建 dtls.Conn
 func dtlsChannel(cSess *session.ConnSession) {
 	var (
-		conn          *dtls.Conn
-		dSess         *session.DtlsSession
-		err           error
-		bytesReceived int
-		dead          = time.Duration(cSess.DTLSDpdTime+5) * time.Second
+		conn  *dtls.Conn
+		dSess *session.DtlsSession
+		err   error
+		dead  = time.Duration(cSess.DTLSDpdTime+5) * time.Second
 	)
 	defer func() {
 		base.Info("dtls channel exit")
@@ -102,41 +103,66 @@ func dtlsChannel(cSess *session.ConnSession) {
 			cSess.ResetDTLSReadDead.Store(false)
 		}
 
-		pl := getPayloadBuffer()                // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
-		bytesReceived, err = conn.Read(pl.Data) // 服务器没有数据返回时，会阻塞
-		if err != nil {
-			base.Error("dtls server to payloadIn error:", err)
+		bytesReceived, keepRunning, readErr := readDTLSPayload(conn, dSess, cSess)
+		if readErr != nil {
+			base.Error("dtls server to payloadIn error:", readErr)
 			return
 		}
-
-		// base.Debug("dtls server to payloadIn")
-		// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-02#section-2.3
-		// UDP 数据包的头部只有 1 字节
-		switch pl.Data[0] {
-		case 0x07: // KEEPALIVE
-			// base.Debug("dtls receive KEEPALIVE")
-		case 0x05: // DISCONNECT
-			// base.Debug("dtls receive DISCONNECT")
+		if !keepRunning {
 			return
-		case 0x03: // DPD-REQ
-			// base.Debug("dtls receive DPD-REQ")
-			pl.Type = 0x04
-			select {
-			case cSess.PayloadOutDTLS <- pl:
-			case <-dSess.CloseChan:
-			}
-		case 0x04:
-			base.Debug("dtls receive DPD-RESP")
-		case 0x00: // DATA
-			pl.Data = append(pl.Data[:0], pl.Data[1:bytesReceived]...)
-			select {
-			case cSess.PayloadIn <- pl:
-			case <-dSess.CloseChan:
-				return
-			}
 		}
 		cSess.Stat.BytesReceived += uint64(bytesReceived)
 	}
+}
+
+// readDTLSPayload 读取并分派一个 DTLS 数据报。只有成功写入数据通道时才移交
+// 缓冲所有权；其余路径统一在返回前归还缓冲池。
+func readDTLSPayload(reader io.Reader, dSess *session.DtlsSession, cSess *session.ConnSession) (bytesReceived int, keepRunning bool, err error) {
+	pl := getPayloadBuffer()
+	transferred := false
+	defer func() {
+		if !transferred {
+			putPayloadBuffer(pl)
+		}
+	}()
+
+	bytesReceived, err = reader.Read(pl.Data)
+	if err != nil {
+		return 0, false, err
+	}
+	if bytesReceived < 1 {
+		return bytesReceived, false, fmt.Errorf("empty DTLS payload")
+	}
+
+	// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-02#section-2.3
+	// UDP 数据包的头部只有 1 字节。
+	switch pl.Data[0] {
+	case 0x07: // KEEPALIVE
+	case 0x05: // DISCONNECT
+		return bytesReceived, false, nil
+	case 0x03: // DPD-REQ
+		pl.Type = 0x04
+		select {
+		case cSess.PayloadOutDTLS <- pl:
+			transferred = true
+			return bytesReceived, true, nil
+		case <-dSess.CloseChan:
+			return bytesReceived, false, nil
+		}
+	case 0x04:
+		base.Debug("dtls receive DPD-RESP")
+	case 0x00: // DATA
+		copy(pl.Data, pl.Data[1:bytesReceived])
+		pl.Data = pl.Data[:bytesReceived-1]
+		select {
+		case cSess.PayloadIn <- pl:
+			transferred = true
+			return bytesReceived, true, nil
+		case <-dSess.CloseChan:
+			return bytesReceived, false, nil
+		}
+	}
+	return bytesReceived, true, nil
 }
 
 // payloadOutDTLSToServer Step 4
@@ -160,31 +186,29 @@ func payloadOutDTLSToServer(conn *dtls.Conn, dSess *session.DtlsSession, cSess *
 			return
 		}
 
-		// base.Debug("dtls payloadOut to server")
-		if pl.Type == 0x00 {
-			// 获取数据长度
-			l := len(pl.Data)
-			// 先扩容 +1
-			pl.Data = pl.Data[:l+1]
-			// 数据后移
-			copy(pl.Data[1:], pl.Data)
-			// 添加头信息
-			pl.Data[0] = pl.Type
-		} else {
-			// 设置头类型
-			pl.Data = append(pl.Data[:0], pl.Type)
-		}
-
-		bytesSent, err = conn.Write(pl.Data)
+		bytesSent, err = writeDTLSPayload(conn, pl)
 		if err != nil {
 			base.Error("dtls payloadOut to server error:", err)
 			return
 		}
 		cSess.Stat.BytesSent += uint64(bytesSent)
-
-		// 释放由 tunToPayloadOut 申请的内存
-		putPayloadBuffer(pl)
 	}
+}
+
+func writeDTLSPayload(writer io.Writer, pl *proto.Payload) (bytesSent int, err error) {
+	defer putPayloadBuffer(pl)
+	if pl.Type == 0x00 {
+		dataLen := len(pl.Data)
+		if dataLen >= cap(pl.Data) {
+			return 0, fmt.Errorf("DTLS payload has no header capacity")
+		}
+		pl.Data = pl.Data[:dataLen+1]
+		copy(pl.Data[1:], pl.Data)
+		pl.Data[0] = pl.Type
+	} else {
+		pl.Data = append(pl.Data[:0], pl.Type)
+	}
+	return writer.Write(pl.Data)
 }
 
 type SessionStore struct {

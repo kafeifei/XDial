@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 type SingBoxConfig struct {
@@ -17,12 +19,17 @@ type SingBoxConfig struct {
 	Experimental map[string]interface{}   `json:"experimental,omitempty"`
 }
 
-// 测试 IP 信息的域名（流量走 selector 出口组）
+// 桌面端“逐线路查公网地址”使用的域名；移动端不使用 Clash API/
+// test-out，也不应该暗中改写这些域名的路由。
 var testDomains = []string{"ip.sb", "ipinfo.io", "ip-api.com"}
 
 const (
-	testSelectorTag    = "test-out"
-	clashAPIController = "127.0.0.1:9090"
+	testSelectorTag               = "test-out"
+	clashAPIController            = "127.0.0.1:9090"
+	connectivityDirectRuleSetID   = "xdial-connectivity-direct"
+	connectivityOutboundRuleSetID = "xdial-connectivity-anyconnect"
+	mobilePublicDNSTag            = "xdial-public-dns"
+	mobileDispatcherDNSTag        = "xdial-mobile-dns"
 )
 
 // Platform 决定 sing-box 配置生成的目标运行环境。
@@ -59,9 +66,14 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 	if mode == nil {
 		return nil, fmt.Errorf("no active mode")
 	}
+	activeLineIDs, activeSubscriptionIDs := effectiveActiveTargetIDs(profile, mode)
+	activeVPNIDs := effectiveActiveVPNLineIDs(profile, mode)
+	if platform == PlatformNE && len(activeVPNIDs) > 1 {
+		return nil, fmt.Errorf("network extension mode supports only one active AnyConnect line")
+	}
 
 	outbounds := []map[string]interface{}{{"type": "direct", "tag": "direct"}}
-	if profile.ActiveVPNLine() != nil {
+	if len(activeVPNIDs) > 0 {
 		vpnOutbound := map[string]interface{}{
 			"type":        "socks",
 			"tag":         "vpn",
@@ -83,22 +95,25 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 
 	var endpoints []map[string]interface{}
 	var tailscaleTags []string
-	if platform == PlatformMacOS {
-		for _, line := range profile.Lines {
-			if !line.Enabled || line.Type != LineTypeTailscale {
-				continue
-			}
-			endpoint, err := buildTailscaleEndpoint(&line, basePath)
-			if err != nil {
-				return nil, err
-			}
-			endpoints = append(endpoints, endpoint)
-			tailscaleTags = append(tailscaleTags, tailscaleEndpointTag(&line))
+	for _, line := range profile.Lines {
+		// Tailscale endpoint 的 preferred_by / accept_routes 是全局路由能力，
+		// 不要求模式显式引用；移动端与桌面端保持相同语义。
+		if !line.Enabled || line.Type != LineTypeTailscale {
+			continue
 		}
+		if platform == PlatformNE && (basePath == "" || !path.IsAbs(basePath)) {
+			return nil, fmt.Errorf("network extension Tailscale state directory is unavailable")
+		}
+		endpoint, err := buildTailscaleEndpoint(&line, basePath)
+		if err != nil {
+			return nil, err
+		}
+		endpoints = append(endpoints, endpoint)
+		tailscaleTags = append(tailscaleTags, tailscaleEndpointTag(&line))
 	}
 
 	for _, line := range profile.Lines {
-		if !line.Enabled || line.Type == LineTypeDirect || line.Type == LineTypeVPN || line.Type == LineTypeTailscale {
+		if !activeLineIDs[line.ID] || !line.Enabled || line.Type == LineTypeDirect || line.Type == LineTypeVPN || line.Type == LineTypeTailscale {
 			continue
 		}
 		ob := buildProxyOutbound(&line)
@@ -111,10 +126,10 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 	subTagMap := make(map[string]string)
 	subGroupTagMap := make(map[string]map[string]string) // subID -> groupName -> tag
 	for _, sub := range profile.Subscriptions {
-		if !sub.Enabled || len(sub.Lines) == 0 {
+		if !activeSubscriptionIDs[sub.ID] || !sub.Enabled || len(sub.Lines) == 0 {
 			continue
 		}
-		obs, mainTag, groupTags := buildSubscriptionOutbounds(&sub)
+		obs, mainTag, groupTags := buildSubscriptionOutbounds(&sub, platform)
 		if mainTag != "" {
 			outbounds = append(outbounds, obs...)
 			subTagMap[sub.ID] = mainTag
@@ -122,22 +137,25 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 		}
 	}
 
-	// selector 出口组：包含所有有效线路和订阅组
-	selectorMembers := []string{"direct"}
-	for _, ob := range outbounds {
-		tag, _ := ob["tag"].(string)
-		if tag == "direct" {
-			continue
+	if platform == PlatformMacOS {
+		// 桌面端通过 Clash API 临时切换 selector 做逐线路地址探测。
+		// NetworkExtension 不启 Clash API，不生成这个诊断专用出口。
+		selectorMembers := []string{"direct"}
+		for _, ob := range outbounds {
+			tag, _ := ob["tag"].(string)
+			if tag == "direct" {
+				continue
+			}
+			selectorMembers = append(selectorMembers, tag)
 		}
-		selectorMembers = append(selectorMembers, tag)
+		selectorMembers = append(selectorMembers, tailscaleTags...)
+		outbounds = append(outbounds, map[string]interface{}{
+			"type":      "selector",
+			"tag":       testSelectorTag,
+			"outbounds": selectorMembers,
+			"default":   "direct",
+		})
 	}
-	selectorMembers = append(selectorMembers, tailscaleTags...)
-	outbounds = append(outbounds, map[string]interface{}{
-		"type":      "selector",
-		"tag":       testSelectorTag,
-		"outbounds": selectorMembers,
-		"default":   "direct",
-	})
 
 	// 收集所有已生成的 outbound tag，规则引用前要校验，避免引用不存在 tag 导致 sing-box 启动失败。
 	// 顺带做唯一性断言：重复 tag 会让 sing-box 在解析阶段直接拒绝启动（而 helper 只确认
@@ -160,12 +178,33 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 		}
 	}
 
-	routeRules := buildSystemRouteRules()
+	dnsOutbound := "direct"
+	if platform == PlatformNE && len(activeVPNIDs) == 1 {
+		// 保留旧变量的出口语义供桌面生成路径使用；NE 的系统 DNS 包会由
+		// hijack-dns 交给 xdial-mobile dispatcher，再按域名选择 Tailscale、
+		// AnyConnect 企业 DNS 或 standalone 公共 DNS。
+		dnsOutbound = "vpn"
+	}
+	routeRules := buildSystemRouteRules(dnsOutbound, platform == PlatformMacOS)
+	if platform == PlatformNE {
+		routeRules = buildNESystemRouteRules()
+	}
 	ruleSetResources := sbCollectRuleSets(profile, mode)
+	acceptanceModeRules, ordinaryModeRules := buildModeRouteRules(
+		profile,
+		mode,
+		subTagMap,
+		validTags,
+	)
 
-	// 订阅自带规则在模式规则之前（让订阅的分组规则优先匹配）
+	// 两条锁定验收规则来自用户可见 profile，不是生成器暗中注入；但它们必须
+	// 先于订阅规则匹配，否则订阅里的大网段（如 1.0.0.0/8）会吞掉 /32，
+	// 让路由验收测到订阅语义而不是两条显式绑定。
+	routeRules = append(routeRules, acceptanceModeRules...)
+
+	// 订阅自带规则仍优先于普通模式规则（让订阅的分组规则优先匹配）。
 	for _, sub := range profile.Subscriptions {
-		if !sub.Enabled {
+		if !activeSubscriptionIDs[sub.ID] || !sub.Enabled {
 			continue
 		}
 		groupTags := subGroupTagMap[sub.ID]
@@ -189,9 +228,8 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 		}
 	}
 
-	// 模式规则作为兜底（引用不存在的 outbound 时跳过）
-	modeRules := buildModeRouteRules(profile, mode, subTagMap, validTags)
-	routeRules = append(routeRules, modeRules...)
+	// 普通模式规则作为兜底（引用不存在的 outbound 时跳过）。
+	routeRules = append(routeRules, ordinaryModeRules...)
 
 	// Tailscale 的 preferred_by 会包含出口节点发布的默认路由。它必须排在
 	// 用户显式配置的订阅/模式规则之后，否则 0.0.0.0/0 会抢走所有流量，
@@ -216,7 +254,11 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 		"rules": routeRules,
 		"final": defaultTag,
 	}
-	if len(tailscaleTags) > 0 {
+	if platform == PlatformNE {
+		// 节点域名和 Tailscale 控制面必须能在首次登录前解析，不能递归进入
+		// 尚未就绪的企业或 Tailscale 分域 resolver。
+		route["default_domain_resolver"] = mobilePublicDNSTag
+	} else if len(tailscaleTags) > 0 {
 		route["default_domain_resolver"] = "system"
 	}
 	// 两个平台都必须选择真实物理出口。NE 只接管“哪些设备流量进 utun”，并不会
@@ -226,12 +268,17 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 	if len(ruleSetResources) > 0 {
 		route["rule_set"] = ruleSetResources
 	}
+	tailscaleDNSTag := firstString(tailscaleTags)
+	dnsConfig := buildDNS(tailscaleDNSTag)
+	if platform == PlatformNE {
+		dnsConfig = buildNEDNS(tailscaleTags)
+	}
 
 	cfg := SingBoxConfig{
 		Log: map[string]interface{}{
 			"level": "info",
 		},
-		DNS:       buildDNS(firstString(tailscaleTags)),
+		DNS:       dnsConfig,
 		Endpoints: endpoints,
 		Inbounds: []map[string]interface{}{
 			buildTUNInbound(vpnServerIP, platform),
@@ -242,6 +289,44 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 	}
 
 	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// effectiveActiveTargetIDs 只返回活动模式真正引用的线路和订阅。未使用但 enabled 的
+// 半成品节点不应进入 sing-box：否则它们即使永远不会承载流量，也可能在 box.New 时
+// 让整个活动模式启动失败。
+func effectiveActiveTargetIDs(profile *Profile, mode *Mode) (map[string]bool, map[string]bool) {
+	lineIDs := make(map[string]bool)
+	subscriptionIDs := make(map[string]bool)
+	addTarget := func(lineID, subscriptionID string) {
+		if lineID != "" {
+			lineIDs[lineID] = true
+		}
+		if subscriptionID != "" {
+			subscriptionIDs[subscriptionID] = true
+		}
+	}
+
+	addTarget(mode.DefaultLineID, mode.DefaultSubscriptionID)
+	for _, binding := range mode.Bindings {
+		ruleSet := profile.FindRuleSet(binding.RuleSetID)
+		if ruleSet == nil || !ruleSet.Enabled {
+			continue
+		}
+		addTarget(binding.LineID, binding.SubscriptionID)
+	}
+	return lineIDs, subscriptionIDs
+}
+
+func effectiveActiveVPNLineIDs(profile *Profile, mode *Mode) map[string]bool {
+	activeLineIDs, _ := effectiveActiveTargetIDs(profile, mode)
+	ids := make(map[string]bool)
+	for lineID := range activeLineIDs {
+		line := profile.FindLine(lineID)
+		if line != nil && line.Enabled && line.Type == LineTypeVPN {
+			ids[line.ID] = true
+		}
+	}
+	return ids
 }
 
 // buildExperimental 组装 experimental 块。
@@ -269,10 +354,16 @@ func buildExperimental(platform Platform, basePath string) map[string]interface{
 }
 
 func buildTUNInbound(vpnServerIP string, platform Platform) map[string]interface{} {
+	addresses := []string{"198.18.0.1/15"}
+	if platform == PlatformNE {
+		// 把 IPv6 一并接入 packetFlow。AnyConnect bridge 当前仅支持 IPv4，
+		// 因而纯 IPv6 目标会在 vpn outbound 明确失败；关键是不能绕过隧道直出。
+		addresses = append(addresses, "fd00::1/126")
+	}
 	inbound := map[string]interface{}{
 		"type":    "tun",
 		"tag":     "tun-in",
-		"address": []string{"198.18.0.1/15"},
+		"address": addresses,
 		"mtu":     9000,
 	}
 	// NE 模式由 gVisor 在进程内终止来自 packetFlow 的连接。明确指定 stack，确保
@@ -309,11 +400,63 @@ func buildDNS(tailscaleTag string) map[string]interface{} {
 	}
 }
 
-func buildSystemRouteRules() []map[string]interface{} {
+func buildNEDNS(tailscaleTags []string) map[string]interface{} {
+	servers := []map[string]interface{}{
+		{
+			"type":        "udp",
+			"tag":         mobilePublicDNSTag,
+			"server":      "1.1.1.1",
+			"server_port": 53,
+		},
+	}
+	bindings := make([]map[string]interface{}, 0, len(tailscaleTags))
+	for _, endpointTag := range tailscaleTags {
+		serverTag := mobileTailscaleDNSTag(endpointTag)
+		servers = append(servers, map[string]interface{}{
+			"type":                     "tailscale",
+			"tag":                      serverTag,
+			"endpoint":                 endpointTag,
+			"accept_default_resolvers": false,
+		})
+		bindings = append(bindings, map[string]interface{}{
+			"endpoint": endpointTag,
+			"server":   serverTag,
+		})
+	}
+	servers = append(servers, map[string]interface{}{
+		"type":            "xdial-mobile",
+		"tag":             mobileDispatcherDNSTag,
+		"public_fallback": mobilePublicDNSTag,
+		"tailscale":       bindings,
+	})
+	return map[string]interface{}{
+		"servers": servers,
+		"final":   mobileDispatcherDNSTag,
+	}
+}
+
+func mobileTailscaleDNSTag(endpointTag string) string {
+	return "xdial-dns-" + endpointTag
+}
+
+func buildSystemRouteRules(dnsOutbound string, includeDesktopDiagnostics bool) []map[string]interface{} {
+	rules := []map[string]interface{}{
+		{"action": "sniff"},
+		{"protocol": "dns", "action": "route", "outbound": dnsOutbound},
+	}
+	if includeDesktopDiagnostics {
+		rules = append(rules, map[string]interface{}{
+			"domain_suffix": testDomains,
+			"outbound":      testSelectorTag,
+		})
+	}
+	return rules
+}
+
+func buildNESystemRouteRules() []map[string]interface{} {
 	return []map[string]interface{}{
 		{"action": "sniff"},
-		{"protocol": "dns", "action": "route", "outbound": "direct"},
-		{"domain_suffix": testDomains, "outbound": testSelectorTag},
+		{"protocol": "dns", "action": "hijack-dns"},
 	}
 }
 
@@ -329,8 +472,12 @@ func buildTailscalePreferredRouteRules(tailscaleTags []string) []map[string]inte
 	return rules
 }
 
-func buildModeRouteRules(profile *Profile, mode *Mode, subTagMap map[string]string, validTags map[string]bool) []map[string]interface{} {
-	var rules []map[string]interface{}
+func buildModeRouteRules(
+	profile *Profile,
+	mode *Mode,
+	subTagMap map[string]string,
+	validTags map[string]bool,
+) (acceptanceRules []map[string]interface{}, ordinaryRules []map[string]interface{}) {
 
 	for _, binding := range mode.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
@@ -354,11 +501,19 @@ func buildModeRouteRules(profile *Profile, mode *Mode, subTagMap map[string]stri
 
 		routeRule := buildRouteRule(ruleSet, outTag)
 		if routeRule != nil {
-			rules = append(rules, routeRule)
+			if isConnectivityAcceptanceRuleSetID(ruleSet.ID) {
+				acceptanceRules = append(acceptanceRules, routeRule)
+			} else {
+				ordinaryRules = append(ordinaryRules, routeRule)
+			}
 		}
 	}
 
-	return rules
+	return acceptanceRules, ordinaryRules
+}
+
+func isConnectivityAcceptanceRuleSetID(id string) bool {
+	return id == connectivityDirectRuleSetID || id == connectivityOutboundRuleSetID
 }
 
 func buildRouteRule(c *RuleSet, outTag string) map[string]interface{} {
@@ -412,13 +567,22 @@ func sbCollectRuleSets(profile *Profile, mode *Mode) []map[string]interface{} {
 		seen[tag] = true
 
 		format := sbResolveRuleSetFormat(c)
-		sets = append(sets, map[string]interface{}{
-			"type":            "remote",
-			"tag":             tag,
-			"format":          format,
-			"url":             c.URL,
-			"download_detour": "direct",
-		})
+		if strings.HasPrefix(c.URL, "file://") {
+			sets = append(sets, map[string]interface{}{
+				"type":   "local",
+				"tag":    tag,
+				"format": format,
+				"path":   strings.TrimPrefix(c.URL, "file://"),
+			})
+		} else {
+			sets = append(sets, map[string]interface{}{
+				"type":            "remote",
+				"tag":             tag,
+				"format":          format,
+				"url":             c.URL,
+				"download_detour": "direct",
+			})
+		}
 	}
 	return sets
 }
@@ -434,12 +598,10 @@ func sbRuleSetTag(c *RuleSet) string {
 func sbResolveRuleSetFormat(c *RuleSet) string {
 	if c.Format != "" && c.Format != "auto" {
 		switch c.Format {
-		case "srs":
+		case "srs", "binary":
 			return "binary"
-		case "json":
+		case "json", "source":
 			return "source"
-		default:
-			return c.Format
 		}
 	}
 	ext := strings.ToLower(path.Ext(c.URL))
@@ -491,7 +653,7 @@ func isRejectName(name string) bool {
 }
 
 // buildSubscriptionOutbounds 返回所有 outbound、主 tag、以及组名→tag 映射
-func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, string, map[string]string) {
+func buildSubscriptionOutbounds(sub *Subscription, platform Platform) ([]map[string]interface{}, string, map[string]string) {
 	prefix := sub.ID + "-"
 
 	// 1. 生成所有节点 outbound，建立 name→tag 映射
@@ -518,8 +680,48 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 	var groupObs []map[string]interface{}
 
 	if len(sub.ProxyGroups) > 0 {
-		// 2a. 有策略组：每个策略组生成一个 outbound
-		// 先注册所有组名 tag，以便组间互相引用。
+		// 2a. 有策略组：先按真实可达成员做 fixpoint。不能先把所有组都当成有效
+		// outbound，否则“有效节点 + 空子组”会把不存在的 tag 塞进 selector，
+		// 直到 sing-box 启动时才失败。
+		nameToTag["DIRECT"] = "direct"
+		nameToTag["Direct"] = "direct"
+		const (
+			groupUnavailable = iota
+			groupRejectOnly
+			groupOutbound
+		)
+		groupDefinitions := make(map[string]ProxyGroup, len(sub.ProxyGroups))
+		for _, group := range sub.ProxyGroups {
+			if _, exists := groupDefinitions[group.Name]; !exists {
+				groupDefinitions[group.Name] = group
+			}
+		}
+		groupStates := make(map[string]int, len(groupDefinitions))
+		for changed := true; changed; {
+			changed = false
+			for name, group := range groupDefinitions {
+				next := groupUnavailable
+				for _, member := range group.Proxies {
+					if isRejectName(member) || groupStates[member] == groupRejectOnly {
+						if next < groupRejectOnly {
+							next = groupRejectOnly
+						}
+						continue
+					}
+					if _, ok := nameToTag[member]; ok || groupStates[member] == groupOutbound {
+						next = groupOutbound
+						break
+					}
+				}
+				if next > groupStates[name] {
+					groupStates[name] = next
+					changed = true
+				}
+			}
+		}
+
+		// 为最终确实存在的 outbound 分配唯一 tag；纯拦截组映射到哨兵，
+		// 完全不可用的组不进入映射。
 		// slugify 把非 ASCII 全映射为 '-'，中文组名（香港节点/台湾节点→"----"）会
 		// 撞成同一 tag，导致 sing-box 因 duplicate outbound tag 拒绝启动（表现为假连接）。
 		// 去重：首个组保留无后缀 base（Swift NetworkInfo 只按第一个组算 tag，保持兼容），
@@ -529,6 +731,13 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 			if _, exists := groupTags[g.Name]; exists {
 				continue // 同名组只保留第一个
 			}
+			if groupStates[g.Name] == groupRejectOnly {
+				groupTags[g.Name] = rejectTag
+				continue
+			}
+			if groupStates[g.Name] != groupOutbound {
+				continue
+			}
 			base := "sub-" + prefix + slugify(g.Name)
 			tag := base
 			for i := 2; usedTags[tag]; i++ {
@@ -537,36 +746,32 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 			usedTags[tag] = true
 			groupTags[g.Name] = tag
 		}
-		// "DIRECT" / "Direct" 映射到内置 direct
-		nameToTag["DIRECT"] = "direct"
-		nameToTag["Direct"] = "direct"
-
+		processedGroups := map[string]bool{}
 		for _, g := range sub.ProxyGroups {
+			if processedGroups[g.Name] || groupStates[g.Name] != groupOutbound {
+				continue
+			}
+			processedGroups[g.Name] = true
 			var memberTags []string
-			hasReject := false
+			selectedTag := ""
 			for _, name := range g.Proxies {
 				if isRejectName(name) {
-					// REJECT 是拦截策略，不是 outbound，不能作 selector 成员；
-					// 记下拦截意图，供纯拦截组保留 rejectTag 哨兵用
-					hasReject = true
 					continue
 				}
 				if tag, ok := nameToTag[name]; ok {
 					memberTags = append(memberTags, tag)
+					if name == g.Selected {
+						selectedTag = tag
+					}
 				} else if tag, ok := groupTags[name]; ok && tag != rejectTag {
 					memberTags = append(memberTags, tag)
+					if name == g.Selected {
+						selectedTag = tag
+					}
 				}
 			}
 			if len(memberTags) == 0 {
-				if hasReject {
-					// 纯拦截组（如广告组 proxies:[REJECT]）：不生成 outbound，但保留
-					// 组名→哨兵映射，让指向它的订阅规则翻译成 action:reject 而非被丢弃
-					groupTags[g.Name] = rejectTag
-				} else {
-					// 没有任何有效成员就不生成 outbound，同时从 groupTags 移除，
-					// 避免 mainTag / subscription rules 后续引用一个不存在的 tag
-					delete(groupTags, g.Name)
-				}
+				delete(groupTags, g.Name)
 				continue
 			}
 
@@ -577,7 +782,10 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 			switch g.Type {
 			case "url-test", "urltest":
 				ob["type"] = "urltest"
-				url := g.URL
+				url := ""
+				if platform != PlatformNE {
+					url = g.URL
+				}
 				if url == "" {
 					url = "https://www.gstatic.com/generate_204"
 				}
@@ -592,6 +800,9 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 				ob["interval"] = fmt.Sprintf("%ds", interval)
 			default:
 				ob["type"] = "selector"
+				if selectedTag != "" {
+					ob["default"] = selectedTag
+				}
 			}
 			groupObs = append(groupObs, ob)
 		}
@@ -609,9 +820,15 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 		switch sub.Strategy {
 		case "selector":
 			group["type"] = "selector"
+			if selectedTag := nameToTag[sub.Selected]; selectedTag != "" {
+				group["default"] = selectedTag
+			}
 		default:
 			group["type"] = "urltest"
-			url := sub.TestURL
+			url := ""
+			if platform != PlatformNE {
+				url = sub.TestURL
+			}
 			if url == "" {
 				url = "https://www.gstatic.com/generate_204"
 			}
@@ -644,6 +861,120 @@ func buildSubscriptionOutbounds(sub *Subscription) ([]map[string]interface{}, st
 
 	all := append(nodeObs, groupObs...)
 	return all, mainTag, groupTags
+}
+
+// RuntimeSubscriptionCatalog exposes the exact tags generated for subscription
+// nodes and groups. Mobile clients use this catalog for live selector changes and
+// latency probes instead of reimplementing slug/collision rules in Swift.
+type RuntimeSubscriptionCatalog struct {
+	Subscriptions []RuntimeSubscription `json:"subscriptions"`
+}
+
+type RuntimeSubscription struct {
+	ID       string          `json:"id"`
+	Name     string          `json:"name"`
+	Strategy string          `json:"strategy"`
+	Nodes    []RuntimeMember `json:"nodes"`
+	Groups   []RuntimeGroup  `json:"groups"`
+}
+
+type RuntimeGroup struct {
+	Name     string          `json:"name"`
+	Tag      string          `json:"tag"`
+	Type     string          `json:"type"`
+	Selected string          `json:"selected,omitempty"`
+	Members  []RuntimeMember `json:"members"`
+}
+
+type RuntimeMember struct {
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name"`
+	Tag  string `json:"tag"`
+}
+
+func BuildSubscriptionRuntimeCatalog(profile *Profile, platform Platform) RuntimeSubscriptionCatalog {
+	catalog := RuntimeSubscriptionCatalog{Subscriptions: []RuntimeSubscription{}}
+	for index := range profile.Subscriptions {
+		subscription := &profile.Subscriptions[index]
+		if !subscription.Enabled {
+			continue
+		}
+		generated, _, groupTags := buildSubscriptionOutbounds(subscription, platform)
+		if len(generated) == 0 {
+			continue
+		}
+		generatedTags := make(map[string]bool, len(generated))
+		for _, outbound := range generated {
+			if tag, ok := outbound["tag"].(string); ok {
+				generatedTags[tag] = true
+			}
+		}
+
+		entry := RuntimeSubscription{
+			ID: subscription.ID, Name: subscription.Name, Strategy: subscription.Strategy,
+			Nodes: []RuntimeMember{}, Groups: []RuntimeGroup{},
+		}
+		memberTags := make(map[string]string)
+		for _, line := range subscription.Lines {
+			if !line.Enabled {
+				continue
+			}
+			lineCopy := line
+			lineCopy.ID = subscription.ID + "-" + line.ID
+			outbound := buildProxyOutbound(&lineCopy)
+			if outbound == nil {
+				continue
+			}
+			tag, _ := outbound["tag"].(string)
+			if tag == "" || !generatedTags[tag] {
+				continue
+			}
+			memberTags[line.Name] = tag
+			entry.Nodes = append(entry.Nodes, RuntimeMember{ID: line.ID, Name: line.Name, Tag: tag})
+		}
+		memberTags["DIRECT"] = "direct"
+		memberTags["Direct"] = "direct"
+		for name, tag := range groupTags {
+			if name != "__default__" && tag != rejectTag {
+				memberTags[name] = tag
+			}
+		}
+
+		if len(subscription.ProxyGroups) == 0 {
+			if tag := groupTags["__default__"]; tag != "" {
+				members := append([]RuntimeMember(nil), entry.Nodes...)
+				entry.Groups = append(entry.Groups, RuntimeGroup{
+					Name: "__default__", Tag: tag, Type: subscription.Strategy,
+					Selected: subscription.Selected, Members: members,
+				})
+			}
+		} else {
+			seenGroups := make(map[string]bool)
+			for _, group := range subscription.ProxyGroups {
+				if seenGroups[group.Name] {
+					continue
+				}
+				seenGroups[group.Name] = true
+				tag := groupTags[group.Name]
+				if tag == "" || tag == rejectTag || !generatedTags[tag] {
+					continue
+				}
+				members := []RuntimeMember{}
+				for _, memberName := range group.Proxies {
+					memberTag := memberTags[memberName]
+					if memberTag == "" || memberTag == rejectTag {
+						continue
+					}
+					members = append(members, RuntimeMember{Name: memberName, Tag: memberTag})
+				}
+				entry.Groups = append(entry.Groups, RuntimeGroup{
+					Name: group.Name, Tag: tag, Type: group.Type, Selected: group.Selected, Members: members,
+				})
+			}
+		}
+		catalog.Subscriptions = append(catalog.Subscriptions, entry)
+	}
+	return catalog
 }
 
 // buildSubscriptionRules 将订阅的规则转换为 sing-box route rules 和 rule_sets
@@ -683,6 +1014,12 @@ func buildSubscriptionRules(sub *Subscription, groupTags map[string]string) ([]m
 		case "GEOIP":
 			// sing-box 1.12 移除了内置 geoip，转换为远程 rule-set
 			code := strings.ToLower(r.Value)
+			if code == "private" || code == "lan" {
+				// Clash 常用 GEOIP,LAN 表达私有地址；sing-box 对应原生
+				// ip_is_private，不应为它构造一个不存在的远程国家规则集。
+				rules = append(rules, subRouteRule("ip_is_private", true, outTag))
+				continue
+			}
 			setTag := "sub-geoip-" + sub.ID + "-" + code
 			if !seenGeoIP[setTag] {
 				seenGeoIP[setTag] = true
@@ -690,7 +1027,7 @@ func buildSubscriptionRules(sub *Subscription, groupTags map[string]string) ([]m
 					"type":            "remote",
 					"tag":             setTag,
 					"format":          "binary",
-					"url":             "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geoip/geoip-" + code + ".srs",
+					"url":             "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-" + code + ".srs",
 					"download_detour": "direct",
 				})
 			}
@@ -741,7 +1078,7 @@ func applyTransport(ob map[string]interface{}, line *Line) {
 func buildProxyOutbound(line *Line) map[string]interface{} {
 	switch line.Type {
 	case LineTypeTrojan:
-		if line.TrojanServer == "" {
+		if line.TrojanServer == "" || line.TrojanPort <= 0 || line.TrojanPort > 65535 || line.TrojanPassword == "" {
 			return nil
 		}
 		tls := map[string]interface{}{
@@ -764,7 +1101,7 @@ func buildProxyOutbound(line *Line) map[string]interface{} {
 		applyTransport(ob, line)
 		return ob
 	case LineTypeShadowsocks:
-		if line.SSServer == "" {
+		if line.SSServer == "" || line.SSPort <= 0 || line.SSPort > 65535 || line.SSMethod == "" || line.SSPass == "" {
 			return nil
 		}
 		ob := map[string]interface{}{
@@ -778,7 +1115,10 @@ func buildProxyOutbound(line *Line) map[string]interface{} {
 		applyTransport(ob, line)
 		return ob
 	case LineTypeVMess:
-		if line.VMessServer == "" {
+		if line.VMessServer == "" || line.VMessPort <= 0 || line.VMessPort > 65535 {
+			return nil
+		}
+		if _, err := uuid.Parse(line.VMessUUID); err != nil {
 			return nil
 		}
 		ob := map[string]interface{}{

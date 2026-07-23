@@ -48,7 +48,7 @@ struct SettingsView: View {
     private var statusSection: some View {
         Section {
             infoRow(
-                label: app.tr("VPN 描述文件", "VPN profile"),
+                label: app.tr("连接描述文件", "Connection profile"),
                 value: app.helperInstalled
                     ? app.tr("已安装", "Installed")
                     : app.tr("未安装", "Not installed")

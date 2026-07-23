@@ -11,19 +11,22 @@ struct XDialIOSApp: App {
 
 struct MobileRootView: View {
     @StateObject private var app: AppState
-    private let runtimeAnchor: AnyObject
 
     init() {
         #if targetEnvironment(simulator)
         let engine = FakeTunnelEngine()
         let manager = FakeTunnelManager(engine: engine)
         engine.retain(manager: manager)
-        runtimeAnchor = manager
-        _app = StateObject(wrappedValue: AppState(engine: engine, tunnelManager: manager))
+        let arguments = ProcessInfo.processInfo.arguments
+        let shouldResetUITesting = arguments.contains("-XDialUITestingReset")
+        let isUITesting = shouldResetUITesting || arguments.contains("-XDialUITesting")
+        let persistence: AppPersistenceContext = isUITesting ? .uiTesting : .production
+        if shouldResetUITesting { _ = persistence.clearForTesting() }
+        let state = AppState(engine: engine, tunnelManager: manager, persistence: persistence)
+        _app = StateObject(wrappedValue: state)
         #else
         let engine = GoEngine.shared
         let manager = TunnelManager(engine: engine)
-        runtimeAnchor = manager
         _app = StateObject(wrappedValue: AppState(engine: engine, tunnelManager: manager))
         #endif
     }

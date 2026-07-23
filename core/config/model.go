@@ -106,6 +106,7 @@ type ProxyGroup struct {
 	Name     string   `json:"name"`
 	Type     string   `json:"type"`    // select / urltest / fallback
 	Proxies  []string `json:"proxies"` // 节点名或其他组名
+	Selected string   `json:"selected,omitempty"`
 	URL      string   `json:"url,omitempty"`
 	Interval int      `json:"interval,omitempty"`
 }
@@ -125,6 +126,7 @@ type Subscription struct {
 	Format       string             `json:"format"`
 	Enabled      bool               `json:"enabled"`
 	Strategy     string             `json:"strategy"`
+	Selected     string             `json:"selected,omitempty"`
 	Lines        []Line             `json:"lines"`
 	ProxyGroups  []ProxyGroup       `json:"proxy_groups,omitempty"`
 	Rules        []SubscriptionRule `json:"rules,omitempty"`

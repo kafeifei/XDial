@@ -9,6 +9,7 @@ import (
 
 	"sslcon/proto"
 	"sslcon/session"
+	sslconvpn "sslcon/vpn"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -27,6 +28,7 @@ type VPNBridge struct {
 	s           *stack.Stack
 	ep          *channel.Endpoint
 	addr        netip.Addr
+	releaseIn   func(*proto.Payload)
 	upPackets   atomic.Uint64
 	upBytes     atomic.Uint64
 	downPackets atomic.Uint64
@@ -43,7 +45,10 @@ type VPNBridgeStats struct {
 func NewVPNBridge(vpnAddr string, mtu int) (*VPNBridge, error) {
 	addr, err := netip.ParseAddr(vpnAddr)
 	if err != nil {
-		return nil, fmt.Errorf("parse vpn addr: %w", err)
+		return nil, fmt.Errorf("parse tunnel address: %w", err)
+	}
+	if !addr.Is4() {
+		return nil, fmt.Errorf("tunnel address must be IPv4")
 	}
 
 	s := stack.New(stack.Options{
@@ -70,7 +75,12 @@ func NewVPNBridge(vpnAddr string, mtu int) (*VPNBridge, error) {
 		NIC:         nicID,
 	})
 
-	return &VPNBridge{s: s, ep: ep, addr: addr}, nil
+	return &VPNBridge{
+		s:         s,
+		ep:        ep,
+		addr:      addr,
+		releaseIn: sslconvpn.ReleasePayloadBuffer,
+	}, nil
 }
 
 // Start bridges sslcon packet channels ↔ gVisor netstack.
@@ -83,8 +93,15 @@ func (b *VPNBridge) Start(cSess *session.ConnSession) {
 func (b *VPNBridge) vpnToStack(cSess *session.ConnSession) {
 	for {
 		select {
-		case pl := <-cSess.PayloadIn:
+		case pl, ok := <-cSess.PayloadIn:
+			if !ok {
+				return
+			}
+			if pl == nil {
+				continue
+			}
 			if pl.Type != 0x00 || len(pl.Data) == 0 {
+				b.releaseIn(pl)
 				continue
 			}
 			b.downPackets.Add(1)
@@ -94,6 +111,9 @@ func (b *VPNBridge) vpnToStack(cSess *session.ConnSession) {
 			})
 			b.ep.InjectInbound(ipv4.ProtocolNumber, pkt)
 			pkt.DecRef()
+			// buffer.MakeWithData 已复制 pl.Data；注入返回后即可把 sslcon 的
+			// 固定大小缓冲归还池，避免 NetworkExtension 每个下行包重新分配。
+			b.releaseIn(pl)
 		case <-cSess.CloseChan:
 			return
 		}
@@ -150,6 +170,9 @@ func (b *VPNBridge) DialTCP(ctx context.Context, addr string) (net.Conn, error) 
 	ip, err := netip.ParseAddr(host)
 	if err != nil {
 		return nil, fmt.Errorf("parse addr %s: %w", host, err)
+	}
+	if !ip.Is4() {
+		return nil, fmt.Errorf("destination address must be IPv4")
 	}
 	p, err := net.LookupPort("tcp", port)
 	if err != nil {

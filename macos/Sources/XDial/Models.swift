@@ -157,20 +157,38 @@ struct SubProxyGroup: Codable, Hashable {
     var name: String
     var type: String
     var proxies: [String] = []
+    var selected: String = ""
     var url: String = ""
     var interval: Int = 0
+
+    init(
+        name: String,
+        type: String,
+        proxies: [String] = [],
+        selected: String = "",
+        url: String = "",
+        interval: Int = 0
+    ) {
+        self.name = name
+        self.type = type
+        self.proxies = proxies
+        self.selected = selected
+        self.url = url
+        self.interval = interval
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         name = try c.decode(String.self, forKey: .name)
         type = try c.decode(String.self, forKey: .type)
         proxies = try c.decodeIfPresent([String].self, forKey: .proxies) ?? []
+        selected = try c.decodeIfPresent(String.self, forKey: .selected) ?? ""
         url = try c.decodeIfPresent(String.self, forKey: .url) ?? ""
         interval = try c.decodeIfPresent(Int.self, forKey: .interval) ?? 0
     }
 
     enum CodingKeys: String, CodingKey {
-        case name, type, proxies, url, interval
+        case name, type, proxies, selected, url, interval
     }
 }
 
@@ -198,6 +216,7 @@ struct Subscription: Codable, Identifiable, Hashable {
     var format: String = "auto"
     var enabled: Bool = true
     var strategy: String = "urltest"
+    var selected: String = ""
     var lines: [Line] = []
     var proxyGroups: [SubProxyGroup] = []
     var rules: [SubRule] = []
@@ -206,7 +225,7 @@ struct Subscription: Codable, Identifiable, Hashable {
     var testInterval: Int = 300
 
     enum CodingKeys: String, CodingKey {
-        case id, name, url, format, enabled, strategy, rules
+        case id, name, url, format, enabled, strategy, selected, rules
         case lines = "lines"
         case proxyGroups = "proxy_groups"
         case updatedAt = "updated_at"
@@ -216,9 +235,10 @@ struct Subscription: Codable, Identifiable, Hashable {
 
     init(id: String, name: String, url: String, format: String = "auto",
          strategy: String = "urltest", lines: [Line] = [],
-         proxyGroups: [SubProxyGroup] = [], rules: [SubRule] = []) {
+         proxyGroups: [SubProxyGroup] = [], rules: [SubRule] = [], selected: String = "") {
         self.id = id; self.name = name; self.url = url; self.format = format
         self.strategy = strategy; self.lines = lines
+        self.selected = selected
         self.proxyGroups = proxyGroups; self.rules = rules
         self.updatedAt = Int(Date().timeIntervalSince1970)
     }
@@ -231,6 +251,7 @@ struct Subscription: Codable, Identifiable, Hashable {
         format = try c.decodeIfPresent(String.self, forKey: .format) ?? "auto"
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         strategy = try c.decodeIfPresent(String.self, forKey: .strategy) ?? "urltest"
+        selected = try c.decodeIfPresent(String.self, forKey: .selected) ?? ""
         lines = try c.decodeIfPresent([Line].self, forKey: .lines) ?? []
         proxyGroups = try c.decodeIfPresent([SubProxyGroup].self, forKey: .proxyGroups) ?? []
         rules = try c.decodeIfPresent([SubRule].self, forKey: .rules) ?? []

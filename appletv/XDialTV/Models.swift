@@ -111,6 +111,20 @@ struct RuleSet: Codable, Identifiable, Hashable {
     var format: String = "auto"
     var domains: [String] = []
     var cidrs: [String] = []
+
+    static let connectivityDirectID = "xdial-connectivity-direct"
+    static let connectivityAnyConnectID = "xdial-connectivity-anyconnect"
+    /// 保留旧持久化 ID，避免升级时短暂出现第三条规则；语义已经从
+    /// “AnyConnect”迁移为当前模式中确定选出的非 Direct 验收出口。
+    static let connectivityOutboundID = connectivityAnyConnectID
+
+    static func isConnectivityTestRuleID(_ id: String) -> Bool {
+        id == connectivityDirectID || id == connectivityOutboundID
+    }
+
+    var isConnectivityTestRule: Bool {
+        Self.isConnectivityTestRuleID(id)
+    }
 }
 
 struct RuleBinding: Codable, Hashable, Identifiable {
@@ -156,20 +170,38 @@ struct SubProxyGroup: Codable, Hashable {
     var name: String
     var type: String
     var proxies: [String] = []
+    var selected: String = ""
     var url: String = ""
     var interval: Int = 0
+
+    init(
+        name: String,
+        type: String,
+        proxies: [String] = [],
+        selected: String = "",
+        url: String = "",
+        interval: Int = 0
+    ) {
+        self.name = name
+        self.type = type
+        self.proxies = proxies
+        self.selected = selected
+        self.url = url
+        self.interval = interval
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         name = try c.decode(String.self, forKey: .name)
         type = try c.decode(String.self, forKey: .type)
         proxies = try c.decodeIfPresent([String].self, forKey: .proxies) ?? []
+        selected = try c.decodeIfPresent(String.self, forKey: .selected) ?? ""
         url = try c.decodeIfPresent(String.self, forKey: .url) ?? ""
         interval = try c.decodeIfPresent(Int.self, forKey: .interval) ?? 0
     }
 
     enum CodingKeys: String, CodingKey {
-        case name, type, proxies, url, interval
+        case name, type, proxies, selected, url, interval
     }
 }
 
@@ -197,6 +229,7 @@ struct Subscription: Codable, Identifiable, Hashable {
     var format: String = "auto"
     var enabled: Bool = true
     var strategy: String = "urltest"
+    var selected: String = ""
     var lines: [Line] = []
     var proxyGroups: [SubProxyGroup] = []
     var rules: [SubRule] = []
@@ -205,7 +238,7 @@ struct Subscription: Codable, Identifiable, Hashable {
     var testInterval: Int = 300
 
     enum CodingKeys: String, CodingKey {
-        case id, name, url, format, enabled, strategy, rules
+        case id, name, url, format, enabled, strategy, selected, rules
         case lines = "lines"
         case proxyGroups = "proxy_groups"
         case updatedAt = "updated_at"
@@ -215,9 +248,10 @@ struct Subscription: Codable, Identifiable, Hashable {
 
     init(id: String, name: String, url: String, format: String = "auto",
          strategy: String = "urltest", lines: [Line] = [],
-         proxyGroups: [SubProxyGroup] = [], rules: [SubRule] = []) {
+         proxyGroups: [SubProxyGroup] = [], rules: [SubRule] = [], selected: String = "") {
         self.id = id; self.name = name; self.url = url; self.format = format
         self.strategy = strategy; self.lines = lines
+        self.selected = selected
         self.proxyGroups = proxyGroups; self.rules = rules
         self.updatedAt = Int(Date().timeIntervalSince1970)
     }
@@ -230,6 +264,7 @@ struct Subscription: Codable, Identifiable, Hashable {
         format = try c.decodeIfPresent(String.self, forKey: .format) ?? "auto"
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         strategy = try c.decodeIfPresent(String.self, forKey: .strategy) ?? "urltest"
+        selected = try c.decodeIfPresent(String.self, forKey: .selected) ?? ""
         lines = try c.decodeIfPresent([Line].self, forKey: .lines) ?? []
         proxyGroups = try c.decodeIfPresent([SubProxyGroup].self, forKey: .proxyGroups) ?? []
         rules = try c.decodeIfPresent([SubRule].self, forKey: .rules) ?? []
@@ -279,7 +314,7 @@ struct Mode: Codable, Identifiable, Hashable {
     }
 }
 
-struct Profile: Codable {
+struct Profile: Codable, Equatable {
     var lines: [Line] = []
     var ruleSets: [RuleSet] = []
     var modes: [Mode] = []
@@ -306,7 +341,184 @@ struct Profile: Codable {
     }
 }
 
+struct ActiveRouteTargetSummary: Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+    let type: String
+    let isSubscription: Bool
+}
+
 extension Profile {
+    private static var connectivityRuleSets: [RuleSet] {
+        [
+            RuleSet(
+                id: RuleSet.connectivityDirectID,
+                name: "连接验收 · Direct",
+                type: "manual",
+                cidrs: ["1.0.0.1/32"]
+            ),
+            RuleSet(
+                id: RuleSet.connectivityOutboundID,
+                name: "连接验收 · 非 Direct 出口",
+                type: "manual",
+                cidrs: ["1.1.1.1/32"]
+            ),
+        ]
+    }
+
+    static func connectivityBindings(outboundLineID: String, directLineID: String) -> [RuleBinding] {
+        var bindings: [RuleBinding] = []
+        if !directLineID.isEmpty {
+            bindings.append(RuleBinding(
+                ruleSetID: RuleSet.connectivityDirectID,
+                lineID: directLineID
+            ))
+        }
+        if !outboundLineID.isEmpty && outboundLineID != directLineID {
+            bindings.append(RuleBinding(
+                ruleSetID: RuleSet.connectivityOutboundID,
+                lineID: outboundLineID
+            ))
+        }
+        return bindings
+    }
+
+    /// 返回模式中用于双出口路由验收的非 Direct 目标。选择顺序是协议的一部分：
+    /// 非 Direct 默认出口优先；否则按普通、已启用规则绑定的原始顺序取首个。
+    /// 锁定验收规则自身不会参与选择，避免旧错误绑定把迁移继续带错。
+    func connectivityOutboundBinding(for mode: Mode) -> RuleBinding? {
+        func isAvailableNonDirect(_ binding: RuleBinding) -> Bool {
+            if !binding.subscriptionID.isEmpty {
+                return subscriptions.contains {
+                    $0.id == binding.subscriptionID && $0.enabled
+                        && $0.lines.contains(where: { $0.enabled })
+                }
+            }
+            guard !binding.lineID.isEmpty,
+                  let line = lines.first(where: {
+                      $0.id == binding.lineID && $0.enabled
+                  }) else { return false }
+            if line.type == "tailscale" {
+                // An overlay-only endpoint is globally generated for subnet
+                // routes, but it is not a public egress for the 1.1.1.1 probe.
+                return !line.tailscaleExitNode.isEmpty
+            }
+            return line.type != "direct"
+        }
+
+        let defaultBinding = RuleBinding(
+            ruleSetID: RuleSet.connectivityOutboundID,
+            lineID: mode.defaultLineID,
+            subscriptionID: mode.defaultSubscriptionID
+        )
+        if isAvailableNonDirect(defaultBinding) {
+            return defaultBinding
+        }
+
+        for binding in mode.bindings where !binding.ruleSetID.isEmpty {
+            guard !RuleSet.isConnectivityTestRuleID(binding.ruleSetID),
+            ruleSets.first(where: { $0.id == binding.ruleSetID })?.enabled == true,
+            isAvailableNonDirect(binding) else {
+                continue
+            }
+            return RuleBinding(
+                ruleSetID: RuleSet.connectivityOutboundID,
+                lineID: binding.lineID,
+                subscriptionID: binding.subscriptionID
+            )
+        }
+        return nil
+    }
+
+    /// 与生成器的活动目标语义一致：默认出口始终计入；只有 enabled 规则的绑定
+    /// 计入；线路和订阅统一去重。主页使用这一份摘要，避免订阅模式被误显示成
+    /// “没有线路”，也避免 disabled 规则把未运行目标带进来。
+    func activeRouteTargetSummaries(for mode: Mode) -> [ActiveRouteTargetSummary] {
+        var result: [ActiveRouteTargetSummary] = []
+        var seen = Set<String>()
+
+        func append(lineID: String, subscriptionID: String) {
+            if !subscriptionID.isEmpty {
+                let key = "sub:\(subscriptionID)"
+                guard seen.insert(key).inserted,
+                      let subscription = subscriptions.first(where: {
+                          $0.id == subscriptionID && $0.enabled
+                              && $0.lines.contains(where: { $0.enabled })
+                      }) else { return }
+                result.append(ActiveRouteTargetSummary(
+                    id: key,
+                    name: subscription.name,
+                    type: "subscription",
+                    isSubscription: true
+                ))
+                return
+            }
+            let key = "port:\(lineID)"
+            guard !lineID.isEmpty, seen.insert(key).inserted,
+                  let line = lines.first(where: {
+                      $0.id == lineID && $0.enabled
+                  }) else { return }
+            result.append(ActiveRouteTargetSummary(
+                id: key,
+                name: line.name,
+                type: line.type,
+                isSubscription: false
+            ))
+        }
+
+        append(
+            lineID: mode.defaultLineID,
+            subscriptionID: mode.defaultSubscriptionID
+        )
+        for binding in mode.bindings {
+            guard ruleSets.first(where: { $0.id == binding.ruleSetID })?.enabled == true else {
+                continue
+            }
+            append(lineID: binding.lineID, subscriptionID: binding.subscriptionID)
+        }
+        return result
+    }
+
+    /// 连接验收规则是真实 profile 的一部分，会在配置页展示，而不是生成器
+    /// 暗中注入的路由。旧 profile 升级时会恢复两条精确 CIDR；第二条只绑定
+    /// 确定选出的非 Direct 活动目标。纯 Direct 模式不伪造第二个出口。
+    @discardableResult
+    mutating func ensureConnectivityTestConfiguration() -> Bool {
+        let before = self
+
+        for expected in Self.connectivityRuleSets {
+            if let index = ruleSets.firstIndex(where: { $0.id == expected.id }) {
+                ruleSets[index] = expected
+            } else {
+                ruleSets.append(expected)
+            }
+        }
+
+        let directLineID = lines.first(where: { $0.type == "direct" && $0.enabled })?.id ?? ""
+        for index in modes.indices {
+            let ordinaryBindings = modes[index].bindings.filter {
+                $0.ruleSetID != RuleSet.connectivityDirectID
+                    && $0.ruleSetID != RuleSet.connectivityOutboundID
+            }
+            var selectionMode = modes[index]
+            selectionMode.bindings = ordinaryBindings
+            let outboundBinding = connectivityOutboundBinding(for: selectionMode)
+            var acceptanceBindings: [RuleBinding] = []
+            if !directLineID.isEmpty {
+                acceptanceBindings.append(RuleBinding(
+                    ruleSetID: RuleSet.connectivityDirectID,
+                    lineID: directLineID
+                ))
+            }
+            if let outboundBinding {
+                acceptanceBindings.append(outboundBinding)
+            }
+            modes[index].bindings = acceptanceBindings + ordinaryBindings
+        }
+
+        return self != before
+    }
+
     static func bootstrap() -> Profile {
         var p = Profile()
         p.lines = [
@@ -323,7 +535,7 @@ extension Profile {
             RuleSet(id: "cnip", name: "国内 IP", type: "url", enabled: false,
                   url: "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geoip/geoip-cn.srs",
                   format: "srs"),
-        ]
+        ] + connectivityRuleSets
         return p
     }
 
@@ -331,13 +543,19 @@ extension Profile {
         Mode(
             id: UUID().uuidString,
             name: "海外",
-            bindings: ruleSetIDs.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) },
+            bindings: connectivityBindings(outboundLineID: vpnLineID, directLineID: directLineID)
+                + ruleSetIDs.filter { id in
+                    id != RuleSet.connectivityDirectID && id != RuleSet.connectivityAnyConnectID
+                }.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) },
             defaultLineID: directLineID
         )
     }
 
     static func templateDomestic(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, directLineID: String) -> Mode {
-        var bindings = ruleSetIDs.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) }
+        var bindings = connectivityBindings(outboundLineID: vpnLineID, directLineID: directLineID)
+            + ruleSetIDs.filter { id in
+                id != RuleSet.connectivityDirectID && id != RuleSet.connectivityAnyConnectID
+            }.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) }
         if !gfwRuleSetID.isEmpty {
             bindings.append(RuleBinding(ruleSetID: gfwRuleSetID, lineID: vpnLineID))
         }
@@ -350,7 +568,10 @@ extension Profile {
     }
 
     static func templateDomesticSS(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, ssLineID: String, directLineID: String) -> Mode {
-        var bindings = ruleSetIDs.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) }
+        var bindings = connectivityBindings(outboundLineID: ssLineID, directLineID: directLineID)
+            + ruleSetIDs.filter { id in
+                id != RuleSet.connectivityDirectID && id != RuleSet.connectivityAnyConnectID
+            }.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) }
         if !gfwRuleSetID.isEmpty {
             bindings.append(RuleBinding(ruleSetID: gfwRuleSetID, lineID: ssLineID))
         }

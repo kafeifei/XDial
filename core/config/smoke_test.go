@@ -29,6 +29,8 @@ type requestRecord struct {
 	Path string
 }
 
+const smokeRuleSetFetchOutbound = "smoke-rule-set-fetch-direct"
+
 func newFakeExit() *fakeExit {
 	return &fakeExit{}
 }
@@ -172,7 +174,7 @@ func newSmokeRunner(t *testing.T, profile *Profile) *smokeRunner {
 		ob := obRaw.(map[string]interface{})
 		tag := ob["tag"].(string)
 		typ := ob["type"].(string)
-		if tag == "direct" || typ == "selector" {
+		if typ == "selector" {
 			continue
 		}
 		fe := newFakeExit()
@@ -189,8 +191,6 @@ func newSmokeRunner(t *testing.T, profile *Profile) *smokeRunner {
 		typ := ob["type"].(string)
 
 		switch {
-		case tag == "direct":
-			newOutbounds = append(newOutbounds, ob)
 		case typ == "selector":
 			newOutbounds = append(newOutbounds, ob)
 		case typ == "urltest":
@@ -216,6 +216,13 @@ func newSmokeRunner(t *testing.T, profile *Profile) *smokeRunner {
 			newOutbounds = append(newOutbounds, newOb)
 		}
 	}
+	// 数据面分流断言把产品里的 direct 也改写成本地 SOCKS，以免测试结果依赖
+	// 公网可达性。远程 rule-set 的本地 HTTP fixture 则需要一条不参与路由选择的
+	// 真实 direct detour，否则下载请求也会被测试 SOCKS 截获并收到假响应。
+	newOutbounds = append(newOutbounds, map[string]interface{}{
+		"type": "direct",
+		"tag":  smokeRuleSetFetchOutbound,
+	})
 
 	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -247,11 +254,15 @@ func newSmokeRunner(t *testing.T, profile *Profile) *smokeRunner {
 
 			for _, rsRaw := range rss {
 				rs := rsRaw.(map[string]interface{})
-				oldURL := rs["url"].(string)
 				filename := rs["tag"].(string) + ".json"
+				oldURL, _ := rs["url"].(string)
+				localPath, _ := rs["path"].(string)
 
-				if strings.HasPrefix(oldURL, "file://") {
-					src, err := os.ReadFile(strings.TrimPrefix(oldURL, "file://"))
+				if localPath != "" || strings.HasPrefix(oldURL, "file://") {
+					if localPath == "" {
+						localPath = strings.TrimPrefix(oldURL, "file://")
+					}
+					src, err := os.ReadFile(localPath)
 					if err != nil {
 						t.Fatalf("read rule_set source: %v", err)
 					}
@@ -260,7 +271,10 @@ func newSmokeRunner(t *testing.T, profile *Profile) *smokeRunner {
 					os.WriteFile(filepath.Join(runner.tmpDir, filename),
 						[]byte(`{"version":1,"rules":[]}`), 0644)
 				}
+				rs["type"] = "remote"
 				rs["url"] = fmt.Sprintf("http://127.0.0.1:%d/%s", filePort, filename)
+				rs["download_detour"] = smokeRuleSetFetchOutbound
+				delete(rs, "path")
 				if rs["format"] == "binary" {
 					rs["format"] = "source"
 				}
@@ -346,10 +360,6 @@ func (r *smokeRunner) requestAndAssert(targetHost string, expectTag string) {
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	if expectTag == "direct" {
-		r.t.Logf("direct-bound request to %s succeeded (status %d)", targetHost, resp.StatusCode)
-		return
-	}
 	r.assertHost(expectTag, targetHost)
 }
 
@@ -643,10 +653,10 @@ func TestSmoke_AutoFormat(t *testing.T) {
 	}
 }
 
-func TestSmoke_CustomFormat(t *testing.T) {
+func TestSmoke_UnsupportedFormatFallsBackSafely(t *testing.T) {
 	ruleSet := &RuleSet{Format: "my-custom-format", URL: "https://example.com/rule.bin"}
-	if f := sbResolveRuleSetFormat(ruleSet); f != "my-custom-format" {
-		t.Errorf("custom format: expected my-custom-format, got %s", f)
+	if f := sbResolveRuleSetFormat(ruleSet); f != "binary" {
+		t.Errorf("unsupported format must not pass through to sing-box, got %s", f)
 	}
 }
 
@@ -694,6 +704,7 @@ func TestSmoke_URLRuleSetDedup(t *testing.T) {
 func TestSmoke_DirectBinding(t *testing.T) {
 	profile := &Profile{
 		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
 		RuleSets: []RuleSet{

@@ -12,16 +12,14 @@ struct HomeView: View {
                     powerButton
                     modeCard
 
-                    if !app.unsupportedActiveLineNames.isEmpty {
-                        warningCard(
-                            title: app.tr("移动端暂不支持 Tailscale", "Tailscale is not available on mobile yet"),
-                            detail: app.unsupportedActiveLineNames.joined(separator: "、")
-                        )
-                    } else if !app.isConnectionConfigured && !app.isConnected {
+                    if app.hasPendingRuntimeChanges {
+                        PendingRuntimeChangesBanner()
+                    }
+
+                    if !app.isConnectionConfigured && !app.hasActiveTunnel {
                         warningCard(
                             title: app.tr("连接配置尚未完成", "Connection setup is incomplete"),
-                            detail: app.tr("请在配置中补全当前模式使用的 AnyConnect 凭据。",
-                                           "Complete the AnyConnect credentials used by this mode.")
+                            detail: app.activeConfigurationIssues.prefix(3).joined(separator: app.tr("；", "; "))
                         )
                     }
 
@@ -52,6 +50,14 @@ struct HomeView: View {
 
             Text(app.activeMode?.name ?? app.tr("未选择模式", "No mode selected"))
                 .foregroundStyle(.secondary)
+
+            if app.hasActiveTunnel, let connectedAt = app.engine.connectedAt {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(formatDuration(context.date.timeIntervalSince(connectedAt)))
+                        .font(.system(.subheadline, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 12)
@@ -59,19 +65,19 @@ struct HomeView: View {
 
     private var powerButton: some View {
         Button {
-            app.isConnected ? app.disconnect() : app.connect()
+            app.hasActiveTunnel ? app.disconnect() : app.connect()
         } label: {
-            Image(systemName: app.isConnected ? "stop.fill" : "power")
+            Image(systemName: app.hasActiveTunnel ? "stop.fill" : "power")
                 .font(.system(size: 38, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 112, height: 112)
-                .background(app.isConnected ? Color.red : Color.accentColor)
+                .background(app.hasActiveTunnel ? Color.red : Color.accentColor)
                 .clipShape(Circle())
-                .shadow(color: (app.isConnected ? Color.red : Color.accentColor).opacity(0.28), radius: 16, y: 8)
+                .shadow(color: (app.hasActiveTunnel ? Color.red : Color.accentColor).opacity(0.28), radius: 16, y: 8)
         }
-        .disabled(app.isBusy || (!app.isConnected && !app.canConnect))
-        .opacity(app.isBusy || (!app.isConnected && !app.canConnect) ? 0.45 : 1)
-        .accessibilityLabel(app.isConnected ? app.tr("断开", "Disconnect") : app.tr("连接", "Connect"))
+        .disabled(app.isBusy || (!app.hasActiveTunnel && !app.canConnect))
+        .opacity(app.isBusy || (!app.hasActiveTunnel && !app.canConnect) ? 0.45 : 1)
+        .accessibilityLabel(app.hasActiveTunnel ? app.tr("断开", "Disconnect") : app.tr("连接", "Connect"))
     }
 
     private var modeCard: some View {
@@ -99,33 +105,36 @@ struct HomeView: View {
             .clipShape(RoundedRectangle(cornerRadius: 16))
         }
         .buttonStyle(.plain)
+        .disabled(app.hasActiveTunnel || app.isBusy)
     }
 
     private var activeLinesCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(app.tr("本模式线路", "Lines in this mode"))
+            Text(app.tr("本模式活动出口", "Active routes in this mode"))
                 .font(.headline)
 
-            if activeLines.isEmpty {
-                Text(app.tr("没有线路", "No lines"))
+            if activeTargets.isEmpty {
+                Text(app.tr("没有活动出口", "No active routes"))
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(activeLines) { line in
+                ForEach(activeTargets) { target in
                     HStack {
-                        Image(systemName: lineSymbol(line.type))
-                            .foregroundStyle(line.type == "tailscale" ? Color.orange : Color.accentColor)
+                        Image(systemName: target.isSubscription
+                              ? "antenna.radiowaves.left.and.right"
+                              : lineSymbol(target.type))
+                            .foregroundStyle(target.type == "tailscale" ? Color.orange : Color.accentColor)
                             .frame(width: 24)
                         VStack(alignment: .leading) {
-                            Text(line.name)
-                            Text(mobileLineTypeLabel(line.type))
+                            Text(target.name)
+                            Text(target.isSubscription
+                                 ? app.tr("订阅", "Subscription")
+                                 : mobileLineTypeLabel(target.type))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        if line.enabled {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
-                        }
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
                     }
                 }
             }
@@ -150,23 +159,67 @@ struct HomeView: View {
         .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
-    private var activeLines: [Line] {
+    private var activeTargets: [ActiveRouteTargetSummary] {
         guard let mode = app.activeMode else { return [] }
-        var ids = Set(mode.bindings.map(\.lineID))
-        if !mode.defaultLineID.isEmpty { ids.insert(mode.defaultLineID) }
-        return app.profile.lines.filter { ids.contains($0.id) }
+        return app.profile.activeRouteTargetSummaries(for: mode)
     }
 
     private var statusIcon: String {
         if app.isConnected { return "checkmark.shield.fill" }
+        if app.requiresUserAction { return "person.crop.circle.badge.exclamationmark" }
         if app.isBusy { return "arrow.triangle.2.circlepath" }
         return "shield.slash"
     }
 
     private var statusColor: Color {
         if app.isConnected { return .green }
+        if app.requiresUserAction { return .orange }
         if app.isBusy { return .orange }
         return .secondary
+    }
+
+    private func formatDuration(_ interval: TimeInterval) -> String {
+        let total = max(0, Int(interval))
+        let hours = total / 3_600
+        let minutes = (total % 3_600) / 60
+        let seconds = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+struct PendingRuntimeChangesBanner: View {
+    @EnvironmentObject private var app: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(
+                app.tr("配置已保存，等待重新连接后应用", "Configuration saved; reconnect to apply"),
+                systemImage: "arrow.triangle.2.circlepath"
+            )
+            .font(.subheadline.bold())
+
+            Text(app.tr(
+                "当前连接继续使用启动时的配置，不会在后台静默切换线路。",
+                "The current connection keeps its startup configuration and will not switch routes silently."
+            ))
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+
+            Button {
+                app.reconnectToApplyChanges()
+            } label: {
+                Label(app.tr("重新连接并应用", "Reconnect and Apply"), systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!app.isConnected || app.isBusy)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding()
+        .background(Color.orange.opacity(0.1))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 }
 
@@ -178,6 +231,7 @@ private struct QuickModePicker: View {
         NavigationStack {
             List(app.profile.modes) { mode in
                 Button {
+                    guard app.canMutateConfiguration else { return }
                     app.profile.activeModeID = mode.id
                     app.save()
                     dismiss()
@@ -197,6 +251,7 @@ private struct QuickModePicker: View {
                         }
                     }
                 }
+                .disabled(app.hasActiveTunnel || app.isBusy)
             }
             .navigationTitle(app.tr("选择模式", "Select mode"))
             .toolbar {

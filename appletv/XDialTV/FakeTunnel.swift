@@ -32,6 +32,9 @@ import Foundation
 final class FakeTunnelEngine: TunnelEngine, ObservableObject {
     @Published private(set) var status: String = "disconnected"
     @Published var lastError: String?
+    @Published var dataPathSummary: String?
+    @Published private(set) var connectedAt: Date?
+    var statusPublisher: AnyPublisher<String, Never> { $status.eraseToAnyPublisher() }
 
     var isConnected: Bool { status == "connected" }
     var isBusy: Bool {
@@ -70,26 +73,102 @@ final class FakeTunnelEngine: TunnelEngine, ObservableObject {
     /// 真实引擎里 syncStatus 会查询扩展当前状态回填；Simulator 无扩展，空实现。
     func syncStatus() {}
 
+    func selectSubscriptionMember(
+        profileJSON: String,
+        subscriptionID: String,
+        groupName: String,
+        memberName: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard isConnected else {
+            completion(.failure(TunnelRuntimeError.unavailable))
+            return
+        }
+        completion(.success(()))
+    }
+
+    func testSubscriptionNode(
+        profileJSON: String,
+        subscriptionID: String,
+        nodeID: String,
+        testURL: String,
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        guard isConnected else {
+            completion(.failure(TunnelRuntimeError.unavailable))
+            return
+        }
+        let checksum = nodeID.utf8.reduce(0) { ($0 + Int($1)) % 240 }
+        completion(.success(28 + checksum))
+    }
+
+    func probeSubscriptionNodeAddress(
+        profileJSON: String,
+        subscriptionID: String,
+        nodeID: String,
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        guard isConnected else {
+            completion(.failure(TunnelRuntimeError.unavailable))
+            return
+        }
+        let suffix = 1 + nodeID.utf8.reduce(0) { ($0 + Int($1)) % 253 }
+        completion(.success("模拟 198.51.100.\(suffix)"))
+    }
+
+    func tailscaleStatus(
+        endpointTag: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        guard ["connected", "action-required"].contains(status), !endpointTag.isEmpty else {
+            completion(.failure(TunnelRuntimeError.unavailable))
+            return
+        }
+        completion(.success(TailscaleRuntimeStatus(
+            backendState: "NeedsLogin",
+            authURL: "https://login.tailscale.com/a/xdial-simulator",
+            exitNodes: [
+                TailscaleRuntimeExitNode(
+                    id: "simulator-online",
+                    name: "家中 Mac",
+                    ip: "100.64.0.8",
+                    online: true,
+                    os: "macOS"
+                ),
+                TailscaleRuntimeExitNode(
+                    id: "simulator-offline",
+                    name: "备用节点",
+                    ip: "100.64.0.9",
+                    online: false,
+                    os: "linux"
+                ),
+            ]
+        )))
+    }
+
     // MARK: 供 FakeTunnelManager 驱动
 
     /// 进入 connecting，1.5s 后到 connected。若已在 connecting/connected 则忽略重复调用。
     func simulateConnect() {
         guard status != "connecting", status != "connected" else { return }
         lastError = nil
+        dataPathSummary = "模拟器 FakeTunnel：未接管系统流量"
         epoch += 1
         let myEpoch = epoch
         status = "connecting"
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard self.epoch == myEpoch else { return }
-            self.status = "connected"
-            appLog("FakeTunnelEngine → connected")
+            self.status = ProcessInfo.processInfo.arguments.contains(
+                "-XDialUITestingTailscaleActionRequired"
+            ) ? "action-required" : "connected"
+            self.connectedAt = Date()
+            appLog("FakeTunnelEngine → \(self.status)")
         }
     }
 
     /// 进入 disconnecting，0.8s 后到 disconnected。若已 disconnecting/disconnected 则忽略。
-    /// disconnect() 里 tunnelManager.stopTunnel() 与 engine.stop() 会各调一次，靠这个
-    /// guard 保证幂等（第二次调用是 no-op）。
+    /// AppState 通过 FakeTunnelManager.stopTunnel() 走到这里，与真机的系统管理路径一致。
     func simulateDisconnect() {
         guard status != "disconnecting", status != "disconnected" else { return }
         epoch += 1
@@ -99,6 +178,7 @@ final class FakeTunnelEngine: TunnelEngine, ObservableObject {
             try? await Task.sleep(nanoseconds: 800_000_000)
             guard self.epoch == myEpoch else { return }
             self.status = "disconnected"
+            self.connectedAt = nil
             appLog("FakeTunnelEngine → disconnected")
         }
     }
@@ -111,7 +191,13 @@ final class FakeTunnelEngine: TunnelEngine, ObservableObject {
 @MainActor
 final class FakeTunnelManager: TunnelManaging, ObservableObject {
     /// Simulator 里 VPN Profile 视为始终已安装可用（对应 macOS 的 helperInstalled=true）。
-    let isProfileInstalled: Bool = true
+    private(set) var isProfileInstalled: Bool = true
+    private(set) var systemOnDemandActive = false
+    @Published private(set) var systemOnDemandState: SystemOnDemandState = .disabled
+    var systemOnDemandStatePublisher: AnyPublisher<SystemOnDemandState, Never> {
+        $systemOnDemandState.eraseToAnyPublisher()
+    }
+    private var systemOnDemandRequested = false
 
     /// 被驱动的引擎。weak：存活锚点在 engine.retainedManager（engine 强持有 manager），
     /// 这里再强引用回 engine 会成环。engine 由 AppState 强持有，本 weak 不会先于它释放。
@@ -125,23 +211,48 @@ final class FakeTunnelManager: TunnelManaging, ObservableObject {
         completion(true)
     }
 
-    /// 记录一条日志（server/username，**不打印密码**），0.3s 后回调成功，
-    /// 并立即驱动引擎进入 connecting→connected。
-    func startTunnel(profile: Profile, server: String, username: String, password: String,
+    func setSystemOnDemandEnabled(_ enabled: Bool) {
+        systemOnDemandRequested = enabled
+        if !enabled {
+            systemOnDemandActive = false
+            systemOnDemandState = .disabled
+        } else if !systemOnDemandActive {
+            systemOnDemandState = .pending
+        }
+    }
+
+    /// 记录不含连接参数的日志，0.3s 后回调成功，并立即驱动引擎进入
+    /// connecting→connected。
+    func startTunnel(profile: Profile, anyConnect: AnyConnectCredentials?,
                      completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
-        appLog("FakeTunnelManager.startTunnel server=\(server) username=\(username) — 模拟拉起隧道")
+        appLog("FakeTunnelManager.startTunnel — 模拟拉起隧道")
+        isProfileInstalled = true
         // 立即驱动引擎切到 connecting，UI 马上能看到「正在连接…」。
         engine?.simulateConnect()
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 300_000_000)
+            systemOnDemandActive = systemOnDemandRequested
+            systemOnDemandState = systemOnDemandRequested ? .active : .disabled
             completion(.success(()))
         }
     }
 
     func stopTunnel() {
         appLog("FakeTunnelManager.stopTunnel — 模拟停止隧道")
+        systemOnDemandActive = false
+        systemOnDemandState = systemOnDemandRequested ? .pending : .disabled
         engine?.simulateDisconnect()
     }
+
+    func removeProfile(completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
+        guard engine?.isConnected != true, engine?.isBusy != true else {
+            completion(.failure(TunnelRuntimeError.unavailable))
+            return
+        }
+        isProfileInstalled = false
+        completion(.success(()))
+    }
+
 }
 
 // MARK: - Simulator 演示数据
@@ -149,7 +260,7 @@ final class FakeTunnelManager: TunnelManaging, ObservableObject {
 extension AppState {
     /// 演示凭据：仅用于 Simulator，让 canConnect 通过、UI 能走完连接流程。
     enum DemoCredentials {
-        static let server = "vpn.demo.example.com"
+        static let server = "connect.demo.example.com"
         static let username = "demo"
         static let password = "demo123"
     }
@@ -184,7 +295,7 @@ extension AppState {
             let directID = profile.lines.first(where: { $0.type == "direct" })?.id ?? "direct"
             let vpnID = profile.lines.first(where: { $0.type == "vpn" })?.id ?? "vpn"
             let manualRuleSetIDs = profile.ruleSets
-                .filter { $0.type == "manual" }
+                .filter { $0.type == "manual" && !$0.isConnectivityTestRule }
                 .map { $0.id }
             let gfwRuleSetID = profile.ruleSets
                 .first(where: { $0.type == "url" && $0.enabled })?.id ?? ""
@@ -205,6 +316,76 @@ extension AppState {
             changed = true
         } else if profile.activeModeID.isEmpty {
             profile.activeModeID = profile.modes.first?.id ?? ""
+            changed = true
+        }
+
+        // UI 自动化需要一份不依赖公网下载的订阅，覆盖无策略组 selector、节点延迟和
+        // 出口地址入口。仅测试进程注入，普通 Simulator 不会看到演示订阅。
+        let isUITesting = ProcessInfo.processInfo.arguments.contains("-XDialUITesting")
+            || ProcessInfo.processInfo.arguments.contains("-XDialUITestingReset")
+        if isUITesting && !profile.lines.contains(where: { $0.type == "tailscale" }) {
+            profile.lines.append(Line(
+                id: "tailscale-ui-demo",
+                name: "Tailscale 演示",
+                type: "tailscale",
+                enabled: true,
+                tailscaleHostname: "xdial-simulator"
+            ))
+            changed = true
+        }
+        if ProcessInfo.processInfo.arguments.contains("-XDialUITestingTailscaleActionRequired"),
+           let modeIndex = profile.modes.firstIndex(where: { $0.id == profile.activeModeID }) {
+            let ruleID = "tailscale-ui-login-rule"
+            if !profile.ruleSets.contains(where: { $0.id == ruleID }) {
+                profile.ruleSets.append(RuleSet(
+                    id: ruleID,
+                    name: "Tailscale 登录演示",
+                    type: "manual",
+                    domains: ["login-demo.invalid"]
+                ))
+                changed = true
+            }
+            if !profile.modes[modeIndex].bindings.contains(where: {
+                $0.ruleSetID == ruleID
+            }) {
+                profile.modes[modeIndex].bindings.append(RuleBinding(
+                    ruleSetID: ruleID,
+                    lineID: "tailscale-ui-demo"
+                ))
+                changed = true
+            }
+        }
+        if isUITesting && profile.subscriptions.isEmpty {
+            profile.subscriptions = [Subscription(
+                id: "sub-ui-demo",
+                name: "UI 测试订阅",
+                url: "",
+                format: "clash",
+                strategy: "selector",
+                lines: [
+                    Line(
+                        id: "ui-node-one",
+                        name: "演示节点一",
+                        type: "shadowsocks",
+                        ssServer: "one.example.invalid",
+                        ssPassword: "demo"
+                    ),
+                    Line(
+                        id: "ui-node-two",
+                        name: "演示节点二",
+                        type: "shadowsocks",
+                        ssServer: "two.example.invalid",
+                        ssPassword: "demo"
+                    ),
+                ],
+                selected: "演示节点一"
+            )]
+            changed = true
+        }
+        if ProcessInfo.processInfo.arguments.contains("-XDialUITestingSubscriptionSummary"),
+           let modeIndex = profile.modes.firstIndex(where: { $0.id == profile.activeModeID }) {
+            profile.modes[modeIndex].defaultLineID = ""
+            profile.modes[modeIndex].defaultSubscriptionID = "sub-ui-demo"
             changed = true
         }
 

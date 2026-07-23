@@ -1,9 +1,19 @@
 package subscription
 
 import (
+	"context"
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/kafeifei/xdial/core/config"
+)
+
+const (
+	maxStrictRemoteRuleSets = 32
+	maxStrictRuleSetBytes   = 1 * 1024 * 1024
+	maxStrictRuleSetLines   = 20_000
+	maxStrictExpandedRules  = 20_000
 )
 
 // ExpandRulesets 下载并就地展开所有 RULE-SET 规则为内联规则。
@@ -12,35 +22,96 @@ import (
 // 下载失败的 RULE-SET 保留原始占位（generator 的 buildSubscriptionRules 会跳过），
 // 不改变后续规则的相对顺序。
 func ExpandRulesets(result *ParseResult) {
+	_ = expandRulesets(context.Background(), result, false)
+}
+
+// ExpandRulesetsStrict 用于移动端导入：所有远程规则都必须在同一总时限内成功展开，
+// 否则整次导入失败，避免生成器跳过残留占位后静默改变路由语义。
+func ExpandRulesetsStrict(result *ParseResult) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return expandRulesets(ctx, result, true)
+}
+
+func expandRulesets(ctx context.Context, result *ParseResult, strict bool) error {
+	return expandRulesetsWithFetcher(ctx, result, strict, fetchRuleSetContent)
+}
+
+type ruleSetFetcher func(context.Context, string, bool, int64) (string, error)
+
+func expandRulesetsWithFetcher(ctx context.Context, result *ParseResult, strict bool, fetcher ruleSetFetcher) error {
 	if result == nil {
-		return
+		return nil
 	}
+	if strict {
+		remoteCount := 0
+		for _, rule := range result.Rules {
+			if strings.EqualFold(rule.Type, "RULE-SET") {
+				remoteCount++
+			}
+		}
+		if remoteCount > maxStrictRemoteRuleSets {
+			return fmt.Errorf("subscription contains too many remote rule sets")
+		}
+		if len(result.Rules) > maxStrictExpandedRules {
+			return fmt.Errorf("subscription contains too many rules")
+		}
+	}
+
 	out := make([]config.SubscriptionRule, 0, len(result.Rules))
+	remainingBytes := int64(maxStrictRuleSetBytes)
+	remainingLines := maxStrictRuleSetLines
 	for _, rule := range result.Rules {
-		if rule.Type != "RULE-SET" {
+		if !strings.EqualFold(rule.Type, "RULE-SET") {
+			if strict && len(out) >= maxStrictExpandedRules {
+				return fmt.Errorf("subscription contains too many rules")
+			}
 			out = append(out, rule)
 			continue
 		}
-		lines, err := fetchRuleSetContent(rule.Value)
+		if strict {
+			if err := validateStrictRemoteURL(rule.Value); err != nil {
+				return err
+			}
+		}
+		content, err := fetcher(ctx, rule.Value, strict, remainingBytes)
 		if err != nil {
+			if strict {
+				return fmt.Errorf("remote rule set could not be downloaded")
+			}
 			out = append(out, rule) // 保留占位，不丢位置
 			continue
 		}
+		if strict {
+			if int64(len(content)) > remainingBytes {
+				return fmt.Errorf("remote rule sets exceed the total size limit")
+			}
+			remainingBytes -= int64(len(content))
+			lineCount := strings.Count(content, "\n") + 1
+			if lineCount > remainingLines {
+				return fmt.Errorf("remote rule sets contain too many lines")
+			}
+			remainingLines -= lineCount
+		}
+		lines := strings.Split(content, "\n")
 		for _, line := range lines {
 			if r, ok := ruleSetLineToRule(line, rule.Group); ok {
+				if strict && len(out) >= maxStrictExpandedRules {
+					return fmt.Errorf("subscription contains too many expanded rules")
+				}
 				out = append(out, r)
 			}
 		}
 	}
 	result.Rules = out
+	return nil
 }
 
-func fetchRuleSetContent(url string) ([]string, error) {
-	content, err := fetch(url)
-	if err != nil {
-		return nil, err
+func fetchRuleSetContent(ctx context.Context, url string, strict bool, maxBytes int64) (string, error) {
+	if strict {
+		return fetchStrictWithContextLimit(ctx, url, maxBytes)
 	}
-	return strings.Split(content, "\n"), nil
+	return fetchWithContext(ctx, url)
 }
 
 // ruleSetLineToRule 解析 .list 文件中的单行

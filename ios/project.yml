@@ -12,6 +12,7 @@ settings:
     DEVELOPMENT_TEAM: UVZM439VGU
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "6.0"
+    XDIAL_SHARED_KEYCHAIN_GROUP: UVZM439VGU.com.kafeifei.xdial.shared
 
 schemes:
   XDialIOS:
@@ -21,8 +22,10 @@ schemes:
         XDialIOS: all
     test:
       targets:
-        - XDialIOSTests
-        - XDialIOSUITests
+        - name: XDialIOSTests
+          parallelizable: false
+        - name: XDialIOSUITests
+          parallelizable: false
 
 targets:
   XDialIOSTunnel:
@@ -30,6 +33,9 @@ targets:
     platform: iOS
     sources:
       - path: ../appletv/XDialTVTunnel/PacketTunnelProvider.swift
+      - path: ../appletv/XDialTV/OnDemandStartEnvelope.swift
+      - path: XDialIOSTunnel/PrivacyInfo.xcprivacy
+        buildPhase: resources
     info:
       path: XDialIOSTunnel/Info.plist
       properties:
@@ -37,6 +43,7 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         ITSAppUsesNonExemptEncryption: false
+        XDialSharedKeychainAccessGroup: $(XDIAL_SHARED_KEYCHAIN_GROUP)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
@@ -47,13 +54,16 @@ targets:
           - packet-tunnel-provider
         com.apple.security.application-groups:
           - group.com.kafeifei.xdial.ios
+        keychain-access-groups:
+          - $(XDIAL_SHARED_KEYCHAIN_GROUP)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ios.tunnel
         MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "6"
+        CURRENT_PROJECT_VERSION: "8"
         APPLICATION_EXTENSION_API_ONLY: true
         SKIP_INSTALL: true
+        TARGETED_DEVICE_FAMILY: "1"
     dependencies:
       - framework: ../build/frameworks/ios/Libbox.xcframework
         embed: false
@@ -70,6 +80,7 @@ targets:
       - path: ../appletv/XDialTV/KeychainStore.swift
       - path: ../appletv/XDialTV/Localization.swift
       - path: ../appletv/XDialTV/Models.swift
+      - path: ../appletv/XDialTV/OnDemandStartEnvelope.swift
       - path: ../appletv/XDialTV/TunnelManager.swift
     entitlements:
       path: XDialIOS/XDialIOS.entitlements
@@ -78,15 +89,18 @@ targets:
           - packet-tunnel-provider
         com.apple.security.application-groups:
           - group.com.kafeifei.xdial.ios
+        keychain-access-groups:
+          - $(XDIAL_SHARED_KEYCHAIN_GROUP)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ios
         PRODUCT_NAME: XDial
         MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "6"
+        CURRENT_PROJECT_VERSION: "8"
         GENERATE_INFOPLIST_FILE: true
         INFOPLIST_KEY_CFBundleDisplayName: XDial
         INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: false
+        INFOPLIST_KEY_XDialSharedKeychainAccessGroup: $(XDIAL_SHARED_KEYCHAIN_GROUP)
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
         INFOPLIST_KEY_UILaunchScreen_Generation: true
         TARGETED_DEVICE_FAMILY: "1"
@@ -107,6 +121,7 @@ targets:
       - target: XDialIOS
     settings:
       base:
+        GENERATE_INFOPLIST_FILE: true
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/XDial.app/XDial
         BUNDLE_LOADER: $(TEST_HOST)
 
@@ -117,3 +132,6 @@ targets:
       - path: XDialIOSUITests
     dependencies:
       - target: XDialIOS
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
