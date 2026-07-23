@@ -520,8 +520,6 @@ struct ConfiguredDataPathResult: Sendable {
 
     var isUsable: Bool {
         unavailableTargets.isEmpty
-            && routedDirectEgressIP != nil
-            && (currentRouteTag == nil || routedCurrentEgressIP != nil)
             && hostnameOK
             && routingEvidenceOK
     }
@@ -544,9 +542,8 @@ struct ConfiguredDataPathResult: Sendable {
         let currentRouteLabel = currentRouteTag.map {
             targetLabels[$0] ?? Self.safeTargetLabel(for: $0)
         } ?? "不适用"
-        return "线路探测：\(lineSummary)；分流探测：1.0.0.1→"
-            + "\(routedDirectEgressIP ?? "不可用") · 1.1.1.1→"
-            + "\(routedCurrentEgressIP ?? "不可用")（\(currentRouteLabel)）；"
+        return "线路探测：\(lineSummary)；分流规则：1.0.0.1→Direct · 1.1.1.1→"
+            + "\(currentRouteLabel)；"
             + "路由命中：\(routingEvidenceOK ? "通过" : "未通过")；"
             + "DNS：\(hostnameOK ? "通过" : "未通过")"
     }
@@ -562,10 +559,6 @@ struct ConfiguredDataPathResult: Sendable {
     var failureMessage: String {
         if !unavailableTargets.isEmpty {
             return "线路“\(unavailableTargets.map(\.label).joined(separator: "、"))”不通，已自动断开"
-        }
-        if routedDirectEgressIP == nil
-            || (currentRouteTag != nil && routedCurrentEgressIP == nil) {
-            return "连接验收地址不可达，已自动断开"
         }
         if !routingEvidenceOK {
             return currentRouteTag == nil
@@ -1592,19 +1585,29 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         let logSummary: String
     }
 
+    private struct OutboundAddressProbeResult: Sendable {
+        let address: String?
+        let failure: String?
+    }
+
     private func probeConfiguredDataPath(plan: TunnelAcceptancePlan) async -> ProbeOutcome {
         var addresses: [String: String] = [:]
         var unavailable: [TunnelAcceptanceTarget] = []
+        var probeFailures: [String] = []
         for target in plan.targets {
             guard !Task.isCancelled else {
                 return ProbeOutcome(
                     isUsable: false, summary: "", failureMessage: "", logSummary: "cancelled"
                 )
             }
-            if let address = await requestOutboundAddress(outboundTag: target.tag) {
+            let probe = await requestOutboundAddress(outboundTag: target.tag)
+            if let address = probe.address {
                 addresses[target.tag] = address
             } else {
                 unavailable.append(target)
+                if let failure = probe.failure {
+                    probeFailures.append("\(target.label)：\(failure)")
+                }
             }
         }
         let routingBefore = await requestRoutingProbeSnapshot()
@@ -1639,9 +1642,12 @@ final class TunnelManager: ObservableObject, TunnelManaging {
             routingEvidenceOK: routingEvidenceOK,
             currentRouteTag: plan.currentRouteTag
         )
+        let failureDetails = probeFailures.isEmpty
+            ? ""
+            : "；拨号错误：\(probeFailures.joined(separator: "；"))"
         return ProbeOutcome(
             isUsable: result.isUsable,
-            summary: result.diagnosticSummary,
+            summary: result.diagnosticSummary + failureDetails,
             failureMessage: result.failureMessage,
             logSummary: "targets=\(addresses.count)/\(plan.targets.count) "
                 + "route=\(plan.currentRouteTag ?? "not-applicable") "
@@ -1649,42 +1655,60 @@ final class TunnelManager: ObservableObject, TunnelManaging {
                 + "dns=\(routed.hostnameOK) routedDirect="
                 + "\(routed.routedDirectEgressIP ?? "unavailable") routedCurrent="
                 + "\(routed.routedAnyConnectEgressIP ?? "unavailable")"
+                + failureDetails
         )
     }
 
     /// 直接让 libbox 通过指定 outbound 访问出口地址，这一层绕过 route matcher，
     /// 只回答“这条线路本身通不通”。后续主 App 的 URLSession 探针才回答
     /// “配置里的分流规则有没有把系统流量送到它”。
-    private func requestOutboundAddress(outboundTag: String) async -> String? {
+    private func requestOutboundAddress(outboundTag: String) async -> OutboundAddressProbeResult {
         guard let session = providerSession,
               let request = try? JSONSerialization.data(withJSONObject: [
                 "cmd": "probe-outbound-address",
                 "outbound_tag": outboundTag,
                 "timeout_ms": "7000",
-              ]) else { return nil }
+              ]) else {
+            return OutboundAddressProbeResult(address: nil, failure: "线路探针不可用")
+        }
 
         return await withCheckedContinuation { continuation in
-            let oneShot = OneShotContinuation<String?>(continuation)
+            let oneShot = OneShotContinuation<OutboundAddressProbeResult>(continuation)
             // 取消旧验收时，provider 中已经开始的一条最多还会占用 7s。
             // 留出“一条旧任务 + 本任务”的上界，不把排队当成线路超时。
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 16) {
-                oneShot.finish(nil)
+                oneShot.finish(OutboundAddressProbeResult(address: nil, failure: "线路探针超时"))
             }
             do {
                 try session.sendProviderMessage(request) { responseData in
                     guard let responseData,
-                          let response = try? JSONDecoder().decode(DaemonResponse.self, from: responseData),
-                          response.ok == true,
+                          let response = try? JSONDecoder().decode(
+                            DaemonResponse.self,
+                            from: responseData
+                          ) else {
+                        oneShot.finish(OutboundAddressProbeResult(
+                            address: nil,
+                            failure: "线路探针响应无效"
+                        ))
+                        return
+                    }
+                    guard response.ok == true,
                           let address = response.data,
                           !address.isEmpty,
                           IPv4Address(address) != nil || IPv6Address(address) != nil else {
-                        oneShot.finish(nil)
+                        oneShot.finish(OutboundAddressProbeResult(
+                            address: nil,
+                            failure: response.message ?? "线路探针失败"
+                        ))
                         return
                     }
-                    oneShot.finish(address)
+                    oneShot.finish(OutboundAddressProbeResult(address: address, failure: nil))
                 }
             } catch {
-                oneShot.finish(nil)
+                oneShot.finish(OutboundAddressProbeResult(
+                    address: nil,
+                    failure: error.localizedDescription
+                ))
             }
         }
     }

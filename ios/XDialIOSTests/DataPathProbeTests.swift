@@ -164,6 +164,33 @@ final class DataPathProbeTests: XCTestCase {
         XCTAssertFalse(result.diagnosticSummary.contains("分流通过"))
     }
 
+    func testConfiguredRoutingUsesLineReachabilityAndRouterEvidenceSeparately() {
+        let targets = [
+            TunnelAcceptanceTarget(tag: "direct", label: "Direct"),
+            TunnelAcceptanceTarget(tag: "vpn", label: "AnyConnect"),
+        ]
+        let result = ConfiguredDataPathResult(
+            targetAddresses: [
+                "direct": "198.51.100.1",
+                "vpn": "203.0.113.2",
+            ],
+            targets: targets,
+            unavailableTargets: [],
+            routedDirectEgressIP: nil,
+            routedCurrentEgressIP: "203.0.113.2",
+            hostnameOK: true,
+            routingEvidenceOK: true,
+            currentRouteTag: "vpn"
+        )
+
+        XCTAssertTrue(result.isUsable)
+        XCTAssertEqual(result.splitRoutingState, .passed)
+        XCTAssertTrue(result.diagnosticSummary.contains(
+            "分流规则：1.0.0.1→Direct · 1.1.1.1→AnyConnect"
+        ))
+        XCTAssertTrue(result.diagnosticSummary.contains("路由命中：通过"))
+    }
+
     func testAcceptancePlanMatchesGlobalGeneratedTailscaleEndpointSemantics() throws {
         var profile = Profile.bootstrap()
         profile.lines.append(Line(

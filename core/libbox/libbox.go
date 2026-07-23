@@ -226,12 +226,28 @@ func (l *Libbox) TestOutbound(outboundTag, testURL string, timeoutMS int) (int, 
 	return int(delay), nil
 }
 
-// ProbeOutboundIP fetches Cloudflare's small trace document through one exact
-// running outbound and returns only the validated public address. The endpoint
-// is fixed so provider messages cannot turn this into an arbitrary network
-// fetch primitive.
+type outboundAddressProbeEndpoint struct {
+	url         string
+	destination M.Socksaddr
+}
+
+var outboundAddressProbeEndpoints = []outboundAddressProbeEndpoint{
+	{
+		url:         "https://checkip.amazonaws.com/",
+		destination: M.ParseSocksaddrHostPortStr("checkip.amazonaws.com", "443"),
+	},
+	{
+		url:         "http://1.1.1.1/cdn-cgi/trace",
+		destination: M.ParseSocksaddrHostPortStr("1.1.1.1", "80"),
+	},
+}
+
+// ProbeOutboundIP fetches a public address through one exact running outbound.
+// Both endpoints are fixed so provider messages cannot turn this into an
+// arbitrary network fetch primitive. The HTTPS endpoint is the primary
+// reachability/address assertion; the numeric HTTP endpoint keeps the probe
+// usable when an enterprise tunnel DNS server cannot resolve public names.
 func (l *Libbox) ProbeOutboundIP(outboundTag string, timeoutMS int) (string, error) {
-	const probeURL = "https://1.1.1.1/cdn-cgi/trace"
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if !l.running || l.box == nil || l.runtimeCtx == nil {
@@ -250,13 +266,41 @@ func (l *Libbox) ProbeOutboundIP(outboundTag string, timeoutMS int) (string, err
 
 	ctx, cancel := context.WithTimeout(l.runtimeCtx, time.Duration(timeoutMS)*time.Millisecond)
 	defer cancel()
-	conn, err := outbound.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr("1.1.1.1", "443"))
+	var probeErrors []string
+	for index, endpoint := range outboundAddressProbeEndpoints {
+		address, err := probeOutboundAddress(ctx, outbound, endpoint, len(outboundAddressProbeEndpoints)-index)
+		if err == nil {
+			return address, nil
+		}
+		probeErrors = append(probeErrors, err.Error())
+	}
+	return "", fmt.Errorf("outbound address probe failed: %s", strings.Join(probeErrors, "; "))
+}
+
+func probeOutboundAddress(
+	parentCtx context.Context,
+	outbound adapter.Outbound,
+	endpoint outboundAddressProbeEndpoint,
+	remainingEndpoints int,
+) (string, error) {
+	remainingTime := time.Until(deadlineFromContext(parentCtx))
+	if remainingTime <= 0 {
+		return "", context.DeadlineExceeded
+	}
+	attemptTimeout := remainingTime / time.Duration(remainingEndpoints)
+	if attemptTimeout < 500*time.Millisecond {
+		attemptTimeout = remainingTime
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, attemptTimeout)
+	defer cancel()
+
+	conn, err := outbound.DialContext(ctx, "tcp", endpoint.destination)
 	if err != nil {
-		return "", fmt.Errorf("outbound address probe failed")
+		return "", fmt.Errorf("outbound address probe dial failed: %w", err)
 	}
 	defer conn.Close()
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.url, nil)
 	if err != nil {
 		return "", fmt.Errorf("create address probe request: %w", err)
 	}
@@ -272,12 +316,12 @@ func (l *Libbox) ProbeOutboundIP(outboundTag string, timeoutMS int) (string, err
 			},
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		Timeout:       time.Duration(timeoutMS) * time.Millisecond,
+		Timeout:       attemptTimeout,
 	}
 	defer client.CloseIdleConnections()
 	response, err := client.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("outbound address probe failed")
+		return "", fmt.Errorf("outbound address probe request failed: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
@@ -290,18 +334,29 @@ func (l *Libbox) ProbeOutboundIP(outboundTag string, timeoutMS int) (string, err
 	return parsePublicProbeAddress(string(body))
 }
 
+func deadlineFromContext(ctx context.Context) time.Time {
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline
+	}
+	return time.Now()
+}
+
 func parsePublicProbeAddress(body string) (string, error) {
 	for _, line := range strings.Split(body, "\n") {
 		if !strings.HasPrefix(line, "ip=") {
 			continue
 		}
-		address, parseErr := netip.ParseAddr(strings.TrimSpace(strings.TrimPrefix(line, "ip=")))
-		if parseErr != nil || !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() {
-			return "", fmt.Errorf("address probe returned an invalid address")
-		}
-		return address.String(), nil
+		return validatePublicProbeAddress(strings.TrimSpace(strings.TrimPrefix(line, "ip=")))
 	}
-	return "", fmt.Errorf("address probe response did not contain an address")
+	return validatePublicProbeAddress(strings.TrimSpace(body))
+}
+
+func validatePublicProbeAddress(rawAddress string) (string, error) {
+	address, err := netip.ParseAddr(rawAddress)
+	if err != nil || !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() {
+		return "", fmt.Errorf("address probe returned an invalid address")
+	}
+	return address.String(), nil
 }
 
 type diagnostics struct {
