@@ -139,10 +139,10 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 
 	if vpnLine != nil {
 		if vpnLine.VPNServer == "" {
-			return fmt.Errorf("VPN 服务器地址未填写")
+			return fmt.Errorf("AnyConnect 服务器地址未填写")
 		}
 		if vpnLine.VPNUsername == "" || vpnLine.VPNPassword == "" {
-			return fmt.Errorf("VPN 用户名或密码未填写")
+			return fmt.Errorf("AnyConnect 用户名或密码未填写")
 		}
 
 		slog.Info("connecting to VPN", "server", vpnLine.VPNServer)
@@ -164,13 +164,13 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 		bridge, err = NewVPNBridge(vpnInfo.VPNAddress, vpnInfo.MTU)
 		if err != nil {
 			e.vpn.Disconnect()
-			return fmt.Errorf("VPN 隧道初始化失败")
+			return fmt.Errorf("AnyConnect 隧道初始化失败")
 		}
 		cSess := e.vpn.Session()
 		if cSess == nil {
 			bridge.Close()
 			e.vpn.Disconnect()
-			return fmt.Errorf("VPN 会话已断开")
+			return fmt.Errorf("AnyConnect 会话已断开")
 		}
 		bridge.Start(cSess)
 		closeCh = cSess.CloseChan
@@ -337,7 +337,7 @@ func (e *Engine) monitorVPN(closeCh chan struct{}) {
 	if e.reconnectCount >= maxReconnectAttempts {
 		slog.Error("giving up reconnect", "attempts", e.reconnectCount)
 		if e.callback != nil {
-			e.callback.OnError(2, "VPN 多次重连失败，已停止重试")
+			e.callback.OnError(2, "AnyConnect 多次重连失败，已停止重试")
 		}
 		e.setStatus(StatusDisconnected)
 		e.mu.Unlock()
@@ -361,7 +361,7 @@ func (e *Engine) reconnect(ctx context.Context, profile *config.Profile, attempt
 	slog.Info("reconnecting VPN", "attempt", attempt, "max", maxReconnectAttempts, "delay", delay)
 
 	if e.callback != nil {
-		e.callback.OnError(2, fmt.Sprintf("VPN 断开，%d秒后重连 (%d/%d)", int(delay.Seconds()), attempt, maxReconnectAttempts))
+		e.callback.OnError(2, fmt.Sprintf("AnyConnect 断开，%d秒后重连 (%d/%d)", int(delay.Seconds()), attempt, maxReconnectAttempts))
 	}
 
 	select {
@@ -388,7 +388,7 @@ func (e *Engine) reconnect(ctx context.Context, profile *config.Profile, attempt
 		if e.status == StatusConnecting {
 			slog.Error("reconnect failed", "attempt", attempt, "err", err)
 			if e.callback != nil {
-				e.callback.OnError(2, "VPN 重连失败："+err.Error())
+				e.callback.OnError(2, "AnyConnect 重连失败："+err.Error())
 			}
 			e.setStatus(StatusDisconnected)
 		}
@@ -430,9 +430,9 @@ func humanizeVPNError(err error, server string) string {
 		return "网络不通，请检查网络连接"
 	case strings.Contains(s, "certificate") ||
 		strings.Contains(s, "x509"):
-		return "服务器证书验证失败（若为自签证书，请在该 VPN 线路里开启\"跳过证书验证\"）"
+		return "服务器证书验证失败（若为自签证书，请在该 AnyConnect 线路里开启\"跳过证书验证\"）"
 	default:
-		return "VPN 连接失败：" + s
+		return "AnyConnect 连接失败：" + s
 	}
 }
 

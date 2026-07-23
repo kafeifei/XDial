@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 
@@ -49,10 +51,18 @@ func initTunnel() {
 // SetupTunnel initiates an HTTP CONNECT command to establish a VPN
 func SetupTunnel() error {
 	initTunnel()
+	if err := auth.EnsureHandshake(); err != nil {
+		auth.AbortHandshake()
+		return fmt.Errorf("secure tunnel handshake deadline setup failed: %w", err)
+	}
 
 	// https://github.com/golang/go/commit/da6c168378b4c1deb2a731356f1f438e4723b8a7
 	// https://github.com/golang/go/issues/17227#issuecomment-341855744
-	req, _ := http.NewRequest("CONNECT", auth.Prof.Scheme+auth.Prof.HostWithPort+"/CSCOSSLC/tunnel", nil)
+	req, err := http.NewRequest("CONNECT", auth.Prof.Scheme+auth.Prof.HostWithPort+"/CSCOSSLC/tunnel", nil)
+	if err != nil {
+		auth.AbortHandshake()
+		return errors.New("secure tunnel handshake could not build CONNECT request")
+	}
 	utils.SetCommonHeader(req)
 	for k, v := range reqHeaders {
 		// req.Header.Set 会将首字母大写，其它小写
@@ -60,21 +70,22 @@ func SetupTunnel() error {
 	}
 
 	// 发送 CONNECT 请求
-	err := req.Write(auth.Conn)
+	err = req.Write(auth.Conn)
 	if err != nil {
-		auth.Conn.Close()
-		return err
+		auth.AbortHandshake()
+		return tunnelHandshakeError("CONNECT request write", err)
 	}
 	var resp *http.Response
 	// resp.Body closed when tlsChannel exit
 	resp, err = http.ReadResponse(auth.BufR, req)
 	if err != nil {
-		auth.Conn.Close()
-		return err
+		auth.AbortHandshake()
+		return tunnelHandshakeError("CONNECT response", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		auth.Conn.Close()
+		_ = resp.Body.Close()
+		auth.AbortHandshake()
 		return fmt.Errorf("tunnel negotiation failed %s", resp.Status)
 	}
 	// 协商成功，读取服务端返回的配置
@@ -98,16 +109,25 @@ func SetupTunnel() error {
 	if !base.Cfg.NoTUN {
 		err = setupTun(cSess)
 		if err != nil {
-			auth.Conn.Close()
+			_ = resp.Body.Close()
+			auth.AbortHandshake()
 			cSess.Close()
 			return err
 		}
 
 		err = vpnc.SetRoutes(cSess)
 		if err != nil {
-			auth.Conn.Close()
+			_ = resp.Body.Close()
+			auth.AbortHandshake()
 			cSess.Close()
+			return err
 		}
+	}
+	if err = auth.CompleteHandshake(); err != nil {
+		_ = resp.Body.Close()
+		auth.AbortHandshake()
+		cSess.Close()
+		return fmt.Errorf("secure tunnel data channel deadline setup failed: %w", err)
 	}
 	base.Info("tls channel negotiation succeeded")
 
@@ -124,4 +144,12 @@ func SetupTunnel() error {
 	cSess.ReadDeadTimer()
 
 	return err
+}
+
+func tunnelHandshakeError(stage string, err error) error {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Errorf("secure tunnel handshake timed out during %s: %w", stage, err)
+	}
+	return fmt.Errorf("secure tunnel handshake failed during %s: %w", stage, err)
 }

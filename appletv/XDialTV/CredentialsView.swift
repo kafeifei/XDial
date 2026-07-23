@@ -78,10 +78,10 @@ struct CredentialsView: View {
             Image(systemName: "key.slash")
                 .font(.system(size: 80))
                 .foregroundStyle(.secondary)
-            Text(app.tr("没有可编辑的 VPN 线路", "No VPN line to edit"))
+            Text(app.tr("没有可编辑的 AnyConnect 线路", "No AnyConnect line to edit"))
                 .font(.title2)
-            Text(app.tr("请先从 Mac 端同步包含 VPN 线路的配置",
-                        "Sync a configuration that includes a VPN line from your Mac"))
+            Text(app.tr("请先从 Mac 端同步包含 AnyConnect 线路的配置",
+                        "Sync a configuration that includes an AnyConnect line from your Mac"))
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

@@ -3,6 +3,8 @@ module github.com/kafeifei/xdial
 go 1.24.7
 
 require (
+	github.com/google/uuid v1.6.0
+	github.com/miekg/dns v1.1.72
 	github.com/sagernet/gvisor v0.0.0-20250811.0-sing-box-mod.1
 	github.com/sagernet/sing v0.8.9
 	github.com/sagernet/sing-box v1.13.11
@@ -46,7 +48,6 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/nftables v0.2.1-0.20240414091927-5e242ec57806 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/gopacket/gopacket v1.5.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
@@ -66,7 +67,6 @@ require (
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/metacubex/utls v1.8.4 // indirect
 	github.com/mholt/acmez/v3 v3.1.6 // indirect
-	github.com/miekg/dns v1.1.72 // indirect
 	github.com/mitchellh/go-ps v1.0.0 // indirect
 	github.com/pion/dtls/v3 v3.0.7 // indirect
 	github.com/pion/logging v0.2.4 // indirect

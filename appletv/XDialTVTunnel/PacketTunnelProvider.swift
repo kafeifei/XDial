@@ -10,6 +10,46 @@ private final class UncheckedSendableBox<Value>: @unchecked Sendable {
     init(_ value: Value) { self.value = value }
 }
 
+/// NetworkExtension 要求 startTunnel 的 completion 恰好调用一次。启动取消、
+/// Go 回调与 NE 设置回调可能并发到达，因此不能只靠分支约定保证一次性。
+private final class StartCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completion: ((Error?) -> Void)?
+
+    init(_ completion: @escaping (Error?) -> Void) {
+        self.completion = completion
+    }
+
+    @discardableResult
+    func finish(_ error: Error?) -> Bool {
+        lock.lock()
+        let callback = completion
+        completion = nil
+        lock.unlock()
+        callback?(error)
+        return callback != nil
+    }
+}
+
+private final class StopCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completion: (() -> Void)?
+
+    init(_ completion: @escaping () -> Void) {
+        self.completion = completion
+    }
+
+    @discardableResult
+    func finish() -> Bool {
+        lock.lock()
+        let callback = completion
+        completion = nil
+        lock.unlock()
+        callback?()
+        return callback != nil
+    }
+}
+
 /// XDial iOS / tvOS 的 packet-tunnel 扩展。
 ///
 /// 进程内跑 Libbox(sslcon + gVisor + sing-box):
@@ -49,6 +89,32 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     /// 引擎最近一次通过 Callback 报上来的错误文本(用于 status 响应带出)。
     private var lastError: String?
 
+    private enum AttemptPhase {
+        case idle
+        case starting
+        case running
+    }
+
+    /// NE 回调、Go 回调与后台启动线程会并发触碰启动生命周期。generation 使已经
+    /// 被 stop 或后续 start 取代的异步结果失效；资源只由摘除它的路径负责清理。
+    private let lifecycleLock = NSLock()
+    private var activeGeneration: UInt64 = 0
+    private var attemptPhase: AttemptPhase = .idle
+    private var activeGenerationUsesSecureEnvelope = false
+    private var startCompletion: StartCompletionGate?
+    /// sslcon 的会话是进程全局资源。创建、StartResolved 与 Stop 必须经过同一
+    /// 串行队列，不能让新 generation 与旧会话在底层并发。
+    private let engineOperationQueue = DispatchQueue(label: "com.kafeifei.xdial.tunnel.engine")
+    /// 设置 job 连同原始系统 completion 严格串行；失效路径会在同一提交锁下
+    /// 排入 barrier，因此新 generation 不会越过旧 generation 的未决设置。
+    private let networkSettingsSubmissionLock = NSLock()
+    private let networkSettingsOperationQueue = DispatchQueue(
+        label: "com.kafeifei.xdial.tunnel.network-settings"
+    )
+    private let networkSettingsCallbackQueue = DispatchQueue(
+        label: "com.kafeifei.xdial.tunnel.network-settings-callback"
+    )
+
     /// sing-box 的 direct/DNS 出站必须始终知道真实 Wi-Fi/蜂窝出口。
     /// 不能把 utun 自身或 nil 当默认接口，否则会出现“系统显示已连接但没有网络”。
     private var pathMonitor: NWPathMonitor?
@@ -56,6 +122,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     private var activeAttemptID = ""
     private var physicalInterfaceName = ""
     private var physicalInterfaceIndex = -1
+    private var diagnosticSensitiveValues: [String] = []
     private let diagnosticLock = NSLock()
     private let diagnosticWriteQueue = DispatchQueue(label: "com.kafeifei.xdial.tunnel.diagnostics")
 
@@ -65,67 +132,98 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     /// 见 DebugSmokeTest.swift 里的 TestCallback(onStatusChanged / onError)。
     private final class EngineCallback: NSObject, LibboxCallbackProtocol {
         weak var provider: PacketTunnelProvider?
-        init(provider: PacketTunnelProvider) {
+        let generation: UInt64
+
+        init(provider: PacketTunnelProvider, generation: UInt64) {
             self.provider = provider
+            self.generation = generation
         }
         func onStatusChanged(_ statusJSON: String?) {
-            os_log("libbox status: %{public}@", log: OSLog(subsystem: PacketTunnelProvider.subsystem, category: "provider"),
-                   type: .info, statusJSON ?? "")
+            provider?.handleEngineStatus(statusJSON, generation: generation)
+            os_log("libbox status changed", log: OSLog(subsystem: PacketTunnelProvider.subsystem, category: "provider"),
+                   type: .info)
         }
         func onError(_ code: Int, message: String?) {
-            os_log("libbox error %d: %{public}@", log: OSLog(subsystem: PacketTunnelProvider.subsystem, category: "provider"),
-                   type: .error, code, message ?? "")
-            provider?.setLastError(message)
+            provider?.handleEngineError(code: code, message: message, generation: generation)
+            os_log("libbox error code=%d", log: OSLog(subsystem: PacketTunnelProvider.subsystem, category: "provider"),
+                   type: .error, code)
         }
     }
 
     // MARK: - startTunnel
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        let completion = UncheckedSendableBox(completionHandler)
+        let completion = StartCompletionGate(completionHandler)
+        let generation = beginLifecycleAttempt(completion: completion)
         beginAttempt(options?["attemptID"] as? String ?? "")
         recordDiagnostic("start_begin")
         os_log("startTunnel: begin", log: log, type: .info)
 
-        // 1) 取凭据与 sing-box 配置。
-        //    优先 options(App 通过 startVPNTunnel(options:) 一次性下发)；
-        //    缺项仅为升级兼容回退旧 App Group 数据，读取后会立即清理。
+        // 1) 取凭据与 sing-box 配置。手动启动使用一次性 options；系统按需冷启动
+        //    没有 options，只允许读取双方共享 Keychain 中最近一次已验收的版本化启动包。
         guard let bundle = resolveStartBundle(options: options) else {
-            let err = providerError(2, "缺少 AnyConnect 凭据或 sing-box 配置(options 与 App Group 均无)")
-            setLastError(err.localizedDescription)
-            recordDiagnostic("start_bundle_missing")
+            let err = providerError(2, "缺少完整且已验收的安全启动配置")
+            failAttempt(generation, error: err, diagnosticStage: "start_bundle_missing")
             os_log("startTunnel: missing credentials/config", log: log, type: .error)
-            completion.value(err)
             return
         }
+        setSecureEnvelopeUsage(bundle.fromSecureEnvelope, generation: generation)
+        setDiagnosticSensitiveValues(from: bundle)
         recordDiagnostic("start_bundle_loaded")
 
+        engineOperationQueue.async { [weak self] in
+            guard let self else {
+                completion.finish(providerErrorStatic(4, "provider deallocated"))
+                return
+            }
+            self.prepareAttempt(bundle, generation: generation, completion: completion)
+        }
+    }
+
+    private func prepareAttempt(
+        _ bundle: StartBundle,
+        generation: UInt64,
+        completion: StartCompletionGate
+    ) {
+        dispatchPrecondition(condition: .onQueue(engineOperationQueue))
+        guard isAttemptStarting(generation) else { return }
+
         // 2) 创建引擎实例。
-        let cb = EngineCallback(provider: self)
+        let cb = EngineCallback(provider: self, generation: generation)
         guard let lb = LibboxNew(cb) else {
             let err = providerError(4, "LibboxNew 返回 nil")
-            setLastError(err.localizedDescription)
-            recordDiagnostic("engine_create_failed")
+            failAttempt(generation, error: err, diagnosticStage: "engine_create_failed")
             os_log("startTunnel: LibboxNew returned nil", log: log, type: .error)
-            completion.value(err)
             return
         }
-        self.libbox = lb
+        guard installEngine(lb, generation: generation) else {
+            // 当前就在全局会话串行队列上；必须先清掉这个尚未登记的实例，
+            // 不能把 Stop 排到已经入队的新 prepare 后面。
+            try? lb.stop()
+            return
+        }
 
         // 3) 在默认路由切进 utun 之前先取得真实物理出口，并持续监听 Wi-Fi/蜂窝切换。
         //    sing-box 官方 Apple 客户端也用 NWPathMonitor 驱动平台接口监控。
         do {
-            try startDefaultInterfaceMonitor()
+            try startDefaultInterfaceMonitor(generation: generation)
             recordDiagnostic("physical_interface_ready")
         } catch {
-            setLastError(error.localizedDescription)
-            recordDiagnostic("physical_interface_failed")
-            os_log("startTunnel: physical interface unavailable: %{public}@",
-                   log: log, type: .error, error.localizedDescription)
-            pathMonitor?.cancel()
-            pathMonitor = nil
-            libbox = nil
-            completion.value(error)
+            failAttempt(generation, error: error, diagnosticStage: "physical_interface_failed")
+            os_log("startTunnel: physical interface unavailable",
+                   log: log, type: .error)
+            return
+        }
+
+        guard isAttemptStarting(generation) else { return }
+
+        if !bundle.usesAnyConnect {
+            prepareStandaloneAttempt(
+                bundle,
+                engine: lb,
+                generation: generation,
+                completion: completion
+            )
             return
         }
 
@@ -139,14 +237,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         guard resolveError == nil, IPv4Address(remoteIPv4) != nil else {
             let error = providerError(5, resolveError?.localizedDescription
                 ?? "服务器地址未解析为有效 IPv4")
-            setLastError(error.localizedDescription)
-            recordDiagnostic("remote_address_resolution_failed")
-            os_log("startTunnel: remote address resolution failed: %{public}@",
-                   log: log, type: .error, error.localizedDescription)
-            pathMonitor?.cancel()
-            pathMonitor = nil
-            libbox = nil
-            completion.value(error)
+            failAttempt(generation, error: error, diagnosticStage: "remote_address_resolution_failed")
+            os_log("startTunnel: remote address resolution failed",
+                   log: log, type: .error)
             return
         }
         recordDiagnostic("remote_address_resolved")
@@ -154,25 +247,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         // 5) 先配置 NE 网络设置(隧道地址/DNS/路由),再拨号。
         //    NE 要求在 completionHandler(nil) 之前必须 setTunnelNetworkSettings 一次,
         //    否则 packetFlow 不会真正建立、拿不到有效 fd。
-        //    真实的隧道地址/DNS 要等 AnyConnect 握手结果(X-CSTP-Address / X-CSTP-DNS),
-        //    当前 Libbox.Start 尚未把握手结果回吐给 Swift,这里先用与 core/config
-        //    buildTUNInbound 一致的占位网段(198.18.0.1/15),DNS 用公共兜底。
-        //    TODO(真机联调):从 AnyConnect 握手结果动态填真实地址/DNS/路由。
+        //    系统 DNS 始终指向隧道内合成地址；引擎启动前它会短暂 fail closed，
+        //    启动后由 hijack-dns 交给移动 dispatcher。企业 DNS 地址只留在 Go
+        //    bridge 内部，不能直接装进系统设置造成 Tailscale 分域失效。
         let settings = buildNetworkSettings(remoteAddress: remoteIPv4)
-        setTunnelNetworkSettings(settings) { [weak self] settingsError in
+        guard setTunnelNetworkSettingsIfStarting(settings, generation: generation, completionHandler: { [weak self] settingsError in
             guard let self else {
-                completion.value(providerErrorStatic(4, "provider deallocated"))
+                completion.finish(providerErrorStatic(4, "provider deallocated"))
                 return
             }
+            guard self.isAttemptStarting(generation) else { return }
             if let settingsError {
-                self.setLastError(settingsError.localizedDescription)
-                self.recordDiagnostic("network_settings_failed")
-                os_log("startTunnel: setTunnelNetworkSettings failed: %{public}@",
-                       log: self.log, type: .error, settingsError.localizedDescription)
-                self.pathMonitor?.cancel()
-                self.pathMonitor = nil
-                self.libbox = nil
-                completion.value(settingsError)
+                self.failAttempt(
+                    generation,
+                    error: settingsError,
+                    diagnosticStage: "network_settings_failed"
+                )
+                os_log("startTunnel: setTunnelNetworkSettings failed",
+                       log: self.log, type: .error)
                 return
             }
             self.recordDiagnostic("network_settings_applied")
@@ -184,60 +276,463 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                 os_log("startTunnel: tun fd set = %d", log: self.log, type: .info, fd)
             } else {
                 let error = self.providerError(4, "无法获取系统隧道接口")
-                self.setLastError(error.localizedDescription)
-                self.recordDiagnostic("tun_unavailable")
+                self.failAttempt(generation, error: error, diagnosticStage: "tun_unavailable")
                 os_log("startTunnel: tun fd unavailable",
                        log: self.log, type: .error)
-                self.pathMonitor?.cancel()
-                self.pathMonitor = nil
-                self.libbox = nil
-                completion.value(error)
                 return
             }
 
             // 7) 拨号 + 启动 sing-box。StartResolved 是阻塞调用，socket 直拨
             //    remoteIPv4；TLS/HTTP 身份仍使用 bundle.server 的原始域名。
             self.recordDiagnostic("engine_starting")
-            DispatchQueue.global(qos: .userInitiated).async {
+            self.engineOperationQueue.async {
+                dispatchPrecondition(condition: .onQueue(self.engineOperationQueue))
+                guard self.isAttemptStarting(generation) else { return }
                 do {
-                    try lb.startResolved(bundle.server, dialAddress: remoteIPv4,
-                                         username: bundle.username, password: bundle.password,
-                                         configJSON: bundle.configJSON)
-                    self.recordDiagnostic("engine_started")
-                    os_log("startTunnel: engine started", log: self.log, type: .info)
-                    completion.value(nil)
+                    try lb.startResolved(
+                        withInsecure: bundle.server,
+                        dialAddress: remoteIPv4,
+                        username: bundle.username,
+                        password: bundle.password,
+                        allowInsecure: bundle.allowInsecure,
+                        configJSON: bundle.configJSON
+                    )
+                    guard self.isAttemptStarting(generation) else { return }
+                    guard let dnsServers = self.validDNSServers(from: lb.tunnelNameServers()),
+                          !dnsServers.isEmpty else {
+                        throw self.providerError(6, "连接未下发可用的域名服务器")
+                    }
+
+                    // 握手 DNS 只用于确认企业 resolver 可用；系统继续查询合成
+                    // 地址，由 dispatcher 把非 Tailscale 域名 fail-closed 地送入 bridge。
+                    self.recordDiagnostic("dns_settings_applying")
+                    let finalSettings = self.buildNetworkSettings(remoteAddress: remoteIPv4)
+                    guard self.setTunnelNetworkSettingsIfStarting(
+                        finalSettings,
+                        generation: generation,
+                        completionHandler: { dnsSettingsError in
+                        guard self.isAttemptStarting(generation) else { return }
+                        if let dnsSettingsError {
+                            self.failAttempt(
+                                generation,
+                                error: dnsSettingsError,
+                                diagnosticStage: "dns_settings_failed"
+                            )
+                            os_log("startTunnel: tunnel DNS settings failed",
+                                   log: self.log, type: .error)
+                            return
+                        }
+                        guard self.completeAttempt(generation) else { return }
+                        self.recordDiagnostic("engine_started")
+                        os_log("startTunnel: engine and tunnel DNS ready",
+                               log: self.log, type: .info)
+                    }) else { return }
                 } catch {
-                    self.setLastError(error.localizedDescription)
-                    self.recordDiagnostic("engine_failed")
-                    os_log("startTunnel: engine start failed: %{public}@",
-                           log: self.log, type: .error, error.localizedDescription)
-                    self.pathMonitor?.cancel()
-                    self.pathMonitor = nil
-                    self.libbox = nil
-                    completion.value(error)
+                    self.failAttempt(generation, error: error, diagnosticStage: "engine_failed")
+                    os_log("startTunnel: engine start failed",
+                           log: self.log, type: .error)
                 }
             }
-        }
+        }) else { return }
+    }
+
+    private func prepareStandaloneAttempt(
+        _ bundle: StartBundle,
+        engine: LibboxLibbox,
+        generation: UInt64,
+        completion: StartCompletionGate
+    ) {
+        dispatchPrecondition(condition: .onQueue(engineOperationQueue))
+        let settings = buildNetworkSettings(remoteAddress: "127.0.0.1")
+        guard setTunnelNetworkSettingsIfStarting(
+            settings,
+            generation: generation,
+            completionHandler: { [weak self] settingsError in
+                guard let self else {
+                    completion.finish(providerErrorStatic(4, "provider deallocated"))
+                    return
+                }
+                guard self.isAttemptStarting(generation) else { return }
+                if let settingsError {
+                    self.failAttempt(
+                        generation,
+                        error: settingsError,
+                        diagnosticStage: "network_settings_failed"
+                    )
+                    return
+                }
+                self.recordDiagnostic("network_settings_applied")
+                guard let fd = self.tunFileDescriptor(), fd > 0 else {
+                    self.failAttempt(
+                        generation,
+                        error: self.providerError(4, "无法获取系统隧道接口"),
+                        diagnosticStage: "tun_unavailable"
+                    )
+                    return
+                }
+                engine.setTunFD(fd)
+                self.recordDiagnostic("tun_ready")
+                self.engineOperationQueue.async {
+                    dispatchPrecondition(condition: .onQueue(self.engineOperationQueue))
+                    guard self.isAttemptStarting(generation) else { return }
+                    do {
+                        try engine.startStandalone(bundle.configJSON)
+                        guard self.completeAttempt(generation) else { return }
+                        self.recordDiagnostic("engine_started")
+                        os_log("startTunnel: standalone engine ready",
+                               log: self.log, type: .info)
+                    } catch {
+                        self.failAttempt(
+                            generation,
+                            error: error,
+                            diagnosticStage: "engine_failed"
+                        )
+                    }
+                }
+            }
+        ) else { return }
     }
 
     // MARK: - stopTunnel
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
-        let completion = UncheckedSendableBox(completionHandler)
-        recordDiagnostic("stopping")
-        os_log("stopTunnel: reason=%d", log: log, type: .info, reason.rawValue)
-        // Stop 也可能阻塞(关闭 sing-box + 断开 AnyConnect),放后台线程。
-        let lb = self.libbox
-        self.libbox = nil
-        pathMonitor?.cancel()
-        pathMonitor = nil
-        DispatchQueue.global(qos: .userInitiated).async {
-            if let lb {
-                try? lb.stop()
+        let completion = StopCompletionGate(completionHandler)
+        // 先原子失效所有启动回调并摘除资源，再等串行队列真正清理旧会话。
+        // 极端情况下 StartResolved 可能长期不返回，兜底只放行系统 completion；
+        // 引擎队列仍保持阻塞，后续 start 不会越过旧会话创建第二个 Libbox。
+        cancelActiveAttempt(
+            startError: providerError(7, "连接启动已取消"),
+            afterCleanupQueued: { [weak self] in
+                self?.recordDiagnostic("stopping")
+                os_log("stopTunnel: reason=%d", log: self?.log ?? .default,
+                       type: .info, reason.rawValue)
+            },
+            cleanupCompletion: { [weak self] in
+                self?.recordDiagnostic("stopped")
+                os_log("stopTunnel: cleanup done", log: self?.log ?? .default, type: .info)
+                completion.finish()
             }
-            os_log("stopTunnel: done", log: self.log, type: .info)
-            completion.value()
+        )
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) { [weak self] in
+            if completion.finish() {
+                os_log("stopTunnel: cleanup timeout", log: self?.log ?? .default, type: .error)
+            }
         }
+    }
+
+    // MARK: - 启动生命周期
+
+    private func beginLifecycleAttempt(completion: StartCompletionGate) -> UInt64 {
+        networkSettingsSubmissionLock.lock()
+        lifecycleLock.lock()
+        let previousEngine = libbox
+        let previousMonitor = pathMonitor
+        let previousCompletion = startCompletion
+        libbox = nil
+        pathMonitor = nil
+        startCompletion = nil
+        attemptPhase = .idle
+        activeGeneration &+= 1
+        let generation = activeGeneration
+        attemptPhase = .starting
+        activeGenerationUsesSecureEnvelope = false
+        startCompletion = completion
+        let settingsBarrier = enqueueNetworkSettingsBarrierLocked()
+        enqueueEngineCleanupLocked(previousEngine, after: settingsBarrier)
+        lifecycleLock.unlock()
+        networkSettingsSubmissionLock.unlock()
+
+        previousMonitor?.cancel()
+        previousCompletion?.finish(providerError(7, "连接启动已被新的连接请求取代"))
+        return generation
+    }
+
+    private func installEngine(_ engine: LibboxLibbox, generation: UInt64) -> Bool {
+        lifecycleLock.lock()
+        guard activeGeneration == generation, attemptPhase == .starting else {
+            lifecycleLock.unlock()
+            return false
+        }
+        libbox = engine
+        lifecycleLock.unlock()
+        return true
+    }
+
+    private func setSecureEnvelopeUsage(_ enabled: Bool, generation: UInt64) {
+        lifecycleLock.lock()
+        if activeGeneration == generation, attemptPhase == .starting {
+            activeGenerationUsesSecureEnvelope = enabled
+        }
+        lifecycleLock.unlock()
+    }
+
+    private func installPathMonitor(_ monitor: NWPathMonitor, generation: UInt64) -> Bool {
+        lifecycleLock.lock()
+        guard activeGeneration == generation, attemptPhase == .starting else {
+            lifecycleLock.unlock()
+            return false
+        }
+        pathMonitor = monitor
+        lifecycleLock.unlock()
+        return true
+    }
+
+    private func isAttemptStarting(_ generation: UInt64) -> Bool {
+        lifecycleLock.lock()
+        let matches = activeGeneration == generation && attemptPhase == .starting
+        lifecycleLock.unlock()
+        return matches
+    }
+
+    private func setTunnelNetworkSettingsIfStarting(
+        _ settings: NEPacketTunnelNetworkSettings,
+        generation: UInt64,
+        completionHandler: @escaping @Sendable (Error?) -> Void
+    ) -> Bool {
+        let completion = UncheckedSendableBox(completionHandler)
+        let settings = UncheckedSendableBox(settings)
+        networkSettingsSubmissionLock.lock()
+        lifecycleLock.lock()
+        guard activeGeneration == generation, attemptPhase == .starting else {
+            lifecycleLock.unlock()
+            networkSettingsSubmissionLock.unlock()
+            return false
+        }
+        networkSettingsOperationQueue.async {
+            dispatchPrecondition(condition: .onQueue(self.networkSettingsOperationQueue))
+            guard self.isAttemptStarting(generation) else { return }
+
+            let result = OneShotNetworkSettingsResult()
+            let finished = DispatchSemaphore(value: 0)
+            self.setTunnelNetworkSettings(settings.value) { error in
+                if result.finish(error) {
+                    finished.signal()
+                }
+            }
+            // 原始系统 completion 只负责 signal；业务 completion 必须等本 job
+            // 退出串行队列后再执行，避免回调反向等待同一 operation queue。
+            if finished.wait(timeout: .now() + 15) == .timedOut {
+                _ = result.finish(self.providerError(31, "应用系统网络设置超时"))
+            }
+            let outcome = result.snapshot()
+            self.networkSettingsCallbackQueue.async {
+                completion.value(outcome.error)
+            }
+        }
+        lifecycleLock.unlock()
+        networkSettingsSubmissionLock.unlock()
+        return true
+    }
+
+    private func completeAttempt(_ generation: UInt64) -> Bool {
+        lifecycleLock.lock()
+        guard activeGeneration == generation, attemptPhase == .starting else {
+            lifecycleLock.unlock()
+            return false
+        }
+        attemptPhase = .running
+        let completion = startCompletion
+        lifecycleLock.unlock()
+
+        // 回调不能在 lifecycleLock 内执行；completion gate 与 stop/new start 竞争，
+        // 只有先到的一方能决定结果，因此失效后不会再补一次成功。
+        let completed = completion?.finish(nil) ?? false
+        lifecycleLock.lock()
+        if activeGeneration == generation, startCompletion === completion {
+            startCompletion = nil
+        }
+        lifecycleLock.unlock()
+        return completed
+    }
+
+    private func failAttempt(
+        _ generation: UInt64,
+        error: Error,
+        diagnosticStage: String
+    ) {
+        networkSettingsSubmissionLock.lock()
+        lifecycleLock.lock()
+        guard activeGeneration == generation, attemptPhase == .starting else {
+            lifecycleLock.unlock()
+            networkSettingsSubmissionLock.unlock()
+            return
+        }
+        let engine = libbox
+        let monitor = pathMonitor
+        let completion = startCompletion
+        let clearSecureEnvelope = activeGenerationUsesSecureEnvelope
+        libbox = nil
+        pathMonitor = nil
+        startCompletion = nil
+        attemptPhase = .idle
+        activeGenerationUsesSecureEnvelope = false
+        activeGeneration &+= 1
+        let settingsBarrier = enqueueNetworkSettingsBarrierLocked()
+        enqueueEngineCleanupLocked(engine, after: settingsBarrier)
+        lifecycleLock.unlock()
+        networkSettingsSubmissionLock.unlock()
+
+        #if os(iOS)
+        if OnDemandStartEnvelopeFailurePolicy.shouldClear(
+            startedFromSecureEnvelope: clearSecureEnvelope,
+            startOrRuntimeFailed: true
+        ) {
+            _ = OnDemandStartEnvelopeStore.clear()
+        }
+        #endif
+        setLastError(error.localizedDescription)
+        recordDiagnostic(diagnosticStage)
+        monitor?.cancel()
+        completion?.finish(error)
+    }
+
+    private func cancelActiveAttempt(
+        startError: Error,
+        afterCleanupQueued: (() -> Void)? = nil,
+        cleanupCompletion: (() -> Void)? = nil
+    ) {
+        networkSettingsSubmissionLock.lock()
+        lifecycleLock.lock()
+        let engine = libbox
+        let monitor = pathMonitor
+        let completion = startCompletion
+        libbox = nil
+        pathMonitor = nil
+        startCompletion = nil
+        attemptPhase = .idle
+        activeGenerationUsesSecureEnvelope = false
+        activeGeneration &+= 1
+        let settingsBarrier = enqueueNetworkSettingsBarrierLocked()
+        enqueueEngineCleanupLocked(
+            engine,
+            after: settingsBarrier,
+            completion: cleanupCompletion
+        )
+        lifecycleLock.unlock()
+        networkSettingsSubmissionLock.unlock()
+
+        afterCleanupQueued?()
+        monitor?.cancel()
+        completion?.finish(startError)
+    }
+
+    /// 调用方必须同时持有 submission/lifecycle 锁，保证 barrier 排在此前设置 job 后。
+    private func enqueueNetworkSettingsBarrierLocked() -> DispatchGroup {
+        let barrier = DispatchGroup()
+        barrier.enter()
+        networkSettingsOperationQueue.async {
+            dispatchPrecondition(condition: .onQueue(self.networkSettingsOperationQueue))
+            barrier.leave()
+        }
+        return barrier
+    }
+
+    /// 调用方必须持有 lifecycleLock；只做入队，不等待队列执行，也不触发外部回调。
+    private func enqueueEngineCleanupLocked(
+        _ engine: LibboxLibbox?,
+        after settingsBarrier: DispatchGroup,
+        completion: (() -> Void)? = nil
+    ) {
+        let completion = completion.map(UncheckedSendableBox.init)
+        engineOperationQueue.async {
+            dispatchPrecondition(condition: .onQueue(self.engineOperationQueue))
+            if let engine {
+                try? engine.stop()
+            }
+            settingsBarrier.wait()
+            completion?.value()
+        }
+    }
+
+    private func currentEngine() -> LibboxLibbox? {
+        lifecycleLock.lock()
+        let engine = libbox
+        lifecycleLock.unlock()
+        return engine
+    }
+
+    private func engine(for generation: UInt64) -> LibboxLibbox? {
+        lifecycleLock.lock()
+        let engine = activeGeneration == generation && attemptPhase != .idle ? libbox : nil
+        lifecycleLock.unlock()
+        return engine
+    }
+
+    private func phase(for generation: UInt64) -> AttemptPhase? {
+        lifecycleLock.lock()
+        let phase = activeGeneration == generation ? attemptPhase : nil
+        lifecycleLock.unlock()
+        return phase
+    }
+
+    private func handleEngineError(code: Int, message: String?, generation: UInt64) {
+        let detail = message.flatMap { $0.isEmpty ? nil : $0 }
+            ?? "底层连接发生错误(代码 \(code))"
+        let error = providerError(20 + code, detail)
+        switch phase(for: generation) {
+        case .starting:
+            failAttempt(generation, error: error, diagnosticStage: "engine_failed")
+        case .running:
+            terminateRunningAttempt(generation, error: error)
+        case .idle, nil:
+            break
+        }
+    }
+
+    private func handleEngineStatus(_ statusJSON: String?, generation: UInt64) {
+        guard let statusJSON,
+              let data = statusJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (object["status"] as? String)?.lowercased() == "disconnected" else {
+            return
+        }
+        let error = providerError(8, "底层连接意外断开")
+        switch phase(for: generation) {
+        case .starting:
+            failAttempt(generation, error: error, diagnosticStage: "engine_disconnected")
+        case .running:
+            terminateRunningAttempt(generation, error: error)
+        case .idle, nil:
+            break
+        }
+    }
+
+    private func terminateRunningAttempt(_ generation: UInt64, error: Error) {
+        networkSettingsSubmissionLock.lock()
+        lifecycleLock.lock()
+        guard activeGeneration == generation, attemptPhase == .running else {
+            lifecycleLock.unlock()
+            networkSettingsSubmissionLock.unlock()
+            return
+        }
+        let engine = libbox
+        let monitor = pathMonitor
+        let completion = startCompletion
+        let clearSecureEnvelope = activeGenerationUsesSecureEnvelope
+        libbox = nil
+        pathMonitor = nil
+        startCompletion = nil
+        attemptPhase = .idle
+        activeGenerationUsesSecureEnvelope = false
+        activeGeneration &+= 1
+        let settingsBarrier = enqueueNetworkSettingsBarrierLocked()
+        enqueueEngineCleanupLocked(engine, after: settingsBarrier)
+        lifecycleLock.unlock()
+        networkSettingsSubmissionLock.unlock()
+
+        #if os(iOS)
+        if OnDemandStartEnvelopeFailurePolicy.shouldClear(
+            startedFromSecureEnvelope: clearSecureEnvelope,
+            startOrRuntimeFailed: true
+        ) {
+            _ = OnDemandStartEnvelopeStore.clear()
+        }
+        #endif
+        setLastError(error.localizedDescription)
+        recordDiagnostic("runtime_disconnected")
+        monitor?.cancel()
+        completion?.finish(error)
+        cancelTunnelWithError(error)
     }
 
     // MARK: - handleAppMessage
@@ -248,6 +743,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     ///   {"cmd":"stop"}
     ///   {"cmd":"status"}
     ///   {"cmd":"parse-sub","sub_url":"...","sub_format":"...","sub_content":"..."}
+    ///   {"cmd":"select-outbound","group_tag":"...","outbound_tag":"..."}
+    ///   {"cmd":"test-outbound","outbound_tag":"...","test_url":"...","timeout_ms":"5000"}
+    ///   {"cmd":"probe-outbound-address","outbound_tag":"...","timeout_ms":"7000"}
+    ///   {"cmd":"routing-probe-snapshot"}
+    ///   {"cmd":"tailscale-status","endpoint_tag":"tailscale-..."}
     /// 响应结构见 GoEngine.swift 的 DaemonResponse:{id?, ok?, message?, data?, event?}。
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         guard let completionHandler else { return }
@@ -268,27 +768,129 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
             // 扩展的真实启动由 NETunnelProviderManager.startVPNTunnel(options:) 触发
             // (走 startTunnel 而非本消息)。这里保留一条幂等语义的应答:若引擎已在跑
             // 回 ok,便于 App 在既有隧道上做「确认」。真正的拨号不在此路径完成。
-            let running = libbox?.isRunning() ?? false
+            let running = currentEngine()?.isRunning() ?? false
             completion.value(encodeResponse(ok: true,
-                message: running ? nil : "隧道由系统 VPN 配置启动(startVPNTunnel),非此消息路径",
+                message: running ? nil : "隧道由系统连接配置启动,非此消息路径",
                 dataString: statusJSONString()))
 
         case "stop":
             // 与 start 对称:真正停止隧道应调 NETunnelProviderManager.stopVPNTunnel()。
             // 这里做一次尽力而为的引擎停止,并回 ok。
-            let lb = libbox
-            libbox = nil
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                if let lb { try? lb.stop() }
-                completion.value(self?.encodeResponse(ok: true, dataString: "{\"status\":\"disconnected\"}"))
-            }
+            cancelActiveAttempt(startError: providerError(7, "连接启动已取消"))
+            completion.value(encodeResponse(ok: true, dataString: "{\"status\":\"disconnected\"}"))
 
         case "parse-sub":
-            // 订阅解析目前没有进程内实现(macOS 版在 helper daemon 里做)。
-            // 如实回一个"未实现"的失败响应,而不是假装成功——上层 sendSubRequest
-            // 会把它当解析失败处理并给用户明确提示。
-            // TODO:接入进程内订阅解析(复用 core 的订阅解析逻辑并经 Libbox 导出)。
-            completion.value(encodeResponse(ok: false, message: "扩展暂不支持订阅解析(parse-sub 未实现)"))
+            // 兼容旧 App 的消息。当前 App 已在主进程直接调用 Libbox 解析，不再依赖扩展会话。
+            completion.value(encodeResponse(ok: false, message: "请更新 XDial 后重试订阅解析"))
+
+        case "select-outbound":
+            guard let groupTag = obj["group_tag"] as? String, !groupTag.isEmpty,
+                  let outboundTag = obj["outbound_tag"] as? String, !outboundTag.isEmpty else {
+                completion.value(encodeResponse(ok: false, message: "线路选择参数不完整"))
+                return
+            }
+            engineOperationQueue.async { [weak self] in
+                guard let self, let engine = self.currentEngine() else {
+                    completion.value(self?.encodeResponse(ok: false, message: "连接引擎未运行"))
+                    return
+                }
+                do {
+                    try engine.selectOutbound(groupTag, outboundTag: outboundTag)
+                    completion.value(self.encodeResponse(ok: true))
+                } catch {
+                    completion.value(self.encodeResponse(ok: false, message: "无法切换到所选线路"))
+                }
+            }
+
+        case "test-outbound":
+            guard let outboundTag = obj["outbound_tag"] as? String, !outboundTag.isEmpty else {
+                completion.value(encodeResponse(ok: false, message: "线路测试参数不完整"))
+                return
+            }
+            let testURL = obj["test_url"] as? String ?? ""
+            let timeoutMS = Int(obj["timeout_ms"] as? String ?? "") ?? 5_000
+            engineOperationQueue.async { [weak self] in
+                guard let self, let engine = self.currentEngine() else {
+                    completion.value(self?.encodeResponse(ok: false, message: "连接引擎未运行"))
+                    return
+                }
+                do {
+                    var delay = 0
+                    try engine.testOutbound(
+                        outboundTag,
+                        testURL: testURL,
+                        timeoutMS: timeoutMS,
+                        ret0_: &delay
+                    )
+                    completion.value(self.encodeResponse(ok: true, dataString: String(delay)))
+                } catch {
+                    completion.value(self.encodeResponse(ok: false, message: "所选线路测试失败"))
+                }
+            }
+
+        case "probe-outbound-address":
+            guard let outboundTag = obj["outbound_tag"] as? String, !outboundTag.isEmpty else {
+                completion.value(encodeResponse(ok: false, message: "出口地址探测参数不完整"))
+                return
+            }
+            let timeoutMS = Int(obj["timeout_ms"] as? String ?? "") ?? 7_000
+            engineOperationQueue.async { [weak self] in
+                guard let self, let engine = self.currentEngine() else {
+                    completion.value(self?.encodeResponse(ok: false, message: "连接引擎未运行"))
+                    return
+                }
+                do {
+                    var probeError: NSError?
+                    let address = engine.probeOutboundIP(
+                        outboundTag,
+                        timeoutMS: timeoutMS,
+                        error: &probeError
+                    )
+                    if let probeError { throw probeError }
+                    completion.value(self.encodeResponse(ok: true, dataString: address))
+                } catch {
+                    completion.value(self.encodeResponse(ok: false, message: "无法确认所选线路的出口地址"))
+                }
+            }
+
+        case "routing-probe-snapshot":
+            guard let engine = currentEngine(), engine.isRunning() else {
+                completion.value(encodeResponse(ok: false, message: "连接引擎未运行"))
+                return
+            }
+            completion.value(encodeResponse(
+                ok: true,
+                dataString: engine.routingProbeSnapshot()
+            ))
+
+        case "tailscale-status":
+            guard let endpointTag = obj["endpoint_tag"] as? String, !endpointTag.isEmpty else {
+                completion.value(encodeResponse(ok: false, message: "Tailscale 状态参数不完整"))
+                return
+            }
+            engineOperationQueue.async { [weak self] in
+                guard let self, let engine = self.currentEngine() else {
+                    completion.value(self?.encodeResponse(ok: false, message: "连接引擎未运行"))
+                    return
+                }
+                do {
+                    var statusError: NSError?
+                    let rawStatus = engine.tailscaleStatus(endpointTag, error: &statusError)
+                    if let statusError { throw statusError }
+                    guard !rawStatus.isEmpty else {
+                        completion.value(self.encodeResponse(ok: false, message: "Tailscale 状态为空"))
+                        return
+                    }
+                    if self.tailscaleBackendIsRunning(rawStatus) {
+                        // reconfig 已原地更新 Tailscale DNS transport；清掉登录前
+                        // 可能缓存的公共 NXDOMAIN 后，下一条查询立即按新分域选择。
+                        try engine.refreshDNS()
+                    }
+                    completion.value(self.encodeResponse(ok: true, dataString: rawStatus))
+                } catch {
+                    completion.value(self.encodeResponse(ok: false, message: "无法读取 Tailscale 状态"))
+                }
+            }
 
         default:
             completion.value(encodeResponse(ok: false, message: "未知命令: \(cmd)"))
@@ -304,7 +906,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     /// 组装 GoEngine.EngineStatus 期望的 JSON:{"status": "...", "error": "..."?}。
     /// EngineStatus 只解 status / mode / connected_at / error;这里给 status(+error)。
     private func statusJSONString() -> String {
-        let running = libbox?.isRunning() ?? false
+        let running = currentEngine()?.isRunning() ?? false
         var dict: [String: Any] = ["status": running ? "connected" : "disconnected"]
         dict["diagnostics"] = diagnosticSnapshot(includeEngine: true)
         if let lastError = currentLastError(), !lastError.isEmpty {
@@ -334,10 +936,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
 
     // MARK: - 凭据/配置读取
 
-    private struct StartBundle {
+    private struct StartBundle: Sendable {
+        let fromSecureEnvelope: Bool
+        let usesAnyConnect: Bool
         let server: String
         let username: String
         let password: String
+        let allowInsecure: Bool
         let configJSON: String
     }
 
@@ -345,46 +950,93 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     /// 成功复制到内存后立即清理旧 key，避免敏感配置继续持久化。
     private func resolveStartBundle(options: [String: NSObject]?) -> StartBundle? {
         let defaults = UserDefaults(suiteName: Self.appGroupID)
-
-        func pick(_ optKey: String, _ groupKey: String) -> String? {
-            if let v = options?[optKey] as? String, !v.isEmpty { return v }
-            if let v = defaults?.string(forKey: groupKey), !v.isEmpty { return v }
-            return nil
-        }
-
-        guard let server = pick("server", Self.serverKey),
-              let username = pick("username", Self.usernameKey),
-              let password = pick("password", Self.passwordKey),
-              let configJSON = pick("configJSON", Self.configKey) else {
-            return nil
-        }
         for key in [Self.serverKey, Self.usernameKey, Self.passwordKey, Self.configKey] {
             defaults?.removeObject(forKey: key)
         }
-        return StartBundle(server: server, username: username, password: password, configJSON: configJSON)
+
+        let configJSON = options?["configJSON"] as? String
+        let explicitAnyConnect = (options?["usesAnyConnect"] as? NSNumber)?.boolValue
+        let server = options?["server"] as? String
+        let username = options?["username"] as? String
+        let password = options?["password"] as? String
+        if OnDemandManualStartContract.isComplete(
+            configJSON: configJSON,
+            usesAnyConnect: explicitAnyConnect,
+            server: server,
+            username: username,
+            password: password
+        ), let configJSON, let explicitAnyConnect {
+            return StartBundle(
+                fromSecureEnvelope: false,
+                usesAnyConnect: explicitAnyConnect,
+                server: server ?? "",
+                username: username ?? "",
+                password: password ?? "",
+                allowInsecure: (options?["allowInsecure"] as? NSNumber)?.boolValue ?? false,
+                configJSON: configJSON
+            )
+        }
+
+        // NetworkExtension 可能传入包含系统字段的非空 options。只要不满足主 App
+        // 的完整手动契约，就必须按冷启动处理，不能误读为旧版手动启动。
+        do {
+            #if os(iOS)
+            guard case .available(let envelope) = OnDemandStartEnvelopeStore.load(),
+                  envelope.isValid,
+                  ["anyconnect", "standalone"].contains(envelope.transport),
+                  let acceptancePlan = envelope.parameters["acceptance_plan"],
+                  let acceptanceData = acceptancePlan.data(using: .utf8),
+                  (try? JSONSerialization.jsonObject(with: acceptanceData)) is [String: Any] else {
+                return nil
+            }
+            let usesAnyConnect = envelope.transport == "anyconnect"
+            let server = envelope.parameters["server"] ?? ""
+            let username = envelope.parameters["username"] ?? ""
+            let password = envelope.parameters["password"] ?? ""
+            guard !usesAnyConnect || (!server.isEmpty && !username.isEmpty && !password.isEmpty) else {
+                return nil
+            }
+            return StartBundle(
+                fromSecureEnvelope: true,
+                usesAnyConnect: usesAnyConnect,
+                server: server,
+                username: username,
+                password: password,
+                allowInsecure: envelope.parameters["allow_insecure"] == "true",
+                configJSON: envelope.configJSON
+            )
+            #else
+            return nil
+            #endif
+        }
     }
 
     // MARK: - NE 网络设置
 
     /// 启动真实物理接口监控并同步等待首个结果。首个接口必须在 Libbox.Start 前
     /// 设置，否则 route.auto_detect_interface 没有可用出口，不能把这种状态算连接成功。
-    private func startDefaultInterfaceMonitor() throws {
+    private func startDefaultInterfaceMonitor(generation: UInt64) throws {
         let monitor = NWPathMonitor()
         let ready = DispatchSemaphore(value: 0)
         let queue = DispatchQueue(label: "\(Self.subsystem).path-monitor")
 
         monitor.pathUpdateHandler = { [weak self, weak monitor] path in
-            self?.updateDefaultInterface(path)
+            self?.updateDefaultInterface(path, generation: generation)
             ready.signal()
             monitor?.pathUpdateHandler = { [weak self] path in
-                self?.updateDefaultInterface(path)
+                self?.updateDefaultInterface(path, generation: generation)
             }
         }
-        pathMonitor = monitor
+        guard installPathMonitor(monitor, generation: generation) else {
+            throw providerError(7, "连接启动已取消")
+        }
         monitor.start(queue: queue)
 
         guard ready.wait(timeout: .now() + 5) == .success else {
             throw providerError(5, "等待物理网络接口超时")
+        }
+        guard isAttemptStarting(generation) else {
+            throw providerError(7, "连接启动已取消")
         }
         guard monitor.currentPath.status == .satisfied,
               selectPhysicalInterface(from: monitor.currentPath) != nil else {
@@ -392,16 +1044,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         }
     }
 
-    private func updateDefaultInterface(_ path: NWPath) {
+    private func updateDefaultInterface(_ path: NWPath, generation: UInt64) {
+        guard let engine = engine(for: generation) else { return }
         guard path.status == .satisfied, let interface = selectPhysicalInterface(from: path) else {
             setPhysicalInterface(name: "", index: -1)
-            libbox?.setDefaultInterface("", index: -1)
+            engine.setDefaultInterface("", index: -1)
             refreshDiagnostic()
             os_log("physical interface unavailable", log: log, type: .error)
             return
         }
         setPhysicalInterface(name: interface.name, index: interface.index)
-        libbox?.setDefaultInterface(interface.name, index: interface.index)
+        engine.setDefaultInterface(interface.name, index: interface.index)
         refreshDiagnostic()
         os_log("physical interface: %{public}@ (%d)", log: log, type: .info,
                interface.name, interface.index)
@@ -424,8 +1077,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     }
 
     /// 构造 NEPacketTunnelNetworkSettings。
-    /// 隧道 IPv4 地址与 core/config buildTUNInbound 的 tun address(198.18.0.1/15)对齐;
-    /// DNS 先用公共兜底。真实值待 AnyConnect 握手结果(见 startTunnel 里的 TODO)。
+    /// 隧道地址与 core/config buildTUNInbound 对齐。IPv6 也必须进入 packetFlow，
+    /// 即使远端仅支持 IPv4，也应在受控出口 fail closed，不能绕过默认路由直出。
     private func buildNetworkSettings(remoteAddress: String) -> NEPacketTunnelNetworkSettings {
         // 调用方已用 IPv4Address 做过最终数值校验；不要在这里回退 hostname。
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remoteAddress)
@@ -439,12 +1092,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         ]
         settings.ipv4Settings = ipv4
 
-        let dns = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])
+        let ipv6 = NEIPv6Settings(addresses: ["fd00::1"], networkPrefixLengths: [126])
+        ipv6.includedRoutes = [NEIPv6Route.default()]
+        settings.ipv6Settings = ipv6
+
+        let dns = NEDNSSettings(servers: ["198.18.0.2"])
+        dns.matchDomains = [""]
+        dns.matchDomainsNoSearch = true
+        if #available(iOS 26.0, tvOS 26.0, *) {
+            dns.allowFailover = false
+        }
         settings.dnsSettings = dns
 
         settings.mtu = 9000 // 与 buildTUNInbound 的 mtu 对齐
 
         return settings
+    }
+
+    private func validDNSServers(from json: String) -> [String]? {
+        guard let data = json.data(using: .utf8),
+              let values = try? JSONDecoder().decode([String].self, from: data) else {
+            return nil
+        }
+        let validated = values.filter { IPv4Address($0) != nil }
+        return validated.count == values.count ? validated : nil
+    }
+
+    private func tailscaleBackendIsRunning(_ rawStatus: String) -> Bool {
+        guard let data = rawStatus.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let state = object["backend_state"] as? String else {
+            return false
+        }
+        return state.caseInsensitiveCompare("running") == .orderedSame
     }
 
     // MARK: - 发布版诊断
@@ -464,12 +1144,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         diagnosticStage = "idle"
         physicalInterfaceName = ""
         physicalInterfaceIndex = -1
+        diagnosticSensitiveValues = []
         diagnosticLock.unlock()
     }
 
     private func setLastError(_ value: String?) {
+        let safeValue = sanitizedDiagnosticText(value)
         diagnosticLock.lock()
-        lastError = value
+        lastError = safeValue
         diagnosticLock.unlock()
     }
 
@@ -550,12 +1232,80 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         if let lastError = state.lastError, !lastError.isEmpty {
             snapshot["last_error"] = lastError
         }
-        if includeEngine, let engineJSON = libbox?.diagnostics(),
+        if includeEngine, let engineJSON = currentEngine()?.diagnostics(),
            let data = engineJSON.data(using: .utf8),
            let engine = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            snapshot["engine"] = engine
+            snapshot["engine"] = sanitizedDiagnosticObject(engine)
         }
         return snapshot
+    }
+
+    private func setDiagnosticSensitiveValues(from bundle: StartBundle) {
+        var values = Set([bundle.server, bundle.username, bundle.password])
+        if let data = bundle.configJSON.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) {
+            collectDiagnosticSensitiveValues(from: object, key: nil, into: &values)
+        }
+        diagnosticLock.lock()
+        diagnosticSensitiveValues = values.filter { $0.count >= 3 }.sorted { $0.count > $1.count }
+        diagnosticLock.unlock()
+    }
+
+    private func collectDiagnosticSensitiveValues(
+        from object: Any,
+        key: String?,
+        into values: inout Set<String>
+    ) {
+        if let dictionary = object as? [String: Any] {
+            for (childKey, child) in dictionary {
+                collectDiagnosticSensitiveValues(from: child, key: childKey, into: &values)
+            }
+            return
+        }
+        if let array = object as? [Any] {
+            for child in array {
+                collectDiagnosticSensitiveValues(from: child, key: key, into: &values)
+            }
+            return
+        }
+        guard let value = object as? String, let key else { return }
+        switch key.lowercased() {
+        case "server", "server_name", "username", "password", "uuid", "url", "path":
+            values.insert(value)
+        default:
+            break
+        }
+    }
+
+    private func sanitizedDiagnosticText(_ value: String?) -> String? {
+        guard var result = value, !result.isEmpty else { return value }
+        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            for match in detector.matches(in: result, range: range).reversed() {
+                guard let swiftRange = Range(match.range, in: result) else { continue }
+                result.replaceSubrange(swiftRange, with: "<redacted-url>")
+            }
+        }
+        diagnosticLock.lock()
+        let sensitiveValues = diagnosticSensitiveValues
+        diagnosticLock.unlock()
+        for sensitive in sensitiveValues {
+            result = result.replacingOccurrences(of: sensitive, with: "<redacted>")
+        }
+        return String(result.prefix(1_024))
+    }
+
+    private func sanitizedDiagnosticObject(_ object: Any) -> Any {
+        if let dictionary = object as? [String: Any] {
+            return dictionary.mapValues { sanitizedDiagnosticObject($0) }
+        }
+        if let array = object as? [Any] {
+            return array.map { sanitizedDiagnosticObject($0) }
+        }
+        if let text = object as? String {
+            return sanitizedDiagnosticText(text) ?? ""
+        }
+        return object
     }
 
     // MARK: - tun fd 获取

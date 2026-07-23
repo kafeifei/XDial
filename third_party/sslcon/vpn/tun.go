@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"fmt"
 	"runtime"
 
 	"github.com/gopacket/gopacket"
@@ -57,45 +58,60 @@ func tunToPayloadOut(dev tun.Device, cSess *session.ConnSession) {
 		base.Info("tun to payloadOut exit")
 		_ = dev.Close()
 	}()
-	var (
-		err error
-		n   int
-	)
-
 	for {
-		// 从池子申请一块内存，存放到 PayloadOutTLS 或 PayloadOutDTLS，在 payloadOutTLSToServer 或 payloadOutDTLSToServer 中释放
-		// 由 payloadOutTLSToServer 或 payloadOutDTLSToServer 添加 header 后发送出去
-		pl := getPayloadBuffer()
-		n, err = dev.Read(pl.Data, offset) // 如果 tun 没有 up，会在这等待
+		keepRunning, err := readTUNPayload(dev, cSess)
 		if err != nil {
 			base.Error("tun to payloadOut error:", err)
 			return
 		}
-
-		// 更新数据长度
-		pl.Data = (pl.Data)[offset : offset+n]
-
-		// base.Debug("tunToPayloadOut")
-		// if base.Cfg.LogLevel == "Debug" {
-		//     src, srcPort, dst, dstPort := utils.ResolvePacket(pl.Data)
-		//     if dst == "8.8.8.8" {
-		//         base.Debug("client from", src, srcPort, "request target", dst, dstPort)
-		//     }
-		// }
-
-		dSess := cSess.DSess
-		if cSess.DtlsConnected.Load() {
-			select {
-			case cSess.PayloadOutDTLS <- pl:
-			case <-dSess.CloseChan:
-			}
-		} else {
-			select {
-			case cSess.PayloadOutTLS <- pl:
-			case <-cSess.CloseChan:
-				return
-			}
+		if !keepRunning {
+			return
 		}
+	}
+}
+
+type tunPacketReader interface {
+	Read([]byte, int) (int, error)
+}
+
+func readTUNPayload(dev tunPacketReader, cSess *session.ConnSession) (keepRunning bool, err error) {
+	pl := getPayloadBuffer()
+	transferred := false
+	defer func() {
+		if !transferred {
+			putPayloadBuffer(pl)
+		}
+	}()
+
+	n, err := dev.Read(pl.Data, offset)
+	if err != nil {
+		return false, err
+	}
+	if n < 0 || offset < 0 || offset+n > len(pl.Data) {
+		return false, fmt.Errorf("tun read returned invalid packet length")
+	}
+	if offset > 0 {
+		copy(pl.Data, pl.Data[offset:offset+n])
+	}
+	pl.Data = pl.Data[:n]
+
+	if cSess.DtlsConnected.Load() {
+		select {
+		case cSess.PayloadOutDTLS <- pl:
+			transferred = true
+			return true, nil
+		case <-cSess.DSess.CloseChan:
+			// DTLS 关闭后会回落到仍然存活的 TLS 通道；本包未移交，归还后继续读。
+			cSess.DtlsConnected.Store(false)
+			return true, nil
+		}
+	}
+	select {
+	case cSess.PayloadOutTLS <- pl:
+		transferred = true
+		return true, nil
+	case <-cSess.CloseChan:
+		return false, nil
 	}
 }
 
@@ -114,49 +130,48 @@ func payloadInToTun(dev tun.Device, cSess *session.ConnSession) {
 		_ = dev.Close()
 	}()
 
-	var (
-		err error
-		pl  *proto.Payload
-	)
-
 	for {
 		select {
-		case pl = <-cSess.PayloadIn:
+		case pl, ok := <-cSess.PayloadIn:
+			if !ok {
+				return
+			}
+			if pl == nil {
+				continue
+			}
+
+			// 只有当使用域名分流且返回数据包为 DNS 时才进一步分析，少建几个协程。
+			if cSess.DynamicSplitTunneling {
+				_, srcPort, _, _ := utils.ResolvePacket(pl.Data)
+				if srcPort == 53 {
+					// 分析在协程里继续，必须复制后再把池缓冲交还给生产者。
+					packetData := append([]byte(nil), pl.Data...)
+					go dynamicSplitRoutes(packetData, cSess)
+				}
+			}
+
+			if _, err := writeTUNPayload(dev, pl); err != nil {
+				base.Error("payloadIn to tun error:", err)
+				return
+			}
 		case <-cSess.CloseChan:
 			return
 		}
-
-		// 只有当使用域名分流且返回数据包为 DNS 时才进一步分析，少建几个协程
-		if cSess.DynamicSplitTunneling {
-			_, srcPort, _, _ := utils.ResolvePacket(pl.Data)
-			if srcPort == 53 {
-				go dynamicSplitRoutes(pl.Data, cSess)
-			}
-		}
-		// base.Debug("payloadInToTun")
-		// if base.Cfg.LogLevel == "Debug" {
-		//     src, srcPort, dst, dstPort := utils.ResolvePacket(pl.Data)
-		//     if src == "8.8.8.8" {
-		//         base.Debug("target from", src, srcPort, "response to client", dst, dstPort)
-		//     }
-		// }
-
-		if offset > 0 {
-			expand := make([]byte, offset+len(pl.Data))
-			copy(expand[offset:], pl.Data)
-			_, err = dev.Write(expand, offset)
-		} else {
-			_, err = dev.Write(pl.Data, offset)
-		}
-
-		if err != nil {
-			base.Error("payloadIn to tun error:", err)
-			return
-		}
-
-		// 释放由 serverToPayloadIn 申请的内存
-		putPayloadBuffer(pl)
 	}
+}
+
+type tunPacketWriter interface {
+	Write([]byte, int) (int, error)
+}
+
+func writeTUNPayload(dev tunPacketWriter, pl *proto.Payload) (int, error) {
+	defer putPayloadBuffer(pl)
+	if offset > 0 {
+		expand := make([]byte, offset+len(pl.Data))
+		copy(expand[offset:], pl.Data)
+		return dev.Write(expand, offset)
+	}
+	return dev.Write(pl.Data, offset)
 }
 
 func dynamicSplitRoutes(data []byte, cSess *session.ConnSession) {

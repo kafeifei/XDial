@@ -29,7 +29,9 @@ import (
 // 是因为 tvOS NetworkExtension 进程内存预算极紧(iOS 17 起仅 15MB 量级),
 // 多余的协议注册会直接挤占内存预算。
 func boxContext(ctx context.Context) context.Context {
-	return box.Context(ctx, inboundRegistry(), outboundRegistry(), endpoint.NewRegistry(), dnsTransportRegistry(), boxservice.NewRegistry())
+	endpointRegistry := endpoint.NewRegistry()
+	registerTailscaleEndpoint(endpointRegistry)
+	return box.Context(ctx, inboundRegistry(), outboundRegistry(), endpointRegistry, dnsTransportRegistry(), boxservice.NewRegistry())
 }
 
 func inboundRegistry() *inbound.Registry {
@@ -62,5 +64,7 @@ func dnsTransportRegistry() *dns.TransportRegistry {
 	transport.RegisterHTTPS(registry)
 	hosts.RegisterTransport(registry)
 	local.RegisterTransport(registry)
+	registerTailscaleDNSTransport(registry)
+	registerMobileDNSTransport(registry)
 	return registry
 }

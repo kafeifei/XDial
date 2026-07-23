@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -20,12 +22,7 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 		_ = conn.Close()
 		cSess.Close()
 	}()
-	var (
-		err           error
-		bytesReceived int
-		dataLen       uint16
-		dead          = time.Duration(cSess.TLSDpdTime+5) * time.Second
-	)
+	dead := time.Duration(cSess.TLSDpdTime+5) * time.Second
 
 	go payloadOutTLSToServer(conn, cSess)
 
@@ -38,44 +35,74 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 			cSess.ResetTLSReadDead.Store(false)
 		}
 
-		pl := getPayloadBuffer()                // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
-		bytesReceived, err = bufR.Read(pl.Data) // 服务器没有数据返回时，会阻塞
-		if err != nil {
-			base.Error("tls server to payloadIn error:", err)
+		bytesReceived, keepRunning, readErr := readTLSPayload(bufR, cSess)
+		if readErr != nil {
+			base.Error("tls server to payloadIn error:", readErr)
 			return
 		}
-
-		// base.Debug("tls server to payloadIn", "Type", pl.Data[6])
-		// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-03#section-2.2
-		switch pl.Data[6] {
-		case 0x00: // DATA
-			// base.Debug("tls receive DATA")
-			// 获取数据长度
-			dataLen = binary.BigEndian.Uint16(pl.Data[4:6])
-			// 去除数据头
-			copy(pl.Data, pl.Data[8:8+dataLen])
-			// 更新切片长度
-			pl.Data = pl.Data[:dataLen]
-
-			select {
-			case cSess.PayloadIn <- pl:
-			case <-cSess.CloseChan:
-				return
-			}
-		case 0x04:
-			base.Debug("tls receive DPD-RESP")
-		case 0x03: // DPD-REQ
-			pl.Type = 0x04
-			select {
-			case cSess.PayloadOutTLS <- pl:
-			case <-cSess.CloseChan:
-				return
-			}
-		case 0x07: // KEEPALIVE
-			// 收到保活包，无需处理，读操作本身已重置超时
+		if !keepRunning {
+			return
 		}
 		cSess.Stat.BytesReceived += uint64(bytesReceived)
 	}
+}
+
+// readTLSPayload 读取并分派一个 CSTP 帧。只有成功写入数据通道时才移交缓冲
+// 所有权；控制包、畸形包、读错误和关闭分支都在返回前归还缓冲池。
+func readTLSPayload(reader io.Reader, cSess *session.ConnSession) (bytesReceived int, keepRunning bool, err error) {
+	pl := getPayloadBuffer()
+	transferred := false
+	defer func() {
+		if !transferred {
+			putPayloadBuffer(pl)
+		}
+	}()
+
+	headerSize := len(proto.Header)
+	headerBytes, readErr := io.ReadFull(reader, pl.Data[:headerSize])
+	bytesReceived = headerBytes
+	if readErr != nil {
+		return bytesReceived, false, readErr
+	}
+	dataLen := int(binary.BigEndian.Uint16(pl.Data[4:6]))
+	if dataLen > len(pl.Data)-headerSize {
+		return bytesReceived, false, fmt.Errorf("CSTP data frame exceeds buffer size")
+	}
+	payloadBytes, readErr := io.ReadFull(reader, pl.Data[headerSize:headerSize+dataLen])
+	bytesReceived += payloadBytes
+	err = readErr
+	if err != nil {
+		return bytesReceived, false, err
+	}
+
+	// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-03#section-2.2
+	switch pl.Data[6] {
+	case 0x00: // DATA
+		copy(pl.Data, pl.Data[headerSize:headerSize+dataLen])
+		pl.Data = pl.Data[:dataLen]
+
+		select {
+		case cSess.PayloadIn <- pl:
+			transferred = true
+			return bytesReceived, true, nil
+		case <-cSess.CloseChan:
+			return bytesReceived, false, nil
+		}
+	case 0x04:
+		base.Debug("tls receive DPD-RESP")
+	case 0x03: // DPD-REQ
+		pl.Type = 0x04
+		select {
+		case cSess.PayloadOutTLS <- pl:
+			transferred = true
+			return bytesReceived, true, nil
+		case <-cSess.CloseChan:
+			return bytesReceived, false, nil
+		}
+	case 0x07: // KEEPALIVE
+		// 收到保活包，无需处理，读操作本身已重置超时。
+	}
+	return bytesReceived, true, nil
 }
 
 // payloadOutTLSToServer Step 4
@@ -99,31 +126,29 @@ func payloadOutTLSToServer(conn *tls.Conn, cSess *session.ConnSession) {
 			return
 		}
 
-		// base.Debug("tls payloadOut to server", "Type", pl.Type)
-		if pl.Type == 0x00 {
-			// 获取数据长度
-			l := len(pl.Data)
-			// 先扩容 +8
-			pl.Data = pl.Data[:l+8]
-			// 数据后移
-			copy(pl.Data[8:], pl.Data)
-			// 添加头信息
-			copy(pl.Data[:8], proto.Header)
-			// 更新头长度
-			binary.BigEndian.PutUint16(pl.Data[4:6], uint16(l))
-		} else {
-			pl.Data = append(pl.Data[:0], proto.Header...)
-			// 设置头类型
-			pl.Data[6] = pl.Type
-		}
-		bytesSent, err = conn.Write(pl.Data)
+		bytesSent, err = writeTLSPayload(conn, pl)
 		if err != nil {
 			base.Error("tls payloadOut to server error:", err)
 			return
 		}
 		cSess.Stat.BytesSent += uint64(bytesSent)
-
-		// 释放由 tunToPayloadOut 申请的内存
-		putPayloadBuffer(pl)
 	}
+}
+
+func writeTLSPayload(writer io.Writer, pl *proto.Payload) (bytesSent int, err error) {
+	defer putPayloadBuffer(pl)
+	if pl.Type == 0x00 {
+		dataLen := len(pl.Data)
+		if dataLen > cap(pl.Data)-len(proto.Header) {
+			return 0, fmt.Errorf("CSTP payload has no header capacity")
+		}
+		pl.Data = pl.Data[:dataLen+len(proto.Header)]
+		copy(pl.Data[len(proto.Header):], pl.Data)
+		copy(pl.Data[:len(proto.Header)], proto.Header)
+		binary.BigEndian.PutUint16(pl.Data[4:6], uint16(dataLen))
+	} else {
+		pl.Data = append(pl.Data[:0], proto.Header...)
+		pl.Data[6] = pl.Type
+	}
+	return writer.Write(pl.Data)
 }

@@ -1,3 +1,5 @@
+//go:build !mobile_no_tailscale
+
 package engine
 
 import (
@@ -15,14 +17,6 @@ import (
 	"github.com/sagernet/tailscale/ipn/ipnstate"
 	"github.com/sagernet/tailscale/tsnet"
 )
-
-type TailscaleExitNode struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	IP     string `json:"ip"`
-	Online bool   `json:"online"`
-	OS     string `json:"os,omitempty"`
-}
 
 type TailscaleSession struct {
 	lineID      string

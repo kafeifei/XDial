@@ -1,11 +1,13 @@
 import Combine
 import Foundation
+import Libbox
 
 // MARK: - GoEngine (iOS / tvOS)
 //
 // macOS 版 GoEngine 通过 AF_UNIX socket 跟本地特权 daemon 进程收发 JSON 请求/响应。
 // iOS / tvOS 上没有特权进程,VPN 逻辑跑在 NEPacketTunnelProvider 扩展进程里,App 与扩展
-// 之间用 NEVPNConnection.sendProviderMessage(_:responseHandler:) 通信。
+// 之间用 NEVPNConnection.sendProviderMessage(_:responseHandler:) 通信;订阅解析不依赖扩展,
+// 直接调用 App 进程内的 Libbox。
 //
 // 这次移植只换「传输层」,不动「协议内容」:
 //   - wire 结构体(DaemonResponse / EngineStatus / ParseResult)不变。
@@ -20,6 +22,10 @@ import Foundation
 // 传输由 `TunnelSession` 抽象注入(见下),真实实现是 NETunnelProviderManager 管理层
 // 包一层 NEVPNConnection.sendProviderMessage。GoEngine 不直接依赖 NetworkExtension,
 // 便于离线做语法检查与单测。
+
+private struct SubscriptionSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+}
 
 /// App → 扩展的传输抽象。方法签名对齐真实的
 /// `NEVPNConnection.sendProviderMessage(_ messageData: Data, responseHandler: ((Data?) -> Void)?) throws`。
@@ -41,13 +47,16 @@ protocol TunnelSession: AnyObject {
 final class GoEngine: ObservableObject, TunnelEngine {
     static let shared = GoEngine()
 
-    /// 传输通道。由 NETunnelProviderManager 管理层注入;未注入(nil)时所有请求都被拒绝,
+    /// 传输通道。由 NETunnelProviderManager 管理层注入;未注入(nil)时扩展控制请求会被拒绝,
     /// 语义等价于 macOS 版「socket 不可用」。用 weak 避免与管理层互相强引用。
     weak var session: TunnelSession?
 
     @Published private(set) var status: String = "disconnected"
     @Published var lastError: String?
+    @Published var dataPathSummary: String?
     @Published private(set) var connectedAt: Date?
+    var statusPublisher: AnyPublisher<String, Never> { $status.eraseToAnyPublisher() }
+    private var automaticReconnectSuppressed = false
 
     // 订阅解析结果直接用 AppState.swift 里定义的顶层 `ParseResult`(与 macOS 版
     // GoEngine.ParseResult 同构)。parseSubscription 的回调结果可直接喂给
@@ -60,6 +69,16 @@ final class GoEngine: ObservableObject, TunnelEngine {
     }
 
     // MARK: - Public API
+
+    func suppressNextAutomaticReconnect() {
+        automaticReconnectSuppressed = true
+    }
+
+    func consumeAutomaticReconnectPermission() -> Bool {
+        let allowed = !automaticReconnectSuppressed
+        automaticReconnectSuppressed = false
+        return allowed
+    }
 
     func start(profileJSON: String) {
         lastError = nil
@@ -90,12 +109,159 @@ final class GoEngine: ObservableObject, TunnelEngine {
 
     func parseSubscription(url: String, content: String = "", format: String = "auto",
                            completion: @escaping (Result<ParseResult, Error>) -> Void) {
-        guard session != nil else {
-            completion(.failure(NSError(domain: "XDial", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "隧道不可用,无法解析订阅"])))
+        let completionBox = SubscriptionSendableBox(value: completion)
+        DispatchQueue.global(qos: .userInitiated).async {
+            var parseError: NSError?
+            let raw = LibboxParseSubscription(url, content, format, &parseError)
+
+            let result: Result<ParseResult, Error>
+            if let parseError {
+                result = .failure(parseError)
+            } else {
+                do {
+                    let decoded = try JSONDecoder().decode(ParseResult.self, from: Data(raw.utf8))
+                    result = .success(decoded)
+                } catch {
+                    result = .failure(error)
+                }
+            }
+
+            let resultBox = SubscriptionSendableBox(value: result)
+            DispatchQueue.main.async {
+                completionBox.value(resultBox.value)
+            }
+        }
+    }
+
+    func selectSubscriptionMember(
+        profileJSON: String,
+        subscriptionID: String,
+        groupName: String,
+        memberName: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        do {
+            let catalog = try runtimeSubscriptionCatalog(profileJSON: profileJSON)
+            guard let group = catalog.subscriptions
+                .first(where: { $0.id == subscriptionID })?.groups
+                .first(where: { $0.name == groupName }),
+                  let member = group.members.first(where: { $0.name == memberName }) else {
+                completion(.failure(TunnelRuntimeError.missingTarget))
+                return
+            }
+            sendRequest(
+                cmd: "select-outbound",
+                fields: ["group_tag": group.tag, "outbound_tag": member.tag]
+            ) { response in
+                if response.ok == true {
+                    completion(.success(()))
+                } else {
+                    completion(.failure(TunnelRuntimeError.requestFailed(
+                        response.message ?? "Runtime route selection failed."
+                    )))
+                }
+            }
+        } catch {
+            completion(.failure(error))
+        }
+    }
+
+    func testSubscriptionNode(
+        profileJSON: String,
+        subscriptionID: String,
+        nodeID: String,
+        testURL: String,
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        do {
+            let catalog = try runtimeSubscriptionCatalog(profileJSON: profileJSON)
+            guard let node = catalog.subscriptions
+                .first(where: { $0.id == subscriptionID })?.nodes
+                .first(where: { $0.id == nodeID }) else {
+                completion(.failure(TunnelRuntimeError.missingTarget))
+                return
+            }
+            sendRequest(
+                cmd: "test-outbound",
+                fields: ["outbound_tag": node.tag, "test_url": testURL, "timeout_ms": "5000"]
+            ) { response in
+                guard response.ok == true, let rawDelay = response.data, let delay = Int(rawDelay) else {
+                    completion(.failure(TunnelRuntimeError.requestFailed(
+                        response.message ?? "Runtime route test failed."
+                    )))
+                    return
+                }
+                completion(.success(delay))
+            }
+        } catch {
+            completion(.failure(error))
+        }
+    }
+
+    func probeSubscriptionNodeAddress(
+        profileJSON: String,
+        subscriptionID: String,
+        nodeID: String,
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        do {
+            let catalog = try runtimeSubscriptionCatalog(profileJSON: profileJSON)
+            guard let node = catalog.subscriptions
+                .first(where: { $0.id == subscriptionID })?.nodes
+                .first(where: { $0.id == nodeID }) else {
+                completion(.failure(TunnelRuntimeError.missingTarget))
+                return
+            }
+            sendRequest(
+                cmd: "probe-outbound-address",
+                fields: ["outbound_tag": node.tag, "timeout_ms": "7000"]
+            ) { response in
+                guard response.ok == true, let address = response.data, !address.isEmpty else {
+                    completion(.failure(TunnelRuntimeError.requestFailed(
+                        response.message ?? "Runtime route address probe failed."
+                    )))
+                    return
+                }
+                completion(.success(address))
+            }
+        } catch {
+            completion(.failure(error))
+        }
+    }
+
+    func tailscaleStatus(
+        endpointTag: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        guard !endpointTag.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            completion(.failure(TunnelRuntimeError.missingTarget))
             return
         }
-        sendSubRequest(url: url, content: content, format: format, completion: completion)
+        sendRequest(cmd: "tailscale-status", fields: ["endpoint_tag": endpointTag]) { response in
+            guard response.ok == true, let rawStatus = response.data,
+                  let data = rawStatus.data(using: .utf8) else {
+                completion(.failure(TunnelRuntimeError.requestFailed(
+                    response.message ?? "Tailscale status request failed."
+                )))
+                return
+            }
+            do {
+                completion(.success(try JSONDecoder().decode(TailscaleRuntimeStatus.self, from: data)))
+            } catch {
+                completion(.failure(TunnelRuntimeError.invalidTailscaleStatus))
+            }
+        }
+    }
+
+    private func runtimeSubscriptionCatalog(profileJSON: String) throws -> RuntimeSubscriptionCatalog {
+        var catalogError: NSError?
+        let raw = LibboxSubscriptionRuntimeCatalog(profileJSON, &catalogError)
+        if let catalogError { throw catalogError }
+        guard let data = raw.data(using: .utf8),
+              let catalog = try? JSONDecoder().decode(RuntimeSubscriptionCatalog.self, from: data) else {
+            throw TunnelRuntimeError.invalidCatalog
+        }
+        return catalog
     }
 
     func syncStatus() {
@@ -134,14 +300,27 @@ final class GoEngine: ObservableObject, TunnelEngine {
 
     /// 发送一条请求到扩展。原 macOS 版 write(fd,...) + newline framing + pendingCallbacks[id]
     /// 这里全部塌缩成一次 sendProviderMessage 调用 —— 请求/响应由 API 自身配对。
-    private func sendRequest(cmd: String, profile: String? = nil,
+    private func sendRequest(cmd: String, profile: String? = nil, fields: [String: String] = [:],
                              callback: ((DaemonResponse) -> Void)? = nil) {
         guard let session else {
             appLog("sendRequest(\(cmd)): no session")
+            let response = DaemonResponse(
+                id: nil,
+                ok: false,
+                message: "连接扩展不可用",
+                data: nil,
+                event: nil
+            )
+            if let callback {
+                callback(response)
+            } else {
+                lastError = response.message
+            }
             return
         }
 
-        var obj: [String: String] = ["cmd": cmd]
+        var obj = fields
+        obj["cmd"] = cmd
         if let profile { obj["profile"] = profile }
 
         guard let data = try? JSONSerialization.data(withJSONObject: obj) else {
@@ -158,7 +337,7 @@ final class GoEngine: ObservableObject, TunnelEngine {
             }
             appLog("sendRequest(\(cmd)): sent \(data.count) bytes")
         } catch {
-            appLog("sendRequest(\(cmd)): sendProviderMessage threw \(error.localizedDescription)")
+            appLog("sendRequest(\(cmd)): sendProviderMessage failed")
             if let callback {
                 // 发送本身失败:合成一个失败响应喂回调,语义等价 macOS 版 write 失败后不会有回调
                 // (这里比 macOS 更友好,直接告知失败)。
@@ -167,55 +346,6 @@ final class GoEngine: ObservableObject, TunnelEngine {
             } else {
                 lastError = error.localizedDescription
             }
-        }
-    }
-
-    private func sendSubRequest(url: String, content: String, format: String,
-                                completion: @escaping (Result<ParseResult, Error>) -> Void) {
-        guard let session else {
-            completion(.failure(NSError(domain: "XDial", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "隧道不可用"])))
-            return
-        }
-        var obj: [String: String] = [
-            "cmd": "parse-sub",
-            "sub_url": url,
-            "sub_format": format,
-        ]
-        if !content.isEmpty {
-            obj["sub_content"] = content
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: obj) else {
-            completion(.failure(NSError(domain: "XDial", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "请求编码失败"])))
-            return
-        }
-
-        let decodeAndComplete: (DaemonResponse) -> Void = { resp in
-            if resp.ok == true, let raw = resp.data?.data(using: .utf8),
-               let result = try? JSONDecoder().decode(ParseResult.self, from: raw) {
-                completion(.success(result))
-            } else {
-                let msg = resp.message ?? "parse failed"
-                completion(.failure(NSError(domain: "XDial", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: msg])))
-            }
-        }
-
-        do {
-            try session.sendProviderMessage(data) { respData in
-                Task { @MainActor in
-                    guard let respData,
-                          let resp = try? JSONDecoder().decode(DaemonResponse.self, from: respData) else {
-                        completion(.failure(NSError(domain: "XDial", code: -1,
-                            userInfo: [NSLocalizedDescriptionKey: "扩展无响应或响应格式错误"])))
-                        return
-                    }
-                    decodeAndComplete(resp)
-                }
-            }
-        } catch {
-            completion(.failure(error))
         }
     }
 
@@ -241,7 +371,7 @@ final class GoEngine: ObservableObject, TunnelEngine {
             }
             return
         }
-        appLog("response(\(cmd)): ok=\(String(describing: resp.ok)) data=\(resp.data ?? "")")
+        appLog("response(\(cmd)): ok=\(String(describing: resp.ok)) hasData=\(resp.data != nil)")
 
         if let callback {
             // 请求-响应配对:回调优先。响应里若还夹带 event(如扩展在响应里顺带推 status),
@@ -266,7 +396,7 @@ final class GoEngine: ObservableObject, TunnelEngine {
     }
 
     private func handleEvent(event: String, data: String?) {
-        appLog("event: \(event) data=\(data ?? "")")
+        appLog("event: \(event) hasData=\(data != nil)")
         switch event {
         case "status":
             if let data {
@@ -289,7 +419,7 @@ final class GoEngine: ObservableObject, TunnelEngine {
     private func handleResponse(id: String, msg: DaemonResponse) {
         // sendProviderMessage 已按调用配对了响应,不再有 id→callback 字典。
         // 保留此方法处理「响应体带 id 但走了无 callback 路径」的边缘情况:仅在失败时冒泡错误。
-        appLog("response: id=\(id) ok=\(String(describing: msg.ok)) data=\(msg.data ?? "")")
+        appLog("response: id=\(id) ok=\(String(describing: msg.ok)) hasData=\(msg.data != nil)")
         if msg.ok != true {
             lastError = msg.message
         }
@@ -327,4 +457,26 @@ struct EngineStatus: Decodable {
         case status, mode, error
         case connectedAt = "connected_at"
     }
+}
+
+private struct RuntimeSubscriptionCatalog: Decodable {
+    let subscriptions: [RuntimeSubscriptionEntry]
+}
+
+private struct RuntimeSubscriptionEntry: Decodable {
+    let id: String
+    let nodes: [RuntimeSubscriptionMember]
+    let groups: [RuntimeSubscriptionGroup]
+}
+
+private struct RuntimeSubscriptionGroup: Decodable {
+    let name: String
+    let tag: String
+    let members: [RuntimeSubscriptionMember]
+}
+
+private struct RuntimeSubscriptionMember: Decodable {
+    let id: String?
+    let name: String
+    let tag: String
 }

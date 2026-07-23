@@ -51,7 +51,7 @@ func (c *VPNClient) Connect(cfg VPNConfig) (*VPNInfo, error) {
 	auth.Prof.Password = cfg.Password
 
 	if err := rpc.Connect(); err != nil {
-		return nil, fmt.Errorf("vpn connect: %w", err)
+		return nil, fmt.Errorf("AnyConnect connect: %w", err)
 	}
 
 	cSess := session.Sess.CSess

@@ -26,7 +26,11 @@ var (
 	BufR         *bufio.Reader
 	reqHeaders   = make(map[string]string)
 	WebVpnCookie string
+
+	handshakeDeadline time.Time
 )
+
+const DefaultHandshakeBudget = 25 * time.Second
 
 // Profile 模板变量字段必须导出，虽然全局，但每次连接都被重置
 type Profile struct {
@@ -90,6 +94,10 @@ func InitAuth() error {
 	if err != nil {
 		return err
 	}
+	if err = BeginHandshake(DefaultHandshakeBudget); err != nil {
+		AbortHandshake()
+		return fmt.Errorf("secure tunnel handshake deadline setup failed: %w", err)
+	}
 	BufR = bufio.NewReader(Conn)
 	// base.Info(Conn.ConnectionState().Version)
 
@@ -100,6 +108,7 @@ func InitAuth() error {
 
 	err = tplPost(tplInit, "", dtd)
 	if err != nil {
+		AbortHandshake()
 		return err
 	}
 	Prof.AuthPath = dtd.Auth.Form.Action
@@ -112,10 +121,51 @@ func InitAuth() error {
 
 	gps := len(dtd.Auth.Form.Groups)
 	if gps != 0 && !utils.InArray(dtd.Auth.Form.Groups, Prof.Group) {
+		AbortHandshake()
 		return fmt.Errorf("available user groups are: %s", strings.Join(dtd.Auth.Form.Groups, " "))
 	}
 
 	return nil
+}
+
+// BeginHandshake 设置认证到 CONNECT 共用的绝对截止时间。
+func BeginHandshake(budget time.Duration) error {
+	if Conn == nil {
+		return errors.New("secure tunnel connection is unavailable")
+	}
+	if budget <= 0 {
+		return errors.New("secure tunnel handshake budget is invalid")
+	}
+	handshakeDeadline = time.Now().Add(budget)
+	return Conn.SetDeadline(handshakeDeadline)
+}
+
+// EnsureHandshake 保留已有总预算；短线重连没有认证阶段时才新建预算。
+func EnsureHandshake() error {
+	if Conn == nil {
+		return errors.New("secure tunnel connection is unavailable")
+	}
+	if handshakeDeadline.IsZero() {
+		return BeginHandshake(DefaultHandshakeBudget)
+	}
+	return Conn.SetDeadline(handshakeDeadline)
+}
+
+// CompleteHandshake 清除初始握手限制，后续数据通道使用服务器 DPD 超时。
+func CompleteHandshake() error {
+	handshakeDeadline = time.Time{}
+	if Conn == nil {
+		return nil
+	}
+	return Conn.SetDeadline(time.Time{})
+}
+
+// AbortHandshake 硬关闭未完成的 TLS，避免失败路径再等待 close-notify。
+func AbortHandshake() {
+	handshakeDeadline = time.Time{}
+	if Conn != nil {
+		_ = Conn.NetConn().Close()
+	}
 }
 
 // PasswordAuth 认证成功后，服务端新建 ConnSession，并生成 SessionToken 或者通过 Header 返回 WebVpnCookie
@@ -124,6 +174,7 @@ func PasswordAuth() error {
 	// 发送用户名或者用户名+密码
 	err := tplPost(tplAuthReply, Prof.AuthPath, dtd)
 	if err != nil {
+		AbortHandshake()
 		return err
 	}
 	// 兼容两步登陆，如必要则再次发送
@@ -131,11 +182,13 @@ func PasswordAuth() error {
 		dtd = new(proto.DTD)
 		err = tplPost(tplAuthReply, Prof.AuthPath, dtd)
 		if err != nil {
+			AbortHandshake()
 			return err
 		}
 	}
 	// 用户名、密码等错误
 	if dtd.Type == "auth-request" {
+		AbortHandshake()
 		if dtd.Auth.Error.Value != "" {
 			return fmt.Errorf(dtd.Auth.Error.Value, dtd.Auth.Error.Param1)
 		}
@@ -173,31 +226,35 @@ func tplPost(typ int, path string, dtd *proto.DTD) error {
 	if Prof.SecretKey != "" {
 		url += "?" + Prof.SecretKey
 	}
-	req, _ := http.NewRequest("POST", url, tplBuffer)
+	req, err := http.NewRequest("POST", url, tplBuffer)
+	if err != nil {
+		AbortHandshake()
+		return errors.New("secure tunnel handshake could not build authentication request")
+	}
 
 	utils.SetCommonHeader(req)
 	for k, v := range reqHeaders {
 		req.Header[k] = []string{v}
 	}
 
-	err := req.Write(Conn)
+	err = req.Write(Conn)
 	if err != nil {
-		Conn.Close()
-		return err
+		AbortHandshake()
+		return handshakeError("authentication request write", err)
 	}
 
 	var resp *http.Response
 	resp, err = http.ReadResponse(BufR, req)
 	if err != nil {
-		Conn.Close()
-		return err
+		AbortHandshake()
+		return handshakeError("authentication response", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		Conn.Close()
-		return err
+		AbortHandshake()
+		return handshakeError("authentication response body", err)
 	}
 	if base.Cfg.LogLevel == "Debug" {
 		base.Debug(string(body))
@@ -205,6 +262,10 @@ func tplPost(typ int, path string, dtd *proto.DTD) error {
 
 	if resp.StatusCode == http.StatusOK {
 		err = xml.Unmarshal(body, dtd)
+		if err != nil {
+			AbortHandshake()
+			return errors.New("secure tunnel handshake failed during authentication response parsing")
+		}
 		if dtd.Type == "complete" && dtd.SessionToken == "" {
 			// 兼容 ocserv
 			cookies := resp.Cookies()
@@ -217,11 +278,18 @@ func tplPost(typ int, path string, dtd *proto.DTD) error {
 				}
 			}
 		}
-		// nil
-		return err
+		return nil
 	}
-	Conn.Close()
+	AbortHandshake()
 	return fmt.Errorf("auth error %s", resp.Status)
+}
+
+func handshakeError(stage string, err error) error {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Errorf("secure tunnel handshake timed out during %s: %w", stage, err)
+	}
+	return fmt.Errorf("secure tunnel handshake failed during %s: %w", stage, err)
 }
 
 var templateInit = `<?xml version="1.0" encoding="UTF-8"?>

@@ -26,7 +26,7 @@ import (
 const typeVPN = "vpn"
 
 // dnsQueryTimeout 是单个隧道 DNS 服务器一次 A 查询的超时。
-// 取值偏小是为了在隧道 DNS 不通时能快速降级到系统 DNS,不阻塞拨号。
+// 取值偏小是为了在隧道 DNS 不通时快速失败，避免查询旁路到物理网络。
 const dnsQueryTimeout = 3 * time.Second
 
 // vpnOutbound 是替代 macOS 版"本地 SOCKS5 中转"的进程内出口:
@@ -34,7 +34,8 @@ const dnsQueryTimeout = 3 * time.Second
 // 不再经过一次额外的本地 socks 跳转,省一层内存/延迟开销。
 //
 // TCP 与 UDP 均经隧道出口;FQDN 域名优先经隧道内 DNS 解析(AnyConnect 握手
-// 下发的 X-CSTP-DNS),解析失败时降级回系统 DNS。
+// 下发的 X-CSTP-DNS)。解析失败必须 fail closed，不能回退系统 DNS 泄露
+// 内部域名，或把公共 DNS 的 NXDOMAIN 当作企业域名不存在。
 type vpnOutbound struct {
 	outbound.Adapter
 	bridge *engine.VPNBridge
@@ -56,7 +57,7 @@ func registerVPNOutbound(registry *outbound.Registry) {
 func newVPNOutbound(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ option.StubOptions) (adapter.Outbound, error) {
 	bridge := service.FromContext[*engine.VPNBridge](ctx)
 	if bridge == nil {
-		return nil, E.New("vpn outbound: no active VPN bridge in context (engine must connect before starting sing-box)")
+		return nil, E.New("AnyConnect outbound: no active tunnel bridge in context (engine must connect before starting sing-box)")
 	}
 	return &vpnOutbound{
 		Adapter:   outbound.NewAdapter(typeVPN, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil),
@@ -89,7 +90,7 @@ func snapshotTunnelDNS() []netip.Addr {
 
 func (o *vpnOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if N.NetworkName(network) != N.NetworkTCP {
-		return nil, E.New("vpn outbound: ", network, " not supported for DialContext")
+		return nil, E.New("AnyConnect outbound: ", network, " not supported for DialContext")
 	}
 
 	addr := destination.Addr
@@ -99,6 +100,14 @@ func (o *vpnOutbound) DialContext(ctx context.Context, network string, destinati
 			return nil, err
 		}
 		addr = resolved
+	}
+	if !addr.Is4() {
+		if !addr.Is4In6() {
+			// 抓到 IPv6 后必须在受控出口明确失败，不能让 bridge.As4 panic，
+			// 更不能绕过 packetFlow 改走物理网络。
+			return nil, E.New("AnyConnect outbound: IPv6 TCP destination not supported: ", destination)
+		}
+		addr = netip.AddrFrom4(addr.As4())
 	}
 
 	return o.bridge.DialTCP(ctx, net.JoinHostPort(addr.String(), strconv.Itoa(int(destination.Port))))
@@ -116,7 +125,7 @@ func (o *vpnOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	if !addr.Is4() {
 		if !addr.Is4In6() {
 			// VPNBridge 是 IPv4-only 的 gVisor 栈,纯 IPv6 目标无法经隧道送达。
-			return nil, E.New("vpn outbound: IPv6 UDP destination not supported: ", destination)
+			return nil, E.New("AnyConnect outbound: IPv6 UDP destination not supported: ", destination)
 		}
 		// 4-in-6 形式归一化到 4 字节。
 		addr = netip.AddrFrom4(addr.As4())
@@ -128,7 +137,7 @@ func (o *vpnOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	// 重定向到 raddr。ListenPacket 语义是"每个目标一条流",连接式最贴合。
 	conn, err := o.bridge.DialUDP(nil, raddr)
 	if err != nil {
-		return nil, E.Cause(err, "vpn outbound: listen packet to ", destination)
+		return nil, E.Cause(err, "AnyConnect outbound: listen packet to ", destination)
 	}
 	return &vpnPacketConn{Conn: conn, remote: raddr}, nil
 }
@@ -158,7 +167,7 @@ func (c *vpnPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	return c.Conn.Write(p)
 }
 
-// resolve 优先经隧道内 DNS 把 FQDN 解析成 IPv4,失败则降级到系统 DNS。
+// resolve 只经隧道内 DNS 把 FQDN 解析成 IPv4；失败时 fail closed。
 func (o *vpnOutbound) resolve(ctx context.Context, fqdn string) (netip.Addr, error) {
 	for _, server := range o.tunnelDNS {
 		if addr, ok := o.resolveViaTunnel(ctx, server, fqdn); ok {
@@ -166,16 +175,7 @@ func (o *vpnOutbound) resolve(ctx context.Context, fqdn string) (netip.Addr, err
 		}
 	}
 
-	// 降级:隧道 DNS 未配置或全部失败,回退系统 DNS。
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", fqdn)
-	if err != nil || len(ips) == 0 {
-		return netip.Addr{}, E.Cause(err, "vpn outbound: resolve ", fqdn)
-	}
-	addr, ok := netip.AddrFromSlice(ips[0].To4())
-	if !ok {
-		return netip.Addr{}, E.New("vpn outbound: resolved non-IPv4 address for ", fqdn)
-	}
-	return addr, nil
+	return netip.Addr{}, E.New("AnyConnect outbound: tunnel DNS failed to resolve ", fqdn)
 }
 
 // resolveViaTunnel 向隧道内某个 DNS 服务器的 53/udp 发一次 A 查询并解析响应。

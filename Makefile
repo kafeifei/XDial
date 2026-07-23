@@ -5,8 +5,9 @@ GOBIN := $(shell go env GOPATH)/bin
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PLIST_VERSION := $(patsubst v%,%,$(VERSION))
 GO_LDFLAGS := -X main.version=$(VERSION)
+MOBILE_LIBBOX_TAGS := with_gvisor
 
-.PHONY: all cli app release restart inspector clean test test-smoke libbox-xcframework libbox-ios-xcframework appletv ios
+.PHONY: all cli app release restart inspector clean test test-smoke check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework appletv ios
 
 # 组装 .app bundle。$(1)=swift 产物目录(debug/release) $(2)=bundle 路径
 define assemble_app
@@ -68,19 +69,28 @@ inspector:
 # Swift 可直接 import 的 xcframework。需要 SagerNet fork 的 gomobile/gobind:
 #   go install github.com/sagernet/gomobile/cmd/gomobile@latest
 #   go install github.com/sagernet/gomobile/cmd/gobind@latest
-libbox-xcframework:
+check-mobile-libbox-deps:
+	@deps="$$(GOOS=ios GOARCH=arm64 CGO_ENABLED=1 GOFLAGS=-mod=mod go list -deps -tags '$(MOBILE_LIBBOX_TAGS)' ./core/libbox)" || exit 1; \
+	if ! printf '%s\n' "$$deps" | grep -Eq '^github\.com/sagernet/sing-box/protocol/tailscale$$'; then \
+		echo 'error: mobile Libbox is missing the sing-box Tailscale endpoint'; exit 1; \
+	fi; \
+	if ! printf '%s\n' "$$deps" | grep -Eq '^github\.com/sagernet/tailscale(/|$$)'; then \
+		echo 'error: mobile Libbox is missing the Tailscale data plane'; exit 1; \
+	fi
+
+libbox-xcframework: check-mobile-libbox-deps
 	@mkdir -p $(BUILD_DIR)
 	rm -rf $(BUILD_DIR)/Libbox.xcframework
-	PATH="$(PATH):$(GOBIN)" GOFLAGS=-mod=mod gomobile bind -tags with_gvisor -target=tvos -o $(BUILD_DIR)/Libbox.xcframework ./core/libbox
+	PATH="$(PATH):$(GOBIN)" GOFLAGS=-mod=mod gomobile bind -tags '$(MOBILE_LIBBOX_TAGS)' -target=tvos -o $(BUILD_DIR)/Libbox.xcframework ./core/libbox
 	@if find $(BUILD_DIR)/Libbox.xcframework -type f -name Libbox -exec strings {} \; | grep -Fq 'gVisor is not included in this build'; then \
 		echo 'error: Libbox was built without the gVisor data stack'; exit 1; \
 	fi
 
 # iOS 使用独立 XCFramework，避免 iOS/tvOS slice 互相覆盖。
-libbox-ios-xcframework:
+libbox-ios-xcframework: check-mobile-libbox-deps
 	@mkdir -p $(BUILD_DIR)/frameworks/ios
 	rm -rf $(BUILD_DIR)/frameworks/ios/Libbox.xcframework
-	PATH="$(PATH):$(GOBIN)" GOFLAGS=-mod=mod gomobile bind -tags with_gvisor -target=ios -o $(BUILD_DIR)/frameworks/ios/Libbox.xcframework ./core/libbox
+	PATH="$(PATH):$(GOBIN)" GOFLAGS=-mod=mod gomobile bind -tags '$(MOBILE_LIBBOX_TAGS)' -target=ios -o $(BUILD_DIR)/frameworks/ios/Libbox.xcframework ./core/libbox
 	@if find $(BUILD_DIR)/frameworks/ios/Libbox.xcframework -type f -name Libbox -exec strings {} \; | grep -Fq 'gVisor is not included in this build'; then \
 		echo 'error: Libbox was built without the gVisor data stack'; exit 1; \
 	fi

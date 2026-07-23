@@ -1,3 +1,5 @@
+//go:build !mobile_no_tailscale
+
 package engine
 
 import (
