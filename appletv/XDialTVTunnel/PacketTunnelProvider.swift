@@ -849,7 +849,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                     if let probeError { throw probeError }
                     completion.value(self.encodeResponse(ok: true, dataString: address))
                 } catch {
-                    completion.value(self.encodeResponse(ok: false, message: "无法确认所选线路的出口地址"))
+                    completion.value(self.encodeResponse(
+                        ok: false,
+                        message: "无法确认所选线路的出口地址：\(error.localizedDescription)"
+                    ))
                 }
             }
 

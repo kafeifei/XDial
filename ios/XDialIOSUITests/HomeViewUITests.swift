@@ -1,7 +1,149 @@
+import Darwin
 import XCTest
 
 @MainActor
 final class HomeViewUITests: XCTestCase {
+    func testPhysicalDeviceDirectTCPBaseline() throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("真实物理网络基线只在 iPhone 上验收")
+        #else
+        let app = XCUIApplication()
+        app.launchArguments += [
+            "-AppleLanguages", "(zh-Hans)",
+            "-AppleLocale", "zh_CN",
+        ]
+        app.launch()
+        XCTAssertTrue(app.tabBars.buttons["首页"].waitForExistence(timeout: 15))
+
+        let disconnect = app.buttons["断开"]
+        if disconnect.waitForExistence(timeout: 2) {
+            disconnect.tap()
+            XCTAssertTrue(app.buttons["连接"].waitForExistence(timeout: 15))
+        }
+
+        let targets: [(String, UInt16)] = [
+            ("1.1.1.1", 443),
+            ("1.1.1.1", 80),
+            ("api.ipify.org", 443),
+            ("checkip.amazonaws.com", 443),
+            ("icanhazip.com", 443),
+            ("ifconfig.me", 443),
+            ("ipinfo.io", 443),
+            ("www.apple.com", 443),
+            ("example.com", 443),
+        ]
+        var results: [String] = []
+        for (host, port) in targets {
+            results.append(directTCPProbe(host: host, port: port, timeoutMS: 5_000))
+        }
+
+        print("XDIAL_DEVICE_DIRECT_TCP_BASELINE_BEGIN")
+        results.forEach { print($0) }
+        print("XDIAL_DEVICE_DIRECT_TCP_BASELINE_END")
+        XCTAssertTrue(
+            results.dropFirst(2).contains(where: { $0.contains("connected") }),
+            "断开 XDial 后，所有替代公网 TCP 443 目标均不可达：\(results.joined(separator: " | "))"
+        )
+        #endif
+    }
+
+    func testPhysicalDeviceConnectionAndDiagnostics() throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("真实 Packet Tunnel 数据面只在 iPhone 上验收")
+        #else
+        let app = XCUIApplication()
+        app.launchArguments += [
+            "-AppleLanguages", "(zh-Hans)",
+            "-AppleLocale", "zh_CN",
+        ]
+
+        addUIInterruptionMonitor(withDescription: "System authorization") { alert in
+            for title in ["允许", "Allow", "好", "OK"] {
+                let button = alert.buttons[title]
+                if button.exists {
+                    button.tap()
+                    return true
+                }
+            }
+            return false
+        }
+
+        app.launch()
+        XCTAssertTrue(app.tabBars.buttons["首页"].waitForExistence(timeout: 15))
+
+        let connect = app.buttons["连接"]
+        if connect.waitForExistence(timeout: 5) {
+            connect.tap()
+            app.tap()
+        }
+
+        let connected = app.staticTexts["已连接"]
+        let deadline = Date().addingTimeInterval(90)
+        while !connected.exists && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(1))
+        }
+
+        let homeLabels = app.staticTexts.allElementsBoundByIndex.map(\.label)
+        print("XDIAL_DEVICE_HOME_LABELS_BEGIN")
+        homeLabels.forEach { print($0) }
+        print("XDIAL_DEVICE_HOME_LABELS_END")
+        attachScreenshot(named: "physical-device-home", app: app)
+        XCTAssertTrue(
+            connected.exists,
+            "连接未在 90 秒内通过。首页文本：\(homeLabels.joined(separator: " | "))"
+        )
+
+        app.tabBars.buttons["设置"].tap()
+        let diagnostics = app.buttons["查看诊断详情"]
+        for _ in 0..<5 where !diagnostics.exists {
+            app.swipeUp()
+        }
+        XCTAssertTrue(diagnostics.waitForExistence(timeout: 10))
+        diagnostics.tap()
+        XCTAssertTrue(app.navigationBars["诊断详情"].waitForExistence(timeout: 10))
+
+        let diagnosticLabels = app.staticTexts.allElementsBoundByIndex.map(\.label)
+        let report = diagnosticLabels.joined(separator: "\n")
+        print("XDIAL_DEVICE_DIAGNOSTICS_BEGIN")
+        print(report)
+        print("XDIAL_DEVICE_DIAGNOSTICS_END")
+        attachScreenshot(named: "physical-device-diagnostics", app: app)
+
+        XCTAssertTrue(report.contains("Direct"), "诊断缺少 Direct 线路证据")
+        XCTAssertTrue(report.contains("AnyConnect"), "诊断缺少 AnyConnect 线路证据")
+        XCTAssertTrue(report.contains("路由命中：通过"), "分流命中没有通过")
+        XCTAssertTrue(report.contains("DNS：通过"), "DNS 验收没有通过")
+
+        app.navigationBars["诊断详情"].buttons["设置"].tap()
+        let onDemandToggle = app.switches["system-on-demand-reconnect"]
+        for _ in 0..<5 where !onDemandToggle.exists {
+            app.swipeDown()
+        }
+        guard onDemandToggle.waitForExistence(timeout: 10) else {
+            XCTFail("设置页缺少系统按需重连开关")
+            return
+        }
+        if onDemandToggle.value as? String != "1" {
+            onDemandToggle.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        }
+        let onDemandEnabled = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", "1"),
+            object: onDemandToggle
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [onDemandEnabled], timeout: 10), .completed)
+        XCTAssertTrue(app.staticTexts["system-on-demand-status"].waitForExistence(timeout: 10))
+
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.tabBars.buttons["首页"].waitForExistence(timeout: 15))
+        XCTAssertTrue(
+            app.staticTexts["已连接"].waitForExistence(timeout: 20),
+            "主 App 重启后没有恢复已连接状态"
+        )
+        attachScreenshot(named: "physical-device-relaunch-recovery", app: app)
+        #endif
+    }
+
     func testConnectingDoesNotShowIncompleteConfigurationWarning() {
         let app = launchApp()
 
@@ -340,5 +482,90 @@ final class HomeViewUITests: XCTestCase {
 
     private func secureValueLength(_ element: XCUIElement) -> Int {
         (element.value as? String)?.count ?? 0
+    }
+
+    private func attachScreenshot(named name: String, app: XCUIApplication) {
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func directTCPProbe(host: String, port: UInt16, timeoutMS: Int32) -> String {
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_STREAM
+        hints.ai_protocol = IPPROTO_TCP
+
+        var list: UnsafeMutablePointer<addrinfo>?
+        let service = String(port)
+        let resolveCode = getaddrinfo(host, service, &hints, &list)
+        guard resolveCode == 0, let first = list else {
+            return "\(host):\(port) resolve_failed=\(resolveCode)"
+        }
+        defer { freeaddrinfo(first) }
+
+        var candidate: UnsafeMutablePointer<addrinfo>? = first
+        var failures: [String] = []
+        while let current = candidate {
+            let info = current.pointee
+            let numericHost = numericAddress(info)
+            let fd = socket(info.ai_family, info.ai_socktype, info.ai_protocol)
+            guard fd >= 0 else {
+                failures.append("\(numericHost) socket_errno=\(errno)")
+                candidate = info.ai_next
+                continue
+            }
+            defer { close(fd) }
+
+            let previousFlags = fcntl(fd, F_GETFL, 0)
+            guard previousFlags >= 0, fcntl(fd, F_SETFL, previousFlags | O_NONBLOCK) == 0 else {
+                failures.append("\(numericHost) nonblock_errno=\(errno)")
+                candidate = info.ai_next
+                continue
+            }
+
+            let connectResult = connect(fd, info.ai_addr, info.ai_addrlen)
+            if connectResult == 0 {
+                return "\(host):\(port) \(numericHost) connected"
+            }
+            guard errno == EINPROGRESS else {
+                failures.append("\(numericHost) connect_errno=\(errno)")
+                candidate = info.ai_next
+                continue
+            }
+
+            var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            let pollResult = poll(&descriptor, 1, timeoutMS)
+            if pollResult > 0 {
+                var socketError: Int32 = 0
+                var errorLength = socklen_t(MemoryLayout<Int32>.size)
+                if getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &errorLength) == 0,
+                   socketError == 0 {
+                    return "\(host):\(port) \(numericHost) connected"
+                }
+                failures.append("\(numericHost) connect_errno=\(socketError)")
+            } else if pollResult == 0 {
+                failures.append("\(numericHost) timeout")
+            } else {
+                failures.append("\(numericHost) poll_errno=\(errno)")
+            }
+            candidate = info.ai_next
+        }
+        return "\(host):\(port) failed [\(failures.joined(separator: ", "))]"
+    }
+
+    private func numericAddress(_ info: addrinfo) -> String {
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let code = getnameinfo(
+            info.ai_addr,
+            info.ai_addrlen,
+            &host,
+            socklen_t(host.count),
+            nil,
+            0,
+            NI_NUMERICHOST
+        )
+        return code == 0 ? String(cString: host) : "unknown"
     }
 }
