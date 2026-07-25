@@ -75,6 +75,33 @@ final class OnDemandReconnectTests: XCTestCase {
         ))
     }
 
+    func testFreshTunnelManagerRestoresAcceptancePlanFromSystemProfileMetadata() throws {
+        let expected = TunnelAcceptancePlan(
+            requiresAnyConnect: false,
+            currentRouteTag: "tailscale-home",
+            targets: [
+                TunnelAcceptanceTarget(tag: "tailscale-home", label: "Home"),
+            ],
+            generatedTailscaleTargets: [
+                TunnelAcceptanceTarget(tag: "tailscale-home", label: "Home"),
+            ]
+        )
+        let persistedConfiguration = TunnelManager.systemProviderConfiguration(
+            acceptancePlan: expected
+        )
+        let restoredProtocol = NETunnelProviderProtocol()
+        restoredProtocol.providerConfiguration = persistedConfiguration
+
+        let freshManager = TunnelManager()
+        XCTAssertNil(freshManager.activeAcceptancePlan)
+        XCTAssertTrue(
+            freshManager.restoreAcceptancePlanFromSystemProfileIfNeeded(restoredProtocol)
+        )
+        XCTAssertEqual(freshManager.activeAcceptancePlan, expected)
+        XCTAssertNil(persistedConfiguration["configJSON"])
+        XCTAssertNil(persistedConfiguration["password"])
+    }
+
     func testSecureEnvelopeIsClearedOnlyWhenItsStartOrRuntimeFails() {
         XCTAssertTrue(OnDemandStartEnvelopeFailurePolicy.shouldClear(
             startedFromSecureEnvelope: true,

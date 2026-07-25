@@ -64,6 +64,54 @@ func TestPlatformInterfaceMonitorPublishesInitialAndChangedInterface(t *testing.
 	}
 }
 
+func TestPlatformNetworkInterfacesUsesDefaultPhysicalSnapshot(t *testing.T) {
+	platform := &xdPlatformInterface{}
+	platform.setDefaultInterface("en0", 7)
+
+	interfaces, err := platform.NetworkInterfaces()
+	if err != nil {
+		t.Fatalf("read platform interfaces: %v", err)
+	}
+	if len(interfaces) != 1 ||
+		interfaces[0].Name != "en0" ||
+		interfaces[0].Index != 7 {
+		t.Fatalf("unexpected platform interfaces: %#v", interfaces)
+	}
+
+	platform.setDefaultInterface("pdp_ip0", 12)
+	interfaces, err = platform.NetworkInterfaces()
+	if err != nil {
+		t.Fatalf("read changed platform interfaces: %v", err)
+	}
+	if len(interfaces) != 1 ||
+		interfaces[0].Name != "pdp_ip0" ||
+		interfaces[0].Index != 12 {
+		t.Fatalf("unexpected changed platform interfaces: %#v", interfaces)
+	}
+}
+
+func TestPlatformNetworkInterfacesRejectsTunnelSnapshot(t *testing.T) {
+	for _, name := range []string{"utun4", "ipsec0", "ppp0"} {
+		t.Run(name, func(t *testing.T) {
+			platform := &xdPlatformInterface{}
+			platform.setDefaultInterface("en0", 7)
+			platform.setDefaultInterface(name, 9)
+
+			interfaces, err := platform.NetworkInterfaces()
+			if err != nil {
+				t.Fatalf("read platform interfaces: %v", err)
+			}
+			if len(interfaces) != 0 {
+				t.Fatalf("tunnel interface was exposed: %#v", interfaces)
+			}
+			monitor := &platformInterfaceMonitor{platform: platform}
+			if current := monitor.DefaultInterface(); current != nil {
+				t.Fatalf("tunnel interface became default: %#v", current)
+			}
+		})
+	}
+}
+
 func assertInterfaceUpdate(t *testing.T, updates <-chan *control.Interface, name string, index int) {
 	t.Helper()
 	value := <-updates

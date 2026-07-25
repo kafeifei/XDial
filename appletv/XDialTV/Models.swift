@@ -29,6 +29,7 @@ struct Line: Codable, Identifiable, Hashable {
     var tailscaleHostname: String = ""
     var tailscaleAcceptRoutes: Bool = true
     var tailscaleExitNode: String = ""
+    var tailscaleAuthenticated: Bool = false
 
     var allowInsecure: Bool = false
 
@@ -53,6 +54,7 @@ struct Line: Codable, Identifiable, Hashable {
         case tailscaleHostname = "tailscale_hostname"
         case tailscaleAcceptRoutes = "tailscale_accept_routes"
         case tailscaleExitNode = "tailscale_exit_node"
+        case tailscaleAuthenticated = "tailscale_authenticated"
     }
 
     init(id: String, name: String, type: String, enabled: Bool = true, verified: Bool = false,
@@ -61,6 +63,7 @@ struct Line: Codable, Identifiable, Hashable {
          ssServer: String = "", ssPort: Int = 8388, ssMethod: String = "aes-256-gcm", ssPassword: String = "",
          vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0,
          tailscaleHostname: String = "", tailscaleAcceptRoutes: Bool = true, tailscaleExitNode: String = "",
+         tailscaleAuthenticated: Bool = false,
          allowInsecure: Bool = false) {
         self.id = id; self.name = name; self.type = type; self.enabled = enabled; self.verified = verified
         self.vpnServer = vpnServer; self.vpnUsername = vpnUsername; self.vpnPassword = vpnPassword
@@ -70,6 +73,7 @@ struct Line: Codable, Identifiable, Hashable {
         self.tailscaleHostname = tailscaleHostname
         self.tailscaleAcceptRoutes = tailscaleAcceptRoutes
         self.tailscaleExitNode = tailscaleExitNode
+        self.tailscaleAuthenticated = tailscaleAuthenticated
         self.allowInsecure = allowInsecure
     }
 
@@ -98,6 +102,10 @@ struct Line: Codable, Identifiable, Hashable {
         tailscaleHostname = try c.decodeIfPresent(String.self, forKey: .tailscaleHostname) ?? ""
         tailscaleAcceptRoutes = try c.decodeIfPresent(Bool.self, forKey: .tailscaleAcceptRoutes) ?? true
         tailscaleExitNode = try c.decodeIfPresent(String.self, forKey: .tailscaleExitNode) ?? ""
+        tailscaleAuthenticated = try c.decodeIfPresent(
+            Bool.self,
+            forKey: .tailscaleAuthenticated
+        ) ?? false
         allowInsecure = try c.decodeIfPresent(Bool.self, forKey: .allowInsecure) ?? false
     }
 }
@@ -401,7 +409,9 @@ extension Profile {
             if line.type == "tailscale" {
                 // An overlay-only endpoint is globally generated for subnet
                 // routes, but it is not a public egress for the 1.1.1.1 probe.
-                return !line.tailscaleExitNode.isEmpty
+                return !line.tailscaleExitNode
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty
             }
             return line.type != "direct"
         }

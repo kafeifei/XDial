@@ -101,6 +101,7 @@ private final class CancellingTunnelManager: TunnelManaging {
     func startTunnel(
         profile: Profile,
         anyConnect: AnyConnectCredentials?,
+        allowSystemOnDemand: Bool,
         completion: @escaping @Sendable (Result<Void, Error>) -> Void
     ) {
         completion(.failure(CancellationError()))
@@ -141,7 +142,11 @@ private final class RuntimeSpyEngine: TunnelEngine, ObservableObject {
     var isBusy: Bool { status == "connecting" || status == "disconnecting" }
     private(set) var selections: [(String, String, String)] = []
     private(set) var tailscaleEndpointTags: [String] = []
+    private(set) var tailscaleLoginEndpointTags: [String] = []
     private var automaticReconnectSuppressed = false
+    var tailscaleResultsByEndpointTag: [
+        String: Result<TailscaleRuntimeStatus, Error>
+    ] = [:]
     var tailscaleResult: Result<TailscaleRuntimeStatus, Error> = .success(TailscaleRuntimeStatus(
         backendState: "Running",
         authURL: "",
@@ -175,7 +180,111 @@ private final class RuntimeSpyEngine: TunnelEngine, ObservableObject {
         completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
     ) {
         tailscaleEndpointTags.append(endpointTag)
+        completion(tailscaleResultsByEndpointTag[endpointTag] ?? tailscaleResult)
+    }
+
+    func beginTailscaleLogin(
+        endpointTag: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        tailscaleLoginEndpointTags.append(endpointTag)
         completion(tailscaleResult)
+    }
+}
+
+@MainActor
+private final class TailscaleSetupRuntimeSpy: TailscaleSetupRuntime {
+    private(set) var isActive = false
+    private(set) var startCalls: [(profileJSON: String, lineID: String)] = []
+    private(set) var statusLineIDs: [String] = []
+    private(set) var beginLoginLineIDs: [String] = []
+    private(set) var logoutLineIDs: [String] = []
+    private(set) var stopCallCount = 0
+    var deferStopCompletion = false
+    private var stopCompletions: [() -> Void] = []
+
+    var startResult: Result<TailscaleRuntimeStatus, Error> = .success(
+        TailscaleRuntimeStatus(
+            backendState: "NeedsLogin",
+            authURL: "https://login.tailscale.com/a/unit-test",
+            exitNodes: []
+        )
+    )
+    var statusResult: Result<TailscaleRuntimeStatus, Error> = .success(
+        TailscaleRuntimeStatus(
+            backendState: "Running",
+            authURL: "",
+            exitNodes: [
+                TailscaleRuntimeExitNode(
+                    id: "mbp64k",
+                    name: "mbp64k",
+                    ip: "100.64.0.8",
+                    online: true,
+                    os: "macOS"
+                ),
+            ]
+        )
+    )
+    var beginLoginResult: Result<TailscaleRuntimeStatus, Error> = .success(
+        TailscaleRuntimeStatus(
+            backendState: "NeedsLogin",
+            authURL: "https://login.tailscale.com/a/unit-test",
+            exitNodes: []
+        )
+    )
+    var logoutResult: Result<Void, Error> = .success(())
+
+    func start(
+        profileJSON: String,
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        startCalls.append((profileJSON, lineID))
+        if case .success = startResult {
+            isActive = true
+        }
+        completion(startResult)
+    }
+
+    func status(
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        statusLineIDs.append(lineID)
+        completion(statusResult)
+    }
+
+    func beginLogin(
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        beginLoginLineIDs.append(lineID)
+        completion(beginLoginResult)
+    }
+
+    func logout(
+        lineID: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        logoutLineIDs.append(lineID)
+        completion(logoutResult)
+    }
+
+    func stop(completion: @escaping () -> Void) {
+        stopCallCount += 1
+        if deferStopCompletion {
+            stopCompletions.append(completion)
+        } else {
+            isActive = false
+            completion()
+        }
+    }
+
+    func completeStop() {
+        isActive = false
+        let completions = stopCompletions
+        stopCompletions.removeAll()
+        completions.forEach { $0() }
     }
 }
 
@@ -215,6 +324,10 @@ private final class RuntimeSpyManager: TunnelManaging {
     private(set) var stopCallCount = 0
     private(set) var removeCallCount = 0
     private(set) var lastAnyConnect: AnyConnectCredentials?
+    private(set) var lastProfile: Profile?
+    private(set) var lastAllowSystemOnDemand: Bool?
+    private(set) var systemOnDemandRequests: [Bool] = []
+    private(set) var systemOnDemandSetupSuspensions: [Bool] = []
     private weak var engine: RuntimeSpyEngine?
 
     init(engine: RuntimeSpyEngine) {
@@ -226,12 +339,25 @@ private final class RuntimeSpyManager: TunnelManaging {
     }
 
     func setSystemOnDemandEnabled(_ enabled: Bool) {
+        systemOnDemandRequests.append(enabled)
         if !enabled {
             systemOnDemandActive = false
             systemOnDemandState = .disabled
         } else if !systemOnDemandActive {
             systemOnDemandState = .pending
         }
+    }
+
+    func setSystemOnDemandSuspendedForSetup(
+        _ suspended: Bool,
+        completion: @escaping () -> Void
+    ) {
+        systemOnDemandSetupSuspensions.append(suspended)
+        if suspended {
+            systemOnDemandActive = false
+            systemOnDemandState = .pending
+        }
+        completion()
     }
 
     func simulateSystemOnDemandActive() {
@@ -247,10 +373,13 @@ private final class RuntimeSpyManager: TunnelManaging {
     func startTunnel(
         profile: Profile,
         anyConnect: AnyConnectCredentials?,
+        allowSystemOnDemand: Bool,
         completion: @escaping @Sendable (Result<Void, Error>) -> Void
     ) {
         startCallCount += 1
+        lastProfile = profile
         lastAnyConnect = anyConnect
+        lastAllowSystemOnDemand = allowSystemOnDemand
         engine?.setStatus("connected")
         completion(.success(()))
     }
@@ -398,7 +527,8 @@ final class AppStateTests: XCTestCase {
     func testConnectionRebindsAcceptanceToCurrentDirectRouteAfterSaveNormalization() async {
         let engine = RuntimeSpyEngine()
         let manager = RuntimeSpyManager(engine: engine)
-        let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
+        let persistence = makePersistence()
+        let app = AppState(engine: engine, tunnelManager: manager, persistence: persistence)
         var profile = configuredProfile()
         profile.modes[0].defaultLineID = "direct"
         profile.modes[0].bindings.removeAll { !$0.isConnectivityAcceptanceBindingForTest }
@@ -448,7 +578,13 @@ final class AppStateTests: XCTestCase {
         let manager = RuntimeSpyManager(engine: engine)
         let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
         var profile = Profile.bootstrap()
-        profile.lines.append(Line(id: "tail", name: "Tail", type: "tailscale"))
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            tailscaleExitNode: "100.64.0.8",
+            tailscaleAuthenticated: true
+        ))
         profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
         profile.activeModeID = "tail-mode"
         profile.ensureConnectivityTestConfiguration()
@@ -460,6 +596,828 @@ final class AppStateTests: XCTestCase {
 
         XCTAssertEqual(manager.startCallCount, 1)
         XCTAssertNil(manager.lastAnyConnect)
+    }
+
+    func testTailscaleSetupUsesLocalRuntimeWithoutStartingSystemTunnel() throws {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let setupRuntime = TailscaleSetupRuntimeSpy()
+        let persistence = makePersistence()
+        persistence.defaults.set(true, forKey: persistence.systemOnDemandKey)
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            tailscaleSetupRuntime: setupRuntime,
+            persistence: persistence
+        )
+        var profile = configuredProfile()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Home Tailnet",
+            type: "tailscale",
+            enabled: false,
+            tailscaleAcceptRoutes: true,
+            tailscaleExitNode: "100.64.0.99"
+        ))
+        app.profile = profile
+        XCTAssertTrue(app.canConnect, app.activeConfigurationIssues.joined(separator: "\n"))
+
+        let recorder = StartCompletionRecorder()
+        app.prepareTailscaleLogin(lineID: "tail") { recorder.record($0) }
+
+        XCTAssertEqual(recorder.successCount, 1)
+        XCTAssertEqual(manager.startCallCount, 0)
+        XCTAssertEqual(manager.stopCallCount, 0)
+        XCTAssertEqual(engine.status, "disconnected")
+        XCTAssertEqual(app.tailscaleSetupLineID, "tail")
+        XCTAssertTrue(app.isTailscaleSetupActive)
+        XCTAssertFalse(app.canConnect)
+        XCTAssertEqual(setupRuntime.startCalls.map(\.lineID), ["tail"])
+        XCTAssertEqual(
+            app.profile.lines.first(where: { $0.id == "tail" })?.tailscaleExitNode,
+            "100.64.0.99"
+        )
+        let setupProfileData = try XCTUnwrap(
+            setupRuntime.startCalls.first?.profileJSON.data(using: .utf8)
+        )
+        let setupProfile = try JSONDecoder().decode(Profile.self, from: setupProfileData)
+        XCTAssertEqual(
+            setupProfile.lines.first(where: { $0.id == "tail" })?.enabled,
+            false
+        )
+        XCTAssertEqual(manager.systemOnDemandSetupSuspensions, [true])
+
+        app.finishTailscaleSetup()
+        XCTAssertEqual(setupRuntime.stopCallCount, 1)
+        XCTAssertEqual(manager.startCallCount, 0)
+        XCTAssertEqual(manager.stopCallCount, 0)
+        XCTAssertEqual(engine.status, "disconnected")
+        XCTAssertEqual(manager.systemOnDemandSetupSuspensions, [true, false])
+        XCTAssertNil(app.tailscaleSetupLineID)
+        XCTAssertNil(persistence.defaults.string(forKey: persistence.tailscaleSetupLineKey))
+        XCTAssertTrue(app.canConnect, app.activeConfigurationIssues.joined(separator: "\n"))
+    }
+
+    func testTailscaleSetupCompletesBeforeFormalConnectionWithoutInterimSystemTunnel() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let setupRuntime = TailscaleSetupRuntimeSpy()
+        setupRuntime.beginLoginResult = .success(TailscaleRuntimeStatus(
+            backendState: "Running",
+            authURL: "",
+            exitNodes: [
+                TailscaleRuntimeExitNode(
+                    id: "mbp64k",
+                    name: "mbp64k",
+                    ip: "100.64.0.8",
+                    online: true,
+                    os: "macOS"
+                ),
+            ]
+        ))
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            tailscaleSetupRuntime: setupRuntime,
+            persistence: makePersistence()
+        )
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            enabled: true
+        ))
+        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
+        profile.activeModeID = "tail-mode"
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        XCTAssertFalse(app.canConnect)
+        XCTAssertTrue(app.activeConfigurationIssues.contains {
+            $0.contains("登录") || $0.lowercased().contains("sign")
+        })
+
+        let setupRecorder = StartCompletionRecorder()
+        app.prepareTailscaleLogin(lineID: "tail") { setupRecorder.record($0) }
+        XCTAssertEqual(setupRecorder.successCount, 1, "离线 Tailscale 设置未成功启动")
+        XCTAssertEqual(engine.status, "disconnected")
+        XCTAssertEqual(manager.startCallCount, 0)
+        XCTAssertEqual(manager.stopCallCount, 0)
+        XCTAssertEqual(manager.systemOnDemandSetupSuspensions, [true])
+
+        var loginStatus: TailscaleRuntimeStatus?
+        app.beginTailscaleLogin(lineID: "tail") { loginStatus = try? $0.get() }
+        XCTAssertEqual(loginStatus?.backendState, "Running")
+        XCTAssertTrue(app.applyTailscaleRuntimeStatus(
+            lineID: "tail",
+            status: loginStatus ?? TailscaleRuntimeStatus(
+                backendState: "",
+                authURL: "",
+                exitNodes: []
+            )
+        ))
+        XCTAssertTrue(app.updateTailscaleExitSelection(
+            lineID: "tail",
+            selected: "100.64.0.8"
+        ))
+
+        app.finishTailscaleSetup()
+        XCTAssertEqual(setupRuntime.stopCallCount, 1)
+        XCTAssertEqual(manager.startCallCount, 0)
+        XCTAssertEqual(manager.stopCallCount, 0)
+        XCTAssertEqual(engine.status, "disconnected")
+        XCTAssertNil(app.tailscaleSetupLineID)
+        XCTAssertEqual(manager.systemOnDemandSetupSuspensions, [true, false])
+        XCTAssertTrue(app.canConnect, app.activeConfigurationIssues.joined(separator: "\n"))
+
+        app.connect()
+        XCTAssertEqual(manager.startCallCount, 1)
+        XCTAssertEqual(engine.status, "connected")
+    }
+
+    func testFinishingTailscaleSetupIsExactOnceAndKeepsConnectLockedUntilStopCompletes() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let setupRuntime = TailscaleSetupRuntimeSpy()
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            tailscaleSetupRuntime: setupRuntime,
+            persistence: makePersistence()
+        )
+        var profile = configuredProfile()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            enabled: false
+        ))
+        app.profile = profile
+        app.prepareTailscaleLogin(lineID: "tail") { _ in }
+        setupRuntime.deferStopCompletion = true
+
+        var finishCount = 0
+        app.finishTailscaleSetup { finishCount += 1 }
+        app.finishTailscaleSetup { finishCount += 1 }
+
+        XCTAssertEqual(setupRuntime.stopCallCount, 1)
+        XCTAssertEqual(finishCount, 0)
+        XCTAssertTrue(app.isStoppingTailscaleSetup)
+        XCTAssertEqual(app.tailscaleSetupLineID, "tail")
+        XCTAssertFalse(app.canConnect)
+
+        setupRuntime.completeStop()
+
+        XCTAssertEqual(finishCount, 2)
+        XCTAssertFalse(app.isStoppingTailscaleSetup)
+        XCTAssertNil(app.tailscaleSetupLineID)
+        XCTAssertTrue(app.canConnect)
+    }
+
+    func testConnectedTunnelCanConfigureDifferentInactiveTailscaleLine() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let setupRuntime = TailscaleSetupRuntimeSpy()
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            tailscaleSetupRuntime: setupRuntime,
+            persistence: makePersistence()
+        )
+        var profile = configuredProfile()
+        profile.lines.append(Line(
+            id: "tail-inactive",
+            name: "Inactive Tail",
+            type: "tailscale",
+            enabled: false
+        ))
+        app.profile = profile
+        app.connect()
+
+        XCTAssertEqual(engine.status, "connected")
+        XCTAssertEqual(manager.startCallCount, 1)
+        XCTAssertFalse(app.isTailscaleLineGeneratedByFormalTunnel("tail-inactive"))
+        XCTAssertTrue(app.canStartTailscaleSetup(lineID: "tail-inactive"))
+
+        let setupRecorder = StartCompletionRecorder()
+        app.prepareTailscaleLogin(lineID: "tail-inactive") {
+            setupRecorder.record($0)
+        }
+        XCTAssertEqual(
+            setupRecorder.successCount,
+            1,
+            "稳定正式连接中未能启动另一条 disabled Tailscale 的独立设置"
+        )
+
+        XCTAssertTrue(app.isConnected)
+        XCTAssertTrue(app.isTailscaleSetupActive)
+        XCTAssertTrue(
+            app.statusText.contains("已连接") || app.statusText.contains("Connected")
+        )
+        XCTAssertTrue(
+            app.statusText.contains("正在设置") || app.statusText.contains("Setting Up")
+        )
+        XCTAssertTrue(app.canQueryTailscaleRuntime(lineID: "tail-inactive"))
+        XCTAssertEqual(manager.startCallCount, 1)
+        XCTAssertEqual(manager.stopCallCount, 0)
+        XCTAssertTrue(manager.systemOnDemandSetupSuspensions.isEmpty)
+
+        app.finishTailscaleSetup()
+
+        XCTAssertTrue(app.isConnected)
+        XCTAssertNil(app.tailscaleSetupLineID)
+        XCTAssertEqual(manager.stopCallCount, 0)
+    }
+
+    func testTailscaleSetupStatusAndLoginUseLocalRuntime() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let setupRuntime = TailscaleSetupRuntimeSpy()
+        let persistence = makePersistence()
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            tailscaleSetupRuntime: setupRuntime,
+            persistence: persistence
+        )
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale"
+        ))
+        app.profile = profile
+
+        let recorder = StartCompletionRecorder()
+        app.prepareTailscaleLogin(lineID: "tail") { recorder.record($0) }
+        XCTAssertEqual(recorder.successCount, 1)
+        XCTAssertEqual(app.tailscaleSetupLineID, "tail")
+
+        var refreshedStatus: TailscaleRuntimeStatus?
+        app.refreshTailscaleStatus(lineID: "tail") { result in
+            refreshedStatus = try? result.get()
+        }
+        var loginStatus: TailscaleRuntimeStatus?
+        app.beginTailscaleLogin(lineID: "tail") { result in
+            loginStatus = try? result.get()
+        }
+
+        XCTAssertEqual(setupRuntime.statusLineIDs, ["tail"])
+        XCTAssertEqual(setupRuntime.beginLoginLineIDs, ["tail"])
+        XCTAssertEqual(refreshedStatus?.backendState, "Running")
+        XCTAssertEqual(refreshedStatus?.exitNodes.map(\.name), ["mbp64k"])
+        XCTAssertEqual(loginStatus?.authURL, "https://login.tailscale.com/a/unit-test")
+        XCTAssertTrue(engine.tailscaleEndpointTags.isEmpty)
+        XCTAssertTrue(engine.tailscaleLoginEndpointTags.isEmpty)
+        XCTAssertEqual(manager.startCallCount, 0)
+        XCTAssertEqual(manager.stopCallCount, 0)
+        XCTAssertEqual(engine.status, "disconnected")
+    }
+
+    func testTailscaleLogoutClearsPersistedLineStateAfterRuntimeSuccess() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let setupRuntime = TailscaleSetupRuntimeSpy()
+        setupRuntime.startResult = .success(TailscaleRuntimeStatus(
+            backendState: "Running",
+            authURL: "",
+            exitNodes: []
+        ))
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            tailscaleSetupRuntime: setupRuntime,
+            persistence: makePersistence()
+        )
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            verified: true,
+            tailscaleExitNode: "100.64.0.8",
+            tailscaleAuthenticated: true
+        ))
+        app.profile = profile
+        app.prepareTailscaleLogin(lineID: "tail") { _ in }
+
+        var logoutSucceeded = false
+        app.logoutTailscale(lineID: "tail") { result in
+            if case .success = result {
+                logoutSucceeded = true
+            }
+        }
+
+        XCTAssertTrue(logoutSucceeded)
+        XCTAssertEqual(setupRuntime.logoutLineIDs, ["tail"])
+        let line = app.profile.lines.first(where: { $0.id == "tail" })
+        XCTAssertEqual(line?.tailscaleAuthenticated, false)
+        XCTAssertEqual(line?.tailscaleExitNode, "")
+        XCTAssertEqual(line?.verified, false)
+    }
+
+    func testTailscaleLogoutFailureKeepsPersistedLineState() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let setupRuntime = TailscaleSetupRuntimeSpy()
+        setupRuntime.startResult = .success(TailscaleRuntimeStatus(
+            backendState: "Running",
+            authURL: "",
+            exitNodes: []
+        ))
+        setupRuntime.logoutResult = .failure(NSError(
+            domain: "TailscaleSetupRuntimeSpy",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "logout failed"]
+        ))
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            tailscaleSetupRuntime: setupRuntime,
+            persistence: makePersistence()
+        )
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            verified: true,
+            tailscaleExitNode: "100.64.0.8",
+            tailscaleAuthenticated: true
+        ))
+        app.profile = profile
+        app.prepareTailscaleLogin(lineID: "tail") { _ in }
+
+        var logoutFailed = false
+        app.logoutTailscale(lineID: "tail") { result in
+            if case .failure = result {
+                logoutFailed = true
+            }
+        }
+
+        XCTAssertTrue(logoutFailed)
+        XCTAssertEqual(setupRuntime.logoutLineIDs, ["tail"])
+        let line = app.profile.lines.first(where: { $0.id == "tail" })
+        XCTAssertEqual(line?.tailscaleAuthenticated, true)
+        XCTAssertEqual(line?.tailscaleExitNode, "100.64.0.8")
+        XCTAssertEqual(line?.verified, true)
+    }
+
+    func testTailscaleDefaultRouteRequiresExitNodeBeforeConnection() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Home Tailnet",
+            type: "tailscale",
+            tailscaleAuthenticated: true
+        ))
+        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
+        profile.activeModeID = "tail-mode"
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        XCTAssertFalse(app.canConnect)
+        XCTAssertTrue(app.activeConfigurationIssues.contains {
+            $0.contains("出口节点") || $0.contains("exit node")
+        })
+
+        guard let tailIndex = app.profile.lines.firstIndex(where: { $0.id == "tail" }) else {
+            return XCTFail("Tailscale line missing")
+        }
+        app.profile.lines[tailIndex].tailscaleExitNode = "100.64.0.8"
+        app.profile.ensureConnectivityTestConfiguration()
+        XCTAssertTrue(app.canConnect, app.activeConfigurationIssues.joined(separator: "\n"))
+    }
+
+    func testInterruptedTailscaleSetupMarkerIsClearedBeforeRestoringOnDemandPreference() async {
+        let persistence = makePersistence()
+        persistence.defaults.set(true, forKey: persistence.systemOnDemandKey)
+        persistence.defaults.set("tail", forKey: persistence.tailscaleSetupLineKey)
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            persistence: persistence
+        )
+        await Task.yield()
+
+        XCTAssertEqual(manager.stopCallCount, 0)
+        XCTAssertEqual(manager.systemOnDemandRequests, [true])
+        XCTAssertTrue(app.systemOnDemandEnabled)
+        XCTAssertNil(persistence.defaults.string(forKey: persistence.tailscaleSetupLineKey))
+        XCTAssertTrue(
+            app.engine.lastError?.contains("Tailscale") == true,
+            app.engine.lastError ?? "missing recovery message"
+        )
+    }
+
+    func testLineConfigurationIssuesNameEveryMissingField() {
+        let app = AppState(persistence: makePersistence())
+        let line = Line(id: "vpn", name: "Test Line", type: "vpn")
+
+        let issues = app.routeLineConfigurationIssues(line)
+
+        XCTAssertTrue(issues.contains { $0.contains("服务器") || $0.contains("server") })
+        XCTAssertTrue(issues.contains { $0.contains("用户名") || $0.contains("username") })
+        XCTAssertTrue(issues.contains { $0.contains("密码") || $0.contains("password") })
+    }
+
+    func testEveryConfigurableLineTypeReportsItsRequiredSetupBeforeConnection() {
+        let app = AppState(persistence: makePersistence())
+        let incompleteLines: [(Line, [String])] = [
+            (
+                Line(id: "vpn", name: "AnyConnect", type: "vpn"),
+                ["server", "username", "password"]
+            ),
+            (
+                Line(
+                    id: "trojan",
+                    name: "Trojan",
+                    type: "trojan",
+                    trojanPort: 0
+                ),
+                ["server", "port", "password"]
+            ),
+            (
+                Line(
+                    id: "ss",
+                    name: "Shadowsocks",
+                    type: "shadowsocks",
+                    ssPort: 0,
+                    ssMethod: ""
+                ),
+                ["server", "port", "method", "password"]
+            ),
+            (
+                Line(
+                    id: "vmess",
+                    name: "VMess",
+                    type: "vmess",
+                    vmessPort: 0
+                ),
+                ["server", "port", "UUID"]
+            ),
+            (
+                Line(id: "tailscale", name: "Tailscale", type: "tailscale"),
+                ["sign-in"]
+            ),
+        ]
+
+        for (line, expectedTokens) in incompleteLines {
+            let issues = app.routeLineConfigurationIssues(line)
+                .map { $0.lowercased() }
+                .joined(separator: "\n")
+            for token in expectedTokens {
+                XCTAssertTrue(
+                    issues.contains(token.lowercased()),
+                    "\(line.type) should report missing \(token), got: \(issues)"
+                )
+            }
+        }
+        XCTAssertTrue(
+            app.routeLineConfigurationIssues(
+                Line(id: "direct", name: "Direct", type: "direct")
+            ).isEmpty
+        )
+    }
+
+    func testEveryIncompleteDefaultLineTypeBlocksManagerStart() async {
+        let incompleteLines = [
+            Line(id: "vpn", name: "AnyConnect", type: "vpn"),
+            Line(id: "trojan", name: "Trojan", type: "trojan"),
+            Line(id: "ss-incomplete", name: "Shadowsocks", type: "shadowsocks"),
+            Line(id: "vmess", name: "VMess", type: "vmess"),
+            Line(id: "tailscale", name: "Tailscale", type: "tailscale"),
+        ]
+
+        for line in incompleteLines {
+            let engine = RuntimeSpyEngine()
+            let manager = RuntimeSpyManager(engine: engine)
+            let app = AppState(
+                engine: engine,
+                tunnelManager: manager,
+                persistence: makePersistence()
+            )
+            var profile = Profile.bootstrap()
+            profile.lines.append(line)
+            profile.modes = [Mode(
+                id: "mode-\(line.id)",
+                name: "Mode \(line.name)",
+                defaultLineID: line.id
+            )]
+            profile.activeModeID = profile.modes[0].id
+            profile.ensureConnectivityTestConfiguration()
+            app.profile = profile
+
+            XCTAssertFalse(app.canConnect, "\(line.type) must require setup")
+            XCTAssertTrue(
+                app.activeConfigurationIssues.contains { $0.contains(line.name) },
+                "\(line.type) issue must name the line"
+            )
+            app.connect()
+            await Task.yield()
+            XCTAssertEqual(
+                manager.startCallCount,
+                0,
+                "\(line.type) must not reach the tunnel manager before setup"
+            )
+        }
+    }
+
+    func testReferencedTailscaleLineRequiresCompletedSetupLogin() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(id: "tail", name: "Tailnet", type: "tailscale"))
+        profile.ruleSets.append(RuleSet(
+            id: "tailnet",
+            name: "Tailnet",
+            type: "manual",
+            domains: ["internal.example"]
+        ))
+        profile.modes = [Mode(
+            id: "mode",
+            name: "Mode",
+            bindings: [RuleBinding(ruleSetID: "tailnet", lineID: "tail")],
+            defaultLineID: "direct"
+        )]
+        profile.activeModeID = "mode"
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        XCTAssertFalse(app.canConnect)
+        XCTAssertTrue(app.activeConfigurationIssues.contains {
+            $0.contains("登录") || $0.contains("sign-in")
+        })
+        XCTAssertTrue(app.updateTailscaleAuthentication(lineID: "tail", authenticated: true))
+        XCTAssertTrue(app.canConnect, app.activeConfigurationIssues.joined(separator: "\n"))
+    }
+
+    func testUnreferencedEnabledTailscaleRequiresLoginBecauseItIsGloballyGenerated() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            persistence: makePersistence()
+        )
+        var profile = configuredProfile()
+        profile.lines.append(Line(
+            id: "global-tail",
+            name: "Global Tailnet",
+            type: "tailscale"
+        ))
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        XCTAssertFalse(app.canConnect)
+        XCTAssertTrue(app.activeConfigurationIssues.contains {
+            $0.contains("Global Tailnet")
+                && ($0.contains("登录") || $0.contains("sign-in"))
+        })
+
+        guard let index = app.profile.lines.firstIndex(where: {
+            $0.id == "global-tail"
+        }) else {
+            return XCTFail("Tailscale line missing")
+        }
+        app.profile.lines[index].enabled = false
+        app.profile.ensureConnectivityTestConfiguration()
+        XCTAssertTrue(app.canConnect, app.activeConfigurationIssues.joined(separator: "\n"))
+    }
+
+    func testIncompleteLineUsedByEnabledRuleBlocksConnectionBeforeManagerStart() async {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
+        var profile = configuredProfile()
+        profile.lines.append(Line(
+            id: "incomplete-proxy",
+            name: "Incomplete Proxy",
+            type: "shadowsocks"
+        ))
+        profile.ruleSets.append(RuleSet(
+            id: "incomplete-rule",
+            name: "Incomplete Rule",
+            type: "manual",
+            domains: ["example.invalid"]
+        ))
+        profile.modes[0].bindings.append(RuleBinding(
+            ruleSetID: "incomplete-rule",
+            lineID: "incomplete-proxy"
+        ))
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        XCTAssertFalse(app.canConnect)
+        XCTAssertTrue(app.activeConfigurationIssues.contains {
+            $0.contains("Incomplete Proxy") && ($0.contains("服务器") || $0.contains("server"))
+        })
+        app.connect()
+        await Task.yield()
+        XCTAssertEqual(manager.startCallCount, 0)
+    }
+
+    func testSelectedIncompleteSubscriptionNodeBlocksInsteadOfSilentlyFallingBack() async {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            persistence: makePersistence()
+        )
+        var profile = Profile.bootstrap()
+        profile.subscriptions = [Subscription(
+            id: "subscription",
+            name: "Subscription",
+            url: "https://example.com/subscription",
+            strategy: "selector",
+            lines: [
+                Line(
+                    id: "broken",
+                    name: "Broken Node",
+                    type: "shadowsocks"
+                ),
+                Line(
+                    id: "working",
+                    name: "Working Node",
+                    type: "trojan",
+                    trojanServer: "working.example.com",
+                    trojanPassword: "secret"
+                ),
+            ],
+            selected: "Broken Node"
+        )]
+        profile.modes = [Mode(
+            id: "subscription-mode",
+            name: "Subscription",
+            defaultSubscriptionID: "subscription"
+        )]
+        profile.activeModeID = "subscription-mode"
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        XCTAssertFalse(app.canConnect)
+        XCTAssertTrue(app.activeConfigurationIssues.contains {
+            $0.contains("Broken Node")
+                && ($0.contains("服务器") || $0.contains("server"))
+                && ($0.contains("密码") || $0.contains("password"))
+        })
+        app.connect()
+        await Task.yield()
+        XCTAssertEqual(manager.startCallCount, 0)
+    }
+
+    func testSelectedIncompleteSubscriptionGroupMemberBlocksSilentFallback() async {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            persistence: makePersistence()
+        )
+        var profile = Profile.bootstrap()
+        profile.subscriptions = [Subscription(
+            id: "subscription",
+            name: "Subscription",
+            url: "https://example.com/subscription",
+            strategy: "selector",
+            lines: [
+                Line(
+                    id: "broken",
+                    name: "Broken Node",
+                    type: "vmess"
+                ),
+                Line(
+                    id: "working",
+                    name: "Working Node",
+                    type: "trojan",
+                    trojanServer: "working.example.com",
+                    trojanPassword: "secret"
+                ),
+            ],
+            proxyGroups: [SubProxyGroup(
+                name: "Primary",
+                type: "select",
+                proxies: ["Broken Node", "Working Node"],
+                selected: "Broken Node"
+            )]
+        )]
+        profile.modes = [Mode(
+            id: "subscription-mode",
+            name: "Subscription",
+            defaultSubscriptionID: "subscription"
+        )]
+        profile.activeModeID = "subscription-mode"
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        XCTAssertFalse(app.canConnect)
+        XCTAssertTrue(app.activeConfigurationIssues.contains {
+            $0.contains("Primary")
+                && $0.contains("Broken Node")
+                && ($0.contains("UUID") || $0.contains("uuid"))
+        })
+        app.connect()
+        await Task.yield()
+        XCTAssertEqual(manager.startCallCount, 0)
+    }
+
+    func testDisabledRuleIsIgnoredButEnabledRuleCannotUseDisabledLine() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            persistence: makePersistence()
+        )
+        var profile = configuredProfile()
+        profile.lines.append(Line(
+            id: "disabled-line",
+            name: "Disabled Line",
+            type: "trojan",
+            enabled: false,
+            trojanServer: "disabled.example.com",
+            trojanPassword: "secret"
+        ))
+        profile.ruleSets.append(RuleSet(
+            id: "optional-rule",
+            name: "Optional Rule",
+            type: "manual",
+            enabled: false,
+            domains: ["optional.example"]
+        ))
+        profile.modes[0].bindings.append(RuleBinding(
+            ruleSetID: "optional-rule",
+            lineID: "disabled-line"
+        ))
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        XCTAssertTrue(app.canConnect, app.activeConfigurationIssues.joined(separator: "\n"))
+
+        guard let ruleIndex = app.profile.ruleSets.firstIndex(where: {
+            $0.id == "optional-rule"
+        }) else {
+            return XCTFail("rule missing")
+        }
+        app.profile.ruleSets[ruleIndex].enabled = true
+        app.profile.ensureConnectivityTestConfiguration()
+        XCTAssertFalse(app.canConnect)
+        XCTAssertTrue(app.activeConfigurationIssues.contains {
+            $0.contains("Disabled Line")
+                && ($0.contains("停用") || $0.contains("disabled"))
+        })
+    }
+
+    func testOverlayOnlyTailscaleNeedsNoExitUntilUsedAsDefault() {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            persistence: makePersistence()
+        )
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail-overlay",
+            name: "Tailnet",
+            type: "tailscale",
+            tailscaleExitNode: " \n ",
+            tailscaleAuthenticated: true
+        ))
+        profile.ruleSets.append(RuleSet(
+            id: "tailnet-only",
+            name: "Tailnet Only",
+            type: "manual",
+            domains: ["internal.example"]
+        ))
+        profile.modes = [Mode(
+            id: "overlay",
+            name: "Overlay",
+            bindings: [RuleBinding(ruleSetID: "tailnet-only", lineID: "tail-overlay")],
+            defaultLineID: "direct"
+        )]
+        profile.activeModeID = "overlay"
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        XCTAssertTrue(app.canConnect, app.activeConfigurationIssues.joined(separator: "\n"))
+        XCTAssertNil(app.profile.connectivityOutboundBinding(for: app.profile.modes[0]))
+
+        app.profile.modes[0].defaultLineID = "tail-overlay"
+        app.profile.ensureConnectivityTestConfiguration()
+        XCTAssertFalse(app.canConnect)
+        XCTAssertTrue(app.activeConfigurationIssues.contains {
+            $0.contains("出口节点") || $0.contains("exit node")
+        })
     }
 
     func testMissingDirectAcceptanceBindingFailsBeforeConnectionStart() {
@@ -658,6 +1616,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertFalse(app.helperInstalled)
     }
 
+    #if targetEnvironment(simulator)
     func testConnectingDoesNotLookLikeIncompleteConfiguration() {
         let engine = FakeTunnelEngine()
         let manager = FakeTunnelManager(engine: engine)
@@ -711,6 +1670,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertFalse(app.isConnectionConfigured)
         XCTAssertFalse(app.canConnect)
     }
+    #endif
 
     func testStatusTextUsesProductConnectionWordingForSystemErrors() {
         let engine = NoopTunnelEngine()
@@ -848,6 +1808,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(replacementCompletion.successCount, 1)
     }
 
+    #if targetEnvironment(simulator)
     func testActiveModeRejectsMultipleAnyConnectLines() {
         let engine = FakeTunnelEngine()
         let manager = FakeTunnelManager(engine: engine)
@@ -898,6 +1859,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(app.activeAnyConnectLineIDs, Set(["vpn"]))
         XCTAssertTrue(app.canConnect)
     }
+    #endif
 
     func testTailscaleOnlyAndMixedModesCanConnect() {
         let engine = RuntimeSpyEngine()
@@ -910,7 +1872,9 @@ final class AppStateTests: XCTestCase {
             name: "Tailscale Home",
             type: "tailscale",
             enabled: true,
-            tailscaleHostname: "xdial-mobile"
+            tailscaleHostname: "xdial-mobile",
+            tailscaleExitNode: "100.64.0.8",
+            tailscaleAuthenticated: true
         ))
         profile.ruleSets = [RuleSet(
             id: "internal",
@@ -963,7 +1927,9 @@ final class AppStateTests: XCTestCase {
             id: "tailscale-home",
             name: "Tailscale Home",
             type: "tailscale",
-            enabled: true
+            enabled: true,
+            tailscaleExitNode: "100.64.0.8",
+            tailscaleAuthenticated: true
         ))
         profile.modes = [Mode(
             id: "tailscale-mode",
@@ -1000,7 +1966,13 @@ final class AppStateTests: XCTestCase {
         let manager = RuntimeSpyManager(engine: engine)
         let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
         var profile = Profile.bootstrap()
-        profile.lines.append(Line(id: "tail", name: "Tail", type: "tailscale"))
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            tailscaleExitNode: "100.64.0.8",
+            tailscaleAuthenticated: true
+        ))
         profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
         profile.activeModeID = "tail-mode"
         profile.ensureConnectivityTestConfiguration()
@@ -1008,6 +1980,7 @@ final class AppStateTests: XCTestCase {
 
         app.connect()
         await Task.yield()
+        XCTAssertEqual(manager.startCallCount, 1)
         engine.setStatus("action-required")
         await Task.yield()
 
@@ -1039,13 +2012,220 @@ final class AppStateTests: XCTestCase {
         XCTAssertFalse(app.hasActiveTunnel)
     }
 
+    func testTailscaleActionRequiredPublishesRuntimeAuthRequestAndClearsAfterLogin() async {
+        let engine = RuntimeSpyEngine()
+        engine.tailscaleResult = .success(TailscaleRuntimeStatus(
+            backendState: "NeedsLogin",
+            authURL: "https://login.tailscale.com/a/runtime-token",
+            exitNodes: []
+        ))
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Home Tailnet",
+            type: "tailscale",
+            tailscaleExitNode: "100.64.0.8",
+            tailscaleAuthenticated: true
+        ))
+        profile.lines.append(Line(
+            id: "tail-running",
+            name: "Running Tailnet",
+            type: "tailscale",
+            tailscaleAuthenticated: true
+        ))
+        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
+        profile.activeModeID = "tail-mode"
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+        engine.tailscaleResultsByEndpointTag = [
+            "tailscale-tail": .success(TailscaleRuntimeStatus(
+                backendState: "NeedsLogin",
+                authURL: "https://login.tailscale.com/a/runtime-token",
+                exitNodes: []
+            )),
+            "tailscale-tail-running": .success(TailscaleRuntimeStatus(
+                backendState: "Running",
+                authURL: "",
+                exitNodes: []
+            )),
+        ]
+
+        app.connect()
+        await Task.yield()
+        XCTAssertEqual(manager.startCallCount, 1)
+        engine.setStatus("action-required")
+
+        for _ in 0..<20 where app.tailscaleAuthRequests.count != 1
+            || app.tailscaleAuthRequests.first?.lineID != "tail" {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(app.tailscaleAuthRequests, [
+            TailscaleAuthRequest(
+                lineID: "tail",
+                lineName: "Home Tailnet"
+            ),
+        ])
+        XCTAssertEqual(
+            Set(engine.tailscaleEndpointTags),
+            Set(["tailscale-tail", "tailscale-tail-running"])
+        )
+
+        XCTAssertTrue(app.applyTailscaleRuntimeStatus(
+            lineID: "tail",
+            status: TailscaleRuntimeStatus(
+                backendState: "NeedsLogin",
+                authURL: "https://login.tailscale.com/a/runtime-token",
+                exitNodes: []
+            )
+        ))
+        XCTAssertFalse(
+            app.profile.lines.first(where: { $0.id == "tail" })?.tailscaleAuthenticated ?? true
+        )
+        engine.setStatus("connected")
+        await Task.yield()
+        XCTAssertTrue(app.tailscaleAuthRequests.isEmpty)
+        XCTAssertTrue(
+            app.profile.lines.first(where: { $0.id == "tail" })?.tailscaleAuthenticated == true
+        )
+        XCTAssertFalse(app.hasPendingRuntimeChanges)
+
+        app.disconnect()
+        XCTAssertEqual(engine.status, "disconnected")
+        app.connect()
+        XCTAssertEqual(manager.startCallCount, 2)
+    }
+
+    func testTailscaleAuthRequestQueriesOnlyEnabledGeneratedLines() async {
+        let engine = RuntimeSpyEngine()
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            tailscaleExitNode: "100.64.0.8",
+            tailscaleAuthenticated: true
+        ))
+        profile.lines.append(Line(
+            id: "tail-disabled",
+            name: "Disabled Tail",
+            type: "tailscale",
+            enabled: false
+        ))
+        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
+        profile.activeModeID = "tail-mode"
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        app.connect()
+        await Task.yield()
+        XCTAssertEqual(manager.startCallCount, 1)
+        engine.tailscaleResult = .success(TailscaleRuntimeStatus(
+            backendState: "NeedsLogin",
+            authURL: "",
+            exitNodes: []
+        ))
+        engine.setStatus("action-required")
+        for _ in 0..<20 where app.tailscaleAuthRequests.isEmpty {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(app.tailscaleAuthRequests, [
+            TailscaleAuthRequest(lineID: "tail", lineName: "Tail"),
+        ])
+        XCTAssertEqual(engine.tailscaleEndpointTags, ["tailscale-tail"])
+    }
+
+    func testBeginTailscaleLoginUsesGeneratedRuntimeEndpoint() async {
+        let engine = RuntimeSpyEngine()
+        engine.tailscaleResult = .success(TailscaleRuntimeStatus(
+            backendState: "NeedsLogin",
+            authURL: "https://login.tailscale.com/a/fresh-token",
+            exitNodes: []
+        ))
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            tailscaleExitNode: "100.64.0.8",
+            tailscaleAuthenticated: true
+        ))
+        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
+        profile.activeModeID = "tail-mode"
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        app.connect()
+        await Task.yield()
+        XCTAssertEqual(manager.startCallCount, 1)
+        engine.setStatus("action-required")
+        try? await Task.sleep(for: .milliseconds(10))
+
+        let result: Result<TailscaleRuntimeStatus, Error> = await withCheckedContinuation {
+            continuation in
+            app.beginTailscaleLogin(lineID: "tail") {
+                continuation.resume(returning: $0)
+            }
+        }
+        guard case .success(let status) = result else {
+            return XCTFail("explicit Tailscale sign-in did not return runtime state")
+        }
+        XCTAssertEqual(status.authURL, "https://login.tailscale.com/a/fresh-token")
+        XCTAssertEqual(engine.tailscaleLoginEndpointTags, ["tailscale-tail"])
+    }
+
+    func testRestoredTailscaleActionRequiredRebuildsRuntimeSnapshotBeforeLogin() async {
+        let engine = RuntimeSpyEngine()
+        engine.tailscaleResult = .success(TailscaleRuntimeStatus(
+            backendState: "NeedsLogin",
+            authURL: "https://login.tailscale.com/a/restored-token",
+            exitNodes: []
+        ))
+        let manager = RuntimeSpyManager(engine: engine)
+        let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(id: "tail", name: "Tail", type: "tailscale"))
+        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
+        profile.activeModeID = "tail-mode"
+        profile.ensureConnectivityTestConfiguration()
+        app.profile = profile
+
+        engine.setStatus("action-required")
+        await Task.yield()
+
+        XCTAssertEqual(app.tailscaleAuthRequests, [
+            TailscaleAuthRequest(lineID: "tail", lineName: "Tail"),
+        ])
+        let result: Result<TailscaleRuntimeStatus, Error> = await withCheckedContinuation {
+            continuation in
+            app.beginTailscaleLogin(lineID: "tail") {
+                continuation.resume(returning: $0)
+            }
+        }
+        guard case .success(let status) = result else {
+            return XCTFail("restored Tailscale sign-in did not reach the runtime endpoint")
+        }
+        XCTAssertEqual(status.authURL, "https://login.tailscale.com/a/restored-token")
+        XCTAssertEqual(engine.tailscaleLoginEndpointTags, ["tailscale-tail"])
+    }
+
     func testTailscaleExitSelectionPersistsOfflineAndMarksConnectedReconnect() async {
         let engine = RuntimeSpyEngine()
         let manager = RuntimeSpyManager(engine: engine)
         let persistence = makePersistence()
         let app = AppState(engine: engine, tunnelManager: manager, persistence: persistence)
         var profile = Profile.bootstrap()
-        profile.lines.append(Line(id: "tail", name: "Tail", type: "tailscale"))
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            tailscaleAuthenticated: true
+        ))
         profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
         profile.activeModeID = "tail-mode"
         profile.ensureConnectivityTestConfiguration()
@@ -1092,6 +2272,54 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testLegacyVerifiedTailscalePreservesLoginWhenExitNodeChanges() {
+        let app = AppState(persistence: makePersistence())
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            verified: true,
+            tailscaleExitNode: "100.64.0.8"
+        ))
+        app.profile = profile
+
+        XCTAssertTrue(app.updateTailscaleExitSelection(
+            lineID: "tail",
+            selected: "100.64.0.9"
+        ))
+        let updated = app.profile.lines.first(where: { $0.id == "tail" })
+        XCTAssertEqual(updated?.tailscaleExitNode, "100.64.0.9")
+        XCTAssertEqual(updated?.verified, false)
+        XCTAssertEqual(updated?.tailscaleAuthenticated, true)
+    }
+
+    func testLegacyVerifiedTailscaleMigratesToDedicatedLoginStateOnReload() {
+        let persistence = makePersistence()
+        let original = AppState(persistence: persistence)
+        var profile = Profile.bootstrap()
+        profile.lines.append(Line(
+            id: "tail",
+            name: "Tail",
+            type: "tailscale",
+            verified: true,
+            tailscaleExitNode: "100.64.0.8"
+        ))
+        original.profile = profile
+        XCTAssertTrue(original.save())
+
+        let restored = AppState(persistence: persistence)
+        let line = restored.profile.lines.first(where: { $0.id == "tail" })
+        XCTAssertEqual(line?.tailscaleAuthenticated, true)
+        XCTAssertFalse(
+            restored.routeLineConfigurationIssues(line ?? Line(
+                id: "missing",
+                name: "Missing",
+                type: "tailscale"
+            )).contains { $0.contains("登录") || $0.contains("sign-in") }
+        )
+    }
+
     func testEveryGeneratedTailscaleEndpointIsQueryableWhileActionIsRequired() async {
         let engine = RuntimeSpyEngine()
         let manager = RuntimeSpyManager(engine: engine)
@@ -1107,18 +2335,28 @@ final class AppStateTests: XCTestCase {
         await Task.yield()
         engine.setStatus("action-required")
         await Task.yield()
+        let expectedEndpointTags = [
+            "tailscale-tail-active",
+            "tailscale-tail-unused",
+        ]
+        XCTAssertEqual(engine.tailscaleEndpointTags, expectedEndpointTags)
 
-        let result: Result<TailscaleRuntimeStatus, Error> = await withCheckedContinuation {
-            continuation in
-            app.refreshTailscaleStatus(lineID: "tail-unused") {
-                continuation.resume(returning: $0)
+        for lineID in ["tail-active", "tail-unused"] {
+            let result: Result<TailscaleRuntimeStatus, Error> = await withCheckedContinuation {
+                continuation in
+                app.refreshTailscaleStatus(lineID: lineID) {
+                    continuation.resume(returning: $0)
+                }
             }
+            guard case .success(let status) = result else {
+                return XCTFail("globally generated endpoint must remain queryable")
+            }
+            XCTAssertEqual(status.backendState, "Running")
         }
-        guard case .success(let status) = result else {
-            return XCTFail("globally generated endpoint must remain queryable")
-        }
-        XCTAssertEqual(status.backendState, "Running")
-        XCTAssertEqual(engine.tailscaleEndpointTags, ["tailscale-tail-unused"])
+        XCTAssertEqual(
+            Array(engine.tailscaleEndpointTags.suffix(expectedEndpointTags.count)),
+            expectedEndpointTags
+        )
     }
 
     func testActiveRouteSummaryIncludesSubscriptionAndIgnoresDisabledRuleBinding() {
@@ -1187,6 +2425,26 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(session.request["endpoint_tag"], "tailscale-home")
         XCTAssertEqual(status.backendState, "Running")
         XCTAssertEqual(status.exitNodes.first?.name, "Home")
+    }
+
+    func testGoEngineBeginsInteractiveTailscaleLogin() async {
+        let engine = GoEngine()
+        let session = TailscaleStatusSession()
+        engine.session = session
+
+        let result: Result<TailscaleRuntimeStatus, Error> = await withCheckedContinuation {
+            continuation in
+            engine.beginTailscaleLogin(endpointTag: "tailscale-home") {
+                continuation.resume(returning: $0)
+            }
+        }
+
+        guard case .success(let status) = result else {
+            return XCTFail("GoEngine did not decode refreshed Tailscale login status")
+        }
+        XCTAssertEqual(session.request["cmd"], "tailscale-begin-login")
+        XCTAssertEqual(session.request["endpoint_tag"], "tailscale-home")
+        XCTAssertEqual(status.backendState, "Running")
     }
 
     func testDeletingReferencedSubscriptionFailsClosed() {

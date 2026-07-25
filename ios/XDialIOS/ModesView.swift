@@ -7,6 +7,7 @@ struct ModesView: View {
         NavigationStack {
             List {
                 ForEach(app.profile.modes) { mode in
+                    let issues = app.configurationIssues(for: mode)
                     NavigationLink {
                         ModeDetailView(modeID: mode.id)
                     } label: {
@@ -18,6 +19,14 @@ struct ModesView: View {
                                 Text(modeSummary(mode))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                if !issues.isEmpty {
+                                    Text(app.tr(
+                                        "需补齐 \(issues.count) 项配置",
+                                        "\(issues.count) setup item(s) required"
+                                    ))
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                }
                             }
                         }
                     }
@@ -196,6 +205,14 @@ private struct ModeDetailView: View {
         includeDefault: Bool,
         ruleSetID: String = ""
     ) -> some View {
+        let availableLines = app.profile.lines.filter {
+            includeDefault ? app.isUsableRouteLine($0) : app.isUsableDefaultRouteLine($0)
+        }
+        let availableSubscriptions = app.profile.subscriptions.filter(app.isUsableSubscription)
+        let availableIDs = Set(
+            availableLines.map { "port:\($0.id)" }
+                + availableSubscriptions.map { "sub:\($0.id)" }
+        )
         if includeDefault {
             if ruleSetID == RuleSet.connectivityOutboundID && selectedTargetID.isEmpty {
                 Text(app.tr("不适用（单出口）", "Not applicable (single route)")).tag("")
@@ -206,14 +223,14 @@ private struct ModeDetailView: View {
             Text(app.tr("未设置", "Not set")).tag("")
         }
 
-        ForEach(app.profile.lines.filter(app.isUsableRouteLine)) { line in
+        ForEach(availableLines) { line in
             Label(line.name, systemImage: lineSymbol(line.type))
                 .tag("port:\(line.id)")
         }
 
-        if !app.profile.subscriptions.filter(app.isUsableSubscription).isEmpty {
+        if !availableSubscriptions.isEmpty {
             Divider()
-            ForEach(app.profile.subscriptions.filter(app.isUsableSubscription)) { subscription in
+            ForEach(availableSubscriptions) { subscription in
                 Label(
                     "\(subscription.name) (\(subscription.lines.count))",
                     systemImage: "antenna.radiowaves.left.and.right"
@@ -222,7 +239,7 @@ private struct ModeDetailView: View {
             }
         }
 
-        if !selectedTargetID.isEmpty && !availableTargetIDs.contains(selectedTargetID) {
+        if !selectedTargetID.isEmpty && !availableIDs.contains(selectedTargetID) {
             Divider()
             Text(app.tr("当前出口不可用", "Current route unavailable"))
                 .tag(selectedTargetID)
@@ -231,12 +248,6 @@ private struct ModeDetailView: View {
 
     private var modeIndex: Int? {
         app.profile.modes.firstIndex { $0.id == modeID }
-    }
-
-    private var availableTargetIDs: Set<String> {
-        let lines = app.profile.lines.filter(app.isUsableRouteLine).map { "port:\($0.id)" }
-        let subscriptions = app.profile.subscriptions.filter(app.isUsableSubscription).map { "sub:\($0.id)" }
-        return Set(lines + subscriptions)
     }
 
     private func modeBinding<T>(_ index: Int, _ keyPath: WritableKeyPath<Mode, T>) -> Binding<T> {

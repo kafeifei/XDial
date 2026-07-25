@@ -37,6 +37,37 @@ struct TailscaleRuntimeStatus: Decodable, Equatable, Sendable {
     }
 }
 
+struct TailscaleAuthRequest: Equatable, Identifiable, Sendable {
+    let lineID: String
+    let lineName: String
+
+    var id: String { lineID }
+}
+
+@MainActor
+protocol TailscaleSetupRuntime: AnyObject {
+    var isActive: Bool { get }
+
+    func start(
+        profileJSON: String,
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    )
+    func status(
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    )
+    func beginLogin(
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    )
+    func logout(
+        lineID: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    )
+    func stop(completion: @escaping () -> Void)
+}
+
 struct AnyConnectCredentials: Equatable, Sendable {
     let server: String
     let username: String
@@ -85,6 +116,10 @@ protocol TunnelEngine: AnyObject {
         endpointTag: String,
         completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
     )
+    func beginTailscaleLogin(
+        endpointTag: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    )
     func suppressNextAutomaticReconnect()
     func consumeAutomaticReconnectPermission() -> Bool
 }
@@ -125,6 +160,13 @@ extension TunnelEngine {
     }
 
     func tailscaleStatus(
+        endpointTag: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        completion(.failure(TunnelRuntimeError.unavailable))
+    }
+
+    func beginTailscaleLogin(
         endpointTag: String,
         completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
     ) {
@@ -201,9 +243,16 @@ protocol TunnelManaging: AnyObject {
     /// 这是唯一真正触发系统级连接的入口——`TunnelEngine.start(profileJSON:)`
     /// 走的是 sendProviderMessage，只有隧道已经在跑时才有意义，不能从冷启动拉起隧道。
     func startTunnel(profile: Profile, anyConnect: AnyConnectCredentials?,
+                      allowSystemOnDemand: Bool,
                       completion: @escaping @Sendable (Result<Void, Error>) -> Void)
     /// 保存用户的系统级重连意图。启用请求只会在连接验收通过且安全启动包可用后生效。
     func setSystemOnDemandEnabled(_ enabled: Bool)
+    /// Tailscale 独立设置期间临时暂停系统接管。与用户开关不同，这个租约必须保留
+    /// 已验收的安全启动包，并在系统偏好确认停用后才回调。
+    func setSystemOnDemandSuspendedForSetup(
+        _ suspended: Bool,
+        completion: @escaping () -> Void
+    )
 
     /// 停止系统级隧道（NETunnelProviderManager.connection.stopVPNTunnel()）。
     func stopTunnel()
@@ -219,6 +268,12 @@ extension TunnelManaging {
     }
 
     func setSystemOnDemandEnabled(_ enabled: Bool) {}
+    func setSystemOnDemandSuspendedForSetup(
+        _ suspended: Bool,
+        completion: @escaping () -> Void
+    ) {
+        completion()
+    }
 
     func removeProfile(completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
         completion(.failure(TunnelRuntimeError.unavailable))
@@ -273,6 +328,7 @@ struct AppPersistenceContext {
     let languageKey: String
     let autoReconnectKey: String
     let systemOnDemandKey: String
+    let tailscaleSetupLineKey: String
 
     static let production = AppPersistenceContext(
         defaults: .standard,
@@ -281,7 +337,8 @@ struct AppPersistenceContext {
         profileKey: "xdial.profile",
         languageKey: "xdial.language",
         autoReconnectKey: "xdial.auto-reconnect",
-        systemOnDemandKey: "xdial.system-on-demand"
+        systemOnDemandKey: "xdial.system-on-demand",
+        tailscaleSetupLineKey: "xdial.tailscale-setup-line"
     )
 
     static func testing(identifier: String) -> AppPersistenceContext {
@@ -298,7 +355,8 @@ struct AppPersistenceContext {
             profileKey: "xdial.profile",
             languageKey: "xdial.language",
             autoReconnectKey: "xdial.auto-reconnect",
-            systemOnDemandKey: "xdial.system-on-demand"
+            systemOnDemandKey: "xdial.system-on-demand",
+            tailscaleSetupLineKey: "xdial.tailscale-setup-line"
         )
     }
 
@@ -386,6 +444,8 @@ final class AppState: ObservableObject {
 
     /// 系统连接管理层必须与 AppState 同生命周期；其反向 engine 引用是 weak，不成环。
     private let tunnelManager: TunnelManaging?
+    /// Tailscale 登录和节点发现运行在主 App 内，不启动系统线路。
+    private let tailscaleSetupRuntime: TailscaleSetupRuntime?
     private var onDemandStateSub: AnyCancellable?
 
     private let persistence: AppPersistenceContext
@@ -401,11 +461,20 @@ final class AppState: ObservableObject {
     /// 重启后才发现账号或模式消失。
     private var lastPersistedProfile = Profile.bootstrap()
     private var runningProfileSnapshot: Profile?
+    @Published private(set) var tailscaleSetupLineID: String?
+    @Published private(set) var isStoppingTailscaleSetup = false
+    @Published private var runtimeTailscaleNeedsLoginIDs: Set<String> = []
+    private var tailscaleSetupGeneration: UInt64 = 0
+    private var tailscaleAuthRefreshGeneration: UInt64 = 0
+    private var tailscaleSetupOwnsOnDemandSuspension = false
+    private var tailscaleSetupSuspensionPending = false
+    private var tailscaleSetupFinishCompletions: [() -> Void] = []
     private var reconnectAfterDisconnect = false
     private var observedEngineStatus = "disconnected"
     private var disconnectRequested = false
     private var autoReconnectAttempt = 0
     private var autoReconnectTask: Task<Void, Never>?
+    private var interruptedTailscaleSetupRecoveryPending = false
 
     func tr(_ zh: String, _ en: String) -> String {
         language == .zh ? zh : en
@@ -413,7 +482,21 @@ final class AppState: ObservableObject {
 
     var isConnected: Bool { engine.isConnected }
     var requiresUserAction: Bool { engine.status == "action-required" }
-    var hasActiveTunnel: Bool { isConnected || requiresUserAction }
+    var hasFormalTunnel: Bool { isConnected || requiresUserAction }
+    var isTailscaleSetupActive: Bool {
+        tailscaleSetupLineID != nil && tailscaleSetupRuntime?.isActive == true
+    }
+    var tailscaleAuthRequests: [TailscaleAuthRequest] {
+        guard requiresUserAction else { return [] }
+        return (runningProfileSnapshot?.lines ?? profile.lines).compactMap { line in
+            guard runtimeTailscaleNeedsLoginIDs.contains(line.id) else { return nil }
+            return TailscaleAuthRequest(
+                lineID: line.id,
+                lineName: line.name.isEmpty ? "Tailscale" : line.name
+            )
+        }
+    }
+    var hasActiveTunnel: Bool { hasFormalTunnel || tailscaleSetupLineID != nil }
     var isBusy: Bool { engine.isBusy }
     var canMutateConfiguration: Bool { !isBusy && !hasActiveTunnel }
 
@@ -458,13 +541,17 @@ final class AppState: ObservableObject {
         guard let mode = activeMode else {
             return [tr("尚未选择模式", "No mode is selected")]
         }
+        return configurationIssues(for: mode)
+    }
 
+    func configurationIssues(for mode: Mode) -> [String] {
         var issues: [String] = []
         appendConnectivityAcceptanceIssues(for: mode, to: &issues)
         appendTargetIssue(
             lineID: mode.defaultLineID,
             subscriptionID: mode.defaultSubscriptionID,
             label: tr("默认出口", "Default route"),
+            requiresPublicEgress: true,
             to: &issues
         )
 
@@ -494,7 +581,31 @@ final class AppState: ObservableObject {
             )
         }
 
-        if activeAnyConnectLineIDs.count > 1 {
+        let referencedLineIDs = effectiveReferencedLineIDs(in: mode)
+        // Tailscale endpoint 的子网路由能力是全局生成的，即使当前模式没有显式
+        // 绑定也会随隧道启动。所有 enabled Tailscale 因而都必须先完成登录；
+        // 出口节点仍只对承担默认公网出口的那一条强制要求。
+        for line in profile.lines
+        where line.enabled
+            && line.type == "tailscale"
+            && !referencedLineIDs.contains(line.id) {
+            let lineIssues = routeLineConfigurationIssues(line)
+            if !lineIssues.isEmpty {
+                let trimmedName = line.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                let displayName = trimmedName.isEmpty ? line.id : trimmedName
+                issues.append(tr(
+                    "全局启用的 Tailscale 线路“\(displayName)”配置不完整：\(lineIssues.joined(separator: "、"))",
+                    "Globally enabled Tailscale line “\(displayName)” is incomplete: \(lineIssues.joined(separator: ", "))"
+                ))
+            }
+        }
+        let anyConnectLineIDs = Set(profile.lines.compactMap { line -> String? in
+            guard referencedLineIDs.contains(line.id),
+                  line.enabled,
+                  line.type == "vpn" else { return nil }
+            return line.id
+        })
+        if anyConnectLineIDs.count > 1 {
             issues.append(tr(
                 "当前模式一次只能使用一条 AnyConnect 线路",
                 "This mode can use only one AnyConnect line at a time"
@@ -555,27 +666,81 @@ final class AppState: ObservableObject {
         return ids
     }
 
-    func isUsableRouteLine(_ line: Line) -> Bool {
-        guard line.enabled else { return false }
+    func routeLineConfigurationIssues(_ line: Line) -> [String] {
+        guard line.enabled else {
+            return [tr("线路已停用", "line is disabled")]
+        }
+        var issues: [String] = []
+        if line.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(tr("缺少名称", "name is missing"))
+        }
         switch line.type {
         case "direct":
-            return true
+            break
         case "vpn":
-            return !line.vpnServer.isEmpty && !line.vpnUsername.isEmpty && !line.vpnPassword.isEmpty
+            if line.vpnServer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(tr("缺少服务器", "server is missing"))
+            }
+            if line.vpnUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(tr("缺少用户名", "username is missing"))
+            }
+            if line.vpnPassword.isEmpty {
+                issues.append(tr("缺少密码", "password is missing"))
+            }
         case "trojan":
-            return !line.trojanServer.isEmpty && (1...65_535).contains(line.trojanPort)
-                && !line.trojanPassword.isEmpty
-        case "shadowsocks":
-            return !line.ssServer.isEmpty && (1...65_535).contains(line.ssPort)
-                && !line.ssMethod.isEmpty && !line.ssPassword.isEmpty
+            if line.trojanServer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(tr("缺少服务器", "server is missing"))
+            }
+            if !(1...65_535).contains(line.trojanPort) {
+                issues.append(tr("端口无效", "port is invalid"))
+            }
+            if line.trojanPassword.isEmpty {
+                issues.append(tr("缺少密码", "password is missing"))
+            }
+        case "shadowsocks", "ss":
+            if line.ssServer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(tr("缺少服务器", "server is missing"))
+            }
+            if !(1...65_535).contains(line.ssPort) {
+                issues.append(tr("端口无效", "port is invalid"))
+            }
+            if line.ssMethod.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(tr("缺少加密方法", "method is missing"))
+            }
+            if line.ssPassword.isEmpty {
+                issues.append(tr("缺少密码", "password is missing"))
+            }
         case "vmess":
-            return !line.vmessServer.isEmpty && (1...65_535).contains(line.vmessPort)
-                && UUID(uuidString: line.vmessUUID) != nil
+            if line.vmessServer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(tr("缺少服务器", "server is missing"))
+            }
+            if !(1...65_535).contains(line.vmessPort) {
+                issues.append(tr("端口无效", "port is invalid"))
+            }
+            if UUID(uuidString: line.vmessUUID) == nil {
+                issues.append(tr("UUID 无效", "UUID is invalid"))
+            }
         case "tailscale":
-            return true
+            if !line.tailscaleAuthenticated {
+                issues.append(tr(
+                    "尚未完成 Tailscale 登录",
+                    "Tailscale sign-in is not complete"
+                ))
+            }
         default:
-            return false
+            issues.append(tr("线路类型不受支持", "line type is unsupported"))
         }
+        return issues
+    }
+
+    func isUsableRouteLine(_ line: Line) -> Bool {
+        routeLineConfigurationIssues(line).isEmpty
+    }
+
+    func isUsableDefaultRouteLine(_ line: Line) -> Bool {
+        guard isUsableRouteLine(line) else { return false }
+        return line.type != "tailscale"
+            || !line.tailscaleExitNode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     func isUsableSubscription(_ subscription: Subscription) -> Bool {
@@ -640,6 +805,100 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 订阅整体“有可用节点”并不代表用户当前选择可用。若已选择的节点配置
+    /// 不完整，生成器会省略它并回退到其他节点；连接前必须明确拦截这种静默换线。
+    private func subscriptionSelectionConfigurationIssues(
+        _ subscription: Subscription
+    ) -> [String] {
+        let supportedLineTypes = Set(["trojan", "shadowsocks", "vmess"])
+        let nodeByName = Dictionary(
+            subscription.lines.map { ($0.name, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let usableNodeNames = Set(subscription.lines.compactMap { line -> String? in
+            guard supportedLineTypes.contains(line.type),
+                  isUsableRouteLine(line) else { return nil }
+            return line.name
+        })
+
+        var availableMembers = usableNodeNames.union(["DIRECT", "Direct"])
+        var outboundGroups = Set<String>()
+        var rejectGroups = Set<String>()
+        var changed = true
+        while changed {
+            changed = false
+            for group in subscription.proxyGroups
+            where !outboundGroups.contains(group.name) && !rejectGroups.contains(group.name) {
+                let hasUsableMember = group.proxies.contains {
+                    availableMembers.contains($0) || outboundGroups.contains($0)
+                }
+                if hasUsableMember {
+                    outboundGroups.insert(group.name)
+                    availableMembers.insert(group.name)
+                    changed = true
+                } else if group.proxies.contains(where: {
+                    ["REJECT", "REJECT-DROP", "REJECT-TINYGIF", "BLOCK"].contains($0.uppercased())
+                        || rejectGroups.contains($0)
+                }) {
+                    rejectGroups.insert(group.name)
+                    changed = true
+                }
+            }
+        }
+
+        var issues: [String] = []
+        func appendSelectionIssue(_ selected: String, context: String) {
+            let selected = selected.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !selected.isEmpty else { return }
+            if let node = nodeByName[selected] {
+                let nodeIssues = routeLineConfigurationIssues(node)
+                if !nodeIssues.isEmpty {
+                    let nodeName = node.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let displayName = nodeName.isEmpty ? node.id : nodeName
+                    issues.append(tr(
+                        "\(context)选择的节点“\(displayName)”配置不完整：\(nodeIssues.joined(separator: "、"))",
+                        "Node “\(displayName)” selected by \(context) is incomplete: \(nodeIssues.joined(separator: ", "))"
+                    ))
+                }
+                return
+            }
+            if ["DIRECT", "Direct"].contains(selected) || outboundGroups.contains(selected) {
+                return
+            }
+            issues.append(tr(
+                "\(context)选择的目标“\(selected)”不可用",
+                "Target “\(selected)” selected by \(context) is unavailable"
+            ))
+        }
+
+        if subscription.proxyGroups.isEmpty,
+           subscription.strategy.lowercased() == "selector" {
+            appendSelectionIssue(
+                subscription.selected,
+                context: tr("订阅", "the subscription")
+            )
+        }
+        for group in subscription.proxyGroups
+        where ["select", "selector"].contains(group.type.lowercased()) {
+            let selected = group.selected.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !selected.isEmpty else { continue }
+            if !group.proxies.contains(selected) {
+                issues.append(tr(
+                    "策略组“\(group.name)”选择的目标“\(selected)”不在该组中",
+                    "Target “\(selected)” selected by group “\(group.name)” is not a member"
+                ))
+                continue
+            }
+            appendSelectionIssue(
+                selected,
+                context: tr("策略组“\(group.name)”", "group “\(group.name)”")
+            )
+        }
+
+        var seen = Set<String>()
+        return issues.filter { seen.insert($0).inserted }
+    }
+
     func canCreateMode(from template: ModeTemplate) -> Bool {
         let hasDirect = profile.lines.contains { $0.type == "direct" && isUsableRouteLine($0) }
         let hasAnyConnect = profile.lines.contains { $0.type == "vpn" && isUsableRouteLine($0) }
@@ -660,6 +919,7 @@ final class AppState: ObservableObject {
         lineID: String,
         subscriptionID: String,
         label: String,
+        requiresPublicEgress: Bool = false,
         to issues: inout [String]
     ) {
         let hasLine = !lineID.isEmpty
@@ -674,6 +934,13 @@ final class AppState: ObservableObject {
                 issues.append(tr("\(label)引用的订阅已删除", "\(label) references a deleted subscription"))
                 return
             }
+            let selectionIssues = subscriptionSelectionConfigurationIssues(subscription)
+            for selectionIssue in selectionIssues {
+                issues.append(tr(
+                    "\(label)使用的订阅“\(subscription.name)”：\(selectionIssue)",
+                    "Subscription “\(subscription.name)” used by \(label): \(selectionIssue)"
+                ))
+            }
             if !isUsableSubscription(subscription) {
                 issues.append(tr(
                     "\(label)使用的订阅“\(subscription.name)”没有可用节点",
@@ -687,15 +954,36 @@ final class AppState: ObservableObject {
             issues.append(tr("\(label)引用的线路已删除", "\(label) references a deleted line"))
             return
         }
-        if !isUsableRouteLine(line) {
+        let lineIssues = routeLineConfigurationIssues(line)
+        if !lineIssues.isEmpty {
+            let trimmedName = line.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayName = trimmedName.isEmpty ? line.id : trimmedName
             issues.append(tr(
-                "\(label)使用的线路“\(line.name)”已停用或配置不完整",
-                "Line “\(line.name)” used by \(label) is disabled or incomplete"
+                "\(label)使用的线路“\(displayName)”配置不完整：\(lineIssues.joined(separator: "、"))",
+                "Line “\(displayName)” used by \(label) is incomplete: \(lineIssues.joined(separator: ", "))"
+            ))
+        } else if requiresPublicEgress,
+                  line.type == "tailscale",
+                  line.tailscaleExitNode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(tr(
+                "\(label)使用的 Tailscale 线路“\(line.name)”尚未选择出口节点",
+                "Tailscale line “\(line.name)” used by \(label) has no exit node"
             ))
         }
     }
 
     var statusText: String {
+        if tailscaleSetupLineID != nil {
+            let name = profile.lines.first(where: { $0.id == tailscaleSetupLineID })?.name
+                ?? "Tailscale"
+            if isConnected {
+                return tr(
+                    "已连接 · 正在设置 \(name)",
+                    "Connected · Setting Up \(name)"
+                )
+            }
+            return tr("正在设置 \(name)", "Setting Up \(name)")
+        }
         switch engine.status {
         case "connected": return tr("已连接", "Connected")
         case "connecting": return tr("正在连接…", "Connecting…")
@@ -716,10 +1004,12 @@ final class AppState: ObservableObject {
     init(
         engine: TunnelEngine = NoopTunnelEngine(),
         tunnelManager: TunnelManaging? = nil,
+        tailscaleSetupRuntime: TailscaleSetupRuntime? = nil,
         persistence: AppPersistenceContext = .production
     ) {
         self.engine = engine
         self.tunnelManager = tunnelManager
+        self.tailscaleSetupRuntime = tailscaleSetupRuntime
         self.persistence = persistence
 
         // 先用 bootstrap 初始化，loadSaved 后会被覆盖
@@ -743,6 +1033,14 @@ final class AppState: ObservableObject {
             .sink { [weak self] state in
                 self?.systemOnDemandState = state
             }
+        interruptedTailscaleSetupRecoveryPending =
+            persistence.defaults.string(forKey: persistence.tailscaleSetupLineKey) != nil
+        if interruptedTailscaleSetupRecoveryPending {
+            // 主 App 已重新启动，旧的进程内 Libbox 与文件锁已经不存在；这里只需清理
+            // 崩溃标记，不能再次暂停并与按需恢复产生一轮新的偏好写入竞态。
+            persistence.defaults.removeObject(forKey: persistence.tailscaleSetupLineKey)
+            persistence.defaults.synchronize()
+        }
         tunnelManager?.setSystemOnDemandEnabled(systemOnDemandEnabled)
 
         observedEngineStatus = engine.status
@@ -768,23 +1066,38 @@ final class AppState: ObservableObject {
         let previous = observedEngineStatus
         observedEngineStatus = current
 
+        if (current == "connected" || current == "action-required"),
+           runningProfileSnapshot == nil {
+            // 主 App 重启时系统隧道可能仍在运行。此时没有本进程内快照，只能用
+            // 已从安全存储恢复的配置重建运行态索引，否则登录入口会显示却无法操作。
+            runningProfileSnapshot = profile
+            updatePendingRuntimeChanges()
+        }
+
         if current == "connected" {
+            tailscaleAuthRefreshGeneration &+= 1
+            runtimeTailscaleNeedsLoginIDs = []
             autoReconnectAttempt = 0
             autoReconnectTask?.cancel()
             autoReconnectTask = nil
             disconnectRequested = false
-            if runningProfileSnapshot == nil {
-                runningProfileSnapshot = profile
-                updatePendingRuntimeChanges()
-            }
+            // Tailscale 配置会话运行的是隔离副本，不代表用户当前模式的数据面已通过验收。
+            // 只有正式连接成功后，才把当前模式实际使用的线路标记为已验证。
             markUsedLinesVerified()
             return
         }
 
+        if current == "action-required" {
+            refreshRuntimeTailscaleAuthRequests()
+            return
+        }
+
         guard current == "disconnected" else { return }
+        tailscaleAuthRefreshGeneration &+= 1
+        runtimeTailscaleNeedsLoginIDs = []
         let hadRunningConfiguration = runningProfileSnapshot != nil
         runningProfileSnapshot = nil
-        hasPendingRuntimeChanges = false
+        updatePendingRuntimeChanges()
         if reconnectAfterDisconnect {
             reconnectAfterDisconnect = false
             disconnectRequested = false
@@ -870,7 +1183,11 @@ final class AppState: ObservableObject {
             engine.start(profileJSON: buildProfileJSON())
             return
         }
-        tunnelManager.startTunnel(profile: profile, anyConnect: anyConnect) { [weak self] result in
+        tunnelManager.startTunnel(
+            profile: profile,
+            anyConnect: anyConnect,
+            allowSystemOnDemand: true
+        ) { [weak self] result in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 switch result {
@@ -887,21 +1204,24 @@ final class AppState: ObservableObject {
         }
     }
 
-    private var lastVerifiedAt: String = ""
-
     private func markUsedLinesVerified() {
         guard let s = activeMode else { return }
-        let key = s.id
-        if lastVerifiedAt == key { return }
-        lastVerifiedAt = key
 
         var usedIDs = Set(s.bindings.map { $0.lineID })
         if !s.defaultLineID.isEmpty { usedIDs.insert(s.defaultLineID) }
+        let runningTailscaleIDs = Set((runningProfileSnapshot?.lines ?? profile.lines).compactMap {
+            $0.enabled && $0.type == "tailscale" ? $0.id : nil
+        })
 
         var changed = false
-        for i in profile.lines.indices where usedIDs.contains(profile.lines[i].id) {
-            if !profile.lines[i].verified {
+        for i in profile.lines.indices {
+            if usedIDs.contains(profile.lines[i].id), !profile.lines[i].verified {
                 profile.lines[i].verified = true
+                changed = true
+            }
+            if runningTailscaleIDs.contains(profile.lines[i].id),
+               !profile.lines[i].tailscaleAuthenticated {
+                profile.lines[i].tailscaleAuthenticated = true
                 changed = true
             }
         }
@@ -1094,6 +1414,8 @@ final class AppState: ObservableObject {
         var normalized = source
         for index in normalized.lines.indices {
             normalized.lines[index].verified = false
+            // 登录事实是控制面状态，不改变当前运行中的 sing-box 配置。
+            normalized.lines[index].tailscaleAuthenticated = false
         }
         for subscriptionIndex in normalized.subscriptions.indices {
             for lineIndex in normalized.subscriptions[subscriptionIndex].lines.indices {
@@ -1213,6 +1535,9 @@ final class AppState: ObservableObject {
 
             let containedPlaintext = containsSensitiveValues(loaded)
             restoreStructuredValues(vaultEnvelope.values, into: &loaded)
+            let profileBeforeNormalization = loaded
+            normalizeLegacyProfile(&loaded)
+            let normalizationChanged = loaded != profileBeforeNormalization
             profile = loaded
             lastPersistedProfile = loaded
             persistedRevision = profileEnvelope.revision
@@ -1223,9 +1548,10 @@ final class AppState: ObservableObject {
                 blockPersistence(with: loaded, log: "legacy secure-data cleanup is incomplete")
                 return
             }
-            if containedPlaintext {
+            if containedPlaintext || normalizationChanged {
                 // 早期 envelope 或中断迁移可能仍把账号/URL 留在 UserDefaults；
-                // revision 已匹配，可以安全地重写为严格脱敏格式。
+                // revision 已匹配，可以安全地重写为严格脱敏格式，同时把旧版
+                // Tailscale verified 登录事实迁移到专用字段。
                 if !save() {
                     // 明文清理失败不能只提示后继续连接，否则敏感字段仍会长期留在
                     // UserDefaults。恢复入口只允许用户显式导入或重置。
@@ -1624,6 +1950,11 @@ final class AppState: ObservableObject {
             if profile.lines[index].type == "vpn", profile.lines[index].name == "VPN" {
                 profile.lines[index].name = "AnyConnect"
             }
+            if profile.lines[index].type == "tailscale",
+               profile.lines[index].verified,
+               !profile.lines[index].tailscaleAuthenticated {
+                profile.lines[index].tailscaleAuthenticated = true
+            }
         }
         for subscriptionIndex in profile.subscriptions.indices {
             for lineIndex in profile.subscriptions[subscriptionIndex].lines.indices
@@ -1762,7 +2093,14 @@ final class AppState: ObservableObject {
         }
         tunnelManager.refreshProfileStatus { [weak self] installed in
             Task { @MainActor in
-                self?.helperInstalled = installed
+                guard let self else { return }
+                self.helperInstalled = installed
+                guard self.interruptedTailscaleSetupRecoveryPending else { return }
+                self.interruptedTailscaleSetupRecoveryPending = false
+                self.engine.lastError = self.tr(
+                    "上次 Tailscale 线路设置未完成，已清理设置状态。",
+                    "The interrupted Tailscale line setup state was cleared."
+                )
             }
         }
     }
@@ -1946,31 +2284,246 @@ final class AppState: ObservableObject {
         "tailscale-" + lineID
     }
 
-    var canQueryTailscaleRuntime: Bool {
-        isConnected || requiresUserAction
+    /// `action-required` 只说明至少一条 Tailscale endpoint 需要授权。逐条读取
+    /// LocalAPI 状态后再生成登录入口，避免把同一模式里已经 Running 的线路也误报。
+    private func refreshRuntimeTailscaleAuthRequests() {
+        tailscaleAuthRefreshGeneration &+= 1
+        let generation = tailscaleAuthRefreshGeneration
+        let lines = (runningProfileSnapshot?.lines ?? profile.lines).filter {
+            $0.enabled && $0.type == "tailscale"
+        }
+        // 查询失败时保留候选入口，不能让用户在 action-required 状态下无处继续；
+        // 成功读到 Running 后会立即从列表移除。
+        runtimeTailscaleNeedsLoginIDs = Set(lines.map(\.id))
+
+        for line in lines {
+            engine.tailscaleStatus(
+                endpointTag: Self.tailscaleEndpointTag(lineID: line.id)
+            ) { [weak self] result in
+                Task { @MainActor in
+                    guard let self,
+                          self.tailscaleAuthRefreshGeneration == generation,
+                          self.observedEngineStatus == "action-required" else {
+                        return
+                    }
+                    guard case .success(let status) = result else { return }
+                    let normalized = status.backendState.lowercased()
+                    if normalized == "running" {
+                        self.runtimeTailscaleNeedsLoginIDs.remove(line.id)
+                    } else if [
+                        "needslogin",
+                        "needs_login",
+                        "needsmachineauth",
+                        "needs_machine_auth",
+                    ].contains(normalized) {
+                        self.runtimeTailscaleNeedsLoginIDs.insert(line.id)
+                    }
+                    _ = self.applyTailscaleRuntimeStatus(
+                        lineID: line.id,
+                        status: status
+                    )
+                }
+            }
+        }
     }
 
-    func isTailscaleLineGeneratedByRunningProfile(_ lineID: String) -> Bool {
+    /// 主 App 用无 TUN 的独立 Libbox 实例完成登录和节点发现。它只运行目标
+    /// Tailscale endpoint 与 Direct，不改变系统连接状态，也不执行正式模式。
+    func prepareTailscaleLogin(
+        lineID: String,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) {
+        guard canStartTailscaleSetup(lineID: lineID),
+              let tailscaleSetupRuntime,
+              let line = profile.lines.first(where: {
+                  $0.id == lineID && $0.type == "tailscale"
+              }) else {
+            completion(.failure(TunnelRuntimeError.unavailable))
+            return
+        }
+        guard save() else {
+            completion(.failure(NSError(
+                domain: "XDial",
+                code: -40,
+                userInfo: [NSLocalizedDescriptionKey: tr(
+                    "保存线路失败，未启动 Tailscale 设置。",
+                    "Tailscale setup was not started because the line could not be saved."
+                )]
+            )))
+            return
+        }
+        tailscaleSetupLineID = lineID
+        tailscaleSetupGeneration &+= 1
+        let generation = tailscaleSetupGeneration
+        persistence.defaults.set(lineID, forKey: persistence.tailscaleSetupLineKey)
+        persistence.defaults.synchronize()
+
+        // 正式隧道已经稳定运行且没有生成目标 lineID 时，两者使用不同的 state
+        // directory，可以并存；离线设置才需要先取得系统按需接管的暂停租约。
+        tailscaleSetupOwnsOnDemandSuspension = !hasFormalTunnel
+        let startRuntime = { [weak self] in
+            guard let self,
+                  self.tailscaleSetupGeneration == generation,
+                  self.tailscaleSetupLineID == lineID else {
+                completion(.failure(CancellationError()))
+                return
+            }
+            tailscaleSetupRuntime.start(
+                profileJSON: self.buildProfileJSON(),
+                lineID: line.id
+            ) { [weak self] result in
+                guard let self else { return }
+                guard self.tailscaleSetupGeneration == generation,
+                      self.tailscaleSetupLineID == lineID else {
+                    completion(.failure(CancellationError()))
+                    return
+                }
+                switch result {
+                case .success(let status):
+                    if self.applyTailscaleRuntimeStatus(
+                        lineID: lineID,
+                        status: status
+                    ) {
+                        completion(.success(()))
+                    } else {
+                        let error = NSError(
+                            domain: "XDial",
+                            code: -42,
+                            userInfo: [NSLocalizedDescriptionKey: self.tr(
+                                "Tailscale 登录状态无法保存。",
+                                "The Tailscale sign-in state could not be saved."
+                            )]
+                        )
+                        self.engine.lastError = error.localizedDescription
+                        self.finishTailscaleSetup {
+                            completion(.failure(error))
+                        }
+                    }
+                case .failure(let error):
+                    self.engine.lastError = error.localizedDescription
+                    self.finishTailscaleSetup {
+                        completion(.failure(error))
+                    }
+                }
+            }
+        }
+        if tailscaleSetupOwnsOnDemandSuspension, let tunnelManager {
+            tailscaleSetupSuspensionPending = true
+            tunnelManager.setSystemOnDemandSuspendedForSetup(true) {
+                self.tailscaleSetupSuspensionPending = false
+                guard self.tailscaleSetupGeneration == generation,
+                      self.tailscaleSetupLineID == lineID else {
+                    if self.isStoppingTailscaleSetup {
+                        self.completeTailscaleSetupStop()
+                    }
+                    completion(.failure(CancellationError()))
+                    return
+                }
+                startRuntime()
+            }
+        } else {
+            startRuntime()
+        }
+    }
+
+    func finishTailscaleSetup(completion: (() -> Void)? = nil) {
+        if let completion {
+            tailscaleSetupFinishCompletions.append(completion)
+        }
+        guard !isStoppingTailscaleSetup else { return }
+        guard tailscaleSetupLineID != nil else {
+            completeTailscaleSetupFinish()
+            return
+        }
+        isStoppingTailscaleSetup = true
+        tailscaleSetupGeneration &+= 1
+        // 暂停租约尚未确认时不能立刻恢复，否则两次 saveToPreferences 会倒序。
+        guard !tailscaleSetupSuspensionPending else { return }
+        guard let tailscaleSetupRuntime else {
+            completeTailscaleSetupStop()
+            return
+        }
+        tailscaleSetupRuntime.stop { [weak self] in
+            self?.completeTailscaleSetupStop()
+        }
+    }
+
+    private func completeTailscaleSetupStop() {
+        tailscaleSetupLineID = nil
+        persistence.defaults.removeObject(forKey: persistence.tailscaleSetupLineKey)
+        persistence.defaults.synchronize()
+        updatePendingRuntimeChanges()
+        let shouldResumeOnDemand = tailscaleSetupOwnsOnDemandSuspension
+        tailscaleSetupOwnsOnDemandSuspension = false
+        let finish = { [weak self] in
+            guard let self else { return }
+            self.isStoppingTailscaleSetup = false
+            self.completeTailscaleSetupFinish()
+        }
+        if shouldResumeOnDemand, let tunnelManager {
+            tunnelManager.setSystemOnDemandSuspendedForSetup(false) {
+                finish()
+            }
+        } else {
+            finish()
+        }
+    }
+
+    private func completeTailscaleSetupFinish() {
+        let completions = tailscaleSetupFinishCompletions
+        tailscaleSetupFinishCompletions.removeAll()
+        completions.forEach { $0() }
+    }
+
+    static func validTailscaleAuthURL(_ rawValue: String) -> URL? {
+        guard let components = URLComponents(string: rawValue),
+              components.scheme?.lowercased() == "https",
+              let host = components.host, !host.isEmpty else { return nil }
+        return components.url
+    }
+
+    func canStartTailscaleSetup(lineID: String) -> Bool {
+        guard !isBusy,
+              tailscaleSetupLineID == nil,
+              tailscaleSetupRuntime?.isActive != true,
+              profile.lines.contains(where: {
+                  $0.id == lineID && $0.type == "tailscale"
+              }) else { return false }
+        if !hasFormalTunnel { return true }
+        return isConnected && !isTailscaleLineGeneratedByFormalTunnel(lineID)
+    }
+
+    func canQueryTailscaleRuntime(lineID: String) -> Bool {
+        if isTailscaleSetupActive && tailscaleSetupLineID == lineID {
+            return true
+        }
+        return hasFormalTunnel && isTailscaleLineGeneratedByFormalTunnel(lineID)
+    }
+
+    func isTailscaleLineGeneratedByFormalTunnel(_ lineID: String) -> Bool {
         guard let runningProfileSnapshot else { return false }
-        // Keep this identical to core/config: every enabled Tailscale line is a
-        // generated global endpoint, even without an explicit mode binding.
         return runningProfileSnapshot.lines.contains {
             $0.id == lineID && $0.enabled && $0.type == "tailscale"
         }
     }
 
-    /// Tailscale 的 LocalAPI 只存在于正在运行的 Packet Tunnel 内。
-    /// 主 App 不自行启动第二份实例，只向当前连接已注册的 endpoint 查询脱敏状态。
+    func isTailscaleLineGeneratedByRunningProfile(_ lineID: String) -> Bool {
+        if isTailscaleSetupActive {
+            return tailscaleSetupLineID == lineID
+        }
+        return isTailscaleLineGeneratedByFormalTunnel(lineID)
+    }
+
     func refreshTailscaleStatus(
         lineID: String,
         completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
     ) {
-        guard canQueryTailscaleRuntime else {
+        guard canQueryTailscaleRuntime(lineID: lineID) else {
             completion(.failure(TunnelRuntimeError.unavailable))
             return
         }
-        guard isTailscaleLineGeneratedByRunningProfile(lineID) else {
-            completion(.failure(TunnelRuntimeError.missingTarget))
+        if tailscaleSetupLineID == lineID, let tailscaleSetupRuntime {
+            tailscaleSetupRuntime.status(lineID: lineID, completion: completion)
             return
         }
         engine.tailscaleStatus(
@@ -1979,21 +2532,124 @@ final class AppState: ObservableObject {
         )
     }
 
+    func beginTailscaleLogin(
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        if tailscaleSetupLineID == lineID,
+           isTailscaleSetupActive,
+           let tailscaleSetupRuntime {
+            tailscaleSetupRuntime.beginLogin(lineID: lineID, completion: completion)
+            return
+        }
+        guard hasFormalTunnel,
+              isTailscaleLineGeneratedByFormalTunnel(lineID) else {
+            completion(.failure(TunnelRuntimeError.unavailable))
+            return
+        }
+        engine.beginTailscaleLogin(
+            endpointTag: Self.tailscaleEndpointTag(lineID: lineID),
+            completion: completion
+        )
+    }
+
+    func logoutTailscale(
+        lineID: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard tailscaleSetupLineID == lineID,
+              isTailscaleSetupActive,
+              let tailscaleSetupRuntime,
+              profile.lines.contains(where: {
+                  $0.id == lineID && $0.type == "tailscale"
+              }),
+              save() else {
+            completion(.failure(TunnelRuntimeError.unavailable))
+            return
+        }
+        tailscaleSetupRuntime.logout(lineID: lineID) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success:
+                guard let index = self.profile.lines.firstIndex(where: {
+                    $0.id == lineID && $0.type == "tailscale"
+                }) else {
+                    completion(.failure(TunnelRuntimeError.missingTarget))
+                    return
+                }
+                self.profile.lines[index].tailscaleAuthenticated = false
+                self.profile.lines[index].tailscaleExitNode = ""
+                self.profile.lines[index].verified = false
+                guard self.save() else {
+                    completion(.failure(NSError(
+                        domain: "XDial",
+                        code: -43,
+                        userInfo: [NSLocalizedDescriptionKey: self.tr(
+                            "已退出 Tailscale，但本地状态无法保存。",
+                            "Tailscale signed out, but the local state could not be saved."
+                        )]
+                    )))
+                    return
+                }
+                completion(.success(()))
+            }
+        }
+    }
+
     /// Exit-node selection is a persisted runtime choice. It may change while
     /// fully connected so the UI can offer an explicit reconnect-to-apply
     /// workflow, but remains locked while the tunnel is starting/stopping or
     /// waiting for first-time Tailscale sign-in.
     @discardableResult
     func updateTailscaleExitSelection(lineID: String, selected: String) -> Bool {
+        let isSetupTarget = isTailscaleSetupActive && tailscaleSetupLineID == lineID
         guard !isBusy,
-              !hasActiveTunnel || isConnected,
+              isSetupTarget || (!hasActiveTunnel || isConnected),
               let index = profile.lines.firstIndex(where: {
-                  $0.id == lineID && $0.enabled && $0.type == "tailscale"
-              }) else { return false }
+                  $0.id == lineID && $0.type == "tailscale"
+              }),
+              profile.lines[index].enabled || isSetupTarget else { return false }
         guard profile.lines[index].tailscaleExitNode != selected else { return true }
+        // 旧版本只用 verified 记录“这条线路曾成功登录并跑通”。首次升级后修改
+        // 出口节点会清除数据面验收结果，但不能同时丢掉已经完成的登录事实。
+        if profile.lines[index].verified && !profile.lines[index].tailscaleAuthenticated {
+            profile.lines[index].tailscaleAuthenticated = true
+        }
         profile.lines[index].tailscaleExitNode = selected
         profile.lines[index].verified = false
         return save()
+    }
+
+    @discardableResult
+    func updateTailscaleAuthentication(lineID: String, authenticated: Bool) -> Bool {
+        guard let index = profile.lines.firstIndex(where: {
+            $0.id == lineID && $0.type == "tailscale"
+        }) else { return false }
+        guard profile.lines[index].tailscaleAuthenticated != authenticated else {
+            return true
+        }
+        profile.lines[index].tailscaleAuthenticated = authenticated
+        return save()
+    }
+
+    @discardableResult
+    func applyTailscaleRuntimeStatus(
+        lineID: String,
+        status: TailscaleRuntimeStatus
+    ) -> Bool {
+        let normalized = status.backendState.lowercased()
+        if normalized == "running" {
+            return updateTailscaleAuthentication(lineID: lineID, authenticated: true)
+        }
+        if normalized == "needslogin"
+            || normalized == "needs_login"
+            || normalized == "needsmachineauth"
+            || normalized == "needs_machine_auth" {
+            return updateTailscaleAuthentication(lineID: lineID, authenticated: false)
+        }
+        return true
     }
 
     func deleteSubscription(_ id: String) {

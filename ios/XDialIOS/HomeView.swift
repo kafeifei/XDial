@@ -2,7 +2,12 @@ import SwiftUI
 
 struct HomeView: View {
     @EnvironmentObject private var app: AppState
+    @Environment(\.openURL) private var openURL
+    @Binding var selectedTab: MobileTab
     @State private var showingModes = false
+    @State private var showingConfigurationIssues = false
+    @State private var tailscaleLoginLineID: String?
+    @State private var tailscaleLoginError: String?
 
     var body: some View {
         NavigationStack {
@@ -11,6 +16,10 @@ struct HomeView: View {
                     statusHero
                     powerButton
                     modeCard
+
+                    if app.requiresUserAction {
+                        tailscaleSignInCard
+                    }
 
                     if app.hasPendingRuntimeChanges {
                         PendingRuntimeChangesBanner()
@@ -51,7 +60,7 @@ struct HomeView: View {
             Text(app.activeMode?.name ?? app.tr("未选择模式", "No mode selected"))
                 .foregroundStyle(.secondary)
 
-            if app.hasActiveTunnel, let connectedAt = app.engine.connectedAt {
+            if app.hasFormalTunnel, let connectedAt = app.engine.connectedAt {
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     Text(formatDuration(context.date.timeIntervalSince(connectedAt)))
                         .font(.system(.subheadline, design: .monospaced))
@@ -65,7 +74,15 @@ struct HomeView: View {
 
     private var powerButton: some View {
         Button {
-            app.hasActiveTunnel ? app.disconnect() : app.connect()
+            if app.hasFormalTunnel {
+                app.disconnect()
+            } else if app.tailscaleSetupLineID != nil {
+                app.finishTailscaleSetup()
+            } else if app.canConnect {
+                app.connect()
+            } else {
+                showingConfigurationIssues = true
+            }
         } label: {
             Image(systemName: app.hasActiveTunnel ? "stop.fill" : "power")
                 .font(.system(size: 38, weight: .semibold))
@@ -75,9 +92,28 @@ struct HomeView: View {
                 .clipShape(Circle())
                 .shadow(color: (app.hasActiveTunnel ? Color.red : Color.accentColor).opacity(0.28), radius: 16, y: 8)
         }
-        .disabled(app.isBusy || (!app.hasActiveTunnel && !app.canConnect))
+        .disabled(app.isBusy)
+        .alert(
+            app.tr("连接前请先补齐线路", "Complete Line Setup Before Connecting"),
+            isPresented: $showingConfigurationIssues
+        ) {
+            Button(app.tr("前往配置", "Open Configuration")) {
+                selectedTab = .configuration
+            }
+            Button(app.tr("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(app.activeConfigurationIssues.joined(separator: app.tr("；", "; ")))
+        }
         .opacity(app.isBusy || (!app.hasActiveTunnel && !app.canConnect) ? 0.45 : 1)
-        .accessibilityLabel(app.hasActiveTunnel ? app.tr("断开", "Disconnect") : app.tr("连接", "Connect"))
+        .accessibilityLabel(
+            app.tailscaleSetupLineID != nil
+                && !app.hasFormalTunnel
+                    ? app.tr("取消 Tailscale 设置", "Cancel Tailscale Setup")
+                    : (app.hasFormalTunnel
+                        ? app.tr("断开", "Disconnect")
+                        : app.tr("连接", "Connect"))
+        )
+        .accessibilityIdentifier("connection-toggle")
     }
 
     private var modeCard: some View {
@@ -108,9 +144,104 @@ struct HomeView: View {
         .disabled(app.hasActiveTunnel || app.isBusy)
     }
 
+    private var tailscaleSignInCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(
+                app.tr("需要登录 Tailscale", "Tailscale Sign-in Required"),
+                systemImage: "person.crop.circle.badge.exclamationmark"
+            )
+            .font(.headline)
+            .foregroundStyle(.orange)
+
+            Text(app.tr(
+                "这是 XDial 内置线路的独立授权，与手机上的 Tailscale App 登录状态不共享。完成一次授权后，XDial 会自动继续连接验收。",
+                "This authorizes XDial's built-in route separately from the Tailscale app. After the one-time sign-in, XDial automatically resumes connection checks."
+            ))
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+
+            ForEach(app.tailscaleAuthRequests) { request in
+                Button {
+                    startTailscaleLogin(request)
+                } label: {
+                    if tailscaleLoginLineID == request.lineID {
+                        HStack {
+                            ProgressView()
+                            Text(app.tr("正在准备登录…", "Preparing sign-in…"))
+                        }
+                        .frame(maxWidth: .infinity)
+                    } else {
+                        Label(
+                            app.tailscaleAuthRequests.count == 1
+                                ? app.tr("登录 Tailscale", "Sign In to Tailscale")
+                                : app.tr("登录 \(request.lineName)", "Sign In to \(request.lineName)"),
+                            systemImage: "safari"
+                        )
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(tailscaleLoginLineID != nil)
+            }
+
+            if let tailscaleLoginError {
+                Label(tailscaleLoginError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding()
+        .background(Color.orange.opacity(0.1))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    private func startTailscaleLogin(_ request: TailscaleAuthRequest) {
+        guard tailscaleLoginLineID == nil else { return }
+        tailscaleLoginLineID = request.lineID
+        tailscaleLoginError = nil
+        app.beginTailscaleLogin(lineID: request.lineID) { result in
+            Task { @MainActor in
+                tailscaleLoginLineID = nil
+                switch result {
+                case .success(let status):
+                    let backendState = status.backendState.lowercased()
+                    guard app.applyTailscaleRuntimeStatus(
+                        lineID: request.lineID,
+                        status: status
+                    ) else {
+                        tailscaleLoginError = app.tr(
+                            "Tailscale 登录状态无法保存。",
+                            "The Tailscale sign-in state could not be saved."
+                        )
+                        return
+                    }
+                    if backendState == "running" {
+                        return
+                    }
+                    guard let url = AppState.validTailscaleAuthURL(status.authURL) else {
+                        tailscaleLoginError = app.tr(
+                            "没有取得有效的登录入口，请重试。",
+                            "No valid sign-in link was returned. Please retry."
+                        )
+                        return
+                    }
+                    openURL(url)
+                case .failure(let error):
+                    tailscaleLoginError = userFacingConnectionText(error.localizedDescription)
+                }
+            }
+        }
+    }
+
     private var activeLinesCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(app.tr("本模式活动出口", "Active routes in this mode"))
+            Text(
+                app.isConnected
+                    ? app.tr("本模式活动出口", "Active routes in this mode")
+                    : app.tr("连接后使用的出口", "Routes used after connecting")
+            )
                 .font(.headline)
 
             if activeTargets.isEmpty {
@@ -133,8 +264,8 @@ struct HomeView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
+                        Image(systemName: app.isConnected ? "checkmark.circle.fill" : "circle.dashed")
+                            .foregroundStyle(app.isConnected ? Color.green : Color.secondary)
                     }
                 }
             }
@@ -165,6 +296,7 @@ struct HomeView: View {
     }
 
     private var statusIcon: String {
+        if app.tailscaleSetupLineID != nil { return "gearshape.2.fill" }
         if app.isConnected { return "checkmark.shield.fill" }
         if app.requiresUserAction { return "person.crop.circle.badge.exclamationmark" }
         if app.isBusy { return "arrow.triangle.2.circlepath" }
@@ -172,6 +304,7 @@ struct HomeView: View {
     }
 
     private var statusColor: Color {
+        if app.tailscaleSetupLineID != nil { return .orange }
         if app.isConnected { return .green }
         if app.requiresUserAction { return .orange }
         if app.isBusy { return .orange }

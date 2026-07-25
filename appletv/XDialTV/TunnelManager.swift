@@ -898,7 +898,9 @@ final class TunnelManager: ObservableObject, TunnelManaging {
     private var activeStartAttemptID: String?
     private(set) var activeAcceptancePlan: TunnelAcceptancePlan?
     private var systemOnDemandRequested = false
+    private var systemOnDemandSuspendedForSetup = false
     private var pendingOnDemandEnvelope: OnDemandStartEnvelope?
+    private var activeStartAllowsSystemOnDemand = true
     private var startWatchdogTask: Task<Void, Never>?
 
     init(engine: GoEngine? = nil) {
@@ -960,6 +962,9 @@ final class TunnelManager: ObservableObject, TunnelManaging {
                 self.systemOnDemandState = self.systemOnDemandActive
                     ? .active
                     : (self.systemOnDemandRequested ? .pending : .disabled)
+                self.restoreAcceptancePlanFromSystemProfileIfNeeded(
+                    mine?.protocolConfiguration as? NETunnelProviderProtocol
+                )
                 let hasSecureEnvelope = self.restoreAcceptancePlanFromSecureEnvelopeIfNeeded()
                 appLog("TunnelManager.load: found \((managers ?? []).count) managers, mine=\(mine != nil)")
                 self.injectSession()
@@ -1021,6 +1026,10 @@ final class TunnelManager: ObservableObject, TunnelManaging {
     func setSystemOnDemandEnabled(_ enabled: Bool) {
         systemOnDemandRequested = enabled
         if enabled {
+            guard !systemOnDemandSuspendedForSetup else {
+                systemOnDemandState = .pending
+                return
+            }
             if !systemOnDemandActive {
                 systemOnDemandState = .pending
             }
@@ -1031,10 +1040,45 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         }
     }
 
+    func setSystemOnDemandSuspendedForSetup(
+        _ suspended: Bool,
+        completion: @escaping () -> Void
+    ) {
+        systemOnDemandSuspendedForSetup = suspended
+        if suspended {
+            // 这是临时租约，不得清掉通过数据面验收后保存的安全启动包。
+            let completionBox = UncheckedBox(value: completion)
+            suspendSystemOnDemand(clearEnvelope: false) {
+                completionBox.value()
+            }
+        } else {
+            armSystemOnDemandIfReady()
+            completion()
+        }
+    }
+
     static func makeSystemOnDemandRules() -> [NEOnDemandRule] {
         let connect = NEOnDemandRuleConnect()
         connect.interfaceTypeMatch = .any
         return [connect]
+    }
+
+    @discardableResult
+    func restoreAcceptancePlanFromSystemProfileIfNeeded(
+        _ providerProtocol: NETunnelProviderProtocol?
+    ) -> Bool {
+        if activeAcceptancePlan != nil {
+            return true
+        }
+        guard let rawPlan = providerProtocol?.providerConfiguration?[
+            Self.acceptancePlanProviderConfigurationKey
+        ] as? String,
+              let data = rawPlan.data(using: .utf8),
+              let plan = try? JSONDecoder().decode(TunnelAcceptancePlan.self, from: data) else {
+            return false
+        }
+        activeAcceptancePlan = plan
+        return true
     }
 
     @discardableResult
@@ -1054,6 +1098,8 @@ final class TunnelManager: ObservableObject, TunnelManaging {
     }
 
     private func armSystemOnDemandIfReady() {
+        guard activeStartAllowsSystemOnDemand,
+              !systemOnDemandSuspendedForSetup else { return }
         let envelope: OnDemandStartEnvelope?
         if let pendingOnDemandEnvelope {
             envelope = pendingOnDemandEnvelope
@@ -1133,6 +1179,23 @@ final class TunnelManager: ObservableObject, TunnelManaging {
 
     // MARK: - Configure & Save
 
+    private static let acceptancePlanProviderConfigurationKey = "acceptancePlan"
+
+    static func systemProviderConfiguration(
+        acceptancePlan: TunnelAcceptancePlan?
+    ) -> [String: Any] {
+        var configuration: [String: Any] = [
+            "appGroup": kAppGroupIdentifier,
+            "schemaVersion": 1,
+        ]
+        if let acceptancePlan,
+           let data = try? JSONEncoder().encode(acceptancePlan),
+           let rawPlan = String(data: data, encoding: .utf8) {
+            configuration[acceptancePlanProviderConfigurationKey] = rawPlan
+        }
+        return configuration
+    }
+
     /// 确保系统里有一份「与 profile 对应」的隧道配置:
     /// 已有则更新其 protocolConfiguration,没有则新建一个 manager,然后 saveToPreferences。
     /// serverAddress 从 profile 的活动线路默认出口推导(仅用于系统 UI 展示,真实拨号参数
@@ -1159,10 +1222,9 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         // TODO: 无法离线验证,真机联调时需要重点检查这里的实际行为。
         // providerConfiguration 有大小与类型限制(只接受 plist 可序列化类型),
         // 且系统对其可见，不应放密码等敏感数据（敏感启动参数只走 start options）。
-        proto.providerConfiguration = [
-            "appGroup": kAppGroupIdentifier,
-            "schemaVersion": 1,
-        ]
+        proto.providerConfiguration = Self.systemProviderConfiguration(
+            acceptancePlan: activeAcceptancePlan
+        )
 
         mgr.protocolConfiguration = proto
         mgr.localizedDescription = kTunnelLocalizedDescription
@@ -1433,6 +1495,8 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         var enteredActionRequired = false
         var transientPolls = 0
         var consecutiveStatusFailures = 0
+        var lastStatusObservations: [String: String] = [:]
+        var loginRequests: Set<String> = []
         while !Task.isCancelled {
             guard dataPathProbeID == probeID,
                   let connection,
@@ -1448,20 +1512,46 @@ final class TunnelManager: ObservableObject, TunnelManaging {
             for tag in tags {
                 let result = await requestTailscaleRuntimeStatus(endpointTag: tag)
                 switch result {
-                case .failure:
+                case .failure(let message):
                     allRunning = false
                     sawTransient = true
                     statusRequestFailed = true
+                    lastStatusObservations[tag] = "读取失败：\(message)"
                 case .cancelled:
                     return .failed("Tailscale 登录等待已取消")
                 case .success(let status):
+                    lastStatusObservations[tag] = status.backendState.isEmpty
+                        ? "空状态"
+                        : status.backendState
                     switch status.backendState.lowercased() {
                     case "running":
                         continue
-                    case "needslogin", "needs_login":
+                    case "needslogin", "needs_login",
+                         "needsmachineauth", "needs_machine_auth":
                         allRunning = false
                         if Self.isValidTailscaleAuthURL(status.authURL) {
                             needsLogin = true
+                        } else if loginRequests.insert(tag).inserted {
+                            let loginResult = await requestTailscaleRuntimeStatus(
+                                command: "tailscale-begin-login",
+                                endpointTag: tag
+                            )
+                            switch loginResult {
+                            case .failure(let message):
+                                lastStatusObservations[tag] = "登录初始化失败：\(message)"
+                                sawTransient = true
+                            case .cancelled:
+                                return .failed("Tailscale 登录等待已取消")
+                            case .success(let loginStatus):
+                                lastStatusObservations[tag] = loginStatus.backendState.isEmpty
+                                    ? "空状态"
+                                    : loginStatus.backendState
+                                if Self.isValidTailscaleAuthURL(loginStatus.authURL) {
+                                    needsLogin = true
+                                } else {
+                                    sawTransient = true
+                                }
+                            }
                         } else {
                             sawTransient = true
                         }
@@ -1517,7 +1607,13 @@ final class TunnelManager: ObservableObject, TunnelManaging {
             if sawTransient {
                 transientPolls += 1
                 if !enteredActionRequired && transientPolls >= 30 {
-                    return .failed("Tailscale 未能进入可登录或已运行状态")
+                    let observations = lastStatusObservations
+                        .sorted { $0.key < $1.key }
+                        .map { "\($0.key)=\($0.value)" }
+                        .joined(separator: "；")
+                    let detail = observations.isEmpty ? "没有状态响应" : observations
+                    engine?.dataPathSummary = "Tailscale 启动状态：\(detail)"
+                    return .failed("Tailscale 未能进入可登录或已运行状态（\(detail)）")
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 continue
@@ -1534,11 +1630,12 @@ final class TunnelManager: ObservableObject, TunnelManaging {
     }
 
     private func requestTailscaleRuntimeStatus(
+        command: String = "tailscale-status",
         endpointTag: String
     ) async -> TailscaleStatusFetchResult {
         guard let session = providerSession,
               let request = try? JSONSerialization.data(withJSONObject: [
-                  "cmd": "tailscale-status",
+                  "cmd": command,
                   "endpoint_tag": endpointTag,
               ]) else {
             return .failure("Tailscale 状态接口不可用")
@@ -1847,8 +1944,10 @@ final class TunnelManager: ObservableObject, TunnelManaging {
     // startVPNTunnel() 需要 saveToPreferences 已成功且 NE entitlement 就绪,
     // 否则会抛 NEVPNError;这里只做结构正确性保证,运行时行为等真机验证。
     func startTunnel(profile: Profile, anyConnect: AnyConnectCredentials?,
+                      allowSystemOnDemand: Bool,
                       completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
         let operationID = beginStartOperation(completion: completion)
+        activeStartAllowsSystemOnDemand = allowSystemOnDemand
         guard isCurrentStartOperation(operationID) else { return }
         guard UserDefaults(suiteName: kAppGroupIdentifier) != nil else {
             finishStartOperation(operationID, result: .failure(NSError(domain: "XDial", code: -2,
@@ -1917,7 +2016,8 @@ final class TunnelManager: ObservableObject, TunnelManaging {
                         operationID: operationID,
                         configJSON: configJSON,
                         allowInsecure: allowInsecure,
-                        anyConnect: anyConnect
+                        anyConnect: anyConnect,
+                        allowSystemOnDemand: allowSystemOnDemand
                     )
                 }
             }
@@ -1928,7 +2028,36 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         operationID: UUID,
         configJSON: String,
         allowInsecure: Bool,
-        anyConnect: AnyConnectCredentials?
+        anyConnect: AnyConnectCredentials?,
+        allowSystemOnDemand: Bool
+    ) {
+        if !allowSystemOnDemand {
+            suspendSystemOnDemand(clearEnvelope: true) { [weak self] in
+                self?.startPreparedTunnelAfterOnDemandSuspended(
+                    operationID: operationID,
+                    configJSON: configJSON,
+                    allowInsecure: allowInsecure,
+                    anyConnect: anyConnect,
+                    allowSystemOnDemand: false
+                )
+            }
+            return
+        }
+        startPreparedTunnelAfterOnDemandSuspended(
+            operationID: operationID,
+            configJSON: configJSON,
+            allowInsecure: allowInsecure,
+            anyConnect: anyConnect,
+            allowSystemOnDemand: true
+        )
+    }
+
+    private func startPreparedTunnelAfterOnDemandSuspended(
+        operationID: UUID,
+        configJSON: String,
+        allowInsecure: Bool,
+        anyConnect: AnyConnectCredentials?,
+        allowSystemOnDemand: Bool
     ) {
         guard isCurrentStartOperation(operationID) else { return }
         guard UserDefaults(suiteName: kAppGroupIdentifier) != nil else {
@@ -1940,7 +2069,8 @@ final class TunnelManager: ObservableObject, TunnelManaging {
 
         clearLegacyStartOptions()
         _ = OnDemandStartEnvelopeStore.clear()
-        if let activeAcceptancePlan,
+        if allowSystemOnDemand,
+           let activeAcceptancePlan,
            let planData = try? JSONEncoder().encode(activeAcceptancePlan),
            let planJSON = String(data: planData, encoding: .utf8) {
             var parameters = [

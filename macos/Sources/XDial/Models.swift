@@ -29,6 +29,7 @@ struct Line: Codable, Identifiable, Hashable {
     var tailscaleHostname: String = ""
     var tailscaleAcceptRoutes: Bool = true
     var tailscaleExitNode: String = ""
+    var tailscaleAuthenticated: Bool = false
 
     // 跳过 TLS 证书验证（自签场景显式开启）。默认 false=验证证书。
     var allowInsecure: Bool = false
@@ -54,6 +55,7 @@ struct Line: Codable, Identifiable, Hashable {
         case tailscaleHostname = "tailscale_hostname"
         case tailscaleAcceptRoutes = "tailscale_accept_routes"
         case tailscaleExitNode = "tailscale_exit_node"
+        case tailscaleAuthenticated = "tailscale_authenticated"
     }
 
     init(id: String, name: String, type: String, enabled: Bool = true, verified: Bool = false,
@@ -62,6 +64,7 @@ struct Line: Codable, Identifiable, Hashable {
          ssServer: String = "", ssPort: Int = 8388, ssMethod: String = "aes-256-gcm", ssPassword: String = "",
          vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0,
          tailscaleHostname: String = "", tailscaleAcceptRoutes: Bool = true, tailscaleExitNode: String = "",
+         tailscaleAuthenticated: Bool = false,
          allowInsecure: Bool = false) {
         self.id = id; self.name = name; self.type = type; self.enabled = enabled; self.verified = verified
         self.vpnServer = vpnServer; self.vpnUsername = vpnUsername; self.vpnPassword = vpnPassword
@@ -71,6 +74,7 @@ struct Line: Codable, Identifiable, Hashable {
         self.tailscaleHostname = tailscaleHostname
         self.tailscaleAcceptRoutes = tailscaleAcceptRoutes
         self.tailscaleExitNode = tailscaleExitNode
+        self.tailscaleAuthenticated = tailscaleAuthenticated
         self.allowInsecure = allowInsecure
     }
 
@@ -99,6 +103,10 @@ struct Line: Codable, Identifiable, Hashable {
         tailscaleHostname = try c.decodeIfPresent(String.self, forKey: .tailscaleHostname) ?? ""
         tailscaleAcceptRoutes = try c.decodeIfPresent(Bool.self, forKey: .tailscaleAcceptRoutes) ?? true
         tailscaleExitNode = try c.decodeIfPresent(String.self, forKey: .tailscaleExitNode) ?? ""
+        tailscaleAuthenticated = try c.decodeIfPresent(
+            Bool.self,
+            forKey: .tailscaleAuthenticated
+        ) ?? false
         allowInsecure = try c.decodeIfPresent(Bool.self, forKey: .allowInsecure) ?? false
     }
 }
