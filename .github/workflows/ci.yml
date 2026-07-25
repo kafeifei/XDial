@@ -26,6 +26,11 @@ jobs:
         run: go vet ./...
       - name: go build
         run: go build ./...
+      - name: install sing-box test validator
+        run: |
+          version=$(go list -m -f '{{.Version}}' github.com/sagernet/sing-box)
+          go install -tags with_gvisor,with_clash_api,with_tailscale \
+            "github.com/sagernet/sing-box/cmd/sing-box@${version}"
       - name: go test
         run: go test -tags with_gvisor ./core/... -count=1 -timeout 10m
 
