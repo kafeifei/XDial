@@ -285,6 +285,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
             // 7) 拨号 + 启动 sing-box。StartResolved 是阻塞调用，socket 直拨
             //    remoteIPv4；TLS/HTTP 身份仍使用 bundle.server 的原始域名。
             self.recordDiagnostic("engine_starting")
+            let engineBox = UncheckedSendableBox(lb)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.isAttemptStarting(generation) else { return }
+                let stage = engineBox.value.startupStage()
+                guard !stage.isEmpty, self.isAttemptStarting(generation) else { return }
+                self.recordDiagnostic(stage)
+            }
             self.engineOperationQueue.async {
                 dispatchPrecondition(condition: .onQueue(self.engineOperationQueue))
                 guard self.isAttemptStarting(generation) else { return }
@@ -372,6 +379,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                 }
                 engine.setTunFD(fd)
                 self.recordDiagnostic("tun_ready")
+                self.recordDiagnostic("engine_starting")
+                let engineBox = UncheckedSendableBox(engine)
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { [weak self] in
+                    guard let self, self.isAttemptStarting(generation) else { return }
+                    let stage = engineBox.value.startupStage()
+                    guard !stage.isEmpty, self.isAttemptStarting(generation) else { return }
+                    self.recordDiagnostic(stage)
+                }
                 self.engineOperationQueue.async {
                     dispatchPrecondition(condition: .onQueue(self.engineOperationQueue))
                     guard self.isAttemptStarting(generation) else { return }
@@ -892,6 +907,30 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                     completion.value(self.encodeResponse(ok: true, dataString: rawStatus))
                 } catch {
                     completion.value(self.encodeResponse(ok: false, message: "无法读取 Tailscale 状态"))
+                }
+            }
+
+        case "tailscale-begin-login":
+            guard let endpointTag = obj["endpoint_tag"] as? String, !endpointTag.isEmpty else {
+                completion.value(encodeResponse(ok: false, message: "Tailscale 登录参数不完整"))
+                return
+            }
+            engineOperationQueue.async { [weak self] in
+                guard let self, let engine = self.currentEngine() else {
+                    completion.value(self?.encodeResponse(ok: false, message: "连接引擎未运行"))
+                    return
+                }
+                do {
+                    var loginError: NSError?
+                    let rawStatus = engine.beginTailscaleLogin(endpointTag, error: &loginError)
+                    if let loginError { throw loginError }
+                    guard !rawStatus.isEmpty else {
+                        completion.value(self.encodeResponse(ok: false, message: "Tailscale 登录状态为空"))
+                        return
+                    }
+                    completion.value(self.encodeResponse(ok: true, dataString: rawStatus))
+                } catch {
+                    completion.value(self.encodeResponse(ok: false, message: "无法启动 Tailscale 登录"))
                 }
             }
 

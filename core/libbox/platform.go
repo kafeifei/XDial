@@ -3,8 +3,8 @@
 package libbox
 
 import (
-	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -155,19 +155,13 @@ func (p *xdPlatformInterface) CreateDefaultInterfaceMonitor(logger logger.Logger
 func (p *xdPlatformInterface) UsePlatformNetworkInterfaces() bool { return true }
 
 func (p *xdPlatformInterface) NetworkInterfaces() ([]adapter.NetworkInterface, error) {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
+	p.mu.Lock()
+	defaultInterface := cloneInterface(p.defaultInterface)
+	p.mu.Unlock()
+	if defaultInterface == nil || isTunnelInterfaceName(defaultInterface.Name) {
+		return nil, nil
 	}
-	result := make([]adapter.NetworkInterface, 0, len(interfaces))
-	for _, netInterface := range interfaces {
-		controlInterface, interfaceErr := control.InterfaceFromNet(netInterface)
-		if interfaceErr != nil {
-			continue
-		}
-		result = append(result, adapter.NetworkInterface{Interface: controlInterface})
-	}
-	return result, nil
+	return []adapter.NetworkInterface{{Interface: *defaultInterface}}, nil
 }
 
 func (p *xdPlatformInterface) NetworkExtensionIncludeAllNetworks() bool { return false }
@@ -271,7 +265,7 @@ func (m *platformInterfaceMonitor) notify(defaultInterface *control.Interface) {
 
 func (p *xdPlatformInterface) setDefaultInterface(name string, index int) {
 	var updated *control.Interface
-	if name != "" && index > 0 {
+	if name != "" && index > 0 && !isTunnelInterfaceName(name) {
 		updated = &control.Interface{Name: name, Index: index}
 	}
 	p.mu.Lock()
@@ -293,6 +287,13 @@ func (p *xdPlatformInterface) setDefaultInterface(name string, index int) {
 	if monitor != nil {
 		monitor.notify(cloneInterface(updated))
 	}
+}
+
+func isTunnelInterfaceName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.HasPrefix(name, "utun") ||
+		strings.HasPrefix(name, "ipsec") ||
+		strings.HasPrefix(name, "ppp")
 }
 
 func cloneInterface(value *control.Interface) *control.Interface {

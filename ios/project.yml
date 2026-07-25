@@ -69,7 +69,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ios.tunnel
         MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "9"
+        CURRENT_PROJECT_VERSION: "11"
         APPLICATION_EXTENSION_API_ONLY: true
         SKIP_INSTALL: true
         TARGETED_DEVICE_FAMILY: "1"
@@ -105,7 +105,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ios
         PRODUCT_NAME: XDial
         MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "9"
+        CURRENT_PROJECT_VERSION: "11"
         GENERATE_INFOPLIST_FILE: true
         INFOPLIST_KEY_CFBundleDisplayName: XDial
         INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: false

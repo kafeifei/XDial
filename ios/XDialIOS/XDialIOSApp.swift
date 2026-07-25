@@ -9,8 +9,16 @@ struct XDialIOSApp: App {
     }
 }
 
+enum MobileTab: Hashable {
+    case home
+    case modes
+    case configuration
+    case settings
+}
+
 struct MobileRootView: View {
     @StateObject private var app: AppState
+    @State private var selectedTab: MobileTab = .home
 
     init() {
         #if targetEnvironment(simulator)
@@ -22,28 +30,41 @@ struct MobileRootView: View {
         let isUITesting = shouldResetUITesting || arguments.contains("-XDialUITesting")
         let persistence: AppPersistenceContext = isUITesting ? .uiTesting : .production
         if shouldResetUITesting { _ = persistence.clearForTesting() }
-        let state = AppState(engine: engine, tunnelManager: manager, persistence: persistence)
+        let state = AppState(
+            engine: engine,
+            tunnelManager: manager,
+            tailscaleSetupRuntime: FakeTailscaleSetupRuntime(),
+            persistence: persistence
+        )
         _app = StateObject(wrappedValue: state)
         #else
         let engine = GoEngine.shared
         let manager = TunnelManager(engine: engine)
-        _app = StateObject(wrappedValue: AppState(engine: engine, tunnelManager: manager))
+        _app = StateObject(wrappedValue: AppState(
+            engine: engine,
+            tunnelManager: manager,
+            tailscaleSetupRuntime: LocalTailscaleSetupRuntime()
+        ))
         #endif
     }
 
     var body: some View {
-        TabView {
-            HomeView()
+        TabView(selection: $selectedTab) {
+            HomeView(selectedTab: $selectedTab)
                 .tabItem { Label(app.tr("首页", "Home"), systemImage: "power") }
+                .tag(MobileTab.home)
 
             ModesView()
                 .tabItem { Label(app.tr("模式", "Modes"), systemImage: "shuffle") }
+                .tag(MobileTab.modes)
 
             ConfigurationView()
                 .tabItem { Label(app.tr("配置", "Config"), systemImage: "slider.horizontal.3") }
+                .tag(MobileTab.configuration)
 
             MobileSettingsView()
                 .tabItem { Label(app.tr("设置", "Settings"), systemImage: "gearshape") }
+                .tag(MobileTab.settings)
         }
         .environmentObject(app)
         #if targetEnvironment(simulator)

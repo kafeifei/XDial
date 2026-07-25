@@ -18,12 +18,17 @@ import (
 	"context"
 	"crypto/tls"
 	stdjson "encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +43,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/service"
+	"golang.org/x/sys/unix"
 	"sslcon/session"
 
 	"github.com/kafeifei/xdial/core/engine"
@@ -85,6 +91,7 @@ type Libbox struct {
 	cleaning     bool
 	runtimeCtx   context.Context
 	routingProbe *routingProbeTracker
+	stateLocks   []*os.File
 }
 
 func New(cb Callback) *Libbox {
@@ -142,6 +149,37 @@ func (l *Libbox) Status() string {
 		return `{"running":true}`
 	}
 	return `{"running":false}`
+}
+
+// StartupStage captures a process-local goroutine snapshot without taking the
+// Libbox lifecycle mutex. It is intentionally callable while Start is blocked,
+// and returns only a coarse allow-listed stage instead of raw stack content.
+func (l *Libbox) StartupStage() string {
+	buffer := make([]byte, 256*1024)
+	length := runtime.Stack(buffer, true)
+	return startupStageFromStack(string(buffer[:length]))
+}
+
+func startupStageFromStack(stack string) string {
+	stages := []struct {
+		marker string
+		stage  string
+	}{
+		{"protocol/tailscale.(*Endpoint).postStart", "tailscale_backend_starting"},
+		{"protocol/tailscale.(*Endpoint).start", "tailscale_endpoint_starting"},
+		{"tailscale/tsnet.(*Server).start", "tailscale_backend_starting"},
+		{"tailscale/tsnet.(*Server).Start", "tailscale_backend_starting"},
+		{"protocol/tun.(*Inbound).Start", "tun_starting"},
+		{"route.(*NetworkManager).UpdateInterfaces", "interfaces_updating"},
+		{"sing-box.(*Box).start", "singbox_starting"},
+		{"libbox.(*Libbox).start", "engine_starting"},
+	}
+	for _, candidate := range stages {
+		if strings.Contains(stack, candidate.marker) {
+			return candidate.stage
+		}
+	}
+	return "unknown_starting"
 }
 
 // TunnelNameServers 返回当前 AnyConnect 握手下发的 DNS IPv4 地址 JSON 数组。
@@ -468,6 +506,16 @@ func (l *Libbox) StartStandalone(configJSON string) error {
 	if err != nil {
 		return fail(ErrCodeConfig, fmt.Errorf("parse sing-box config: %w", err))
 	}
+	stateLocks, err := acquireTailscaleStateLocks(configJSON)
+	if err != nil {
+		return fail(ErrCodeState, err)
+	}
+	keepStateLocks := false
+	defer func() {
+		if !keepStateLocks {
+			releaseTailscaleStateLocks(stateLocks)
+		}
+	}()
 	instance, err := box.New(box.Options{Options: opts, Context: ctx})
 	if err != nil {
 		return fail(ErrCodeEngine, fmt.Errorf("construct sing-box: %w", err))
@@ -475,6 +523,7 @@ func (l *Libbox) StartStandalone(configJSON string) error {
 	routingProbe := newRoutingProbeTracker()
 	instance.Router().AppendTracker(routingProbe)
 	if err := instance.Start(); err != nil {
+		instance.Close()
 		return fail(ErrCodeEngine, fmt.Errorf("start sing-box: %w", err))
 	}
 
@@ -484,6 +533,8 @@ func (l *Libbox) StartStandalone(configJSON string) error {
 	l.session = nil
 	l.runtimeCtx = ctx
 	l.routingProbe = routingProbe
+	l.stateLocks = stateLocks
+	keepStateLocks = true
 	l.generation++
 	if cb := l.cb; cb != nil {
 		notify = func() {
@@ -533,6 +584,17 @@ func (l *Libbox) start(server, dialAddress, username, password string, allowInse
 	}
 	l.lastError = ""
 	l.dnsJSON = ""
+
+	stateLocks, err := acquireTailscaleStateLocks(configJSON)
+	if err != nil {
+		return fail(ErrCodeState, err)
+	}
+	keepStateLocks := false
+	defer func() {
+		if !keepStateLocks {
+			releaseTailscaleStateLocks(stateLocks)
+		}
+	}()
 
 	vpnInfo, err := l.vpn.Connect(startVPNConfig(server, dialAddress, username, password, allowInsecure))
 	if err != nil {
@@ -592,6 +654,7 @@ func (l *Libbox) start(server, dialAddress, username, password string, allowInse
 	routingProbe := newRoutingProbeTracker()
 	instance.Router().AppendTracker(routingProbe)
 	if err := instance.Start(); err != nil {
+		instance.Close()
 		bridge.Close()
 		l.vpn.Disconnect()
 		return fail(ErrCodeEngine, fmt.Errorf("start sing-box: %w", err))
@@ -603,6 +666,8 @@ func (l *Libbox) start(server, dialAddress, username, password string, allowInse
 	l.session = cSess
 	l.runtimeCtx = ctx
 	l.routingProbe = routingProbe
+	l.stateLocks = stateLocks
+	keepStateLocks = true
 	l.generation++
 	monitoredSession = cSess
 	monitoredGeneration = l.generation
@@ -631,12 +696,12 @@ func (l *Libbox) Stop() error {
 		return nil
 	}
 
-	instance, bridge := l.detachRunningLocked()
+	instance, bridge, stateLocks := l.detachRunningLocked()
 	cb := l.cb
 	l.mu.Unlock()
 	defer l.finishCleaning()
 
-	l.closeDetached(instance, bridge)
+	l.closeDetached(instance, bridge, stateLocks)
 
 	if cb != nil {
 		cb.OnStatusChanged(`{"status":"disconnected"}`)
@@ -656,13 +721,13 @@ func (l *Libbox) monitorSession(generation uint64, cSess *session.ConnSession) {
 		l.mu.Unlock()
 		return
 	}
-	instance, bridge := l.detachRunningLocked()
+	instance, bridge, stateLocks := l.detachRunningLocked()
 	l.lastError = unexpectedSessionCloseError
 	cb := l.cb
 	l.mu.Unlock()
 	defer l.finishCleaning()
 
-	l.closeDetached(instance, bridge)
+	l.closeDetached(instance, bridge, stateLocks)
 
 	// 外部回调不持有内部锁，允许上层同步读取 Diagnostics 或调用 Stop。
 	// cleaning 在回调完成前保持为 true，避免旧连接的回调落到已启动的新连接上。
@@ -674,11 +739,13 @@ func (l *Libbox) monitorSession(generation uint64, cSess *session.ConnSession) {
 
 // detachRunningLocked 在状态锁内一次性切断当前运行代际；实际 Close 放在锁外，
 // 避免关闭 box/session 时反向等待 monitor 而形成锁与 channel 的闭环。
-func (l *Libbox) detachRunningLocked() (*box.Box, *engine.VPNBridge) {
+func (l *Libbox) detachRunningLocked() (*box.Box, *engine.VPNBridge, []*os.File) {
 	instance := l.box
 	bridge := l.bridge
+	stateLocks := l.stateLocks
 	l.box = nil
 	l.bridge = nil
+	l.stateLocks = nil
 	l.session = nil
 	l.runtimeCtx = nil
 	l.routingProbe = nil
@@ -686,10 +753,14 @@ func (l *Libbox) detachRunningLocked() (*box.Box, *engine.VPNBridge) {
 	l.dnsJSON = ""
 	l.generation++
 	l.cleaning = true
-	return instance, bridge
+	return instance, bridge, stateLocks
 }
 
-func (l *Libbox) closeDetached(instance *box.Box, bridge *engine.VPNBridge) {
+func (l *Libbox) closeDetached(
+	instance *box.Box,
+	bridge *engine.VPNBridge,
+	stateLocks []*os.File,
+) {
 	if instance != nil {
 		instance.Close()
 	}
@@ -699,10 +770,79 @@ func (l *Libbox) closeDetached(instance *box.Box, bridge *engine.VPNBridge) {
 	if l.vpn != nil {
 		l.vpn.Disconnect()
 	}
+	releaseTailscaleStateLocks(stateLocks)
 }
 
 func (l *Libbox) finishCleaning() {
 	l.mu.Lock()
 	l.cleaning = false
 	l.mu.Unlock()
+}
+
+var errTailscaleStateInUse = errors.New("Tailscale state is already in use by another XDial session")
+
+type tailscaleStateLockDocument struct {
+	Endpoints []struct {
+		Type           string `json:"type"`
+		StateDirectory string `json:"state_directory"`
+	} `json:"endpoints"`
+}
+
+func acquireTailscaleStateLocks(configJSON string) ([]*os.File, error) {
+	var document tailscaleStateLockDocument
+	if err := stdjson.Unmarshal([]byte(configJSON), &document); err != nil {
+		return nil, fmt.Errorf("inspect Tailscale state configuration: %w", err)
+	}
+
+	lockPaths := make([]string, 0, len(document.Endpoints))
+	seen := make(map[string]struct{}, len(document.Endpoints))
+	for _, endpoint := range document.Endpoints {
+		if endpoint.Type != "tailscale" {
+			continue
+		}
+		stateDirectory := filepath.Clean(strings.TrimSpace(endpoint.StateDirectory))
+		if stateDirectory == "." || !filepath.IsAbs(stateDirectory) {
+			return nil, fmt.Errorf("Tailscale state directory is unavailable")
+		}
+		lockPath := filepath.Join(
+			filepath.Dir(stateDirectory),
+			"."+filepath.Base(stateDirectory)+".xdial-runtime.lock",
+		)
+		if _, exists := seen[lockPath]; exists {
+			continue
+		}
+		seen[lockPath] = struct{}{}
+		lockPaths = append(lockPaths, lockPath)
+	}
+	sort.Strings(lockPaths)
+
+	locks := make([]*os.File, 0, len(lockPaths))
+	for _, lockPath := range lockPaths {
+		if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+			releaseTailscaleStateLocks(locks)
+			return nil, fmt.Errorf("prepare Tailscale state lock: %w", err)
+		}
+		lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			releaseTailscaleStateLocks(locks)
+			return nil, fmt.Errorf("open Tailscale state lock: %w", err)
+		}
+		if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			_ = lockFile.Close()
+			releaseTailscaleStateLocks(locks)
+			if errors.Is(err, unix.EWOULDBLOCK) {
+				return nil, errTailscaleStateInUse
+			}
+			return nil, fmt.Errorf("lock Tailscale state: %w", err)
+		}
+		locks = append(locks, lockFile)
+	}
+	return locks, nil
+}
+
+func releaseTailscaleStateLocks(locks []*os.File) {
+	for index := len(locks) - 1; index >= 0; index-- {
+		_ = unix.Flock(int(locks[index].Fd()), unix.LOCK_UN)
+		_ = locks[index].Close()
+	}
 }

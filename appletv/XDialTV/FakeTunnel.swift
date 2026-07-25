@@ -146,6 +146,13 @@ final class FakeTunnelEngine: TunnelEngine, ObservableObject {
         )))
     }
 
+    func beginTailscaleLogin(
+        endpointTag: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        tailscaleStatus(endpointTag: endpointTag, completion: completion)
+    }
+
     // MARK: 供 FakeTunnelManager 驱动
 
     /// 进入 connecting，1.5s 后到 connected。若已在 connecting/connected 则忽略重复调用。
@@ -184,6 +191,110 @@ final class FakeTunnelEngine: TunnelEngine, ObservableObject {
     }
 }
 
+/// Simulator 中独立于正式隧道的 Tailscale 设置运行时。
+///
+/// 每条线路保留自己的登录状态，用来模拟真实实现按 lineID 隔离的 state directory。
+/// `start` 只要求目标是 Tailscale 线路，不要求线路已启用，因此可以先完成设置再启用。
+@MainActor
+final class FakeTailscaleSetupRuntime: TailscaleSetupRuntime {
+    private var activeLineID: String?
+    private var authenticatedByLineID: [String: Bool] = [:]
+
+    var isActive: Bool { activeLineID != nil }
+
+    func start(
+        profileJSON: String,
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        guard activeLineID == nil,
+              let data = profileJSON.data(using: .utf8),
+              let profile = try? JSONDecoder().decode(Profile.self, from: data),
+              let line = profile.lines.first(where: {
+                  $0.id == lineID && $0.type == "tailscale"
+              }) else {
+            completion(.failure(TunnelRuntimeError.missingTarget))
+            return
+        }
+
+        if authenticatedByLineID[lineID] == nil {
+            authenticatedByLineID[lineID] = line.tailscaleAuthenticated
+        }
+        activeLineID = lineID
+        completion(.success(runtimeStatus(for: lineID)))
+    }
+
+    func status(
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        guard activeLineID == lineID else {
+            completion(.failure(TunnelRuntimeError.missingTarget))
+            return
+        }
+        completion(.success(runtimeStatus(for: lineID)))
+    }
+
+    func beginLogin(
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        guard activeLineID == lineID else {
+            completion(.failure(TunnelRuntimeError.missingTarget))
+            return
+        }
+        authenticatedByLineID[lineID] = true
+        completion(.success(runtimeStatus(for: lineID)))
+    }
+
+    func logout(
+        lineID: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard activeLineID == lineID else {
+            completion(.failure(TunnelRuntimeError.missingTarget))
+            return
+        }
+        authenticatedByLineID[lineID] = false
+        completion(.success(()))
+    }
+
+    func stop(completion: @escaping () -> Void) {
+        activeLineID = nil
+        completion()
+    }
+
+    private func runtimeStatus(for lineID: String) -> TailscaleRuntimeStatus {
+        guard authenticatedByLineID[lineID] == true else {
+            return TailscaleRuntimeStatus(
+                backendState: "NeedsLogin",
+                authURL: "https://login.tailscale.com/a/xdial-simulator",
+                exitNodes: []
+            )
+        }
+        return TailscaleRuntimeStatus(
+            backendState: "Running",
+            authURL: "",
+            exitNodes: [
+                TailscaleRuntimeExitNode(
+                    id: "simulator-mbp64k",
+                    name: "mbp64k",
+                    ip: "100.64.0.8",
+                    online: true,
+                    os: "macOS"
+                ),
+                TailscaleRuntimeExitNode(
+                    id: "simulator-offline",
+                    name: "备用节点",
+                    ip: "100.64.0.9",
+                    online: false,
+                    os: "linux"
+                ),
+            ]
+        )
+    }
+}
+
 /// Simulator 演示管理层：conform TunnelManaging，永远「已安装」，startTunnel 直接成功。
 ///
 /// 构造时持有 FakeTunnelEngine 的引用，startTunnel/stopTunnel 时驱动引擎状态机——
@@ -198,6 +309,7 @@ final class FakeTunnelManager: TunnelManaging, ObservableObject {
         $systemOnDemandState.eraseToAnyPublisher()
     }
     private var systemOnDemandRequested = false
+    private var systemOnDemandSuspendedForSetup = false
 
     /// 被驱动的引擎。weak：存活锚点在 engine.retainedManager（engine 强持有 manager），
     /// 这里再强引用回 engine 会成环。engine 由 AppState 强持有，本 weak 不会先于它释放。
@@ -221,18 +333,40 @@ final class FakeTunnelManager: TunnelManaging, ObservableObject {
         }
     }
 
+    func setSystemOnDemandSuspendedForSetup(
+        _ suspended: Bool,
+        completion: @escaping () -> Void
+    ) {
+        systemOnDemandSuspendedForSetup = suspended
+        if suspended {
+            systemOnDemandActive = false
+            systemOnDemandState = systemOnDemandRequested ? .pending : .disabled
+        } else if systemOnDemandRequested {
+            systemOnDemandState = systemOnDemandActive ? .active : .pending
+        }
+        completion()
+    }
+
     /// 记录不含连接参数的日志，0.3s 后回调成功，并立即驱动引擎进入
     /// connecting→connected。
     func startTunnel(profile: Profile, anyConnect: AnyConnectCredentials?,
+                     allowSystemOnDemand: Bool,
                      completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
         appLog("FakeTunnelManager.startTunnel — 模拟拉起隧道")
         isProfileInstalled = true
+        if !allowSystemOnDemand {
+            systemOnDemandActive = false
+        }
         // 立即驱动引擎切到 connecting，UI 马上能看到「正在连接…」。
         engine?.simulateConnect()
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 300_000_000)
-            systemOnDemandActive = systemOnDemandRequested
-            systemOnDemandState = systemOnDemandRequested ? .active : .disabled
+            systemOnDemandActive = allowSystemOnDemand
+                && systemOnDemandRequested
+                && !systemOnDemandSuspendedForSetup
+            systemOnDemandState = systemOnDemandRequested
+                ? (systemOnDemandActive ? .active : .pending)
+                : .disabled
             completion(.success(()))
         }
     }
@@ -319,17 +453,66 @@ extension AppState {
             changed = true
         }
 
+        if ProcessInfo.processInfo.arguments.contains("-XDialUITestingIncompleteLine"),
+           let modeIndex = profile.modes.firstIndex(where: { $0.id == profile.activeModeID }) {
+            let lineID = "incomplete-ui-line"
+            if !profile.lines.contains(where: { $0.id == lineID }) {
+                profile.lines.append(Line(
+                    id: lineID,
+                    name: "待配置线路",
+                    type: "vpn"
+                ))
+            }
+            profile.modes[modeIndex].defaultLineID = lineID
+            profile.modes[modeIndex].defaultSubscriptionID = ""
+            changed = true
+        }
+
         // UI 自动化需要一份不依赖公网下载的订阅，覆盖无策略组 selector、节点延迟和
         // 出口地址入口。仅测试进程注入，普通 Simulator 不会看到演示订阅。
         let isUITesting = ProcessInfo.processInfo.arguments.contains("-XDialUITesting")
             || ProcessInfo.processInfo.arguments.contains("-XDialUITestingReset")
-        if isUITesting && !profile.lines.contains(where: { $0.type == "tailscale" }) {
+        let testsOfflineTailscaleSetup = ProcessInfo.processInfo.arguments.contains(
+            "-XDialUITestingOfflineTailscaleSetup"
+        )
+        if isUITesting
+            && !testsOfflineTailscaleSetup
+            && !profile.lines.contains(where: { $0.type == "tailscale" }) {
             profile.lines.append(Line(
                 id: "tailscale-ui-demo",
                 name: "Tailscale 演示",
                 type: "tailscale",
                 enabled: true,
-                tailscaleHostname: "xdial-simulator"
+                tailscaleHostname: "xdial-simulator",
+                tailscaleAuthenticated: true
+            ))
+            changed = true
+        }
+        if testsOfflineTailscaleSetup,
+           !profile.lines.contains(where: { $0.id == "tailscale-offline-setup" }) {
+            profile.lines.removeAll { $0.type == "tailscale" }
+            profile.lines.append(Line(
+                id: "tailscale-offline-setup",
+                name: "Tailscale 首次设置",
+                type: "tailscale",
+                enabled: true
+            ))
+            profile.modes = [Mode(
+                id: "tailscale-offline-mode",
+                name: "Tailscale 首次设置",
+                defaultLineID: "tailscale-offline-setup"
+            )]
+            profile.activeModeID = "tailscale-offline-mode"
+            profile.ensureConnectivityTestConfiguration()
+            changed = true
+        }
+        if ProcessInfo.processInfo.arguments.contains("-XDialUITestingConnectedInactiveTailscale"),
+           !profile.lines.contains(where: { $0.id == "tailscale-inactive-ui" }) {
+            profile.lines.append(Line(
+                id: "tailscale-inactive-ui",
+                name: "Tailscale 待设置",
+                type: "tailscale",
+                enabled: false
             ))
             changed = true
         }

@@ -63,6 +63,70 @@ func GenerateNEConfig(profileJSON string, vpnServerIP string, basePath string) (
 	return string(data), nil
 }
 
+// GenerateTailscaleSetupConfig 生成主 App 登录和发现节点所需的最小配置。
+// 它只启动指定 Tailscale endpoint，不创建 TUN，也不启用该线路的出口节点或路由。
+func GenerateTailscaleSetupConfig(profileJSON string, lineID string, basePath string) (string, error) {
+	profile, err := config.ParseProfile([]byte(profileJSON))
+	if err != nil {
+		return "", err
+	}
+	lineID = strings.TrimSpace(lineID)
+	if lineID == "" {
+		return "", fmt.Errorf("Tailscale line is missing")
+	}
+	line := profile.FindLine(lineID)
+	if line == nil {
+		return "", fmt.Errorf("Tailscale line is missing")
+	}
+	if line.Type != config.LineTypeTailscale {
+		return "", fmt.Errorf("line is not a Tailscale line")
+	}
+	if basePath == "" || !filepath.IsAbs(basePath) {
+		return "", fmt.Errorf("shared Tailscale state directory is unavailable")
+	}
+	setupLine := *line
+	setupLine.Enabled = true
+
+	endpoint := map[string]interface{}{
+		"type":            "tailscale",
+		"tag":             "tailscale-" + setupLine.ID,
+		"state_directory": config.TailscaleStateDirectory(basePath, setupLine.ID),
+		"accept_routes":   false,
+	}
+	if setupLine.TailscaleHostname != "" {
+		endpoint["hostname"] = setupLine.TailscaleHostname
+	}
+	document := map[string]interface{}{
+		"log": map[string]interface{}{
+			"disabled": true,
+		},
+		"dns": map[string]interface{}{
+			"servers": []map[string]interface{}{{
+				"type":        "udp",
+				"tag":         "xdial-public-dns",
+				"server":      "1.1.1.1",
+				"server_port": 53,
+			}},
+			"final": "xdial-public-dns",
+		},
+		"endpoints": []map[string]interface{}{endpoint},
+		"inbounds":  []interface{}{},
+		"outbounds": []map[string]interface{}{{
+			"type": "direct",
+			"tag":  "direct",
+		}},
+		"route": map[string]interface{}{
+			"final":                   "direct",
+			"default_domain_resolver": "xdial-public-dns",
+		},
+	}
+	data, err := json.Marshal(document)
+	if err != nil {
+		return "", fmt.Errorf("encode Tailscale setup config: %w", err)
+	}
+	return string(data), nil
+}
+
 func prepareNERuleSetDirectory(basePath string) (string, error) {
 	if basePath == "" || !filepath.IsAbs(basePath) {
 		return "", fmt.Errorf("shared rule-set directory is unavailable")

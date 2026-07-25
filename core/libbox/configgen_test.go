@@ -69,6 +69,96 @@ func TestGenerateNEConfigIncludesTailscaleEndpointWithMobileDNSDispatcher(t *tes
 	}
 }
 
+func TestGenerateTailscaleSetupConfigIsIsolated(t *testing.T) {
+	basePath := t.TempDir()
+	profile := config.Profile{
+		Lines: []config.Line{
+			{ID: "direct", Type: config.LineTypeDirect, Enabled: true},
+			{ID: "vpn", Type: config.LineTypeVPN, Enabled: true, VPNServer: "private-vpn.example", VPNPassword: "must-not-leak"},
+			{ID: "tailnet", Type: config.LineTypeTailscale, Enabled: false, TailscaleHostname: "xdial-mobile", TailscaleAcceptRoutes: true, TailscaleExitNode: "must-not-activate"},
+			{ID: "other-tailnet", Type: config.LineTypeTailscale, Enabled: true, TailscaleHostname: "must-not-leak"},
+		},
+		Modes:        []config.Mode{{ID: "mode", DefaultLineID: "vpn"}},
+		ActiveModeID: "mode",
+	}
+	profileJSON, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	generated, err := GenerateTailscaleSetupConfig(string(profileJSON), "tailnet", basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]interface{}
+	if err := json.Unmarshal([]byte(generated), &document); err != nil {
+		t.Fatal(err)
+	}
+	inbounds, ok := document["inbounds"].([]interface{})
+	if !ok || len(inbounds) != 0 {
+		t.Fatalf("setup config must not contain an inbound: %v", document["inbounds"])
+	}
+	outbounds, ok := document["outbounds"].([]interface{})
+	if !ok || len(outbounds) != 1 {
+		t.Fatalf("setup config must contain only Direct: %v", document["outbounds"])
+	}
+	direct := outbounds[0].(map[string]interface{})
+	if direct["type"] != "direct" || direct["tag"] != "direct" {
+		t.Fatalf("unexpected setup outbound: %v", direct)
+	}
+	endpoints, ok := document["endpoints"].([]interface{})
+	if !ok || len(endpoints) != 1 {
+		t.Fatalf("setup config must contain one endpoint: %v", document["endpoints"])
+	}
+	endpoint := endpoints[0].(map[string]interface{})
+	if endpoint["type"] != "tailscale" ||
+		endpoint["tag"] != "tailscale-tailnet" ||
+		endpoint["hostname"] != "xdial-mobile" ||
+		endpoint["state_directory"] != config.TailscaleStateDirectory(basePath, "tailnet") ||
+		endpoint["accept_routes"] != false {
+		t.Fatalf("unexpected setup endpoint: %v", endpoint)
+	}
+	if _, exists := endpoint["exit_node"]; exists {
+		t.Fatalf("setup endpoint must not activate an exit node: %v", endpoint)
+	}
+	for _, forbidden := range []string{"private-vpn.example", "must-not-leak", "must-not-activate", "other-tailnet", `"type":"tun"`, `"type":"vpn"`} {
+		if strings.Contains(generated, forbidden) {
+			t.Fatalf("setup config leaked unrelated profile value %q: %s", forbidden, generated)
+		}
+	}
+}
+
+func TestGenerateTailscaleSetupConfigRejectsInvalidSelection(t *testing.T) {
+	basePath := t.TempDir()
+	profile := config.Profile{
+		Lines: []config.Line{
+			{ID: "direct", Type: config.LineTypeDirect, Enabled: true},
+			{ID: "tailnet", Type: config.LineTypeTailscale, Enabled: true},
+		},
+	}
+	profileJSON, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		lineID   string
+		basePath string
+	}{
+		{name: "missing ID", lineID: "", basePath: basePath},
+		{name: "unknown line", lineID: "missing", basePath: basePath},
+		{name: "non-Tailscale line", lineID: "direct", basePath: basePath},
+		{name: "relative base path", lineID: "tailnet", basePath: "relative"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := GenerateTailscaleSetupConfig(string(profileJSON), test.lineID, test.basePath); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
 func TestGenerateNEConfigRejectsOversizedOutput(t *testing.T) {
 	domains := make([]string, 30_000)
 	for index := range domains {

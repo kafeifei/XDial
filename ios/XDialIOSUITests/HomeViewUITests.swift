@@ -144,6 +144,59 @@ final class HomeViewUITests: XCTestCase {
         #endif
     }
 
+    func testPhysicalDeviceTailscaleLoginOpensOfficialAuthorization() throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("真实 Tailscale 授权入口只在 iPhone 上验收")
+        #else
+        let app = XCUIApplication()
+        app.launchArguments += [
+            "-AppleLanguages", "(zh-Hans)",
+            "-AppleLocale", "zh_CN",
+        ]
+        app.launch()
+        XCTAssertTrue(app.tabBars.buttons["首页"].waitForExistence(timeout: 15))
+
+        app.tabBars.buttons["配置"].tap()
+        let tailscaleLine = app.buttons.matching(NSPredicate(
+            format: "label CONTAINS %@",
+            "Tailscale"
+        )).firstMatch
+        XCTAssertTrue(tailscaleLine.waitForExistence(timeout: 10))
+        tailscaleLine.tap()
+        XCTAssertTrue(app.navigationBars["编辑线路"].waitForExistence(timeout: 10))
+
+        let signIn = app.buttons["tailscale-start-setup"]
+        XCTAssertTrue(signIn.waitForExistence(timeout: 10))
+        attachScreenshot(named: "physical-device-tailscale-sign-in", app: app)
+        signIn.tap()
+
+        let safari = XCUIApplication(bundleIdentifier: "com.apple.mobilesafari")
+        let foregroundDeadline = Date().addingTimeInterval(90)
+        while app.state == .runningForeground,
+              safari.state != .runningForeground,
+              Date() < foregroundDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        }
+        if app.state == .runningForeground && safari.state != .runningForeground {
+            attachScreenshot(named: "physical-device-tailscale-sign-in-result", app: app)
+            XCTFail(
+                "点击真实 Tailscale 登录入口后 XDial 仍停留在前台：首页文本 "
+                    + app.staticTexts.allElementsBoundByIndex.map(\.label).joined(separator: " | ")
+            )
+        }
+        safari.activate()
+        XCTAssertTrue(safari.wait(for: .runningForeground, timeout: 10))
+        let address = safari.textFields.firstMatch
+        XCTAssertTrue(address.waitForExistence(timeout: 15))
+        let addressValue = (address.value as? String ?? "").lowercased()
+        attachScreenshot(named: "physical-device-tailscale-authorization", app: safari)
+        XCTAssertTrue(
+            addressValue.contains("tailscale.com"),
+            "打开的不是 Tailscale 官方授权页：\(addressValue)"
+        )
+        #endif
+    }
+
     func testConnectingDoesNotShowIncompleteConfigurationWarning() {
         let app = launchApp()
 
@@ -170,6 +223,35 @@ final class HomeViewUITests: XCTestCase {
         XCTAssertTrue(simulatorProbe.waitForExistence(timeout: 2))
     }
 
+    func testIncompleteReferencedLinePromptsBeforeConnectingAndOpensConfiguration() {
+        let app = launchApp(extraArguments: ["-XDialUITestingIncompleteLine"])
+
+        XCTAssertTrue(app.staticTexts["连接配置尚未完成"].waitForExistence(timeout: 3))
+        let connect = app.buttons["连接"]
+        XCTAssertTrue(connect.exists)
+        connect.tap()
+
+        let alert = app.alerts["连接前请先补齐线路"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 2))
+        let message = alert.staticTexts.allElementsBoundByIndex
+            .map(\.label)
+            .joined(separator: " ")
+        XCTAssertTrue(message.contains("待配置线路"))
+        XCTAssertTrue(message.contains("服务器"))
+        XCTAssertTrue(message.contains("用户名"))
+        XCTAssertTrue(message.contains("密码"))
+
+        alert.buttons["前往配置"].tap()
+        XCTAssertTrue(app.navigationBars["配置"].waitForExistence(timeout: 2))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@ AND label CONTAINS %@",
+            "需配置",
+            "缺少服务器"
+        )).firstMatch.waitForExistence(timeout: 2))
+        XCTAssertFalse(app.staticTexts["正在连接…"].exists)
+        XCTAssertFalse(app.staticTexts["已连接"].exists)
+    }
+
     func testConfigurationModeAndDiagnosticsEntryPoints() {
         let app = launchApp()
 
@@ -180,7 +262,10 @@ final class HomeViewUITests: XCTestCase {
 
         app.buttons["添加线路"].tap()
         app.buttons["VMess"].tap()
+        XCTAssertTrue(app.navigationBars["编辑线路"].waitForExistence(timeout: 2))
         XCTAssertTrue(app.staticTexts["VMess"].waitForExistence(timeout: 2))
+        app.navigationBars["编辑线路"].buttons["配置"].tap()
+        XCTAssertTrue(app.navigationBars["配置"].waitForExistence(timeout: 2))
 
         app.segmentedControls.buttons["规则"].tap()
         app.buttons["添加规则"].tap()
@@ -333,24 +418,28 @@ final class HomeViewUITests: XCTestCase {
         XCTAssertTrue(tailscaleMenuItem.waitForExistence(timeout: 2))
         tailscaleMenuItem.tap()
 
-        let tailscaleLine = app.buttons.matching(NSPredicate(
-            format: "label CONTAINS %@",
-            "Tailscale"
-        )).firstMatch
-        XCTAssertTrue(tailscaleLine.waitForExistence(timeout: 2))
-        tailscaleLine.tap()
         XCTAssertTrue(app.navigationBars["编辑线路"].waitForExistence(timeout: 2))
+        let lineNameField = app.textFields.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@",
+            "line-name-line-"
+        )).firstMatch
+        XCTAssertTrue(lineNameField.waitForExistence(timeout: 2))
+        let newLineIdentifier = lineNameField.identifier.replacingOccurrences(
+            of: "line-name-",
+            with: "line-row-"
+        )
         let deviceName = app.textFields["设备名称（可选）"]
         let acceptRoutes = app.switches["接受子网路由"]
         XCTAssertTrue(deviceName.waitForExistence(timeout: 2))
         XCTAssertTrue(acceptRoutes.exists)
-        XCTAssertTrue(app.staticTexts["请先连接，再登录或刷新状态。"].exists)
+        XCTAssertEqual(app.switches["启用"].value as? String, "0")
+        XCTAssertTrue(app.buttons["tailscale-start-setup"].isEnabled)
 
         let initialAcceptRoutesValue = acceptRoutes.value as? String
         let expectedAcceptRoutesValue = initialAcceptRoutesValue == "1" ? "0" : "1"
         deviceName.tap()
         deviceName.typeText("ui-tailscale")
-        app.keyboards.buttons["return"].tap()
+        app.keyboards.buttons["Return"].tap()
         XCTAssertTrue(acceptRoutes.isEnabled)
         acceptRoutes.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
         let switchExpectation = XCTNSPredicateExpectation(
@@ -361,10 +450,10 @@ final class HomeViewUITests: XCTestCase {
         XCTAssertTrue(app.buttons["已保存"].waitForExistence(timeout: 2))
         app.navigationBars["编辑线路"].buttons["配置"].tap()
 
-        let savedTailscaleLine = app.buttons.matching(NSPredicate(
-            format: "label CONTAINS %@",
-            "Tailscale"
-        )).firstMatch
+        let savedTailscaleLine = app.buttons[newLineIdentifier]
+        for _ in 0..<4 where !savedTailscaleLine.exists {
+            app.swipeUp()
+        }
         XCTAssertTrue(savedTailscaleLine.waitForExistence(timeout: 2))
         savedTailscaleLine.tap()
         let restoredDeviceName = app.textFields["设备名称（可选）"]
@@ -372,6 +461,158 @@ final class HomeViewUITests: XCTestCase {
         XCTAssertTrue(restoredDeviceName.waitForExistence(timeout: 2))
         XCTAssertTrue((restoredDeviceName.value as? String)?.contains("ui-tailscale") == true)
         XCTAssertEqual(restoredAcceptRoutes.value as? String, expectedAcceptRoutesValue)
+
+        app.buttons["tailscale-start-setup"].tap()
+        XCTAssertTrue(app.staticTexts["tailscale-login-status"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["tailscale-refresh-nodes"].exists)
+        let exitNodePicker = app.buttons["tailscale-exit-node-picker"]
+        XCTAssertTrue(exitNodePicker.waitForExistence(timeout: 3))
+        exitNodePicker.tap()
+        let homeExit = app.buttons.matching(NSPredicate(
+            format: "label CONTAINS %@",
+            "mbp64k"
+        )).firstMatch
+        XCTAssertTrue(homeExit.waitForExistence(timeout: 2))
+        homeExit.tap()
+
+        let finishSetup = app.buttons["tailscale-finish-setup"]
+        XCTAssertTrue(finishSetup.isEnabled)
+        finishSetup.tap()
+        XCTAssertTrue(app.buttons["tailscale-start-setup"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["tailscale-start-setup"].label.contains("检查登录状态"))
+        XCTAssertEqual(app.switches["启用"].value as? String, "0")
+
+        app.terminate()
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 5))
+        let relaunched = launchApp(reset: false)
+        relaunched.tabBars.buttons["配置"].tap()
+        let restoredLine = relaunched.buttons[newLineIdentifier]
+        for _ in 0..<4 where !restoredLine.exists {
+            relaunched.swipeUp()
+        }
+        XCTAssertTrue(restoredLine.waitForExistence(timeout: 3))
+        XCTAssertTrue(restoredLine.label.contains("100.64.0.8"))
+        restoredLine.tap()
+        XCTAssertEqual(relaunched.switches["启用"].value as? String, "0")
+        XCTAssertTrue(relaunched.buttons["tailscale-start-setup"].label.contains("检查登录状态"))
+
+        relaunched.buttons["tailscale-start-setup"].tap()
+        XCTAssertTrue(relaunched.staticTexts["tailscale-login-status"].waitForExistence(timeout: 5))
+        let signOut = relaunched.buttons["tailscale-logout"]
+        XCTAssertTrue(signOut.waitForExistence(timeout: 2))
+        signOut.tap()
+        let confirmSignOut = relaunched.buttons["tailscale-logout-confirm"].firstMatch
+        XCTAssertTrue(confirmSignOut.waitForExistence(timeout: 2))
+        confirmSignOut.tap()
+        let signedOutSetup = relaunched.buttons["tailscale-start-setup"]
+        XCTAssertTrue(signedOutSetup.waitForExistence(timeout: 3))
+        XCTAssertTrue(signedOutSetup.label.contains("设置并登录"))
+
+        relaunched.terminate()
+        XCTAssertTrue(relaunched.wait(for: .notRunning, timeout: 5))
+        let signedOutRelaunch = launchApp(reset: false)
+        signedOutRelaunch.tabBars.buttons["配置"].tap()
+        let signedOutLine = signedOutRelaunch.buttons[newLineIdentifier]
+        for _ in 0..<4 where !signedOutLine.exists {
+            signedOutRelaunch.swipeUp()
+        }
+        XCTAssertTrue(signedOutLine.waitForExistence(timeout: 3))
+        XCTAssertTrue(signedOutLine.label.contains("尚未登录"))
+        XCTAssertFalse(signedOutLine.label.contains("100.64.0.8"))
+        signedOutLine.tap()
+        XCTAssertTrue(signedOutRelaunch.buttons["tailscale-start-setup"].label.contains("设置并登录"))
+    }
+
+    func testOfflineTailscaleSetupThenFormalConnectAndColdRestart() {
+        let fixture = "-XDialUITestingOfflineTailscaleSetup"
+        let app = launchApp(extraArguments: [fixture])
+
+        XCTAssertTrue(app.staticTexts["连接配置尚未完成"].waitForExistence(timeout: 3))
+        app.buttons["连接"].tap()
+        let openConfiguration = app.buttons["前往配置"]
+        XCTAssertTrue(openConfiguration.waitForExistence(timeout: 2))
+        openConfiguration.tap()
+
+        let line = app.buttons.matching(NSPredicate(
+            format: "label CONTAINS %@",
+            "Tailscale 首次设置"
+        )).firstMatch
+        XCTAssertTrue(line.waitForExistence(timeout: 3))
+        line.tap()
+        let setup = app.buttons["tailscale-start-setup"]
+        XCTAssertTrue(setup.waitForExistence(timeout: 2))
+        XCTAssertTrue(setup.isEnabled)
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@",
+            "请先连接"
+        )).firstMatch.exists)
+        setup.tap()
+
+        XCTAssertTrue(app.staticTexts["tailscale-login-status"].waitForExistence(timeout: 5))
+        let picker = app.buttons["tailscale-exit-node-picker"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 3))
+        picker.tap()
+        let exitNode = app.buttons.matching(NSPredicate(
+            format: "label CONTAINS %@",
+            "mbp64k"
+        )).firstMatch
+        XCTAssertTrue(exitNode.waitForExistence(timeout: 2))
+        exitNode.tap()
+
+        let finish = app.buttons["tailscale-finish-setup"]
+        XCTAssertTrue(finish.waitForExistence(timeout: 2))
+        XCTAssertTrue(finish.isEnabled)
+        finish.tap()
+        XCTAssertTrue(app.buttons["tailscale-start-setup"].waitForExistence(timeout: 3))
+
+        app.tabBars.buttons["首页"].tap()
+        XCTAssertTrue(app.buttons["连接"].waitForExistence(timeout: 3))
+        app.buttons["连接"].tap()
+        XCTAssertTrue(app.staticTexts["已连接"].waitForExistence(timeout: 5))
+        app.buttons["断开"].tap()
+        XCTAssertTrue(app.staticTexts["未连接"].waitForExistence(timeout: 4))
+
+        app.terminate()
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 5))
+        let relaunched = launchApp(reset: false, extraArguments: [fixture])
+        XCTAssertTrue(relaunched.buttons["连接"].waitForExistence(timeout: 3))
+        XCTAssertFalse(relaunched.staticTexts["连接配置尚未完成"].exists)
+        relaunched.buttons["连接"].tap()
+        XCTAssertTrue(relaunched.staticTexts["已连接"].waitForExistence(timeout: 5))
+    }
+
+    func testConnectedInactiveTailscaleCanUseIsolatedSetupWithoutDisconnecting() {
+        let app = launchApp(extraArguments: ["-XDialUITestingConnectedInactiveTailscale"])
+        app.buttons["连接"].tap()
+        XCTAssertTrue(app.staticTexts["已连接"].waitForExistence(timeout: 5))
+
+        app.tabBars.buttons["配置"].tap()
+        let line = app.buttons.matching(NSPredicate(
+            format: "label CONTAINS %@",
+            "Tailscale 待设置"
+        )).firstMatch
+        XCTAssertTrue(line.waitForExistence(timeout: 3))
+        line.tap()
+
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@",
+            "当前连接没有运行这条线路"
+        )).firstMatch.waitForExistence(timeout: 2))
+        let setup = app.buttons["tailscale-start-setup"]
+        XCTAssertTrue(setup.isEnabled)
+        setup.tap()
+        XCTAssertTrue(app.staticTexts["tailscale-login-status"].waitForExistence(timeout: 5))
+
+        app.tabBars.buttons["首页"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@ AND label CONTAINS %@",
+            "已连接",
+            "正在设置"
+        )).firstMatch.waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["断开"].exists)
+        app.tabBars.buttons["配置"].tap()
+        XCTAssertTrue(app.buttons["tailscale-finish-setup"].waitForExistence(timeout: 3))
+        app.buttons["tailscale-finish-setup"].tap()
     }
 
     func testTailscaleActionRequiredOffersSignInLocksConfigurationAndCanDisconnect() {
@@ -382,6 +623,10 @@ final class HomeViewUITests: XCTestCase {
         let disconnect = app.buttons["断开"]
         XCTAssertTrue(disconnect.exists)
         XCTAssertTrue(disconnect.isEnabled)
+        XCTAssertTrue(app.buttons["登录 Tailscale"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts[
+            "这是 XDial 内置线路的独立授权，与手机上的 Tailscale App 登录状态不共享。完成一次授权后，XDial 会自动继续连接验收。"
+        ].exists)
 
         app.tabBars.buttons["模式"].tap()
         XCTAssertFalse(app.buttons["添加模式"].isEnabled)
@@ -405,7 +650,7 @@ final class HomeViewUITests: XCTestCase {
     func testSubscriptionDefaultAppearsInHomeActiveRoutes() {
         let app = launchApp(extraArguments: ["-XDialUITestingSubscriptionSummary"])
 
-        XCTAssertTrue(app.staticTexts["本模式活动出口"].waitForExistence(timeout: 2))
+        XCTAssertTrue(app.staticTexts["连接后使用的出口"].waitForExistence(timeout: 2))
         XCTAssertTrue(app.staticTexts["UI 测试订阅"].exists)
         XCTAssertFalse(app.staticTexts["没有活动出口"].exists)
     }

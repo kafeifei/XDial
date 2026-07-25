@@ -233,11 +233,34 @@ final class GoEngine: ObservableObject, TunnelEngine {
         endpointTag: String,
         completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
     ) {
+        requestTailscaleRuntimeStatus(
+            cmd: "tailscale-status",
+            endpointTag: endpointTag,
+            completion: completion
+        )
+    }
+
+    func beginTailscaleLogin(
+        endpointTag: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        requestTailscaleRuntimeStatus(
+            cmd: "tailscale-begin-login",
+            endpointTag: endpointTag,
+            completion: completion
+        )
+    }
+
+    private func requestTailscaleRuntimeStatus(
+        cmd: String,
+        endpointTag: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
         guard !endpointTag.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             completion(.failure(TunnelRuntimeError.missingTarget))
             return
         }
-        sendRequest(cmd: "tailscale-status", fields: ["endpoint_tag": endpointTag]) { response in
+        sendRequest(cmd: cmd, fields: ["endpoint_tag": endpointTag]) { response in
             guard response.ok == true, let rawStatus = response.data,
                   let data = rawStatus.data(using: .utf8) else {
                 completion(.failure(TunnelRuntimeError.requestFailed(

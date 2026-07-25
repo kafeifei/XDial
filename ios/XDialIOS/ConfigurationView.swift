@@ -5,6 +5,7 @@ struct ConfigurationView: View {
     @EnvironmentObject private var app: AppState
     @State private var section: ConfigSection = .lines
     @State private var showAddSubscription = false
+    @State private var editingLineID: String?
     @State private var refreshingSubscriptionIDs: Set<String> = []
     @State private var subscriptionErrors: [String: String] = [:]
 
@@ -41,6 +42,9 @@ struct ConfigurationView: View {
             .sheet(isPresented: $showAddSubscription) {
                 AddSubscriptionView()
                     .environmentObject(app)
+            }
+            .navigationDestination(item: $editingLineID) { lineID in
+                LineEditorView(lineID: lineID)
             }
         }
     }
@@ -80,6 +84,7 @@ struct ConfigurationView: View {
     private var lineList: some View {
         List {
             ForEach(app.profile.lines) { line in
+                let issues = line.enabled ? app.routeLineConfigurationIssues(line) : []
                 NavigationLink {
                     LineEditorView(lineID: line.id)
                 } label: {
@@ -89,9 +94,18 @@ struct ConfigurationView: View {
                             .frame(width: 28)
                         VStack(alignment: .leading, spacing: 4) {
                             Text(line.name)
-                            Text(mobileLineTypeLabel(line.type))
+                            Text(lineListSummary(line))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            if !issues.isEmpty {
+                                Text(app.tr(
+                                    "需配置：\(issues.joined(separator: "、"))",
+                                    "Setup required: \(issues.joined(separator: ", "))"
+                                ))
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .lineLimit(2)
+                            }
                         }
                         Spacer()
                         if !line.enabled {
@@ -100,6 +114,8 @@ struct ConfigurationView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("line-row-\(line.id)")
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                     if line.type != "direct" {
@@ -122,6 +138,20 @@ struct ConfigurationView: View {
                 )
             }
         }
+    }
+
+    private func lineListSummary(_ line: Line) -> String {
+        guard line.type == "tailscale" else {
+            return mobileLineTypeLabel(line.type)
+        }
+        let exitNode = line.tailscaleExitNode.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !line.tailscaleAuthenticated {
+            return app.tr("Tailscale · 尚未登录", "Tailscale · Sign-in required")
+        }
+        if exitNode.isEmpty {
+            return app.tr("Tailscale · 未选择出口节点", "Tailscale · No exit node")
+        }
+        return app.tr("Tailscale · 出口 \(exitNode)", "Tailscale · Exit \(exitNode)")
     }
 
     private var ruleList: some View {
@@ -261,7 +291,8 @@ struct ConfigurationView: View {
             guard !app.hasActiveTunnel, !app.isBusy else { return }
             let id = "line-" + String(UUID().uuidString.prefix(8)).lowercased()
             app.profile.lines.append(Line(id: id, name: name, type: type, enabled: false))
-            app.save()
+            editingLineID = id
+            _ = app.save()
         }
     }
 
@@ -387,6 +418,9 @@ private struct LineEditorView: View {
     @State private var tailscaleStatusError: String?
     @State private var isRefreshingTailscaleStatus = false
     @State private var tailscaleExitSelectionNeedsReconnect = false
+    @State private var pendingTailscaleSetupLogin = false
+    @State private var showingTailscaleLogoutConfirmation = false
+    @State private var isLoggingOutTailscale = false
     let lineID: String
 
     var body: some View {
@@ -394,6 +428,7 @@ private struct LineEditorView: View {
             if let index = lineIndex {
                 Section(app.tr("基本信息", "Basics")) {
                     TextField(app.tr("名称", "Name"), text: lineBinding(index, \.name))
+                        .accessibilityIdentifier("line-name-\(lineID)")
                     LabeledContent(app.tr("类型", "Type"), value: mobileLineTypeLabel(app.profile.lines[index].type))
                     Toggle(app.tr("启用", "Enabled"), isOn: lineBinding(index, \.enabled))
                 }
@@ -429,6 +464,7 @@ private struct LineEditorView: View {
             }
         }
         .disabled(app.isBusy)
+        .accessibilityIdentifier("line-editor-\(lineID)")
         .navigationTitle(app.tr("编辑线路", "Edit Line"))
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
@@ -440,19 +476,28 @@ private struct LineEditorView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { _ = persistPendingChanges() }
+            if phase != .active {
+                _ = persistPendingChanges()
+            } else {
+                handlePendingTailscaleSetupState()
+                refreshTailscaleStatusIfAvailable()
+            }
         }
         .onAppear {
             refreshTailscaleStatusIfAvailable()
         }
         .onChange(of: app.engine.status) { _, _ in
-            if app.canQueryTailscaleRuntime {
+            if app.canQueryTailscaleRuntime(lineID: lineID) {
+                handlePendingTailscaleSetupState()
                 refreshTailscaleStatusIfAvailable()
             } else {
                 tailscaleRuntimeStatus = nil
                 tailscaleStatusError = nil
                 isRefreshingTailscaleStatus = false
                 tailscaleExitSelectionNeedsReconnect = false
+                if app.tailscaleSetupLineID == nil {
+                    pendingTailscaleSetupLogin = false
+                }
             }
         }
         .onDisappear {
@@ -463,6 +508,22 @@ private struct LineEditorView: View {
             Button(app.tr("好", "OK"), role: .cancel) {}
         } message: {
             Text(saveFailureMessage ?? app.tr("无法保存配置，请重试。", "Could not save the configuration. Please try again."))
+        }
+        .confirmationDialog(
+            app.tr("退出这条 Tailscale 线路？", "Sign Out This Tailscale Line?"),
+            isPresented: $showingTailscaleLogoutConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(app.tr("退出登录", "Sign Out"), role: .destructive) {
+                logoutTailscale()
+            }
+            .accessibilityIdentifier("tailscale-logout-confirm")
+            Button(app.tr("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(app.tr(
+                "只会退出 XDial 内的这条线路，不影响手机上的 Tailscale App 或其他线路。",
+                "This signs out only this XDial line. It does not affect the Tailscale app or other lines."
+            ))
         }
     }
 
@@ -530,59 +591,125 @@ private struct LineEditorView: View {
                 Text("Tailscale")
             } footer: {
                 Text(app.tr(
-                    "首次登录等待期间隧道会保持运行；登录完成后 MagicDNS/.ts.net 会按域名交给对应 Tailscale 线路，其他解析保持原出口。",
-                    "The tunnel stays active during first sign-in. After sign-in, MagicDNS/.ts.net queries are routed to the matching Tailscale line while other DNS keeps its original path."
+                    "登录在 XDial 内独立完成，不会启动系统线路。正式连接后，MagicDNS/.ts.net 会按域名交给对应 Tailscale 线路。",
+                    "Sign-in is completed inside XDial without starting a system line. During a normal connection, MagicDNS/.ts.net queries use the matching Tailscale line."
                 ))
             }
             .disabled(app.hasActiveTunnel)
 
             Section {
-                if !app.canQueryTailscaleRuntime {
+                if !app.canQueryTailscaleRuntime(lineID: lineID) {
                     Label(
-                        app.tr("请先连接，再登录或刷新状态。", "Connect first, then sign in or refresh status."),
+                        app.hasFormalTunnel
+                            ? app.tr(
+                                "当前连接没有运行这条线路。可启动独立设置来登录并选择出口节点，不影响当前连接。",
+                                "The current connection is not running this line. Start isolated setup to sign in and select an exit node without affecting the connection."
+                            )
+                            : app.tr(
+                                "尚未检查登录状态。启动独立设置后可登录并选择出口节点，不会启动系统线路。",
+                                "Sign-in has not been checked. Isolated setup lets you sign in and select an exit node without starting the system line."
+                            ),
                         systemImage: "info.circle"
                     )
                     .foregroundStyle(.secondary)
-                } else if !app.isTailscaleLineGeneratedByRunningProfile(lineID) {
-                    Label(
-                        app.tr(
-                            "这条线路未在当前连接中启用；请先断开，启用后重新连接。",
-                            "This line is not enabled in the running connection. Disconnect, enable it, and reconnect."
-                        ),
-                        systemImage: "exclamationmark.triangle.fill"
+
+                    Button {
+                        startTailscaleSetup()
+                    } label: {
+                        if pendingTailscaleSetupLogin || isRefreshingTailscaleStatus {
+                            HStack {
+                                ProgressView()
+                                Text(app.tr("正在启动登录…", "Starting Sign-in…"))
+                            }
+                        } else {
+                            Label(
+                                app.profile.lines[index].tailscaleAuthenticated
+                                    ? app.tr("检查登录状态与节点", "Check Sign-in and Nodes")
+                                    : app.tr("设置并登录 Tailscale", "Set Up and Sign In to Tailscale"),
+                                systemImage: "person.crop.circle.badge.checkmark"
+                            )
+                        }
+                    }
+                    .accessibilityIdentifier("tailscale-start-setup")
+                    .disabled(
+                        pendingTailscaleSetupLogin
+                            || isRefreshingTailscaleStatus
+                            || !app.canStartTailscaleSetup(lineID: lineID)
                     )
-                    .foregroundStyle(.orange)
                 } else {
                     if let status = tailscaleRuntimeStatus {
                         LabeledContent(
                             app.tr("登录状态", "Sign-in status"),
                             value: tailscaleBackendLabel(status.backendState)
                         )
+                        .accessibilityIdentifier("tailscale-login-status")
 
                         if let authURL = validTailscaleAuthURL(status.authURL) {
                             Button {
-                                openURL(authURL)
+                                beginTailscaleLogin(fallbackURL: authURL)
                             } label: {
                                 Label(app.tr("在浏览器中登录", "Sign In in Browser"), systemImage: "safari")
                             }
+                            .accessibilityIdentifier("tailscale-open-login")
+                        } else if ["needslogin", "needs_login",
+                                   "needsmachineauth", "needs_machine_auth"].contains(
+                                    status.backendState.lowercased()
+                                   ) {
+                            Button {
+                                beginTailscaleLogin()
+                            } label: {
+                                Label(app.tr("登录 Tailscale", "Sign In to Tailscale"), systemImage: "safari")
+                            }
+                            .accessibilityIdentifier("tailscale-open-login")
                         }
 
-                        Picker(
-                            app.tr("出口节点", "Exit node"),
-                            selection: tailscaleExitNodeBinding(index)
-                        ) {
-                            Text(app.tr("不使用", "None")).tag("")
+                        if status.backendState.lowercased() == "running" {
+                            Picker(
+                                app.tr("出口节点", "Exit node"),
+                                selection: tailscaleExitNodeBinding(index)
+                            ) {
+                                Text(app.tr("不使用", "None")).tag("")
+                                let selected = app.profile.lines[index].tailscaleExitNode
+                                if !selected.isEmpty && !status.exitNodes.contains(where: { $0.ip == selected }) {
+                                    Text(app.tr("已保存但当前不可用：\(selected)", "Saved but unavailable: \(selected)"))
+                                        .tag(selected)
+                                }
+                                ForEach(status.exitNodes) { node in
+                                    Text(tailscaleExitNodeLabel(node))
+                                        .tag(node.ip)
+                                        .disabled(!node.online)
+                                }
+                            }
+                            .accessibilityIdentifier("tailscale-exit-node-picker")
+                            .disabled(app.isBusy || (app.hasFormalTunnel && !app.isConnected))
+
                             let selected = app.profile.lines[index].tailscaleExitNode
                             if !selected.isEmpty && !status.exitNodes.contains(where: { $0.ip == selected }) {
-                                Text(app.tr("已保存：\(selected)", "Saved: \(selected)")).tag(selected)
+                                Label(
+                                    app.tr(
+                                        "已保存的出口节点当前不可用，请刷新或重新选择。",
+                                        "The saved exit node is currently unavailable. Refresh or choose another node."
+                                    ),
+                                    systemImage: "exclamationmark.triangle.fill"
+                                )
+                                .foregroundStyle(.orange)
                             }
-                            ForEach(status.exitNodes) { node in
-                                Text(tailscaleExitNodeLabel(node))
-                                    .tag(node.ip)
-                                    .disabled(!node.online)
+
+                            Button(role: .destructive) {
+                                showingTailscaleLogoutConfirmation = true
+                            } label: {
+                                if isLoggingOutTailscale {
+                                    HStack {
+                                        ProgressView()
+                                        Text(app.tr("正在退出…", "Signing Out…"))
+                                    }
+                                } else {
+                                    Label(app.tr("退出 Tailscale", "Sign Out of Tailscale"), systemImage: "rectangle.portrait.and.arrow.right")
+                                }
                             }
+                            .accessibilityIdentifier("tailscale-logout")
+                            .disabled(isLoggingOutTailscale || app.tailscaleSetupLineID != lineID)
                         }
-                        .disabled(app.isBusy || (app.hasActiveTunnel && !app.isConnected))
                     }
 
                     if let tailscaleStatusError {
@@ -602,19 +729,50 @@ private struct LineEditorView: View {
                             Label(app.tr("刷新状态", "Refresh Status"), systemImage: "arrow.clockwise")
                         }
                     }
+                    .accessibilityIdentifier("tailscale-refresh-nodes")
                     .disabled(isRefreshingTailscaleStatus)
+
+                    if app.tailscaleSetupLineID == lineID {
+                        Button {
+                            app.finishTailscaleSetup()
+                        } label: {
+                            Label(app.tr("完成线路设置", "Finish Line Setup"), systemImage: "checkmark.circle")
+                        }
+                        .accessibilityIdentifier("tailscale-finish-setup")
+                        .disabled(
+                            app.isBusy
+                                || !app.profile.lines[index].tailscaleAuthenticated
+                                || tailscaleRuntimeStatus?.backendState.lowercased() != "running"
+                        )
+                    }
                 }
             } header: {
-                Text(app.tr("连接内状态", "Connected Status"))
+                Text(app.tr("登录与出口节点", "Sign-in and Exit Node"))
             } footer: {
-                if app.canQueryTailscaleRuntime
-                    && app.isTailscaleLineGeneratedByRunningProfile(lineID)
+                if app.canQueryTailscaleRuntime(lineID: lineID)
                     && tailscaleRuntimeStatus == nil && tailscaleStatusError == nil {
-                    Text(app.tr("状态正在从当前连接读取。", "Status is read from the current connection."))
+                    Text(
+                        app.tailscaleSetupLineID == lineID
+                            ? app.tr(
+                                "状态正在从独立设置会话读取。",
+                                "Status is read from the isolated setup session."
+                            )
+                            : app.tr(
+                                "状态正在从当前连接读取。",
+                                "Status is read from the current connection."
+                            )
+                    )
+                } else if !app.canQueryTailscaleRuntime(lineID: lineID) {
+                    Text(app.tr(
+                        "独立设置只在 XDial 内登录并读取节点，不改变系统连接状态。",
+                        "Isolated setup signs in and discovers nodes inside XDial without changing the system connection state."
+                    ))
                 }
             }
 
-            if tailscaleExitSelectionNeedsReconnect && app.isConnected {
+            if tailscaleExitSelectionNeedsReconnect
+                && app.isConnected
+                && app.tailscaleSetupLineID != lineID {
                 Section {
                     Text(app.tr(
                         "出口节点已保存；当前连接仍使用原设置。",
@@ -662,22 +820,21 @@ private struct LineEditorView: View {
                           lineID: lineID,
                           selected: selected
                       ) else { return }
-                tailscaleExitSelectionNeedsReconnect = app.isConnected
+                tailscaleExitSelectionNeedsReconnect =
+                    app.isConnected && app.tailscaleSetupLineID != lineID
             }
         )
     }
 
     private func refreshTailscaleStatusIfAvailable() {
-        guard app.canQueryTailscaleRuntime,
-              app.isTailscaleLineGeneratedByRunningProfile(lineID),
+        guard app.canQueryTailscaleRuntime(lineID: lineID),
               let index = lineIndex,
               app.profile.lines[index].type == "tailscale" else { return }
         refreshTailscaleStatus()
     }
 
     private func refreshTailscaleStatus() {
-        guard app.canQueryTailscaleRuntime,
-              app.isTailscaleLineGeneratedByRunningProfile(lineID),
+        guard app.canQueryTailscaleRuntime(lineID: lineID),
               !isRefreshingTailscaleStatus else { return }
         isRefreshingTailscaleStatus = true
         tailscaleStatusError = nil
@@ -686,9 +843,110 @@ private struct LineEditorView: View {
             switch result {
             case .success(let status):
                 tailscaleRuntimeStatus = status
+                _ = applyTailscaleAuthenticationStatus(status)
             case .failure(let error):
                 tailscaleRuntimeStatus = nil
                 tailscaleStatusError = tailscaleErrorMessage(error)
+            }
+        }
+    }
+
+    private func startTailscaleSetup() {
+        guard !pendingTailscaleSetupLogin,
+              !isRefreshingTailscaleStatus,
+              persistPendingChanges() else { return }
+        pendingTailscaleSetupLogin = true
+        isRefreshingTailscaleStatus = true
+        tailscaleStatusError = nil
+        app.prepareTailscaleLogin(lineID: lineID) { result in
+            Task { @MainActor in
+                isRefreshingTailscaleStatus = false
+                switch result {
+                case .success:
+                    continueTailscaleSetupAfterStart()
+                case .failure(let error):
+                    pendingTailscaleSetupLogin = false
+                    tailscaleStatusError = tailscaleErrorMessage(error)
+                }
+            }
+        }
+    }
+
+    private func continueTailscaleSetupAfterStart() {
+        guard app.canQueryTailscaleRuntime(lineID: lineID) else {
+            pendingTailscaleSetupLogin = false
+            tailscaleStatusError = app.tr(
+                "Tailscale 设置运行时未就绪，请重试。",
+                "The Tailscale setup runtime is not ready. Please retry."
+            )
+            return
+        }
+        isRefreshingTailscaleStatus = true
+        app.refreshTailscaleStatus(lineID: lineID) { result in
+            isRefreshingTailscaleStatus = false
+            switch result {
+            case .failure(let error):
+                pendingTailscaleSetupLogin = false
+                tailscaleStatusError = tailscaleErrorMessage(error)
+            case .success(let status):
+                tailscaleRuntimeStatus = status
+                guard applyTailscaleAuthenticationStatus(status) else {
+                    pendingTailscaleSetupLogin = false
+                    return
+                }
+                if status.backendState.lowercased() == "running" {
+                    pendingTailscaleSetupLogin = false
+                } else {
+                    beginTailscaleLogin()
+                }
+            }
+        }
+    }
+
+    private func handlePendingTailscaleSetupState() {
+        guard pendingTailscaleSetupLogin, !isRefreshingTailscaleStatus else { return }
+        if app.requiresUserAction {
+            beginTailscaleLogin()
+        } else if app.isConnected {
+            pendingTailscaleSetupLogin = false
+            refreshTailscaleStatusIfAvailable()
+        }
+    }
+
+    private func beginTailscaleLogin(fallbackURL: URL? = nil) {
+        guard !isRefreshingTailscaleStatus else { return }
+        isRefreshingTailscaleStatus = true
+        tailscaleStatusError = nil
+        app.beginTailscaleLogin(lineID: lineID) { result in
+            Task { @MainActor in
+                isRefreshingTailscaleStatus = false
+                switch result {
+                case .success(let status):
+                    tailscaleRuntimeStatus = status
+                    guard applyTailscaleAuthenticationStatus(status) else {
+                        pendingTailscaleSetupLogin = false
+                        return
+                    }
+                    if let url = validTailscaleAuthURL(status.authURL) {
+                        pendingTailscaleSetupLogin = false
+                        openURL(url)
+                    } else if status.backendState.lowercased() == "running" {
+                        pendingTailscaleSetupLogin = false
+                        refreshTailscaleStatusIfAvailable()
+                    } else {
+                        tailscaleStatusError = app.tr(
+                            "没有取得有效的登录入口，请重试。",
+                            "No valid sign-in link was returned. Please retry."
+                        )
+                    }
+                case .failure(let error):
+                    pendingTailscaleSetupLogin = false
+                    // 旧链接仍可能在控制面有效；先保持用户可继续，再明确展示刷新失败。
+                    if let fallbackURL {
+                        openURL(fallbackURL)
+                    }
+                    tailscaleStatusError = tailscaleErrorMessage(error)
+                }
             }
         }
     }
@@ -697,11 +955,14 @@ private struct LineEditorView: View {
         if let runtimeError = error as? TunnelRuntimeError {
             switch runtimeError {
             case .unavailable:
-                return app.tr("请先连接，再刷新 Tailscale 状态。", "Connect before refreshing Tailscale status.")
+                return app.tr(
+                    "请先启动这条 Tailscale 线路的设置。",
+                    "Start setup for this Tailscale line first."
+                )
             case .missingTarget:
                 return app.tr(
-                    "这条 Tailscale 线路未在当前连接中启用，请启用后重新连接。",
-                    "This Tailscale line is not enabled in the running connection. Enable it and reconnect."
+                    "这条 Tailscale 线路当前没有可用的设置会话，请重新启动独立设置。",
+                    "This Tailscale line has no available setup session. Restart isolated setup."
                 )
             default:
                 break
@@ -710,11 +971,37 @@ private struct LineEditorView: View {
         return userFacingConnectionText(error.localizedDescription)
     }
 
+    @discardableResult
+    private func applyTailscaleAuthenticationStatus(_ status: TailscaleRuntimeStatus) -> Bool {
+        guard app.applyTailscaleRuntimeStatus(lineID: lineID, status: status) else {
+            tailscaleStatusError = app.tr(
+                "登录状态无法保存，请不要结束设置并重试。",
+                "The sign-in state could not be saved. Keep setup open and retry."
+            )
+            return false
+        }
+        return true
+    }
+
+    private func logoutTailscale() {
+        guard !isLoggingOutTailscale, app.tailscaleSetupLineID == lineID else { return }
+        isLoggingOutTailscale = true
+        tailscaleStatusError = nil
+        app.logoutTailscale(lineID: lineID) { result in
+            isLoggingOutTailscale = false
+            switch result {
+            case .failure(let error):
+                tailscaleStatusError = tailscaleErrorMessage(error)
+            case .success:
+                tailscaleRuntimeStatus = nil
+                pendingTailscaleSetupLogin = false
+                app.finishTailscaleSetup()
+            }
+        }
+    }
+
     private func validTailscaleAuthURL(_ rawValue: String) -> URL? {
-        guard let components = URLComponents(string: rawValue),
-              components.scheme?.lowercased() == "https",
-              let host = components.host, !host.isEmpty else { return nil }
-        return components.url
+        AppState.validTailscaleAuthURL(rawValue)
     }
 
     private func tailscaleBackendLabel(_ rawValue: String) -> String {
@@ -723,6 +1010,8 @@ private struct LineEditorView: View {
             return app.tr("已登录", "Signed In")
         case "needslogin", "needs_login":
             return app.tr("需要登录", "Sign-in Required")
+        case "needsmachineauth", "needs_machine_auth":
+            return app.tr("需要设备授权", "Device Approval Required")
         case "starting":
             return app.tr("正在启动", "Starting")
         case "stopped":
@@ -779,8 +1068,8 @@ private struct LineEditorView: View {
     private func persistPendingChanges() -> Bool {
         pendingSaveTask?.cancel()
         pendingSaveTask = nil
-        guard !app.hasActiveTunnel else { return false }
         guard hasPendingChanges, let index = lineIndex else { return true }
+        guard !app.hasActiveTunnel else { return false }
 
         let attemptedLine = app.profile.lines[index]
         guard app.save() else {
