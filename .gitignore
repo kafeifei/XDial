@@ -3,9 +3,10 @@ build/
 macos/.build/
 /tmp/
 *.log
-# .claude 下只提交 settings.json，其余（worktrees/settings.local.json 等）本地私有
+# .claude 下只提交 settings.json 和 hooks/，其余（worktrees/settings.local.json 等）本地私有
 .claude/*
 !.claude/settings.json
+!.claude/hooks/
 /libboxtest
 /xdial
 appletv/XDialTV.xcodeproj/
