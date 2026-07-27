@@ -533,6 +533,23 @@ final class AppState: ObservableObject {
             }
         }
 
+        // 自愈：清洗存量数据里混入的控制/格式字符。老输入层只 trim 空白，
+        // 粘贴带入的 \u{03} 等会存进 profile 并写进 domain_suffix（永远匹配
+        // 不中，UI 又看不见）。清洗后走 didMigrate 回写持久化。
+        for i in loaded.ruleSets.indices {
+            let cleanedDomains = loaded.ruleSets[i].domains
+                .map(RuleSet.sanitizeEntry).filter { !$0.isEmpty }
+            let cleanedCIDRs = loaded.ruleSets[i].cidrs
+                .map(RuleSet.sanitizeEntry).filter { !$0.isEmpty }
+            if cleanedDomains != loaded.ruleSets[i].domains
+                || cleanedCIDRs != loaded.ruleSets[i].cidrs {
+                loaded.ruleSets[i].domains = cleanedDomains
+                loaded.ruleSets[i].cidrs = cleanedCIDRs
+                didMigrate = true
+                appLog("loadSaved: sanitized control chars in rule set \(loaded.ruleSets[i].id)")
+            }
+        }
+
         self.profile = loaded
         if didMigrate { save() }
     }
