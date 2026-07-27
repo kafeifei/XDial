@@ -544,10 +544,10 @@ struct RuleSetRow: View {
 
     private func saveDomainsAndCIDRs() {
         rule.domains = domainsText.split(whereSeparator: \.isNewline)
-            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .map { RuleSet.sanitizeEntry(String($0)) }
             .filter { !$0.isEmpty }
         rule.cidrs = cidrsText.split(whereSeparator: \.isNewline)
-            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .map { RuleSet.sanitizeEntry(String($0)) }
             .filter { !$0.isEmpty }
         state.save()
     }

@@ -109,6 +109,16 @@ struct RuleSet: Codable, Identifiable, Hashable {
     var format: String = "auto"
     var domains: [String] = []
     var cidrs: [String] = []
+
+    /// 清洗单条域名/CIDR 条目：剥掉所有控制与格式类字符（粘贴常混入
+    /// \u{03}、零宽空格、BOM 等，Cc/Cf 两类都在 controlCharacters 集合里），
+    /// 再去首尾空白。这类字符一旦写进 domain_suffix，规则永远匹配不中，
+    /// 且在 UI 里不可见——用户以为绑定了实际没绑上。
+    static func sanitizeEntry(_ raw: String) -> String {
+        let stripped = String(String.UnicodeScalarView(
+            raw.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }))
+        return stripped.trimmingCharacters(in: .whitespaces)
+    }
 }
 
 struct RuleBinding: Codable, Hashable, Identifiable {
