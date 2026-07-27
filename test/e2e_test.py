@@ -10,6 +10,17 @@
     vault 密码（~/.xdial/vault.json），真连接后断言：
       连接态：系统 DNS 已被接管到 198.18.0.2、解析可用、默认线路可达、
               VPN 绑定的内网域名可达、sing-box 数据面进程存在
+      同源性：对活动模式里每条基于域名的绑定，断言「同一域名的路由出口与
+              DNS 应答来源一致」（ARCHITECTURE.md §4.1 因果链 / INV7 的运行时版）：
+              - DNS 侧：向名义公网解析器发查询必须被盒内应答（hijack-dns），
+                且名义服务器换成接管地址答案不变；VPN 绑定的内网名，应答
+                必须落在同一绑定的 CIDR 内——只有经该线路的企业 DNS 能给出
+                这样的答案，这就是「应答来源」的行为学归属
+              - 路由侧：真连该域名并保持连接，从 Clash API /connections 按
+                本端源端口找到这条连接（结构化接口，非日志抓取），其出口链
+                末端必须是同一线路；探针目标优先取 CIDR 外应答（域名归属）
+              直连默认出口只验路由侧（direct 不声明解析器，INV7 显式豁免），
+              判据是 rule=="final" 的探针域名出口链末端等于默认出口 tag
       断开后：系统 DNS 还原、解析仍可用、无残留 sing-box 进程
     会真实拨通 VPN 并短暂改变整机路由/DNS，只在开发机上跑。
 
@@ -23,13 +34,17 @@
 需要 helper daemon 已在运行（launchd 托管，/tmp/xdial.sock 可达）。
 """
 import argparse
+import http.client
+import ipaddress
 import json
 import plistlib
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -39,6 +54,11 @@ PROFILE_KEY = "xdial.profile"
 VAULT_PATH = Path.home() / ".xdial" / "vault.json"
 # 与 core/engine/dns_takeover.go 的 dnsTakeoverAddress 一致
 DNS_TAKEOVER_ADDR = "198.18.0.2"
+# 与 core/config/generator.go 的 clashAPIController 一致（仅桌面数据面开启）
+CLASH_API = "http://127.0.0.1:9090"
+# 与 core/config/generator.go 的 testDomains 一致（桌面诊断规则的探测域名，
+# 会被前置系统规则导向 test-out selector，不能用作归属探针；改那边须同步）
+TEST_DOMAINS = ["ip.sb", "ipinfo.io", "ip-api.com"]
 
 CONNECT_TIMEOUT = 60  # AnyConnect 拨号 + 数据面就绪
 DISCONNECT_TIMEOUT = 20
@@ -370,8 +390,10 @@ def pick_vpn_probe_domain(profile: dict) -> Optional[str]:
         if (line.get("type") == "vpn" and line.get("enabled")
                 and rs.get("type") == "manual" and rs.get("enabled")):
             for domain in rs.get("domains", []):
-                d = domain.strip().lstrip(".")
-                if d:
+                d = domain.strip()
+                # 带前导点的条目只匹配子域名（sing-box domain_suffix 语义），
+                # 剥点探测裸域名会假失败，跳过
+                if d and not d.startswith(".") and re.fullmatch(r"[A-Za-z0-9.-]+", d):
                     return d
     return None
 
@@ -418,6 +440,374 @@ def resolve_ok(name: str) -> bool:
     except subprocess.TimeoutExpired:
         return False
     return "ip_address" in out.stdout or "ipv6_address" in out.stdout
+
+
+# ---------------------------------------------------------------------------
+# 同源性断言：同一域名的路由出口与 DNS 应答来源必须一致。
+#
+# 这是 ARCHITECTURE.md §4.1 因果链（名字→线路→地址）/ INV7 的运行时版：
+# INV7 在生成阶段保证 route 规则与 dns 规则从同一份 mode.Bindings 编译，
+# 这里在真实数据面上验证编译产物确实按同一归属生效——流量走 A 线路而解析
+# 走 B 线路（漂移）时，得到的地址在 A 那头根本不通，且配置里看不出问题。
+#
+# 观测手段都是结构化接口，不抓日志（架构约束禁止事项 6 的同款纪律）：
+#   路由侧   Clash API /connections 的 chains 字段（连接的出口链归属）
+#   DNS 侧   真实 DNS 查询的行为学差分——密封盒下 hijack-dns 把发往任意名义
+#            服务器的查询都拦在盒内，由 DNS 规则链选应答者。内网名的应答落在
+#            绑定 CIDR 内 ⟺ 应答出自经该线路的企业 DNS（公网解析器既无记录
+#            也不可能给出内网地址）。
+# DNS 应答来源的归属证据分三级（依可观测性递进，测试输出里注明达到了哪级）：
+#   E1 盒内应答不变性（硬断言）——@8.8.8.8 与 @198.18.0.2 两个名义服务器的答案
+#      必须一致且非空。198.18.0.2 上没有任何真实服务器，能应答者只有盒内规则链；
+#      答案一致证明 @8.8.8.8 的查询同样被拦在盒内（hijack 失效时两者必然不相交）。
+#   E2 上游查询的出口链归属（可观测则硬断言）——若 Clash API 连接表里能看到
+#      53 端口（企业 DNS）/ DoH 上游连接，其 chains 必须含绑定线路的 tag。
+#   E3 应答落在绑定 CIDR 内（机会性强证据）——命中即为最强归属（公网解析器
+#      不可能给出内网地址）；真实规则集里的域名多为「经 VPN 访问的公网站点」，
+#      企业 DNS 对它们也返回公网 IP，故 E3 缺席不判失败，只降级提示。
+# ---------------------------------------------------------------------------
+
+def clash_get(path: str) -> dict:
+    """读桌面数据面的 Clash API（只在连接态存在，只绑回环）。
+
+    异常覆盖注意：OSError 才能罩住全版本的 socket.timeout / URLError /
+    ConnectionError（Python 3.9 的 socket.timeout 不是 TimeoutError 子类，
+    且 getresponse/read 阶段的超时不会被 urllib 包成 URLError）；
+    HTTPException 罩住 IncompleteRead / RemoteDisconnected。
+    """
+    try:
+        with urllib.request.urlopen(CLASH_API + path, timeout=5) as resp:
+            return json.loads(resp.read())
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as e:
+        raise Failure(f"Clash API {path} 不可达: {e}")
+
+
+def dig_short(name: str, nominal_server: str) -> list:
+    """向指定名义服务器发 A 查询，返回应答 IP 列表。
+
+    连接态下这个查询必然被 hijack-dns 拦在盒内——nominal_server 只是包上写的
+    地址，真正的应答者由 sing-box DNS 规则链（mode.Bindings 编译产物）决定。
+    """
+    try:
+        out = run(["dig", "+short", "+time=3", "+tries=1",
+                   f"@{nominal_server}", name, "A"], timeout=10)
+    except subprocess.TimeoutExpired:
+        return []
+    ips = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        try:
+            ipaddress.ip_address(line)
+            ips.append(line)
+        except ValueError:
+            continue  # CNAME 等非地址行
+    return ips
+
+
+def hold_connection(host: str, ip: str, use_tls: bool) -> socket.socket:
+    """连到 ip:443 并保持连接打开，让它出现在 /connections 里。
+
+    TLS 模式发真实 ClientHello（带 SNI），sniff 拿到域名后路由按域名归属，
+    /connections 的 host 字段也会是这个域名；证书不校验——要的是路由归属，
+    不是对端身份。裸 TCP 模式不发数据，sniff 超时后按目的 IP 归属。
+    """
+    sock = socket.create_connection((ip, 443), timeout=8)
+    if not use_tls:
+        return sock
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx.wrap_socket(sock, server_hostname=host)
+    except (ssl.SSLError, OSError):
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def connection_entry(source_port: int) -> Optional[dict]:
+    """在 /connections 快照里按本端源端口找到**我们自己的**那条连接。
+
+    不按 host / 目的 IP 匹配：连接表里有全系统的连接，浏览器到同一 CDN IP
+    的长连接会顶包（审查实证：裸 TCP 时 sniff 无 host，目的 IP 撞车必然取错）。
+    tun 记录的是 NAT 前的原始源端口，与 getsockname() 一致。
+    """
+    snapshot = clash_get("/connections")
+    for conn in snapshot.get("connections") or []:
+        meta = conn.get("metadata") or {}
+        if str(meta.get("sourcePort", "")) == str(source_port):
+            return conn
+    return None
+
+
+def route_probe(host: str, ip: str, allow_plain_tcp: bool) -> tuple:
+    """真连 host（ip:443）并读出这条连接的 (出口链, 命中规则)。
+
+    路由裁决选中的 tag 是 chains 的**末元素**（tracker 构链后 Reverse，
+    首元素是嵌套组展开的叶子）；rule 字段未命中任何规则时是字符串 "final"
+    ——这是判定「该连接落在默认出口」的结构化依据。
+
+    TLS 模式发真实 ClientHello（带 SNI），路由按域名归属；裸 TCP 不发数据，
+    sniff 超时后只能按目的 IP 归属——所以仅当调用方明确说「按 IP 归属也
+    成立」（目标 IP 落在同绑定 CIDR 内）时才允许退回裸 TCP。
+    """
+    last_error = "未尝试"
+    modes = (True, False) if allow_plain_tcp else (True,)
+    for use_tls in modes:
+        try:
+            held = hold_connection(host, ip, use_tls)
+        except (OSError, ssl.SSLError) as e:
+            last_error = f"{'TLS' if use_tls else 'TCP'} 连接失败: {e}"
+            continue
+        try:
+            source_port = held.getsockname()[1]
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                conn = connection_entry(source_port)
+                if conn and conn.get("chains"):
+                    return conn["chains"], str(conn.get("rule", ""))
+                time.sleep(0.4)
+            last_error = f"{'TLS' if use_tls else 'TCP'} 连接建立但 /connections 里找不到"
+        finally:
+            try:
+                held.close()
+            except OSError:
+                pass
+    raise Failure(f"无法取得 {host}（{ip}:443）的路由出口链——{last_error}")
+
+
+def line_outbound_tag(line: dict) -> str:
+    """线路 → outbound tag 的命名映射，与 core/config/generator.go 的
+    resolveOutboundTag 逐分支镜像（Python 测试进不了 Go 包，只能对齐这份
+    4 行映射；改那边必须同步这里）。else 分支与 Go 侧 default 同构：一切
+    其余类型都是 proxy-<id>。订阅出口的组名要过 slugify，本函数不处理
+    ——调用方对订阅绑定一律先行跳过。"""
+    line_type = line.get("type")
+    if line_type == "direct":
+        return "direct"
+    if line_type == "vpn":
+        return "vpn"
+    if line_type == "tailscale":
+        return "tailscale-" + line["id"]
+    return "proxy-" + line["id"]
+
+
+def active_mode(profile: dict) -> Optional[dict]:
+    return next((m for m in profile.get("modes", [])
+                 if m["id"] == profile.get("active_mode_id")), None)
+
+
+def build_consistency_probes(profile: dict) -> list:
+    """把活动模式里「基于域名的绑定」编译成同源性探针清单。
+
+    输入源刻意与生成器相同（mode.Bindings），覆盖范围与 INV7 的收窄语义一致：
+    只看域名绑定；direct / tailscale 豁免（前者不声明解析器，后者的 tailnet
+    名字在静态配置里没有域名列表）；URL 规则集的域名在远端 .srs 里，测试侧
+    无法枚举，跳过（route 侧与 dns 侧引用的本就是同一份 rule_set 资源，
+    静态一致性由 INV7 守护）。
+    """
+    mode = active_mode(profile)
+    if mode is None:
+        return []
+    lines = {l["id"]: l for l in profile.get("lines", [])}
+    rulesets = {r["id"]: r for r in profile.get("rule_sets", [])}
+    probes = []
+    for binding in mode.get("bindings", []):
+        if binding.get("subscription_id"):
+            continue  # 订阅出口的组 tag 经 slugify，测试侧不复刻命名规则
+        line = lines.get(binding.get("line_id", ""))
+        ruleset = rulesets.get(binding.get("rule_set_id", ""))
+        if not line or not ruleset:
+            continue
+        if not (line.get("enabled") and ruleset.get("enabled")):
+            continue
+        if ruleset.get("type") != "manual":
+            continue
+        if line.get("type") in ("direct", "tailscale"):
+            continue
+        domains = []
+        for raw in ruleset.get("domains", []):
+            cleaned = raw.strip()
+            if not cleaned:
+                continue
+            if cleaned.startswith("."):
+                # 生成器原样写入 domain_suffix，sing-box 对带前导点的条目只
+                # 匹配子域名、不匹配裸域名——剥点探测裸域名会得到假失败。跳过。
+                print(f"  – 规则集 {ruleset.get('name')} 条目 {raw!r} 带前导点"
+                      f"（仅匹配子域名），跳过该条探测")
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9.-]+", cleaned):
+                # 例如混入控制字符的条目：不修复、不沉默——这样的 domain_suffix
+                # 在数据面永远匹配不中，用户以为绑定了实际没绑上
+                print(f"  ⚠ 规则集 {ruleset.get('name')} 含非法域名条目 {raw!r}，"
+                      f"该条绑定在数据面不会生效")
+                continue
+            if any(cleaned == t or cleaned.endswith("." + t) for t in TEST_DOMAINS):
+                # 与桌面诊断规则（testDomains → test-out）撞车的域名会被前置
+                # 系统规则截走，不适合做归属探针
+                continue
+            domains.append(cleaned)
+        if not domains:
+            continue
+        probes.append({
+            "ruleset": ruleset.get("name", ruleset.get("id", "?")),
+            "domains": domains,
+            "line_type": line.get("type"),
+            "tag": line_outbound_tag(line),
+            "cidrs": [c for c in ruleset.get("cidrs", []) if c],
+        })
+    return probes
+
+
+def dns_upstream_chains(tag: str) -> list:
+    """证据 E2：在连接表里找疑似 DNS 上游连接（企业 DNS 的 :53 / DoH 的
+    1.1.1.1:443，见 generator.go buildDNS），返回它们的出口链列表。
+    观测不到返回空（sing-box 是否把 DNS 上游计入连接表不属于我们的契约）。"""
+    try:
+        snapshot = clash_get("/connections")
+    except Failure:
+        return []
+    chains = []
+    for conn in snapshot.get("connections") or []:
+        meta = conn.get("metadata") or {}
+        port = str(meta.get("destinationPort", ""))
+        is_plain_dns = port == "53"
+        is_doh = port == "443" and meta.get("destinationIP") == "1.1.1.1"
+        if not (is_plain_dns or is_doh):
+            continue
+        chain = conn.get("chains") or []
+        if tag in chain:
+            chains.append(chain)
+    return chains
+
+
+def assert_route_dns_agree(probe: dict) -> None:
+    """同一批域名（一条绑定）：路由出口与 DNS 应答来源必须归属同一条线路。
+
+    扫描绑定的域名列表（上限 8 个）而不是只看第一个：真实规则集里 apex 域名
+    往往是公网可解析的（split-horizon），单点判定既会误红也会漏放。
+    """
+    tag = probe["tag"]
+    networks = [ipaddress.ip_network(c, strict=False) for c in probe["cidrs"]]
+
+    resolved = []       # (domain, answers)
+    in_cidr_pick = None  # (domain, ip) —— E3 强归属候选
+    for domain in probe["domains"][:8]:
+        answer_public = dig_short(domain, "8.8.8.8")
+        if not answer_public:
+            continue  # 该域名在当前视角无 A 记录，换下一个
+        answer_takeover = dig_short(domain, DNS_TAKEOVER_ADDR)
+        # E1：两个名义服务器的答案必须相交。198.18.0.2 上没有真实服务器，
+        # 应答只可能来自盒内；不相交 = @8.8.8.8 的查询漏出了盒（hijack 失效）
+        # 或盒内应答者不唯一。这是硬断言，一个域名违反即失败。
+        if not set(answer_public) & set(answer_takeover):
+            # 附带路由侧参考再报错：漂移的本质是两侧不一致，
+            # 两侧的观测都给出来才好归因（例如叠罗汉场景是路由被抢，不是 DNS 配错）
+            try:
+                chain, rule_str = route_probe(domain, answer_public[0], False)
+                route_ref = f"路由侧参考：出口链 {chain}，命中规则 {rule_str!r}"
+            except Failure as route_err:
+                route_ref = f"路由侧参考：{route_err}"
+            raise Failure(
+                f"{domain} 换名义服务器答案不相交（hijack 失效或应答者漂移）："
+                f"@8.8.8.8={answer_public} @{DNS_TAKEOVER_ADDR}={answer_takeover}；{route_ref}")
+        resolved.append((domain, answer_public))
+        if in_cidr_pick is None:
+            for ip in answer_public:
+                if any(ipaddress.ip_address(ip) in n for n in networks):
+                    in_cidr_pick = (domain, ip)
+                    break
+
+    if not resolved:
+        raise Failure(
+            f"绑定 {probe['ruleset']} 的域名（前 8 个）无一可解析——"
+            f"该绑定的 DNS 分支整体不可用（漂移到 NXDOMAIN 路径或 SERVFAIL）")
+
+    # E2：上游 DNS 连接的出口链归属（刚触发过真实查询，若 sing-box 把 DNS
+    # 上游计入连接表，此刻应能看到）。观测到即为结构化硬证据。
+    upstream = dns_upstream_chains(tag)
+
+    dns_evidence = "E1 盒内应答不变性"
+    if upstream:
+        dns_evidence += f" + E2 上游出口链 {upstream[0]}"
+    if in_cidr_pick:
+        dns_evidence += f" + E3 内网应答 {in_cidr_pick[0]}→{in_cidr_pick[1]}"
+    if not in_cidr_pick and not upstream:
+        print(f"    （{probe['ruleset']}：应答来源仅达弱归属 E1——"
+              f"域名均解析为公网 IP 且未观测到上游 DNS 连接）")
+
+    # --- 路由侧 ---
+    # 探针目标刻意优先选 CIDR **外**的应答：绑定规则同时携带 domain_suffix
+    # 与 ip_cidr，CIDR 内的目标无论域名分支死活都会命中 ip_cidr 半边——只有
+    # 「CIDR 外目标 + 带 SNI 的 TLS」才真正行使按域名归属（审查实证：否则
+    # domain_suffix 路由分支丢失检不出）。全部应答都在 CIDR 内时才退回
+    # IP 归属，并在输出里降级注明。
+    attempts = []  # (域名, 目标 IP, 归属级别, 允许裸 TCP 兜底)
+    for domain, answers in resolved:
+        out_of_cidr = [ip for ip in answers
+                       if not any(ipaddress.ip_address(ip) in n for n in networks)]
+        if out_of_cidr:
+            attempts.append((domain, out_of_cidr[0], "域名归属", False))
+            break
+    if in_cidr_pick:
+        # 裸 TCP 只在目标落在绑定 CIDR 内时才允许：无 SNI 时按 IP 归属成立
+        attempts.append((in_cidr_pick[0], in_cidr_pick[1], "IP 归属", True))
+
+    chain, rule_str, route_domain, route_grade = None, "", "", ""
+    route_errors = []
+    for domain, ip, grade, allow_tcp in attempts:
+        try:
+            chain, rule_str = route_probe(domain, ip, allow_tcp)
+            route_domain, route_grade = domain, grade
+            break
+        except Failure as e:
+            route_errors.append(str(e))
+    if chain is None:
+        raise Failure(f"路由探针全部失败: {' ; '.join(route_errors)}")
+    if chain[-1] != tag:
+        raise Failure(
+            f"{route_domain} 的路由出口链 {chain}（命中规则 {rule_str!r}）"
+            f"末端不是期望线路 {tag}——路由与 DNS 归属漂移（流量走 A、解析走 B）；"
+            f"DNS 侧证据：{dns_evidence}")
+    if route_grade != "域名归属":
+        print(f"    （{probe['ruleset']}：路由侧仅达 IP 归属——全部应答都在绑定 CIDR 内）")
+    print(f"    （{probe['ruleset']}：路由出口 {chain}（{route_grade}）↔ DNS {dns_evidence}）")
+
+
+def assert_default_line_chain(default_tag: str) -> None:
+    """默认出口（route.final）的路由归属。
+
+    「未绑定域名」不能靠假设——热门域名常被模式 URL 规则集 / 订阅自带规则
+    截走（此时断言的是那条规则而不是 final，若出口同名就恒绿假测）。判据用
+    结构化的 rule 字段：未命中任何规则时它就是字符串 "final"。被截走则换
+    备选域名，全部被截走时可见跳过，不产出假绿。出口比对用 chains 末元素
+    （末元素才是路由裁决选中的 tag，`in` 会把嵌套组成员误判为命中）。
+    （direct 不声明解析器，DNS 侧按 INV7 豁免，不做来源归属。）"""
+    candidates = ["www.apple.com", "example.com", "www.bing.com"]
+    intercepted, unresolvable = [], []
+    for domain in candidates:
+        answers = dig_short(domain, DNS_TAKEOVER_ADDR)
+        if not answers:
+            unresolvable.append(domain)
+            continue
+        chain, rule_str = route_probe(domain, answers[0], allow_plain_tcp=False)
+        if rule_str != "final":
+            intercepted.append(f"{domain}（被 {rule_str!r} 截走）")
+            continue
+        if chain[-1] != default_tag:
+            raise Failure(
+                f"{domain} 落在 route.final，但出口链 {chain} 末端不是默认出口 {default_tag}")
+        print(f"    （默认出口探针 {domain}：rule=final，出口链 {chain}）")
+        return
+    if not intercepted:
+        # 全部候选连 DNS 应答都拿不到：这不是“探针不适用”，是接管地址上的
+        # DNS 面已不可用——本身就是缺陷，必须红
+        raise Failure(f"默认出口探针候选 {candidates} 经 {DNS_TAKEOVER_ADDR} 均无应答"
+                      f"——接管地址上的 DNS 面不可用")
+    print(f"    – 默认出口探针域名全部被前置规则截走：{'；'.join(intercepted + unresolvable)}"
+          f"——该 profile 下无法构造 final 探针，跳过（非通过）")
 
 
 def check_repo_freshness(client: DaemonClient, require_fresh: bool) -> None:
@@ -511,6 +901,37 @@ def run_tier_b(socket_path: str, require_fresh: bool) -> int:
         if probe_domain:
             check(f"VPN 域名可达 ({probe_domain})", assert_vpn_probe)
         check("数据面进程存在", assert_dataplane_process)
+
+        # --- 同源性：同一域名的路由出口与 DNS 应答来源一致（INV7 运行时版）---
+        def assert_clash_api_up():
+            version = clash_get("/version")
+            if not version.get("version"):
+                raise Failure(f"Clash API /version 返回异常: {version}")
+
+        check("Clash API 可达", assert_clash_api_up)
+        probes = build_consistency_probes(profile)
+        if not probes:
+            print("  – 同源性：活动模式没有可探测的域名绑定（手动规则集），跳过")
+        for consistency_probe in probes:
+            check(f"同源性 {consistency_probe['ruleset']} → {consistency_probe['tag']}",
+                  lambda p=consistency_probe: assert_route_dns_agree(p))
+        # 默认出口的期望值复刻生成器口径（generator.go 默认出口段）：
+        # DefaultSubscriptionID 优先于 DefaultLineID；线路须存在且 enabled，
+        # 否则 final 回落 "direct"。残余口径差：enabled 但参数不全的代理线路
+        # 也会回落 direct（lineHasUsableOutbound），测试侧不复刻——vault
+        # 注入后现实中不出现。
+        if mode.get("default_subscription_id"):
+            print("  – 默认出口是订阅组（tag 经 slugify 生成，测试侧不复刻），跳过出口链断言")
+        else:
+            default_line = next((l for l in profile.get("lines", [])
+                                 if l["id"] == mode.get("default_line_id")), None)
+            if default_line is not None and default_line.get("enabled"):
+                default_tag = line_outbound_tag(default_line)
+            else:
+                default_tag = "direct"
+                print("  – 默认线路缺失或已禁用，按生成器口径断言 final 回落 direct")
+            check(f"默认出口 route.final → {default_tag}",
+                  lambda t=default_tag: assert_default_line_chain(t))
 
         print("  → stop")
         resp = client.request("stop", timeout=DISCONNECT_TIMEOUT)
