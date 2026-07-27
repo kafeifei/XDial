@@ -601,7 +601,7 @@ func TestGenerate_ContentVerification(t *testing.T) {
 	}
 
 	// 验证模式规则在订阅自带规则之前。
-	// 宪法：Mode 是唯一裁决者，订阅只是供给源（D28）—— 用户在模式里显式绑定的
+	// 架构约束：Mode 是唯一裁决者，订阅只是供给源（D28）—— 用户在模式里显式绑定的
 	// 规则必须先匹配，订阅自带的宽匹配（GEOIP,CN 之类）只能当兜底，否则订阅
 	// 一更新就能把用户的显式分流整片遮蔽掉。
 	rules := route["rules"].([]interface{})

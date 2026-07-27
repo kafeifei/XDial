@@ -1,8 +1,8 @@
 package config
 
-// invariants_test.go —— 把 XDial 宪法写成 CI 门禁。
+// invariants_test.go —— 把 XDial 架构约束写成 CI 门禁。
 //
-// 这里的每个测试守护一条宪法条款，而不是某个函数的实现细节。它们的存在意义是：
+// 这里的每个测试守护一条架构约束条款，而不是某个函数的实现细节。它们的存在意义是：
 // 任何“看起来很合理”的生成器改动，只要破坏了密封律 / 正交律 / DNS 归属，
 // 都必须在这里变红，而不是等到用户机器上表现为“连上了但全断”。
 //
@@ -52,14 +52,14 @@ func invBaseProfile() *Profile {
 		RuleSets: []RuleSet{
 			{ID: "intranet", Name: "内网", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"corp.example"}, CIDRs: []string{"10.0.0.0/8"}},
-			{ID: "gfw", Name: "GFW", Type: RuleSetTypeURL, Enabled: true,
-				URL: "https://example.com/gfw.srs"},
+			{ID: "remote", Name: "远程规则集", Type: RuleSetTypeURL, Enabled: true,
+				URL: "https://example.com/rules.srs"},
 		},
 		Modes: []Mode{{
 			ID: "m", Name: "默认模式",
 			Bindings: []RuleBinding{
 				{RuleSetID: "intranet", LineID: "corp"},
-				{RuleSetID: "gfw", LineID: "px"},
+				{RuleSetID: "remote", LineID: "px"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -357,7 +357,7 @@ func invHasEnabledTailscaleLine(profile *Profile) bool {
 // INV1 —— 内部正交律：未被 active Mode 引用的对象不得影响本机流量决策
 // ===========================================================================
 //
-// 守护：宪法「内部正交律」+「声明≠生效」。Line/RuleSet/订阅可以存在于 profile 里
+// 守护：架构约束「内部正交律」+「声明≠生效」。Line/RuleSet/订阅可以存在于 profile 里
 // （用户配了但没启用到当前模式），但只要 active Mode 没引用它，生成的数据面配置
 // 就必须逐字节语义等价。
 //
@@ -500,7 +500,7 @@ func TestINV1c_UnreferencedTailscaleLineOnlyAddsEndpoint(t *testing.T) {
 // INV2 —— DNS 归属：每个 dns.server 都必须有主
 // ===========================================================================
 //
-// 守护：宪法「DNS 原理：名字→线路→地址」+「解析权随线路走」。
+// 守护：架构约束「DNS 原理：名字→线路→地址」+「解析权随线路走」。
 // 每一个 dns.servers 条目要么属于显式的全局默认白名单（系统解析器 / 公共 fallback /
 // bootstrap），要么必须能追溯到 active Mode 引用的某条 Line。
 //
@@ -608,7 +608,7 @@ func TestINV2_EveryDNSServerTracesToAnActiveLine(t *testing.T) {
 // INV3 —— 外部密封律：DNS 绝不溢出到系统层
 // ===========================================================================
 //
-// 守护：宪法「外部密封律」。桌面配置必须自己劫持并应答 DNS；一旦把原始 DNS 包
+// 守护：架构约束「外部密封律」。桌面配置必须自己劫持并应答 DNS；一旦把原始 DNS 包
 // 以 route→direct 的形式放出盒外，系统 DNS 指向 100.100.100.100（官方 Tailscale
 // 接管）时就是黑洞，接管路由的瞬间整机断网（2026-07-26 实测）。
 //
@@ -680,7 +680,7 @@ func TestINV3_DesktopSealsDNSInsideTheBox(t *testing.T) {
 // INV4 —— 无隐藏规则：route.rules 每一条都要有出处
 // ===========================================================================
 //
-// 守护：宪法「Mode 是唯一裁决者」+ D28「供给出来的规则必须以一等公民身份进入 Mode
+// 守护：架构约束「Mode 是唯一裁决者」+ D28「供给出来的规则必须以一等公民身份进入 Mode
 // 裁决，绝不隐式抢注」。
 //
 // 每条 route rule 必须属于以下三类之一：
@@ -704,7 +704,7 @@ type invRuleContext struct {
 //     xdial-connectivity-anyconnect）：它们是用户 profile 里真实存在的 RuleSet + Mode
 //     binding，只是被生成器提到订阅规则之前而已。它们必须走 (a) 追溯；如果哪天
 //     它们变成生成器凭空注入的，本测试就应该变红。
-//   - 任何“默认直连私有网段 / 默认拦截广告”之类的便利规则：宪法禁止隐式裁决。
+//   - 任何“默认直连私有网段 / 默认拦截广告”之类的便利规则：架构约束禁止隐式裁决。
 var invSystemRuleWhitelist = []struct {
 	reason string
 	match  func(rule map[string]interface{}, ctx invRuleContext) bool
@@ -929,7 +929,7 @@ func TestINV4_NoHiddenRouteRules(t *testing.T) {
 
 // INV4b —— 用户显式绑定优先于订阅自带规则。
 //
-// 守护：宪法 D28「供给出来的规则必须以一等公民身份进入 Mode 裁决，绝不隐式抢注」。
+// 守护：架构约束 D28「供给出来的规则必须以一等公民身份进入 Mode 裁决，绝不隐式抢注」。
 // 订阅自带规则若排在模式普通规则之前，用户在 UI 上明明把某域名绑到了 A 线路，
 // 实际却被订阅的大范围规则抢先匹配走 B —— 这是最典型的“隐式抢注”。
 //
@@ -997,7 +997,7 @@ func TestINV6a_DanglingReferencesAreRejected(t *testing.T) {
 		{
 			name: "binding 指向不存在的 SubscriptionID",
 			mutate: func(p *Profile) {
-				p.Modes[0].Bindings[1] = RuleBinding{RuleSetID: "gfw", SubscriptionID: "nope"}
+				p.Modes[0].Bindings[1] = RuleBinding{RuleSetID: "remote", SubscriptionID: "nope"}
 			},
 		},
 		{
@@ -1037,7 +1037,7 @@ func TestINV6a_DanglingReferencesAreRejected(t *testing.T) {
 // 或者反过来把 warning 悄悄删掉（回到静默降级）。
 func TestINV6b_DisabledReferencesWarnButDoNotFail(t *testing.T) {
 	profile := invBaseProfile()
-	// px 线路被显式禁用，但 gfw 规则集仍绑定着它。
+	// px 线路被显式禁用，但 远程规则集仍绑定着它。
 	for index := range profile.Lines {
 		if profile.Lines[index].ID == "px" {
 			profile.Lines[index].Enabled = false
@@ -1130,7 +1130,7 @@ func TestINVD30_DesktopRejectsMultipleActiveAnyConnectLines(t *testing.T) {
 //     它没有域名匹配键，因此不算“域名分支”，不参与本测试的反向追溯。
 //
 // 什么改动会让它变红：给路由加了域名绑定却忘了同步 dns.rules（分流看似生效，
-// 实际用本地污染结果去连隧道那头），或者反过来在 dns.rules 里塞了没有路由对应的域名分支。
+// 实际用本地解析结果去连隧道那头），或者反过来在 dns.rules 里塞了没有路由对应的域名分支。
 func TestINV7_DomainBindingsAndDNSRulesAgree(t *testing.T) {
 	profile := invBaseProfile()
 	// 再加一条「URL 规则集 → AnyConnect 线路」：预设模式“国内”就是这个形状，

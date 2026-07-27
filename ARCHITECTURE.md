@@ -1,8 +1,8 @@
-# XDial 架构宪法
+# XDial 架构约束规范
 
 ## 0. 这份文档是什么
 
-这是 XDial 的**架构约束规范**，不是设计介绍。任何 AI 编码工具（Claude Code / Codex / Cursor）和人类贡献者在改动本仓库前必须先读完本文，改完后必须能对照第 7 节（禁止事项）和第 8 节（不变量测试）自证没有违宪。
+这是 XDial 的**架构约束规范**，不是设计介绍。任何 AI 编码工具（Claude Code / Codex / Cursor）和人类贡献者在改动本仓库前必须先读完本文，改完后必须能对照第 7 节（禁止事项）和第 8 节（不变量测试）自证没有越界。
 
 **为什么要有这份文档。** XDial 桌面版长期不稳定的根因不是某个函数写错，而是**模块越界**：某个维度的组件擅自替另一个维度做了决策，且这个决策对用户不可见。典型症状是"改一个看似无关的开关，全局路由/DNS 行为整个变了，且没人能在配置里指出是哪一行造成的"。这类 bug 无法靠 code review 逮住——每一处单看都"合理"，问题只在跨模块组合时出现。
 
@@ -11,7 +11,7 @@
 - **本文档**——说明边界在哪、为什么在那里、越界长什么样。给人和 AI 读。
 - **CI 不变量测试**（第 8 节）——把边界编码成可执行断言。给编译器读。
 
-文档负责让你**理解**边界，测试负责在你**没理解**时把提交拦下来。如果你发现测试挡住了一个你认为正确的改动，**先停下来和用户讨论修改宪法，不要绕过测试、不要放宽断言、不要给断言加特例分支**。
+文档负责让你**理解**边界，测试负责在你**没理解**时把提交拦下来。如果你发现测试挡住了一个你认为正确的改动，**先停下来和用户讨论修改架构约束，不要绕过测试、不要放宽断言、不要给断言加特例分支**。
 
 > **关于代码引用格式。** 本文用 `文件路径` + **符号名**（函数/常量）定位，不用行号。这些文件正在被多条并行工作流改动，行号漂移会让引用在几次提交内全部失效，而符号名可以直接 `grep` 到。看到 `core/config/generator.go` 的 `buildDNS` 就 `grep -n "func buildDNS" core/config/generator.go`。
 
@@ -48,7 +48,7 @@
 
 - **Tailscale 线路 `enabled` 即全局注入 `preferred_by` 路由**。exit node 广播的 `0.0.0.0/0` 被 `preferred_by` 整个捞给 Tailscale endpoint，结果是 **Mode 的默认出口永远失效**——用户在 Mode 里配好的"默认直连"被一条谁也没写过的规则抢走。这是 Line 越权做路由裁决的教科书案例：Line 只该声明"我是一个出口"，却直接改写了全局默认。2026-07 反复犯了两次。现状：Tailscale endpoint 只在线路 `enabled` 时生成（MagicDNS 解析需要它就绪），但路由上它是普通 outbound，只有 Mode 显式绑定的流量才走它——`grep -n "preferred_by" core/config/generator.go` 能读到这两处教训注释。想要"默认走 exit node"的正确做法是把 Mode 的默认线路设为该 Tailscale 线路（`final` 即 endpoint tag）。
 - **同款问题的 DNS 版本**：Tailscale DNS server 的 `accept_default_resolvers` 若为 `true`，tailnet 的 resolver 会接管**所有**域名而不只是 tailnet 自家名字。这个字段现在在 `buildDNS` 和 `buildNEDNS` 里都被显式写死为 `false`，不依赖 sing-box 默认值——默认值翻转一次就等于全局 DNS 被静默劫持。
-- **订阅规则表隐式抢注在用户显式绑定之前**。订阅自带的规则表（Clash/Surge 的 `RULE-SET` / `DOMAIN-SUFFIX` 列表）被无条件插在 Mode 绑定规则之前，导致订阅里的大网段（如 `1.0.0.0/8`）吞掉用户显式写的 `/32`。用户看到的是"我明明把 example.com 绑到了某条线路，流量却被订阅规则整个遮蔽掉"。现状是显式绑定的锁定验收规则先于订阅规则（见 `GenerateSingBoxFor` 里 `acceptanceModeRules` → 订阅规则 → `ordinaryModeRules` 的装配段）——但**这个顺序本身仍是宪法约束的对象**，任何调整都必须在本文档留痕。
+- **订阅规则表隐式抢注在用户显式绑定之前**。订阅自带的规则表（Clash/Surge 的 `RULE-SET` / `DOMAIN-SUFFIX` 列表）被无条件插在 Mode 绑定规则之前，导致订阅里的大网段（如 `1.0.0.0/8`）吞掉用户显式写的 `/32`。用户看到的是"我明明把 example.com 绑到了某条线路，流量却被订阅规则整个遮蔽掉"。现状是显式绑定的锁定验收规则先于订阅规则（见 `GenerateSingBoxFor` 里 `acceptanceModeRules` → 订阅规则 → `ordinaryModeRules` 的装配段）——但**这个顺序本身仍是架构约束约束的对象**，任何调整都必须在本文档留痕。
 - **交互式 Tailscale 登录流程反过来约束引擎状态机**。为了给 Tailscale 走浏览器登录，引擎被迫加上"必须先断开 XDial 才能登录/刷新出口节点"的限制（历史上的 `Engine.StartTailscaleAuth` / `Engine.TailscaleStatus` 都以 `e.status != StatusDisconnected` 直接拒绝）。这是**依赖方向倒流**：Line 的一个实现细节（某个协议的认证方式是交互式的）爬到了引擎生命周期上，让所有其他线路一起承担这个代价。用户体验上就是"我只想换个出口节点，为什么要断网"。裁定见 ADR **D29**：Tailscale 配置形态必须与其他 Line 同构，`auth_key` 是纯参数，无登录流程。
 
 ---
@@ -62,9 +62,9 @@
 | **RuleSet**（匹配） | 只管**匹配流量**：域名、后缀、CIDR、远程规则集资源 | **不知道任何 Line 存在**。`RuleSet` 结构体里绝不能出现 `line_id`、`outbound`、`server` 之类字段 | 在 `RuleSet` 上加 `DefaultLineID`；在 `buildRouteRule` 里根据规则集内容猜出口；订阅规则表直接携带出口名并绕过 Mode |
 | **Mode**（裁决） | 唯一裁决者：绑定 RuleSet→Line、指定默认出口、裁决 DNS 分域归属。route 规则和 DNS 规则**必须从同一份 Mode binding 编译** | 不定义匹配内容（那是 RuleSet），不定义出口参数（那是 Line），不定义流量如何进盒（那是 Ingress） | Mode 里内联域名列表；Mode 里内联服务器地址；route 规则从 Mode 编译而 DNS 规则从别处编译（两者必然漂移） |
 
-**依赖方向是单向的**：`Mode → {RuleSet, Line}`。RuleSet 不指向 Line，Line 不指向 RuleSet，二者都不指向 Mode。Ingress 谁也不指向。任何引入反向或横向依赖的改动都是违宪。
+**依赖方向是单向的**：`Mode → {RuleSet, Line}`。RuleSet 不指向 Line，Line 不指向 RuleSet，二者都不指向 Mode。Ingress 谁也不指向。任何引入反向或横向依赖的改动都是越界。
 
-数据模型上这一点是可验证的：`core/config/model.go` 里 `RuleSet` 只有匹配字段，`Line` 只有出口参数，绑定关系全部集中在 `Mode.Bindings`（`RuleBinding{RuleSetID, LineID, SubscriptionID}`）和 `Mode.DefaultLineID` / `Mode.DefaultSubscriptionID`。**给 `Line` 或 `RuleSet` 加一个指向对方的字段，就是违宪的最短路径**。
+数据模型上这一点是可验证的：`core/config/model.go` 里 `RuleSet` 只有匹配字段，`Line` 只有出口参数，绑定关系全部集中在 `Mode.Bindings`（`RuleBinding{RuleSetID, LineID, SubscriptionID}`）和 `Mode.DefaultLineID` / `Mode.DefaultSubscriptionID`。**给 `Line` 或 `RuleSet` 加一个指向对方的字段，就是越界的最短路径**。
 
 ---
 
@@ -99,10 +99,10 @@
 这三步的顺序**不可交换**，理由是一条严格的因果链：
 
 1. **分流只需要名字。** 判断 `google.com` 该走哪条线，不需要知道它的 IP。规则匹配的输入是域名。
-2. **解析的正确答案取决于从哪出去。** `oa.corp.example` 在企业 DNS 有记录、在公共 DNS 是 NXDOMAIN；`google.com` 在境内 resolver 被污染、在隧道那头是干净的。**同一个名字，从不同出口解析得到不同且都"正确"的答案。**
+2. **解析的正确答案取决于从哪出去。** `oa.corp.example` 在企业 DNS 有记录、在公共 DNS 是 NXDOMAIN；`google.com` 经本地 resolver 解析可能被中间层改写、经隧道那头解析则是权威结果。**同一个名字，从不同出口解析得到不同且都"正确"的答案。**
 3. 所以：**先按名字选线路，再按线路选解析器，最后才拿到地址。** 反过来（先解析再分流）等于用一个任意选定的解析器的答案去做本该由线路决定的判断，结论必然错。
 
-推论：**解析权随线路走。** Line 声明它的解析器能力（企业 DNS、tailnet resolver、经隧道的 DoH），Mode 决定用不用。这在代码里就是 `collectVPNBoundDomains` + `collectProxyBoundDNSTargets`：两者都从 `mode.Bindings` 遍历，而**不是**从 Line 列表遍历。同一条线路上，手动规则集（内网名，归企业 DNS）和 URL 规则集（gfwlist 之类的公网名，归经隧道的公共 DoH）的正确解析器不同，这个二分逻辑就写在 `collectProxyBoundDNSTargets` 的注释里。
+推论：**解析权随线路走。** Line 声明它的解析器能力（企业 DNS、tailnet resolver、经隧道的 DoH），Mode 决定用不用。这在代码里就是 `collectVPNBoundDomains` + `collectProxyBoundDNSTargets`：两者都从 `mode.Bindings` 遍历，而**不是**从 Line 列表遍历。同一条线路上，手动规则集（内网名，归企业 DNS）和 URL 规则集（远程规则集里的公网名，归经隧道的公共 DoH）的正确解析器不同，这个二分逻辑就写在 `collectProxyBoundDNSTargets` 的注释里。
 
 **DNS 规则与路由规则必须从同一份 Mode binding 编译。** 两者一旦分家，就会漂移：某个域名的流量走 A 线路、解析走 B 线路，得到的地址在 A 线路那头根本不通。当前实现里两者都以 `mode.Bindings` 为唯一输入源，这是硬约束不是巧合。
 
@@ -122,7 +122,7 @@ fake IP 的作用是：在 resolve 时刻返回一个**唯一的假地址**作�
 
 > **fake IP 不做任何决策。它只是在连接到来时，"回忆起"DNS 时刻已经做出的决策。它的作用域严格限于 resolve 与 connect 之间的失忆缝隙。**
 
-这决定了它在宪法里的位置：fake IP 是**实现细节**，不是维度。它不得改变任何裁决结果——同一份 Mode，开不开 fake IP，流量的出口归属必须完全一致。任何"开了 fake IP 之后分流行为变了"的实现都是错的。
+这决定了它在架构约束里的位置：fake IP 是**实现细节**，不是维度。它不得改变任何裁决结果——同一份 Mode，开不开 fake IP，流量的出口归属必须完全一致。任何"开了 fake IP 之后分流行为变了"的实现都是错的。
 
 v1 不启用 fake IP（ADR **D-FAKEIP**），但地址段必须预留且与 tun 段分开，理由见 ADR。
 
@@ -131,7 +131,7 @@ v1 不启用 fake IP（ADR **D-FAKEIP**），但地址段必须预留且与 tun 
 要点提炼自 `core/engine/dns_takeover.go` 顶部三个常量的注释块（`dnsTakeoverAddress` / `dnsTakeoverGateway` / `dnsTakeoverPrefix`）。那里写得比本节详细，**改这块前请完整读原文**。
 
 - **接管地址是 tun 接口地址 +1（`198.18.0.2`），不是 tun 地址本身（`198.18.0.1`）。** tun 自己的地址在内核路由表里是 `RTF_LOCAL` 项，发往它的包被环回投递给本机协议栈，**根本不会写进 tun 设备**，`hijack-dns` 永远接不住 → 系统 DNS 查询原地超时 → 整机解析全灭。`198.18.0.2` 不是接口地址，走的是 `auto_route` 装的 sub-range 路由，包会真正进 tun。sing-box 官方 libbox 的 `GetDNSServerAddress` 用的也是 `Addr().Next()`，同款约定。
-- **为什么非接管系统 DNS 不可**：LAN 网关是 on-link 直达、官方 Tailscale 的 `100.100.100.100` 有自己的 host route，两者都天然绕过 tun 路由。不接管的话应用拿到的是污染结果，按域名分流随之失准。这是定律一的直接推论——解析这一步不能留在盒外。
+- **为什么非接管系统 DNS 不可**：LAN 网关是 on-link 直达、官方 Tailscale 的 `100.100.100.100` 有自己的 host route，两者都天然绕过 tun 路由。不接管的话应用拿到的解析结果不可信，按域名分流随之失准。这是定律一的直接推论——解析这一步不能留在盒外。
 - **就绪判据**：`route -n get 198.18.0.2` 打印的 gateway 行等于 `198.18.0.1`。darwin 上 `auto_route` 装的不是 `198.18.0.0/15` 接口路由，而是 8 条覆盖全 IPv4 的 sub-range（`1.0.0.0/8`、`2.0.0.0/7` … `128.0.0.0/1`），每条都是 `RTF_GATEWAY` 且 gateway 就是 tun 地址。别的 utun（官方 Tailscale 装的 link 路由）在 `route get` 里根本不打印 gateway 行，天然被这条判据拒掉。
 - **残留识别是双判据**：先比对显式记录过的地址列表，再兜底判断"是否落在 `198.18.0.0/15` 段内"。RFC 2544 的这段地址不会出现在任何真实 DNS 配置里，误判率为零；而漏认一个的代价不可逆——一个死地址永久留在系统 DNS 里，没有任何路径会去救它。
 - **地址同源约束**：`dnsTakeoverAddress` 与 `buildTUNInbound` 生成的 tun 地址必须保持 +1 关系，防漂移断言是 `TestDNSTakeoverAddressIsTunAddressPlusOne`。
@@ -142,7 +142,7 @@ v1 不启用 fake IP（ADR **D-FAKEIP**），但地址段必须预留且与 tun 
 ## 5. 铁律
 
 1. **失败 fail-closed，且用户可感知。** 任何一步失败，宁可让流量断掉并弹出可见错误，也不能"看起来连上了但流量在盒外裸奔"。
-2. **绝不静默降级到 direct 或公共 DNS。** 降级本身可以存在，但必须是用户显式配置的，且必须有可见提示。代码里出现 `if err != nil { use direct }` 一律视为违宪。`Engine.takeoverDNSLocked` 是正确范例：接管失败了，但同时 `callback.OnError` 把"按域名分流可能不准"推给用户。
+2. **绝不静默降级到 direct 或公共 DNS。** 降级本身可以存在，但必须是用户显式配置的，且必须有可见提示。代码里出现 `if err != nil { use direct }` 一律视为越界。`Engine.takeoverDNSLocked` 是正确范例：接管失败了，但同时 `callback.OnError` 把"按域名分流可能不准"推给用户。
 3. **Line 不可用窗口期（重连中）语义固定**：绑定到该 Line 的流量 **REJECT**，对应域名的 DNS **SERVFAIL**。不是超时、不是回落到其他线路、不是放行到 direct。理由：超时会让应用重试几十秒后才失败，用户以为是网络慢；回落会把本该走隧道的流量泄漏到明网。
 4. **配置变更只有唯一生效通道**：修改 Profile → 重新生成完整 sing-box 配置 → 重启数据面。不允许存在"运行时热改某条规则"的旁路。唯一例外是桌面端通过 Clash API 切换 `testSelectorTag` 做逐线路地址探测，且它**仅用于诊断**，不影响用户流量归属（NE 端不启 Clash API，连这个例外都没有）。
 5. **启动期失败必须被捕获。** `sing-box check` 只做 `box.New` 不做 `Start`，抓不到启动期错误（典型：规则集首次下载失败让 router 直接 FATAL）。子进程退出必须被 `Engine.handleSingBoxExit` 接住并转成用户可见错误，否则 engine 会停在"已连接"而用户整机没网。
@@ -170,7 +170,7 @@ v1 不启用 fake IP（ADR **D-FAKEIP**），但地址段必须预留且与 tun 
 
 - **决策**：v1 硬校验：一个 profile 里 active（被 active Mode 引用且 enabled）的 AnyConnect 线路不得超过一条，超过则生成阶段直接报错。
 - **理由**：vendored sslcon 是**包级单例**（全局状态、单一会话），两条线路会互相踩掉对方的隧道。
-- **被否决的替代方案**：(a) 改造 sslcon 成多实例——违反"`third_party/` 不改"纪律，上游合并无望，维护成本无限；(b) 运行时择一启用——用户配了两条却只有一条生效，且"哪条生效"不可预测，正是宪法要消灭的那类 bug。
+- **被否决的替代方案**：(a) 改造 sslcon 成多实例——违反"`third_party/` 不改"纪律，上游合并无望，维护成本无限；(b) 运行时择一启用——用户配了两条却只有一条生效，且"哪条生效"不可预测，正是架构约束要消灭的那类 bug。
 - **影响面**：`GenerateSingBoxFor` 的前置守卫（`only one active AnyConnect line is supported`）；UI 需要在用户 enable 第二条时就给出提示，而不是等到连接时才报错。同款约束因同款理由（state 目录单例）也适用于 Tailscale（`only one enabled Tailscale line is supported`）。
 
 ### D-DNS — DNS 分域归属由 Mode 裁决
@@ -226,14 +226,14 @@ v1 不启用 fake IP（ADR **D-FAKEIP**），但地址段必须预留且与 tun 
 6. **不许用日志抓取做控制流。** 解析 sing-box / sslcon 的日志文本来判断状态，然后据此决策——日志格式不是契约，上游改一个字就静默失效，且失效方式是"永远走 else 分支"，没有任何报错。状态判断必须走结构化接口（Clash API、进程退出码、显式回调）。
 7. **不许把 DNS 规则和 route 规则从不同来源编译。** 两者的唯一输入源是 `mode.Bindings`。
 8. **不许扩大 tailnet 内网段的自动规则豁免。** 那条豁免的合法性完全来自"作用域等于 tailnet 私有地址空间"。任何覆盖公网地址、`0.0.0.0/0` 或域名的自动规则都不在豁免范围内。
-9. **不许依赖 sing-box 的默认值来维持宪法性质。** 影响裁决归属的字段（`accept_default_resolvers`、`independent_cache`、`auto_detect_interface`、`default_domain_resolver`、tun 的 `stack`）必须显式写死。上游默认值翻转过一次就会静默摧毁密封性。
+9. **不许依赖 sing-box 的默认值来维持架构约束性质。** 影响裁决归属的字段（`accept_default_resolvers`、`independent_cache`、`auto_detect_interface`、`default_domain_resolver`、tun 的 `stack`）必须显式写死。上游默认值翻转过一次就会静默摧毁密封性。
 10. **不许改 `third_party/`。** 需要上游改动时走本地补丁，并在 `third_party/` 的补丁说明里留痕。
 
 ---
 
 ## 8. 不变量测试清单
 
-CI 门禁包含以下不变量，实现在 `core/config/invariants_test.go`。每条注明它守护宪法的哪一部分。**这些测试是宪法的可执行形式，失败即违宪，不得通过放宽断言来"修复"。**
+CI 门禁包含以下不变量，实现在 `core/config/invariants_test.go`。每条注明它守护架构约束的哪一部分。**这些测试是架构约束的可执行形式，失败即越界，不得通过放宽断言来"修复"。**
 
 | 编号 | 不变量 | 守护什么 |
 |---|---|---|
@@ -248,7 +248,7 @@ CI 门禁包含以下不变量，实现在 `core/config/invariants_test.go`。�
 | **INV7** | **域名绑定与 DNS 分域同源**（收窄版）：**基于域名的**绑定必须双向一致——有路由分支就有 DNS 分支，反之亦然。基于 IP 的绑定不参与（见 4.1 节的不可满足性论证）。豁免：`direct`、`tailscale-dns` | D-DNS；禁止事项 7 |
 | **INVD30** | **单 AnyConnect**：桌面端存在多条 active AnyConnect 线路时拒绝生成 | D30 |
 
-**尚未实现、但同样是宪法要求的**（新增代码不得违反，实现该测试是待办）：
+**尚未实现、但同样是架构约束要求的**（新增代码不得违反，实现该测试是待办）：
 
 | 编号 | 不变量 | 守护什么 |
 |---|---|---|

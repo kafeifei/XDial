@@ -730,7 +730,7 @@ func TestSmoke_DirectBinding(t *testing.T) {
 }
 
 // 悬空引用（INV6a）必须让生成直接失败，而不是让那条规则悄悄蒸发、
-// 流量落到 final —— 那正是宪法禁止的静默降级。
+// 流量落到 final —— 那正是架构约束禁止的静默降级。
 func TestSmoke_NonexistentBinding(t *testing.T) {
 	base := func() *Profile {
 		return &Profile{
@@ -892,7 +892,7 @@ func TestSmoke_SubscribeWithGroups(t *testing.T) {
 }
 
 // 同一个域名既被模式显式绑定、又被订阅自带规则命中时，必须由模式裁决。
-// 宪法：Mode 是唯一裁决者，订阅只是供给源（D28），订阅规则不得抢在模式规则之前。
+// 架构约束：Mode 是唯一裁决者，订阅只是供给源（D28），订阅规则不得抢在模式规则之前。
 func TestSmokeModeRuleOverridesSubscriptionRule(t *testing.T) {
 	profile := &Profile{
 		Lines: []Line{

@@ -127,7 +127,7 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 		return nil, fmt.Errorf("only one enabled Tailscale line is supported: %d lines would share one state directory", enabledTailscaleLines)
 	}
 
-	// Tailscale 标签分两份，对应宪法的「声明≠生效」（INV1c）：
+	// Tailscale 标签分两份，对应架构约束的「声明≠生效」（INV1c）：
 	//
 	// endpoints 只要线路 enabled 就生成 —— 节点得先在 tailnet 注册、tsnet 得先
 	// 就绪，MagicDNS 才有解析能力可供 Mode 调用。这是「声明」，是本条唯一的例外。
@@ -242,7 +242,7 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 
 	// 模式的普通规则排在订阅自带规则之前。
 	//
-	// 宪法：Mode 是唯一裁决者，订阅只是"自带规则的供给源"（D28）。订阅那几百条
+	// 架构约束：Mode 是唯一裁决者，订阅只是"自带规则的供给源"（D28）。订阅那几百条
 	// 宽匹配（GEOIP,CN→DIRECT 之类）一旦排在前面，就会把用户在模式里显式绑定的
 	// 规则整个遮蔽掉 —— 用户明明把 example.com 绑到了某条线路，流量却被订阅的
 	// 兜底规则抢走，这正是"隐式抢注"。改为：用户显式绑定优先，订阅规则退为兜底。

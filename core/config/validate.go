@@ -7,7 +7,7 @@ import "fmt"
 //	INV6a 悬空引用（FindLine/FindRuleSet/FindSubscription 返回 nil，
 //	      或绑定压根没写出口）—— 配置已经损坏，生成直接失败。
 //	      绝不允许"整条规则蒸发"式的静默降级：用户以为绑定生效了，
-//	      实际流量落到 final，正是宪法禁止的静默降级到 direct。
+//	      实际流量落到 final，正是架构约束禁止的静默降级到 direct。
 //
 //	INV6b 显式禁用（对象存在但 Enabled=false）—— 这是用户自己的选择，
 //	      允许跳过，但必须结构化上报，让 daemon/UI 能把"这条绑定当前没生效"
