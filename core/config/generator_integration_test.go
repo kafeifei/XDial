@@ -600,7 +600,10 @@ func TestGenerate_ContentVerification(t *testing.T) {
 		t.Errorf("final = %q, want sub-sub-test-proxies", final)
 	}
 
-	// 验证订阅规则在模式规则之前
+	// 验证模式规则在订阅自带规则之前。
+	// 宪法：Mode 是唯一裁决者，订阅只是供给源（D28）—— 用户在模式里显式绑定的
+	// 规则必须先匹配，订阅自带的宽匹配（GEOIP,CN 之类）只能当兜底，否则订阅
+	// 一更新就能把用户的显式分流整片遮蔽掉。
 	rules := route["rules"].([]interface{})
 	var internalIdx, netflixIdx int
 	for i, r := range rules {
@@ -624,8 +627,8 @@ func TestGenerate_ContentVerification(t *testing.T) {
 	if netflixIdx == 0 {
 		t.Error("netflix subscription rule not found")
 	}
-	if netflixIdx > internalIdx {
-		t.Errorf("subscription rule (idx=%d) should come before mode rule (idx=%d)", netflixIdx, internalIdx)
+	if internalIdx > netflixIdx {
+		t.Errorf("mode rule (idx=%d) should come before subscription rule (idx=%d)", internalIdx, netflixIdx)
 	}
 
 	t.Logf("Content verification: %d outbounds, %d rules, final=%s", len(outbounds), len(rules), final)

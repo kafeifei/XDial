@@ -700,7 +700,18 @@ func TestGenerateTailscaleEndpoint(t *testing.T) {
 			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
 			{ID: "../../work", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true},
 		},
-		Modes:        []Mode{{ID: "tailnet", Name: "Tailnet", DefaultLineID: "direct"}},
+		RuleSets: []RuleSet{
+			// 用 CIDR 而非域名：tailnet 访问本就是 IP 语义，且 IP 规则不参与
+			// DNS 裁决，不会额外生成域名解析器。
+			{ID: "ts-net", Name: "Tailnet 网段", Type: RuleSetTypeManual, Enabled: true, CIDRs: []string{"100.64.0.0/10"}},
+		},
+		// 新语义（INV1c 声明≠生效）：tailnet 路由与 tailscale-dns 只有在
+		// 线路被 active Mode 引用时才生成，这里显式绑定。
+		Modes: []Mode{{
+			ID: "tailnet", Name: "Tailnet",
+			Bindings:      []RuleBinding{{RuleSetID: "ts-net", LineID: "../../work"}},
+			DefaultLineID: "direct",
+		}},
 		ActiveModeID: "tailnet",
 		Tailscale:    TailscaleIdentity{Hostname: "xdial-mac"},
 	}
@@ -787,7 +798,15 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 				TailscaleExitNode: "exit-node",
 			},
 		},
-		Modes:        []Mode{{ID: "tailnet", Name: "Tailnet", DefaultLineID: "direct"}},
+		RuleSets: []RuleSet{
+			{ID: "ts-hosts", Name: "Tailnet 域名", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"ts.example"}},
+		},
+		// 同桌面：tailnet 路由/DNS 只对被 active Mode 引用的线路生成（INV1c）。
+		Modes: []Mode{{
+			ID: "tailnet", Name: "Tailnet",
+			Bindings:      []RuleBinding{{RuleSetID: "ts-hosts", LineID: "mobile-tailnet"}},
+			DefaultLineID: "direct",
+		}},
 		ActiveModeID: "tailnet",
 		Tailscale:    TailscaleIdentity{Hostname: "xdial-mobile"},
 	}
@@ -987,10 +1006,15 @@ func TestTailscaleRoutesOnlyTailnetCIDR(t *testing.T) {
 		},
 		RuleSets: []RuleSet{
 			{ID: "internal", Name: "内部域名", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"corp.example.com"}},
+			{ID: "ts-hosts", Name: "Tailnet 域名", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"ts.example"}},
 		},
 		Modes: []Mode{{
 			ID: "split", Name: "分流",
-			Bindings:      []RuleBinding{{RuleSetID: "internal", LineID: "vpn"}},
+			// ts 线路必须被引用，tailnet CIDR 路由才会生成（INV1c 声明≠生效）。
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
+				{RuleSetID: "ts-hosts", LineID: "ts"},
+			},
 			DefaultLineID: "direct",
 		}},
 		ActiveModeID: "split",
@@ -1203,9 +1227,17 @@ func TestGenerateDesktopKeepsDirectBoundRuleSetsOnPublicDNS(t *testing.T) {
 // 跳过，于是落到 final 的境内解析器上被污染 —— 分流白做。
 func TestGenerateDesktopResolvesVPNBoundURLRuleSetThroughTheTunnel(t *testing.T) {
 	p := splitProfileWithTailscale()
+	// gfw 从 ts 改挂到 vpn（本用例的验证点：URL 规则集绑到 VPN 线时要经隧道解析）。
+	// ts 线路仍须被引用，tailnet 的 DNS 规则才会生成（INV1c 声明≠生效）；用 CIDR
+	// 规则集绑定，避免额外产生域名解析器干扰本用例的 dns.rules 断言。
+	p.RuleSets = append(p.RuleSets, RuleSet{
+		ID: "ts-net", Name: "Tailnet 网段", Type: RuleSetTypeManual, Enabled: true,
+		CIDRs: []string{"100.64.0.0/10"},
+	})
 	p.Modes[0].Bindings = []RuleBinding{
 		{RuleSetID: "internal", LineID: "vpn"},
 		{RuleSetID: "gfw", LineID: "vpn"},
+		{RuleSetID: "ts-net", LineID: "ts"},
 	}
 
 	data, err := GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10"})
@@ -1352,6 +1384,9 @@ func TestGenerateTailscaleExitNodeAsDefault(t *testing.T) {
 	}
 }
 
+// D30：多条 active AnyConnect 线路必须在所有平台被拒绝。
+// 所有 VPN 线路共享 "vpn" 这一个 outbound tag，第二条线路的流量会静默钻进
+// 第一条的隧道 —— 桌面和 NE 都只有一份 sslcon/VPNBridge，没有例外。
 func TestGenerateNERejectsMultipleActiveAnyConnectLines(t *testing.T) {
 	profile := &Profile{
 		Lines: []Line{
@@ -1369,18 +1404,315 @@ func TestGenerateNERejectsMultipleActiveAnyConnectLines(t *testing.T) {
 		ActiveModeID: "mode",
 	}
 
-	if _, err := GenerateSingBoxFor(profile, 0, "", PlatformNE, t.TempDir()); err == nil || !strings.Contains(err.Error(), "only one") {
-		t.Fatalf("expected multiple-AnyConnect error, got %v", err)
+	for _, platform := range []Platform{PlatformNE, PlatformMacOS} {
+		profile.Modes[0].Bindings[0].LineID = "vpn-b"
+		profile.RuleSets[0].Enabled = true
+
+		if _, err := GenerateSingBoxFor(profile, 0, "", platform, t.TempDir()); err == nil ||
+			!strings.Contains(err.Error(), "only one") {
+			t.Fatalf("platform %v: expected multiple-AnyConnect error, got %v", platform, err)
+		}
+
+		profile.Modes[0].Bindings[0].LineID = "vpn-a"
+		if _, err := GenerateSingBoxFor(profile, 0, "", platform, t.TempDir()); err != nil {
+			t.Fatalf("platform %v: same AnyConnect line referenced twice should be allowed: %v", platform, err)
+		}
+
+		profile.Modes[0].Bindings[0].LineID = "vpn-b"
+		profile.RuleSets[0].Enabled = false
+		if _, err := GenerateSingBoxFor(profile, 0, "", platform, t.TempDir()); err != nil {
+			t.Fatalf("platform %v: disabled rule must not create an AnyConnect conflict: %v", platform, err)
+		}
+
+		// 第二条线路被禁用 → 不再是 active，同样不构成冲突。
+		profile.RuleSets[0].Enabled = true
+		profile.Lines[2].Enabled = false
+		if _, err := GenerateSingBoxFor(profile, 0, "", platform, t.TempDir()); err != nil {
+			t.Fatalf("platform %v: disabled second AnyConnect line must not conflict: %v", platform, err)
+		}
+		profile.Lines[2].Enabled = true
+	}
+}
+
+// 模式的普通规则必须排在订阅自带规则之前：Mode 是唯一裁决者，订阅只是供给源。
+func TestGenerateModeRulesPrecedeSubscriptionSuppliedRules(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		RuleSets: []RuleSet{{
+			ID: "mine", Name: "我的显式绑定", Type: RuleSetTypeManual, Enabled: true,
+			Domains: []string{"mine.example.com"},
+		}},
+		Subscriptions: []Subscription{{
+			ID: "sub", Name: "Sub", Enabled: true, Strategy: "selector",
+			Lines: []Line{{
+				ID: "n1", Name: "N1", Type: LineTypeTrojan, Enabled: true,
+				TrojanServer: "n1.example.com", TrojanPort: 443, TrojanPassword: "p",
+			}},
+			// 订阅自带的宽匹配：不加约束就会把 mine.example.com 一起吃掉。
+			Rules: []SubscriptionRule{{Type: "DOMAIN-SUFFIX", Value: "example.com", Group: "DIRECT"}},
+		}},
+		Modes: []Mode{{
+			ID: "m", Name: "M",
+			Bindings:      []RuleBinding{{RuleSetID: "mine", SubscriptionID: "sub"}},
+			DefaultLineID: "direct",
+		}},
+		ActiveModeID: "m",
 	}
 
-	profile.Modes[0].Bindings[0].LineID = "vpn-a"
-	if _, err := GenerateSingBoxFor(profile, 0, "", PlatformNE, t.TempDir()); err != nil {
-		t.Fatalf("same AnyConnect line referenced twice should be allowed: %v", err)
+	data, err := GenerateSingBox(p, 10800, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
 	}
 
-	profile.Modes[0].Bindings[0].LineID = "vpn-b"
-	profile.RuleSets[0].Enabled = false
-	if _, err := GenerateSingBoxFor(profile, 0, "", PlatformNE, t.TempDir()); err != nil {
-		t.Fatalf("disabled rule must not create an AnyConnect conflict: %v", err)
+	modeIdx, subIdx := -1, -1
+	for index, raw := range cfg.Route["rules"].([]interface{}) {
+		rule := raw.(map[string]interface{})
+		domains, ok := rule["domain_suffix"].([]interface{})
+		if !ok || len(domains) != 1 {
+			continue
+		}
+		switch domains[0] {
+		case "mine.example.com":
+			modeIdx = index
+		case "example.com":
+			subIdx = index
+		}
+	}
+	if modeIdx < 0 || subIdx < 0 {
+		t.Fatalf("rules missing: modeIdx=%d subIdx=%d", modeIdx, subIdx)
+	}
+	if modeIdx > subIdx {
+		t.Fatalf("mode rule (idx=%d) must precede subscription rule (idx=%d)", modeIdx, subIdx)
+	}
+}
+
+// INV6a：悬空引用一律拒绝生成，不允许"规则整条蒸发"。
+func TestGenerateRejectsDanglingReferences(t *testing.T) {
+	base := func() *Profile {
+		return &Profile{
+			Lines: []Line{
+				{ID: "direct", Type: LineTypeDirect, Enabled: true},
+				{ID: "px", Type: LineTypeShadowsocks, Enabled: true,
+					SSServer: "px.example.com", SSPort: 8388, SSMethod: "aes-256-gcm", SSPass: "s"},
+			},
+			RuleSets: []RuleSet{{
+				ID: "rs", Name: "RS", Type: RuleSetTypeManual, Enabled: true,
+				Domains: []string{"a.example.com"},
+			}},
+			Modes: []Mode{{
+				ID: "m", Name: "M",
+				Bindings:      []RuleBinding{{RuleSetID: "rs", LineID: "px"}},
+				DefaultLineID: "direct",
+			}},
+			ActiveModeID: "m",
+		}
+	}
+
+	cases := map[string]func(*Profile){
+		"missing rule set":       func(p *Profile) { p.Modes[0].Bindings[0].RuleSetID = "ghost-rs" },
+		"missing line":           func(p *Profile) { p.Modes[0].Bindings[0].LineID = "ghost-line" },
+		"missing subscription":   func(p *Profile) { p.Modes[0].Bindings[0].SubscriptionID = "ghost-sub" },
+		"missing default line":   func(p *Profile) { p.Modes[0].DefaultLineID = "ghost-default" },
+		"missing default sub":    func(p *Profile) { p.Modes[0].DefaultSubscriptionID = "ghost-default-sub" },
+		"binding without target": func(p *Profile) { p.Modes[0].Bindings[0].LineID = "" },
+		"binding without rule":   func(p *Profile) { p.Modes[0].Bindings[0].RuleSetID = "" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := base()
+			mutate(p)
+			if _, err := GenerateSingBox(p, 0, ""); err == nil {
+				t.Fatal("dangling reference must be rejected")
+			}
+			if _, err := CollectProfileWarnings(p); err == nil {
+				t.Fatal("CollectProfileWarnings must report the same dangling reference")
+			}
+		})
+	}
+
+	// 禁用的绑定同样要校验出口存在性：不能因为"现在没生效"就放过悬空引用，
+	// 否则用户哪天一勾选就变成静默错路由。
+	p := base()
+	p.RuleSets[0].Enabled = false
+	p.Modes[0].Bindings[0].LineID = "ghost-line"
+	if _, err := GenerateSingBox(p, 0, ""); err == nil {
+		t.Fatal("dangling line under a disabled rule set must still be rejected")
+	}
+
+	// "direct" 是保留 ID：即使 profile 里没有显式直连线路也不算悬空。
+	p = base()
+	p.Lines = p.Lines[1:]
+	p.Modes[0].Bindings[0].LineID = "direct"
+	if _, err := GenerateSingBox(p, 0, ""); err != nil {
+		t.Fatalf("builtin direct reference must be accepted: %v", err)
+	}
+}
+
+// INV6b：显式禁用允许跳过，但必须结构化上报，且绝不能悄悄降级成 direct。
+func TestDisabledReferencesWarnAndDoNotFallBackToDirect(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{
+			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
+			// 被禁用的直连线路：它的 tag "direct" 恒在 validTags 里，
+			// 不查 Enabled 就会静默生成一条走直连的规则。
+			{ID: "off-direct", Name: "备用直连", Type: LineTypeDirect, Enabled: false},
+			{ID: "off-px", Name: "备用代理", Type: LineTypeShadowsocks, Enabled: false,
+				SSServer: "off.example.com", SSPort: 8388, SSMethod: "aes-256-gcm", SSPass: "s"},
+		},
+		RuleSets: []RuleSet{
+			{ID: "rs-off", Name: "禁用规则", Type: RuleSetTypeManual, Enabled: false,
+				Domains: []string{"off.example.com"}},
+			{ID: "rs-a", Name: "A", Type: RuleSetTypeManual, Enabled: true,
+				Domains: []string{"a.example.com"}},
+			{ID: "rs-b", Name: "B", Type: RuleSetTypeManual, Enabled: true,
+				Domains: []string{"b.example.com"}},
+		},
+		Modes: []Mode{{
+			ID: "m", Name: "M",
+			Bindings: []RuleBinding{
+				{RuleSetID: "rs-off", LineID: "direct"},
+				{RuleSetID: "rs-a", LineID: "off-direct"},
+				{RuleSetID: "rs-b", LineID: "off-px"},
+			},
+			DefaultLineID: "off-px",
+		}},
+		ActiveModeID: "m",
+	}
+
+	warnings, err := CollectProfileWarnings(p)
+	if err != nil {
+		t.Fatalf("disabled objects must not fail generation: %v", err)
+	}
+	got := map[ProfileWarningKind]int{}
+	for _, w := range warnings {
+		got[w.Kind]++
+		if w.Message == "" {
+			t.Fatalf("warning %+v has no message", w)
+		}
+		if w.ModeID != "m" {
+			t.Fatalf("warning %+v should carry the mode id", w)
+		}
+	}
+	if got[WarningDisabledRuleSet] != 1 {
+		t.Fatalf("expected one disabled-rule-set warning, got %v", got)
+	}
+	if got[WarningDisabledLine] != 2 {
+		t.Fatalf("expected two disabled-line warnings, got %v", got)
+	}
+	if got[WarningDisabledDefaultLine] != 1 {
+		t.Fatalf("expected one disabled-default-line warning, got %v", got)
+	}
+
+	data, err := GenerateSingBox(p, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range cfg.Route["rules"].([]interface{}) {
+		rule := raw.(map[string]interface{})
+		domains, ok := rule["domain_suffix"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, domain := range domains {
+			switch domain {
+			case "a.example.com", "b.example.com", "off.example.com":
+				t.Fatalf("binding to a disabled object must not emit a route rule: %v", rule)
+			}
+		}
+	}
+	if cfg.Route["final"] != "direct" {
+		t.Fatalf("disabled default line falls back to direct, got %v", cfg.Route["final"])
+	}
+}
+
+// 订阅/线路存在且 enabled 但生成不出 outbound 时，同样要有可读的 warning。
+func TestCollectProfileWarningsReportsUnavailableTargets(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			// 参数不完整：buildProxyOutbound 返回 nil。
+			{ID: "broken", Name: "残缺代理", Type: LineTypeShadowsocks, Enabled: true},
+		},
+		RuleSets: []RuleSet{
+			{ID: "rs-a", Name: "A", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"a.example.com"}},
+			{ID: "rs-b", Name: "B", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"b.example.com"}},
+		},
+		Subscriptions: []Subscription{{ID: "empty-sub", Name: "空订阅", Enabled: true}},
+		Modes: []Mode{{
+			ID: "m", Name: "M",
+			Bindings: []RuleBinding{
+				{RuleSetID: "rs-a", LineID: "broken"},
+				{RuleSetID: "rs-b", SubscriptionID: "empty-sub"},
+			},
+			DefaultLineID: "direct",
+		}},
+		ActiveModeID: "m",
+	}
+
+	warnings, err := CollectProfileWarnings(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[ProfileWarningKind]bool{}
+	for _, w := range warnings {
+		got[w.Kind] = true
+	}
+	for _, kind := range []ProfileWarningKind{WarningUnavailableLine, WarningUnavailableSubscription} {
+		if !got[kind] {
+			t.Fatalf("missing %s warning, got %+v", kind, warnings)
+		}
+	}
+}
+
+// D29：auth_key 作为纯参数下发；节点必须保持常驻（绝不 ephemeral）。
+func TestGenerateTailscaleEndpointCarriesAuthKeyAndStaysPersistent(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
+				TailscaleAuthKey: "tskey-auth-example"},
+		},
+		Modes:        []Mode{{ID: "m", Name: "M", DefaultLineID: "ts"}},
+		ActiveModeID: "m",
+	}
+
+	data, err := GenerateSingBoxFor(p, 0, "", PlatformMacOS, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	endpoint := cfg.Endpoints[0]
+	if endpoint["auth_key"] != "tskey-auth-example" {
+		t.Fatalf("auth_key not emitted: %v", endpoint)
+	}
+	if value, ok := endpoint["ephemeral"]; ok && value != false {
+		t.Fatalf("Tailscale node must stay persistent, got ephemeral=%v", value)
+	}
+
+	// 不填 auth_key 时不得出现该字段（回退 sing-box 自己的授权 URL 流程）。
+	p.Lines[1].TailscaleAuthKey = ""
+	data, err = GenerateSingBoxFor(p, 0, "", PlatformMacOS, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 必须解到全新的值：json.Unmarshal 会把内容合并进已存在的 map，
+	// 复用上一轮的 cfg 会让 auth_key 残留，测试变成永远通过。
+	var withoutKey SingBoxConfig
+	if err := json.Unmarshal(data, &withoutKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := withoutKey.Endpoints[0]["auth_key"]; ok {
+		t.Fatalf("empty auth key must not emit the option: %v", withoutKey.Endpoints[0])
 	}
 }

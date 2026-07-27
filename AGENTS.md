@@ -81,3 +81,16 @@ curl -X POST 127.0.0.1:19876/action -d '{"action":"select-mode","id":"mode-id"}'
 - 概念命名：线路 Line / 规则 RuleSet / 模式 Mode（旧 JSON key 有兼容层，见 core/config/compat.go）
 - Go 代码提交前必须 `gofmt`（CI 有门禁）；vendored `third_party/` 不改不动
 - 回复用户用中文，代码标识符保持英文
+
+## 架构宪法（动代码前必读）
+
+本仓库有两条**不可违反**的定律，它们不是风格偏好，是硬约束：
+
+1. **外部密封律** —— XDial 对系统只呈现一个 VPN，DNS/路由/分流全部盒内处理，不溢出到系统层。
+2. **内部正交律** —— Ingress / Line / RuleSet / Mode 四个维度互不知道对方存在，**Mode 是唯一的裁决者和连接点**。声明 ≠ 生效：未被 active Mode 引用的对象，绝不能对本机流量决策产生任何影响。
+
+完整规范见 **[ARCHITECTURE.md](ARCHITECTURE.md)** —— 含职责边界表、供给源模型（D28）、DNS 因果链、铁律、ADR 决策记录、禁止事项清单。**动任何代码前先读完，尤其是第 7 节（禁止事项）和第 9 节（自检清单）。**
+
+CI 有一组**不变量测试**（`core/config/invariants_test.go`，INV1/INV1c/INV2/INV3/INV4/INV4b/INV6a/INV6b/INV7/INVD30）把这两条定律编码成了可执行断言。**违宪的改动会让它们变红。**
+
+这些测试红了的时候，唯一正确的反应是**改你的代码**。绝对不允许：放宽断言、给断言加特例分支、跳过/删除测试、或用任何方式绕过。**如果你确信自己的改动是对的、需要修改宪法本身——停下来，先和用户讨论并更新 ARCHITECTURE.md，然后才动测试。** 未经用户明确同意就修改不变量测试，等同于破坏这个项目。

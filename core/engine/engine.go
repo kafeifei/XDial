@@ -36,15 +36,14 @@ const (
 const dnsSelfHealInterval = 5 * time.Minute
 
 type Engine struct {
-	mu            sync.Mutex
-	status        Status
-	vpn           *VPNClient
-	bridge        *VPNBridge
-	socks         *socks5.Server
-	socksLn       net.Listener
-	singbox       *SingBoxProcess
-	tailscaleAuth *TailscaleSession
-	dns           *dnsTakeover
+	mu      sync.Mutex
+	status  Status
+	vpn     *VPNClient
+	bridge  *VPNBridge
+	socks   *socks5.Server
+	socksLn net.Listener
+	singbox *SingBoxProcess
+	dns     *dnsTakeover
 	// allowDNSTakeover 见 AllowSystemDNSTakeover：默认关闭，只有 daemon 打开。
 	allowDNSTakeover bool
 	callback         StatusCallback
@@ -206,10 +205,6 @@ func (e *Engine) Start(profile *config.Profile) error {
 	if e.status == StatusConnected || e.status == StatusConnecting || e.status == StatusReconnecting {
 		return fmt.Errorf("already %s", e.status)
 	}
-	if e.tailscaleAuth != nil {
-		e.tailscaleAuth.Close()
-		e.tailscaleAuth = nil
-	}
 
 	e.profile = profile
 	e.reconnectCount = 0
@@ -222,88 +217,27 @@ func (e *Engine) Start(profile *config.Profile) error {
 	return nil
 }
 
-func (e *Engine) StartTailscaleAuth(identity config.TailscaleIdentity, line *config.Line) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if e.status != StatusDisconnected {
-		return fmt.Errorf("请先断开 XDial，再登录 Tailscale")
-	}
-	if e.tailscaleAuth != nil {
-		e.tailscaleAuth.Close()
-	}
-
-	lineID := line.ID
-	authSession, err := NewTailscaleSession(e.statePath, identity, lineID, e.notifyAuthRequired, func(status TailscaleStatus) {
-		e.notifyTailscaleStatus(lineID, status)
-	})
-	if err != nil {
-		e.tailscaleAuth = nil
-		return err
-	}
-	e.tailscaleAuth = authSession
-	return nil
-}
-
-func (e *Engine) TailscaleStatus(identity config.TailscaleIdentity, line *config.Line) (TailscaleStatus, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if e.status != StatusDisconnected {
-		return TailscaleStatus{}, fmt.Errorf("请先断开 XDial，再刷新出口节点")
-	}
-	if e.tailscaleAuth == nil || e.tailscaleAuth.LineID() != line.ID {
-		if e.tailscaleAuth != nil {
-			e.tailscaleAuth.Close()
-		}
-		lineID := line.ID
-		session, err := NewTailscaleSession(e.statePath, identity, lineID, e.notifyAuthRequired, func(status TailscaleStatus) {
-			e.notifyTailscaleStatus(lineID, status)
-		})
-		if err != nil {
-			e.tailscaleAuth = nil
-			return TailscaleStatus{}, err
-		}
-		e.tailscaleAuth = session
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return e.tailscaleAuth.Status(ctx)
-}
-
-// LogoutTailscale 退出 tailnet 登录。
+// ResetTailscaleState 清除本机 tailnet 身份（state 目录），下次连接时用当前
+// auth key 重新注册为一台新设备。
 //
-// 登录态就是 state 目录本身，删掉即退出；因为身份是全局单份的，所有 Tailscale
-// 线路会一并失效 —— 这正是“退出后所有线路同步退出”的预期语义。
+// D29 之后 Tailscale 是纯参数线路：auth key 只是 Line 上的一个字段，引擎不再
+// 持有任何 tsnet 会话，也就无从向控制面发注销请求。这里只做本地清除——换 auth
+// key / 换 tailnet 时必须有这一步，否则 sing-box 会直接复用已登录的旧 state，
+// 新填的 key 根本不会生效。控制面里那条旧设备记录需要用户自己在后台删。
 //
-// 节点是常驻设备，先向控制面显式注销（tailnet 里的设备记录随之删除），
-// 再清本地 state。注销是尽力而为：断网时也必须能退出登录，本地清除才是
-// 硬语义，控制面残留最多是一台离线设备，可在后台手动删。
-func (e *Engine) LogoutTailscale() error {
+// 身份是全局单份的，所以清除会让所有 Tailscale 线路一并重新注册。
+//
+// 要求先断开：state 目录正被运行中的 sing-box 打开，边跑边删是在拆自己脚下的
+// 地板。这不是 Line 溢出到状态机，而是"别删正在用的文件"。
+func (e *Engine) ResetTailscaleState() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.status != StatusDisconnected {
-		return fmt.Errorf("请先断开 XDial，再退出 Tailscale")
+		return fmt.Errorf("请先断开 XDial，再清除 Tailscale 本机状态")
 	}
-	session := e.tailscaleAuth
-	if session == nil {
-		// 没有活跃会话就临时起一个，身份从磁盘 state 恢复。
-		if s, err := NewTailscaleSession(e.statePath, config.TailscaleIdentity{}, "logout", nil, nil); err == nil {
-			session = s
-		}
-	}
-	if session != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := session.Logout(ctx); err != nil {
-			slog.Warn("tailscale control-plane logout failed, clearing local state anyway", "err", err)
-		}
-		cancel()
-		session.Close()
-	}
-	e.tailscaleAuth = nil
 	if err := os.RemoveAll(config.TailscaleStateDirectory(e.statePath)); err != nil {
-		return fmt.Errorf("清除 Tailscale 登录状态: %w", err)
+		return fmt.Errorf("清除 Tailscale 本机状态: %w", err)
 	}
 	return nil
 }
@@ -412,7 +346,7 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 		}
 	}
 
-	singbox := NewSingBoxProcess(e.basePath, e.statePath, e.notifyAuthRequired, e.handleSingBoxExit)
+	singbox := NewSingBoxProcess(e.basePath, e.statePath, e.handleSingBoxExit)
 	if err := singbox.Start(prepared, socksAddr, vpnServerIP, enterpriseDNS); err != nil {
 		releasePartial()
 		return fmt.Errorf("sing-box 启动失败: %w", err)
@@ -491,18 +425,6 @@ func (e *Engine) handleSingBoxExit(exitErr error) {
 	}
 }
 
-func (e *Engine) notifyAuthRequired(authURL string) {
-	if callback, ok := e.callback.(AuthCallback); ok {
-		callback.OnAuthRequired(authURL)
-	}
-}
-
-func (e *Engine) notifyTailscaleStatus(lineID string, status TailscaleStatus) {
-	if callback, ok := e.callback.(TailscaleStatusCallback); ok {
-		callback.OnTailscaleStatus(lineID, status)
-	}
-}
-
 func (e *Engine) startSOCKS(bridge *VPNBridge) (string, error) {
 	srv := socks5.NewServer(
 		socks5.WithDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -541,10 +463,6 @@ func (e *Engine) Stop() error {
 	defer e.mu.Unlock()
 
 	if e.status != StatusConnected && e.status != StatusConnecting && e.status != StatusReconnecting {
-		if e.tailscaleAuth != nil {
-			e.tailscaleAuth.Close()
-			e.tailscaleAuth = nil
-		}
 		return nil
 	}
 
@@ -574,10 +492,6 @@ func (e *Engine) cleanupLocked() {
 	// 软失败（服务还在、只是当前被禁用）不算 Restore 的错误，但用户必须知道：重新启用
 	// 那个服务时它的 DNS 还指着已消失的 tun。之后由周期自愈接手，不会重复上报。
 	e.reportDNSPending()
-	if e.tailscaleAuth != nil {
-		e.tailscaleAuth.Close()
-		e.tailscaleAuth = nil
-	}
 	if e.singbox != nil {
 		e.singbox.Stop()
 		e.singbox = nil

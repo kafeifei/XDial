@@ -729,31 +729,70 @@ func TestSmoke_DirectBinding(t *testing.T) {
 	r.requestAndAssert("google.com", "vpn")
 }
 
+// 悬空引用（INV6a）必须让生成直接失败，而不是让那条规则悄悄蒸发、
+// 流量落到 final —— 那正是宪法禁止的静默降级。
 func TestSmoke_NonexistentBinding(t *testing.T) {
-	profile := &Profile{
-		Lines: []Line{
-			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
-		},
-		RuleSets: []RuleSet{
-			{ID: "real", Name: "真实", Type: RuleSetTypeManual, Enabled: true,
-				Domains: []string{"real.local"}},
-		},
-		Modes: []Mode{{
-			ID: "main",
-			Bindings: []RuleBinding{
-				{RuleSetID: "nonexistent-ruleset", LineID: "my-vpn"},
-				{RuleSetID: "real", LineID: "nonexistent-line"},
-				{RuleSetID: "real", LineID: "my-vpn"},
+	base := func() *Profile {
+		return &Profile{
+			Lines: []Line{
+				{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 			},
-			DefaultLineID: "direct",
-		}},
-		ActiveModeID: "main",
+			RuleSets: []RuleSet{
+				{ID: "real", Name: "真实", Type: RuleSetTypeManual, Enabled: true,
+					Domains: []string{"real.local"}},
+			},
+			Modes: []Mode{{
+				ID:            "main",
+				Bindings:      []RuleBinding{{RuleSetID: "real", LineID: "my-vpn"}},
+				DefaultLineID: "direct",
+			}},
+			ActiveModeID: "main",
+		}
 	}
 
-	r := newSmokeRunner(t, profile)
-	defer r.stop()
+	cases := []struct {
+		name    string
+		mutate  func(*Profile)
+		wantSub string
+	}{
+		{"missing rule set", func(p *Profile) {
+			p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+				RuleBinding{RuleSetID: "nonexistent-ruleset", LineID: "my-vpn"})
+		}, "nonexistent-ruleset"},
+		{"missing line", func(p *Profile) {
+			p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+				RuleBinding{RuleSetID: "real", LineID: "nonexistent-line"})
+		}, "nonexistent-line"},
+		{"missing subscription", func(p *Profile) {
+			p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+				RuleBinding{RuleSetID: "real", SubscriptionID: "nonexistent-sub"})
+		}, "nonexistent-sub"},
+		{"missing default line", func(p *Profile) {
+			p.Modes[0].DefaultLineID = "nonexistent-default"
+		}, "nonexistent-default"},
+		{"binding without outbound", func(p *Profile) {
+			p.Modes[0].Bindings = append(p.Modes[0].Bindings, RuleBinding{RuleSetID: "real"})
+		}, "neither a line nor a subscription"},
+	}
 
-	r.requestAndAssert("real.local", "vpn")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			profile := base()
+			tc.mutate(profile)
+			_, err := GenerateSingBox(profile, 0, "")
+			if err == nil {
+				t.Fatalf("dangling reference must be rejected, got no error")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error %q should mention %q", err, tc.wantSub)
+			}
+		})
+	}
+
+	// 对照组：引用全部合法时照常生成。
+	if _, err := GenerateSingBox(base(), 0, ""); err != nil {
+		t.Fatalf("valid profile must generate: %v", err)
+	}
 }
 
 // --- 订阅分流烟雾测试 ---
@@ -808,8 +847,6 @@ func TestSmoke_SubscribeWithGroups(t *testing.T) {
 		RuleSets: []RuleSet{
 			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
-			{ID: "streaming", Name: "流媒体", Type: RuleSetTypeManual, Enabled: true,
-				Domains: []string{"netflix.com"}},
 		},
 		Subscriptions: []Subscription{{
 			ID: "sub1", Name: "MySub", URL: "https://example.com/sub",
@@ -838,6 +875,49 @@ func TestSmoke_SubscribeWithGroups(t *testing.T) {
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", SubscriptionID: "sub1"},
+			},
+			DefaultLineID: "direct",
+		}},
+		ActiveModeID: "main",
+	}
+
+	r := newSmokeRunner(t, profile)
+	defer r.stop()
+
+	// google → 模式显式绑定到订阅 → 订阅主策略组 Proxies → 默认第一个节点 HK 01
+	r.requestAndAssert("google.com", "proxy-sub1-n1")
+	// netflix 没有模式绑定，落到订阅自带规则（兜底层）→ Streaming 策略组 → US 01。
+	// 顺序语义：模式规则在前、订阅自带规则在后，见 TestSmokeModeRuleOverridesSubscriptionRule。
+	r.requestAndAssert("netflix.com", "proxy-sub1-n2")
+}
+
+// 同一个域名既被模式显式绑定、又被订阅自带规则命中时，必须由模式裁决。
+// 宪法：Mode 是唯一裁决者，订阅只是供给源（D28），订阅规则不得抢在模式规则之前。
+func TestSmokeModeRuleOverridesSubscriptionRule(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
+		},
+		RuleSets: []RuleSet{
+			{ID: "streaming", Name: "流媒体", Type: RuleSetTypeManual, Enabled: true,
+				Domains: []string{"netflix.com"}},
+		},
+		Subscriptions: []Subscription{{
+			ID: "sub1", Name: "MySub", URL: "https://example.com/sub",
+			Format: "surge", Enabled: true, Strategy: "urltest",
+			Lines: []Line{
+				{ID: "n1", Name: "HK 01", Type: LineTypeTrojan, Enabled: true,
+					TrojanServer: "hk1.example.com", TrojanPort: 443,
+					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
+			},
+			// 订阅自带规则把 netflix.com 判给 DIRECT，模式里用户把它绑到了订阅节点。
+			Rules: []SubscriptionRule{
+				{Type: "DOMAIN-SUFFIX", Value: "netflix.com", Group: "DIRECT"},
+			},
+		}},
+		Modes: []Mode{{
+			ID: "main",
+			Bindings: []RuleBinding{
 				{RuleSetID: "streaming", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
@@ -848,10 +928,7 @@ func TestSmoke_SubscribeWithGroups(t *testing.T) {
 	r := newSmokeRunner(t, profile)
 	defer r.stop()
 
-	// google → Proxies 策略组 → 默认第一个节点 HK 01
-	r.requestAndAssert("google.com", "proxy-sub1-n1")
-	// netflix → Streaming 策略组 → 默认第一个节点 US 01
-	r.requestAndAssert("netflix.com", "proxy-sub1-n2")
+	r.requestAndAssert("netflix.com", "proxy-sub1-n1")
 }
 
 func TestSmoke_SubscribeMixed(t *testing.T) {

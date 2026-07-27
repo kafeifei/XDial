@@ -72,7 +72,7 @@ final class DebugServer {
                     "GET  /health",
                     "GET  /state",
                     "GET  /ax[?depth=N]",
-                    "POST /action  {action: connect|disconnect|select-mode|ax-press|ax-set-value, ...}",
+                    "POST /action  {action: connect|disconnect|reconnect|select-mode|ax-press|ax-set-value, ...}",
                 ],
             ]))
         }
@@ -128,6 +128,8 @@ final class DebugServer {
         dict["language"] = s.language.rawValue
         dict["launchAtLogin"] = s.launchAtLogin
         dict["activeModeID"] = s.profile.activeModeID
+        // 配置改了但引擎还在跑旧快照 —— 验收改动是否真正生效必须看这个
+        dict["configDirty"] = s.configDirty
 
         if let d = try? JSONEncoder().encode(s.profile),
            let p = try? JSONSerialization.jsonObject(with: d) {
@@ -157,6 +159,7 @@ final class DebugServer {
     // 密码/凭据字段一律打码；订阅 url 内嵌 token，同样按凭据处理
     private static let secretKeys: Set<String> = [
         "vpn_password", "trojan_password", "ss_password", "vmess_uuid",
+        "tailscale_auth_key",
     ]
 
     private static func redactSecrets(_ value: Any) -> Any {
@@ -290,13 +293,23 @@ final class DebugServer {
         case "disconnect":
             state.disconnect()
             return ok(["ok": true])
+        case "reconnect":
+            state.reconnect()
+            return ok(["ok": true, "status": state.engine.status])
         case "select-mode":
             guard let id = obj["id"] as? String else {
                 return ("400 Bad Request", json(["error": "missing 'id'"]))
             }
-            state.profile.activeModeID = id
-            state.save()
-            return ok(["ok": true, "activeModeID": id])
+            // 必须走和用户点击完全相同的 intent：直接改 state 会绕开门禁和
+            // configDirty 置位，调试验收就会给出"已生效"的假象。
+            guard state.activateMode(id) else {
+                return ("404 Not Found", json(["error": "no such mode", "id": id]))
+            }
+            return ok([
+                "ok": true,
+                "activeModeID": state.profile.activeModeID,
+                "configDirty": state.configDirty,
+            ])
         case "open-settings":
             NSApp.activate(ignoringOtherApps: true)
             if let w = settingsWindow() {
@@ -362,7 +375,7 @@ final class DebugServer {
             ])
         default:
             return ("400 Bad Request", json(["error": "unknown action: \(action)",
-                "available": ["connect", "disconnect", "select-mode", "open-settings",
+                "available": ["connect", "disconnect", "reconnect", "select-mode", "open-settings",
                               "ax-press", "ax-set-value", "setup-helper", "check-helper", "daemon-info"]]))
         }
     }

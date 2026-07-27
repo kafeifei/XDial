@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 
 // 日志放到用户私有目录并以 0600 创建；之前写 /tmp/xdial-app.log（世界可读），
@@ -24,33 +23,6 @@ func appLog(_ msg: String) {
     }
 }
 
-struct TailscaleExitNode: Codable, Identifiable, Hashable {
-    let id: String
-    let name: String
-    let ip: String
-    let online: Bool
-    let os: String?
-}
-
-/// daemon 的 tailscale-exit-nodes 响应与事件共用这一个结构。
-///
-/// loggedIn 为 false 不是错误：未登录是正常状态，UI 据此显示登录入口。
-private struct TailscaleStatusPayload: Codable {
-    let lineID: String
-    let loggedIn: Bool
-    let account: String?
-    let hostname: String?
-    let exitNodes: [TailscaleExitNode]?
-
-    enum CodingKeys: String, CodingKey {
-        case lineID = "line_id"
-        case loggedIn = "logged_in"
-        case account
-        case hostname
-        case exitNodes = "exit_nodes"
-    }
-}
-
 @MainActor
 final class GoEngine: ObservableObject {
     static let shared = GoEngine()
@@ -65,17 +37,6 @@ final class GoEngine: ObservableObject {
     @Published private(set) var status: String = "disconnected"
     @Published var lastError: String?
     @Published private(set) var connectedAt: Date?
-    @Published private(set) var tailscaleAuthURL: URL?
-    @Published private(set) var tailscaleAuthLineID: String?
-    @Published private(set) var tailscaleAuthInProgress = false
-    @Published private(set) var tailscaleExitNodes: [String: [TailscaleExitNode]] = [:]
-    @Published private(set) var tailscaleExitNodesLoading: Set<String> = []
-    // 登录态是全局的：所有 Tailscale 线路共享同一次登录。
-    @Published private(set) var tailscaleLoggedIn = false
-    @Published private(set) var tailscaleAccount = ""
-    /// 实际注册到 tailnet 的设备名。首次登录由 Go 侧生成，登录成功后回传给这里，
-    /// 再由 AppState 落盘到 Profile —— 避免两侧各实现一遍生成规则。
-    @Published private(set) var tailscaleDeviceName = ""
 
     struct ParseResult: Decodable {
         let lines: [Line]
@@ -96,9 +57,6 @@ final class GoEngine: ObservableObject {
 
     func start(profileJSON: String) {
         lastError = nil
-        tailscaleAuthURL = nil
-        tailscaleAuthLineID = nil
-        tailscaleAuthInProgress = false
         status = "connecting"
         let json = profileJSON
         Task.detached { [weak self] in
@@ -117,9 +75,6 @@ final class GoEngine: ObservableObject {
 
     func stop() {
         appLog("stop() called, fd=\(self.fd), status=\(self.status)")
-        tailscaleAuthURL = nil
-        tailscaleAuthLineID = nil
-        tailscaleAuthInProgress = false
         guard ensureSocket() else {
             appLog("stop: ensureSocket failed")
             status = "disconnected"
@@ -129,63 +84,6 @@ final class GoEngine: ObservableObject {
         sendRequest(cmd: "stop") { [weak self] resp in
             if resp.ok != true {
                 self?.lastError = resp.message
-            }
-        }
-    }
-
-    func loginTailscale(lineID: String, profileJSON: String) {
-        lastError = nil
-        tailscaleAuthURL = nil
-        tailscaleAuthLineID = lineID
-        tailscaleAuthInProgress = true
-        tailscaleExitNodes[lineID] = []
-        let json = profileJSON
-        Task { [weak self] in
-            guard let self else { return }
-            let ok = await self.ensureHelperAsync()
-            guard ok else {
-                self.tailscaleAuthInProgress = false
-                return
-            }
-            guard self.ensureSocket() else {
-                self.lastError = "无法连接到 helper 进程"
-                self.tailscaleAuthInProgress = false
-                return
-            }
-            self.sendRequest(cmd: "tailscale-auth", profile: json, lineID: lineID) { [weak self] resp in
-                self?.tailscaleAuthInProgress = false
-                if resp.ok != true {
-                    self?.lastError = resp.message ?? "Tailscale 登录启动失败"
-                }
-            }
-        }
-    }
-
-    func refreshTailscaleExitNodes(lineID: String, profileJSON: String) {
-        lastError = nil
-        tailscaleAuthLineID = lineID
-        tailscaleExitNodesLoading.insert(lineID)
-        let json = profileJSON
-        Task { [weak self] in
-            guard let self else { return }
-            let ok = await self.ensureHelperAsync()
-            guard ok else {
-                self.tailscaleExitNodesLoading.remove(lineID)
-                return
-            }
-            guard self.ensureSocket() else {
-                self.lastError = "无法连接到 helper 进程"
-                self.tailscaleExitNodesLoading.remove(lineID)
-                return
-            }
-            self.sendRequest(cmd: "tailscale-exit-nodes", profile: json, lineID: lineID) { [weak self] resp in
-                guard let self else { return }
-                self.tailscaleExitNodesLoading.remove(lineID)
-                if resp.ok == true, let data = resp.data {
-                    self.applyTailscaleExitNodes(data)
-                } else {
-                    self.lastError = resp.message ?? "读取 Tailscale 出口节点失败"
-                }
             }
         }
     }
@@ -228,7 +126,7 @@ final class GoEngine: ObservableObject {
     }
 
     @discardableResult
-    private func sendRequest(cmd: String, profile: String? = nil, lineID: String? = nil,
+    private func sendRequest(cmd: String, profile: String? = nil,
                              callback: ((DaemonResponse) -> Void)? = nil) -> Bool {
         guard fd >= 0 else {
             appLog("sendRequest(\(cmd)): fd < 0")
@@ -238,7 +136,6 @@ final class GoEngine: ObservableObject {
         let reqID = nextID()
         var obj: [String: String] = ["id": reqID, "cmd": cmd]
         if let profile { obj["profile"] = profile }
-        if let lineID { obj["line_id"] = lineID }
 
         guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return false }
         data.append(UInt8(ascii: "\n"))
@@ -445,11 +342,7 @@ final class GoEngine: ObservableObject {
     }
 
     private func handleEvent(event: String, data: String?) {
-        if event == "tailscale-auth-required" || event == "tailscale-exit-nodes" {
-            appLog("event: \(event) dataLen=\(data?.count ?? 0)")
-        } else {
-            appLog("event: \(event) data=\(data ?? "")")
-        }
+        appLog("event: \(event) data=\(data ?? "")")
         switch event {
         case "status":
             if let data {
@@ -463,21 +356,6 @@ final class GoEngine: ObservableObject {
                         self?.applyStatusData(data)
                     }
                 }
-            }
-        case "tailscale-auth-required":
-            guard let data, let url = URL(string: data),
-                  url.scheme == "https" || url.scheme == "http" else { return }
-            tailscaleAuthURL = url
-            tailscaleAuthInProgress = false
-            if tailscaleAuthLineID != nil {
-                NSWorkspace.shared.open(url)
-            } else {
-                lastError = "Tailscale 尚未登录，请在线路设置中点击登录"
-                stop()
-            }
-        case "tailscale-exit-nodes":
-            if let data {
-                applyTailscaleExitNodes(data)
             }
         default:
             break
@@ -510,49 +388,6 @@ final class GoEngine: ObservableObject {
         }
     }
 
-    private func applyTailscaleExitNodes(_ dataStr: String) {
-        guard let data = dataStr.data(using: .utf8),
-              let payload = try? JSONDecoder().decode(TailscaleStatusPayload.self, from: data) else {
-            return
-        }
-        tailscaleExitNodesLoading.remove(payload.lineID)
-        tailscaleLoggedIn = payload.loggedIn
-        tailscaleAccount = payload.account ?? ""
-        tailscaleDeviceName = payload.hostname ?? ""
-        tailscaleExitNodes[payload.lineID] = payload.exitNodes ?? []
-        if payload.loggedIn, tailscaleAuthLineID == payload.lineID {
-            tailscaleAuthURL = nil
-            tailscaleAuthInProgress = false
-        }
-        lastError = nil
-    }
-
-    /// 退出 tailnet 登录。身份是全局的，所以所有 Tailscale 线路会一并失效。
-    func logoutTailscale(completion: @escaping (Bool, String?) -> Void) {
-        lastError = nil
-        Task { [weak self] in
-            guard let self else { return }
-            guard await self.ensureHelperAsync(), self.ensureSocket() else {
-                completion(false, "无法连接到 helper 进程")
-                return
-            }
-            self.sendRequest(cmd: "tailscale-logout") { [weak self] resp in
-                guard let self else { return }
-                if resp.ok == true {
-                    self.tailscaleLoggedIn = false
-                    self.tailscaleAccount = ""
-                    self.tailscaleDeviceName = ""
-                    self.tailscaleExitNodes.removeAll()
-                    self.tailscaleAuthURL = nil
-                    self.tailscaleAuthLineID = nil
-                    self.tailscaleAuthInProgress = false
-                    completion(true, nil)
-                } else {
-                    completion(false, resp.message ?? "退出 Tailscale 失败")
-                }
-            }
-        }
-    }
 }
 
 private struct DaemonResponse: Decodable {

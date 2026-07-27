@@ -77,10 +77,20 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 	if mode == nil {
 		return nil, fmt.Errorf("no active mode")
 	}
+	// INV6a：悬空引用（模式指向不存在的规则/线路/订阅）在这里就拒绝，
+	// 绝不让它变成"整条规则蒸发、流量静默落到 final"。存在但被禁用的对象
+	// （INV6b）只产生 warning，由 CollectProfileWarnings 供 daemon/UI 读取。
+	if _, err := inspectModeReferences(profile, mode); err != nil {
+		return nil, err
+	}
 	activeLineIDs, activeSubscriptionIDs := effectiveActiveTargetIDs(profile, mode)
 	activeVPNIDs := effectiveActiveVPNLineIDs(profile, mode)
-	if platform == PlatformNE && len(activeVPNIDs) > 1 {
-		return nil, fmt.Errorf("network extension mode supports only one active AnyConnect line")
+	// D30：sslcon 是包级单例，一个进程只能维持一条 AnyConnect 隧道，而所有 VPN
+	// 线路共享 "vpn" 这一个 outbound tag。两条不同的 active VPN 线路会让第二条的
+	// 流量静默钻进第一条的隧道（违反 Line 隔离）。所有平台一律硬校验报错，
+	// 不区分桌面/NE —— 桌面同样只有一份 VPNBridge。
+	if len(activeVPNIDs) > 1 {
+		return nil, fmt.Errorf("only one active AnyConnect line is supported: %d active lines would share one tunnel", len(activeVPNIDs))
 	}
 
 	outbounds := []map[string]interface{}{{"type": "direct", "tag": "direct"}}
@@ -117,12 +127,18 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 		return nil, fmt.Errorf("only one enabled Tailscale line is supported: %d lines would share one state directory", enabledTailscaleLines)
 	}
 
+	// Tailscale 标签分两份，对应宪法的「声明≠生效」（INV1c）：
+	//
+	// endpoints 只要线路 enabled 就生成 —— 节点得先在 tailnet 注册、tsnet 得先
+	// 就绪，MagicDNS 才有解析能力可供 Mode 调用。这是「声明」，是本条唯一的例外。
+	//
+	// activeTailscaleTags 只收「同时被 active Mode 引用」的线路，它才是「生效」：
+	// tailnet CIDR 路由、tailscale-dns 解析权、诊断 selector 成员，全部只认它。
+	// 否则一条配了但当前模式没用的 Tailscale 线路会抢走 100.64/10 的路由和
+	// tailnet 名字的解析权 —— 那正是 preferred_by 全局劫持的翻版。
 	var endpoints []map[string]interface{}
-	var tailscaleTags []string
+	var activeTailscaleTags []string
 	for _, line := range profile.Lines {
-		// endpoint 只要线路 enabled 就生成，不要求模式显式引用 —— tailnet 的
-		// MagicDNS 解析依赖它就绪。但路由上它已是普通 outbound：只有模式显式
-		// 绑定的流量才走它，不再有 preferred_by 那种隐式全局劫持。
 		if !line.Enabled || line.Type != LineTypeTailscale {
 			continue
 		}
@@ -134,7 +150,9 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 			return nil, err
 		}
 		endpoints = append(endpoints, endpoint)
-		tailscaleTags = append(tailscaleTags, tailscaleEndpointTag(&line))
+		if activeLineIDs[line.ID] {
+			activeTailscaleTags = append(activeTailscaleTags, tailscaleEndpointTag(&line))
+		}
 	}
 
 	for _, line := range profile.Lines {
@@ -173,7 +191,7 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 			}
 			selectorMembers = append(selectorMembers, tag)
 		}
-		selectorMembers = append(selectorMembers, tailscaleTags...)
+		selectorMembers = append(selectorMembers, activeTailscaleTags...)
 		outbounds = append(outbounds, map[string]interface{}{
 			"type":      "selector",
 			"tag":       testSelectorTag,
@@ -222,7 +240,15 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 	// 让路由验收测到订阅语义而不是两条显式绑定。
 	routeRules = append(routeRules, acceptanceModeRules...)
 
-	// 订阅自带规则仍优先于普通模式规则（让订阅的分组规则优先匹配）。
+	// 模式的普通规则排在订阅自带规则之前。
+	//
+	// 宪法：Mode 是唯一裁决者，订阅只是"自带规则的供给源"（D28）。订阅那几百条
+	// 宽匹配（GEOIP,CN→DIRECT 之类）一旦排在前面，就会把用户在模式里显式绑定的
+	// 规则整个遮蔽掉 —— 用户明明把 example.com 绑到了某条线路，流量却被订阅的
+	// 兜底规则抢走，这正是"隐式抢注"。改为：用户显式绑定优先，订阅规则退为兜底。
+	routeRules = append(routeRules, ordinaryModeRules...)
+
+	// 订阅自带规则：以一等公民身份进入裁决，但排在用户显式绑定之后。
 	for _, sub := range profile.Subscriptions {
 		if !activeSubscriptionIDs[sub.ID] || !sub.Enabled {
 			continue
@@ -248,9 +274,6 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 		}
 	}
 
-	// 普通模式规则作为兜底（引用不存在的 outbound 时跳过）。
-	routeRules = append(routeRules, ordinaryModeRules...)
-
 	// Tailscale 只自动接管 tailnet 内部地址（MagicDNS 解析出的设备地址），
 	// 其余流量的归属完全由用户的显式规则和模式默认出口决定。
 	//
@@ -258,15 +281,18 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 	// 0.0.0.0/0 整个捞给 Tailscale——它让「模式默认出口」永远失效，用户配好
 	// 的"默认直连"全部被抢走。想要"默认流量走 exit node"，正确做法是把模式
 	// 默认线路设为 Tailscale 线路（final 即 endpoint tag），而不是靠隐式全捞。
-	routeRules = append(routeRules, buildTailscaleInternalRouteRules(tailscaleTags)...)
+	routeRules = append(routeRules, buildTailscaleInternalRouteRules(activeTailscaleTags)...)
 
+	// 默认出口。悬空引用已在 inspectModeReferences 里报错拒绝，这里能走到回落
+	// direct 的只剩"对象存在但被禁用/参数不全"一种情况，且已经产生了对应的
+	// ProfileWarning（INV6b），不是静默降级。
 	defaultTag := "direct"
 	if mode.DefaultSubscriptionID != "" {
 		if tag, ok := subTagMap[mode.DefaultSubscriptionID]; ok && validTags[tag] {
 			defaultTag = tag
 		}
 	} else if mode.DefaultLineID != "" {
-		if l := profile.FindLine(mode.DefaultLineID); l != nil {
+		if l := profile.FindLine(mode.DefaultLineID); l != nil && l.Enabled {
 			candidate := resolveOutboundTag(l)
 			if validTags[candidate] {
 				defaultTag = candidate
@@ -294,10 +320,10 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 	if len(ruleSetResources) > 0 {
 		route["rule_set"] = ruleSetResources
 	}
-	dnsConfig := buildNEDNS(tailscaleTags)
+	dnsConfig := buildNEDNS(activeTailscaleTags)
 	if platform != PlatformNE {
 		dnsConfig = buildDNS(
-			firstString(tailscaleTags),
+			firstString(activeTailscaleTags),
 			enterpriseDNS,
 			collectVPNBoundDomains(profile, mode),
 			collectProxyBoundDNSTargets(profile, mode, subTagMap, validTags),
@@ -710,10 +736,22 @@ func buildModeRouteRules(
 			outTag = subTagMap[binding.SubscriptionID]
 		} else {
 			line := profile.FindLine(binding.LineID)
-			if line == nil {
+			switch {
+			case line == nil:
+				// 悬空引用已由 inspectModeReferences 在生成入口拒绝，能到这里
+				// 的只有内建 direct（profile 里没有显式直连线路时的保留 ID）。
+				if binding.LineID != builtinDirectLineID {
+					continue
+				}
+				outTag = "direct"
+			case !line.Enabled:
+				// 被禁用的线路必须显式跳过：direct/vpn 这类固定 tag 恒在
+				// validTags 里，不查 Enabled 就会让"已禁用的线路"悄悄把流量
+				// 塞进 direct 或别人的 VPN 隧道（对应 WarningDisabledLine）。
 				continue
+			default:
+				outTag = resolveOutboundTag(line)
 			}
-			outTag = resolveOutboundTag(line)
 		}
 		if outTag == "" || !validTags[outTag] {
 			continue

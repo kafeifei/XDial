@@ -26,8 +26,9 @@ struct Line: Codable, Identifiable, Hashable {
     var vmessUUID: String = ""
     var vmessAltID: Int = 0
 
-    // Tailscale 身份（设备名、登录态）是 Profile 全局唯一的一份，见 TailscaleIdentity。
-    // 线路上只留「这条线路走哪个出口」。
+    // Tailscale 按 D29 是纯参数线路：没有交互式登录流程，用户在 Tailscale 后台
+    // 生成 auth key 填进来即可。auth key 是密码性质字段，落盘时进 Keychain vault。
+    var tailscaleAuthKey: String = ""
     var tailscaleExitNode: String = ""
 
     // 跳过 TLS 证书验证（自签场景显式开启）。默认 false=验证证书。
@@ -51,6 +52,7 @@ struct Line: Codable, Identifiable, Hashable {
         case vmessPort = "vmess_port"
         case vmessUUID = "vmess_uuid"
         case vmessAltID = "vmess_alt_id"
+        case tailscaleAuthKey = "tailscale_auth_key"
         case tailscaleExitNode = "tailscale_exit_node"
     }
 
@@ -59,14 +61,14 @@ struct Line: Codable, Identifiable, Hashable {
          trojanServer: String = "", trojanPort: Int = 443, trojanPassword: String = "", trojanSNI: String = "",
          ssServer: String = "", ssPort: Int = 8388, ssMethod: String = "aes-256-gcm", ssPassword: String = "",
          vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0,
-         tailscaleExitNode: String = "",
+         tailscaleAuthKey: String = "", tailscaleExitNode: String = "",
          allowInsecure: Bool = false) {
         self.id = id; self.name = name; self.type = type; self.enabled = enabled; self.verified = verified
         self.vpnServer = vpnServer; self.vpnUsername = vpnUsername; self.vpnPassword = vpnPassword
         self.trojanServer = trojanServer; self.trojanPort = trojanPort; self.trojanPassword = trojanPassword; self.trojanSNI = trojanSNI
         self.ssServer = ssServer; self.ssPort = ssPort; self.ssMethod = ssMethod; self.ssPassword = ssPassword
         self.vmessServer = vmessServer; self.vmessPort = vmessPort; self.vmessUUID = vmessUUID; self.vmessAltID = vmessAltID
-        self.tailscaleExitNode = tailscaleExitNode
+        self.tailscaleAuthKey = tailscaleAuthKey; self.tailscaleExitNode = tailscaleExitNode
         self.allowInsecure = allowInsecure
     }
 
@@ -92,6 +94,7 @@ struct Line: Codable, Identifiable, Hashable {
         vmessPort = try c.decodeIfPresent(Int.self, forKey: .vmessPort) ?? 443
         vmessUUID = try c.decodeIfPresent(String.self, forKey: .vmessUUID) ?? ""
         vmessAltID = try c.decodeIfPresent(Int.self, forKey: .vmessAltID) ?? 0
+        tailscaleAuthKey = try c.decodeIfPresent(String.self, forKey: .tailscaleAuthKey) ?? ""
         tailscaleExitNode = try c.decodeIfPresent(String.self, forKey: .tailscaleExitNode) ?? ""
         allowInsecure = try c.decodeIfPresent(Bool.self, forKey: .allowInsecure) ?? false
     }
@@ -295,12 +298,13 @@ struct Mode: Codable, Identifiable, Hashable {
     }
 }
 
-/// 本机在 tailnet 中的身份，整个 Profile 全局唯一一份。
+/// 本机在 tailnet 中注册用的设备名，整个 Profile 全局唯一一份。
 ///
 /// 一个 tsnet 实例就是 tailnet 里的一台设备，两个实例不能共用同一份 state，
-/// 所以身份必须是全局的：所有 Tailscale 线路共享同一次登录，退出一次全部失效。
+/// 所以设备名是全局的而不是每条线路一份。
+/// D29 之后没有交互式登录，凭据是线路上的 auth key，这里只剩设备名这一个参数。
 struct TailscaleIdentity: Codable, Hashable {
-    /// 注册到 tailnet 的设备名，首次登录时自动生成后固定不变，用户不可编辑。
+    /// 注册到 tailnet 的设备名。留空则由 Go 侧按本机名生成。
     var hostname: String = ""
 
     init(hostname: String = "") {
