@@ -47,8 +47,8 @@ type AuthCallback interface {
 	OnAuthRequired(url string)
 }
 
-type TailscaleExitNodesCallback interface {
-	OnTailscaleExitNodes(lineID string, nodes []TailscaleExitNode)
+type TailscaleStatusCallback interface {
+	OnTailscaleStatus(lineID string, status TailscaleStatus)
 }
 
 func newStatusMessage(s Status) StatusMessage {

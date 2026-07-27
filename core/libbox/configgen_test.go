@@ -18,13 +18,11 @@ func TestGenerateNEConfigIncludesTailscaleEndpointWithMobileDNSDispatcher(t *tes
 	profile := config.Profile{
 		Lines: []config.Line{
 			{ID: "direct", Type: config.LineTypeDirect, Enabled: true},
-			{
-				ID: "tailnet", Type: config.LineTypeTailscale, Enabled: true,
-				TailscaleHostname: "xdial-mobile", TailscaleAcceptRoutes: true,
-			},
+			{ID: "tailnet", Type: config.LineTypeTailscale, Enabled: true},
 		},
 		Modes:        []config.Mode{{ID: "mode", DefaultLineID: "direct"}},
 		ActiveModeID: "mode",
+		Tailscale:    config.TailscaleIdentity{Hostname: "xdial-mobile"},
 	}
 	profileJSON, err := json.Marshal(profile)
 	if err != nil {
@@ -45,7 +43,7 @@ func TestGenerateNEConfigIncludesTailscaleEndpointWithMobileDNSDispatcher(t *tes
 	}
 	endpoint := endpoints[0].(map[string]interface{})
 	stateDirectory := endpoint["state_directory"].(string)
-	if filepath.Dir(stateDirectory) != filepath.Join(basePath, "tailscale") {
+	if stateDirectory != filepath.Join(basePath, "tailscale") {
 		t.Fatalf("Tailscale state escaped writable base path: %q", stateDirectory)
 	}
 	dns := document["dns"].(map[string]interface{})
@@ -75,11 +73,12 @@ func TestGenerateTailscaleSetupConfigIsIsolated(t *testing.T) {
 		Lines: []config.Line{
 			{ID: "direct", Type: config.LineTypeDirect, Enabled: true},
 			{ID: "vpn", Type: config.LineTypeVPN, Enabled: true, VPNServer: "private-vpn.example", VPNPassword: "must-not-leak"},
-			{ID: "tailnet", Type: config.LineTypeTailscale, Enabled: false, TailscaleHostname: "xdial-mobile", TailscaleAcceptRoutes: true, TailscaleExitNode: "must-not-activate"},
-			{ID: "other-tailnet", Type: config.LineTypeTailscale, Enabled: true, TailscaleHostname: "must-not-leak"},
+			{ID: "tailnet", Type: config.LineTypeTailscale, Enabled: false, TailscaleExitNode: "must-not-activate"},
+			{ID: "other-tailnet", Type: config.LineTypeTailscale, Enabled: true},
 		},
 		Modes:        []config.Mode{{ID: "mode", DefaultLineID: "vpn"}},
 		ActiveModeID: "mode",
+		Tailscale:    config.TailscaleIdentity{Hostname: "xdial-mobile"},
 	}
 	profileJSON, err := json.Marshal(profile)
 	if err != nil {
@@ -114,9 +113,14 @@ func TestGenerateTailscaleSetupConfigIsIsolated(t *testing.T) {
 	if endpoint["type"] != "tailscale" ||
 		endpoint["tag"] != "tailscale-tailnet" ||
 		endpoint["hostname"] != "xdial-mobile" ||
-		endpoint["state_directory"] != config.TailscaleStateDirectory(basePath, "tailnet") ||
-		endpoint["accept_routes"] != false {
+		endpoint["state_directory"] != config.TailscaleStateDirectory(basePath) {
 		t.Fatalf("unexpected setup endpoint: %v", endpoint)
+	}
+	if _, exists := endpoint["accept_routes"]; exists {
+		t.Fatalf("setup endpoint must not accept tailnet routes: %v", endpoint)
+	}
+	if _, exists := endpoint["ephemeral"]; exists {
+		t.Fatalf("setup endpoint must be a persistent node: %v", endpoint)
 	}
 	if _, exists := endpoint["exit_node"]; exists {
 		t.Fatalf("setup endpoint must not activate an exit node: %v", endpoint)

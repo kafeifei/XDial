@@ -90,11 +90,12 @@ func GenerateTailscaleSetupConfig(profileJSON string, lineID string, basePath st
 	endpoint := map[string]interface{}{
 		"type":            "tailscale",
 		"tag":             "tailscale-" + setupLine.ID,
-		"state_directory": config.TailscaleStateDirectory(basePath, setupLine.ID),
-		"accept_routes":   false,
+		"state_directory": config.TailscaleStateDirectory(basePath),
+		// 与 buildTailscaleEndpoint 保持同一身份语义：state 全局单份、
+		// 设备名来自全局身份、常驻节点（ephemeral 会在会话切换时丢身份）。
 	}
-	if setupLine.TailscaleHostname != "" {
-		endpoint["hostname"] = setupLine.TailscaleHostname
+	if profile.Tailscale.Hostname != "" {
+		endpoint["hostname"] = profile.Tailscale.Hostname
 	}
 	document := map[string]interface{}{
 		"log": map[string]interface{}{

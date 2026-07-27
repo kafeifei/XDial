@@ -19,34 +19,38 @@ import (
 )
 
 type TailscaleSession struct {
-	lineID      string
-	server      *tsnet.Server
-	client      *local.Client
-	cancel      context.CancelFunc
-	onAuth      func(string)
-	onExitNodes func([]TailscaleExitNode)
+	lineID   string
+	server   *tsnet.Server
+	client   *local.Client
+	cancel   context.CancelFunc
+	onAuth   func(string)
+	onStatus func(TailscaleStatus)
 }
 
-func NewTailscaleSession(statePath string, line *config.Line, onAuth func(string), onExitNodes func([]TailscaleExitNode)) (*TailscaleSession, error) {
-	if line == nil || line.Type != config.LineTypeTailscale || line.ID == "" {
+func NewTailscaleSession(statePath string, identity config.TailscaleIdentity, lineID string, onAuth func(string), onStatus func(TailscaleStatus)) (*TailscaleSession, error) {
+	if lineID == "" {
 		return nil, fmt.Errorf("无效的 Tailscale 线路")
 	}
-	stateDirectory := config.TailscaleStateDirectory(statePath, line.ID)
+	stateDirectory := config.TailscaleStateDirectory(statePath)
 	if err := os.MkdirAll(stateDirectory, 0700); err != nil {
 		return nil, fmt.Errorf("创建 Tailscale 状态目录: %w", err)
 	}
 
-	hostname := strings.TrimSpace(line.TailscaleHostname)
+	// 设备名由 Profile 持有并在首次登录时生成，这里不再回退到 os.Hostname()：
+	// 每次启动重算会让用户改个机器名就变成一台新设备重新注册。
+	hostname := strings.TrimSpace(identity.Hostname)
 	if hostname == "" {
-		hostname, _ = os.Hostname()
-	}
-	if hostname == "" {
-		hostname = "xdial"
+		hostname = config.GenerateTailscaleHostname()
 	}
 
 	server := &tsnet.Server{
 		Dir:      stateDirectory,
 		Hostname: hostname,
+		// 常驻节点，不能用 Ephemeral：登录会话关闭后控制面会立刻回收
+		// ephemeral 的 node key，随后 sing-box endpoint 复用同一份 state 时
+		// 就被要求重新登录——「登录一次、连接复用」的两阶段模型直接失效。
+		// 设备不堆积由全局唯一 state + 固定 hostname 保证；退出登录时通过
+		// Logout 显式通知控制面删除设备记录。
 		Logf: func(format string, args ...any) {
 			slog.Debug("Tailscale", "message", fmt.Sprintf(format, args...))
 		},
@@ -62,12 +66,12 @@ func NewTailscaleSession(statePath string, line *config.Line, onAuth func(string
 
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &TailscaleSession{
-		lineID:      line.ID,
-		server:      server,
-		client:      client,
-		cancel:      cancel,
-		onAuth:      onAuth,
-		onExitNodes: onExitNodes,
+		lineID:   lineID,
+		server:   server,
+		client:   client,
+		cancel:   cancel,
+		onAuth:   onAuth,
+		onStatus: onStatus,
 	}
 	go session.watch(ctx)
 	return session, nil
@@ -77,26 +81,62 @@ func (s *TailscaleSession) LineID() string {
 	return s.lineID
 }
 
-func (s *TailscaleSession) ExitNodes(ctx context.Context) ([]TailscaleExitNode, error) {
+func (s *TailscaleSession) Status(ctx context.Context) (TailscaleStatus, error) {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		status, err := s.client.Status(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("读取 Tailscale 状态: %w", err)
+			return TailscaleStatus{}, fmt.Errorf("读取 Tailscale 状态: %w", err)
 		}
 		switch status.BackendState {
 		case "NeedsLogin", "NoState":
-			return nil, fmt.Errorf("Tailscale 尚未登录")
+			// 未登录是正常状态，不是错误：UI 要据此显示登录入口。
+			return TailscaleStatus{}, nil
 		case "Running":
-			return tailscaleExitNodes(status), nil
+			return buildTailscaleStatus(status), nil
 		}
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("等待 Tailscale 连接: %w", ctx.Err())
+			return TailscaleStatus{}, fmt.Errorf("等待 Tailscale 连接: %w", ctx.Err())
 		case <-ticker.C:
 		}
 	}
+}
+
+func buildTailscaleStatus(status *ipnstate.Status) TailscaleStatus {
+	return TailscaleStatus{
+		LoggedIn:  true,
+		Account:   tailscaleAccount(status),
+		Hostname:  tailscaleSelfHostname(status),
+		ExitNodes: tailscaleExitNodes(status),
+	}
+}
+
+// tailscaleAccount 取登录邮箱。
+func tailscaleAccount(status *ipnstate.Status) string {
+	if status.Self == nil {
+		return ""
+	}
+	if user, ok := status.User[status.Self.UserID]; ok {
+		return user.LoginName
+	}
+	return ""
+}
+
+func tailscaleSelfHostname(status *ipnstate.Status) string {
+	if status.Self == nil {
+		return ""
+	}
+	return status.Self.HostName
+}
+
+// Logout 通知控制面注销本机节点，tailnet 里的设备记录随之删除。
+func (s *TailscaleSession) Logout(ctx context.Context) error {
+	if s.client == nil {
+		return fmt.Errorf("Tailscale 会话不可用")
+	}
+	return s.client.Logout(ctx)
 }
 
 func (s *TailscaleSession) Close() error {
@@ -126,8 +166,8 @@ func (s *TailscaleSession) watch(ctx context.Context) {
 				}
 			}
 			if status.BackendState == "Running" {
-				if s.onExitNodes != nil {
-					s.onExitNodes(tailscaleExitNodes(status))
+				if s.onStatus != nil {
+					s.onStatus(buildTailscaleStatus(status))
 				}
 				return
 			}

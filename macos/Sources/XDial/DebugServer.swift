@@ -119,7 +119,10 @@ final class DebugServer {
             "isBusy": s.isBusy,
         ] as [String: Any]
         dict["helperInstalled"] = s.helperInstalled
-        dict["helperNeedsUpdate"] = s.helperNeedsUpdate
+        dict["helperNeedsApproval"] = s.helperNeedsApproval
+        dict["helperSMStatus"] = PrivilegeManager.status.rawValue
+        dict["helperLegacyInstalled"] = PrivilegeManager.legacyInstalled
+        dict["daemonBundledSHA256"] = PrivilegeManager.bundledDaemonSHA256() ?? ""
         dict["canConnect"] = s.canConnect
         dict["statusText"] = s.statusText
         dict["language"] = s.language.rawValue
@@ -265,6 +268,11 @@ final class DebugServer {
     // MARK: - Actions
 
     @MainActor
+    private static func settingsWindow() -> NSWindow? {
+        NSApp.windows.first { $0.title.contains("设置") || $0.title.contains("Settings") }
+    }
+
+    @MainActor
     private static func handleAction(_ body: String) -> (String, String) {
         guard let data = body.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -291,19 +299,71 @@ final class DebugServer {
             return ok(["ok": true, "activeModeID": id])
         case "open-settings":
             NSApp.activate(ignoringOtherApps: true)
-            for w in NSApp.windows where w.title.contains("设置") || w.title.contains("Settings") {
+            if let w = settingsWindow() {
                 w.makeKeyAndOrderFront(nil)
                 return ok(["ok": true])
             }
-            return ok(["ok": false, "error": "settings window not found (use the gear icon first)"])
+            // 窗口尚未创建：请常驻的菜单栏 label 代为 openWindow。同步等它出现，
+            // 好让调用方拿到确定结果而不是自己去轮询。
+            NotificationCenter.default.post(name: .xdialDebugOpenSettings, object: nil)
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+                if let w = settingsWindow() {
+                    w.makeKeyAndOrderFront(nil)
+                    return ok(["ok": true])
+                }
+            }
+            return ok(["ok": false, "error": "settings window did not open"])
         case "ax-press":
             return axPress(obj)
         case "ax-set-value":
             return axSetValue(obj)
+        case "setup-helper":
+            state.setupHelper()
+            return ok(["ok": true, "smStatus": PrivilegeManager.status.rawValue])
+        case "sm-register":
+            do {
+                try PrivilegeManager.register()
+                state.checkHelper()
+                return ok(["ok": true, "smStatus": PrivilegeManager.status.rawValue])
+            } catch {
+                state.checkHelper()
+                return ok(["ok": false, "error": error.localizedDescription,
+                           "smStatus": PrivilegeManager.status.rawValue])
+            }
+        case "sm-unregister":
+            do {
+                try PrivilegeManager.unregister()
+                state.checkHelper()
+                return ok(["ok": true, "smStatus": PrivilegeManager.status.rawValue])
+            } catch {
+                state.checkHelper()
+                return ok(["ok": false, "error": error.localizedDescription,
+                           "smStatus": PrivilegeManager.status.rawValue])
+            }
+        case "check-helper":
+            state.checkHelper()
+            return ok([
+                "ok": true,
+                "smStatus": PrivilegeManager.status.rawValue,
+                "installed": state.helperInstalled,
+                "needsApproval": state.helperNeedsApproval,
+                "legacyInstalled": PrivilegeManager.legacyInstalled,
+            ])
+        case "daemon-info":
+            let info = PrivilegeManager.probeDaemonInfo()
+            return ok([
+                "ok": info != nil,
+                "version": info?.version ?? "",
+                "exeSHA256": info?.exeSHA256 ?? "",
+                "pid": info?.pid ?? 0,
+                "bundledSHA256": PrivilegeManager.bundledDaemonSHA256() ?? "",
+            ])
         default:
             return ("400 Bad Request", json(["error": "unknown action: \(action)",
                 "available": ["connect", "disconnect", "select-mode", "open-settings",
-                              "ax-press", "ax-set-value"]]))
+                              "ax-press", "ax-set-value", "setup-helper", "check-helper", "daemon-info"]]))
         }
     }
 
