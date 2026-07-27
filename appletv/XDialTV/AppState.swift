@@ -1328,7 +1328,6 @@ final class AppState: ObservableObject {
             profile.lines[i].ssPassword = profile.lines[i].ssPassword.normalizedASCII()
             profile.lines[i].vmessServer = profile.lines[i].vmessServer.normalizedASCII()
             profile.lines[i].vmessUUID = profile.lines[i].vmessUUID.normalizedASCII()
-            profile.lines[i].tailscaleHostname = profile.lines[i].tailscaleHostname.normalizedASCII()
             profile.lines[i].tailscaleExitNode = profile.lines[i].tailscaleExitNode.normalizedASCII()
         }
         for i in profile.ruleSets.indices {
@@ -1455,7 +1454,6 @@ final class AppState: ObservableObject {
             store(&line.ssPassword, key: Self.vaultKey(scope + ["ss"]))
             store(&line.vmessServer, key: Self.vaultKey(scope + ["vmess-server"]))
             store(&line.vmessUUID, key: Self.vaultKey(scope + ["vmess"]))
-            store(&line.tailscaleHostname, key: Self.vaultKey(scope + ["tailscale-hostname"]))
             store(&line.tailscaleExitNode, key: Self.vaultKey(scope + ["tailscale-exit-node"]))
         }
 
@@ -1649,7 +1647,7 @@ final class AppState: ObservableObject {
                 || !line.trojanServer.isEmpty || !line.trojanPassword.isEmpty || !line.trojanSNI.isEmpty
                 || !line.ssServer.isEmpty || !line.ssPassword.isEmpty
                 || !line.vmessServer.isEmpty || !line.vmessUUID.isEmpty
-                || !line.tailscaleHostname.isEmpty || !line.tailscaleExitNode.isEmpty
+                || !line.tailscaleExitNode.isEmpty
         }
         if profile.lines.contains(where: lineContainsSensitiveValue) { return true }
         if profile.ruleSets.contains(where: { $0.type == "url" && !$0.url.isEmpty }) { return true }
@@ -1679,7 +1677,6 @@ final class AppState: ObservableObject {
             restore(&line.ssPassword, key: Self.vaultKey(scope + ["ss"]))
             restore(&line.vmessServer, key: Self.vaultKey(scope + ["vmess-server"]))
             restore(&line.vmessUUID, key: Self.vaultKey(scope + ["vmess"]))
-            restore(&line.tailscaleHostname, key: Self.vaultKey(scope + ["tailscale-hostname"]))
             restore(&line.tailscaleExitNode, key: Self.vaultKey(scope + ["tailscale-exit-node"]))
         }
 

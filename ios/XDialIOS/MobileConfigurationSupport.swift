@@ -437,13 +437,16 @@ enum MobileDiagnosticsService {
                 line.trojanServer, line.trojanPassword, line.trojanSNI,
                 line.ssServer, line.ssPassword,
                 line.vmessServer, line.vmessUUID,
-                line.tailscaleHostname, line.tailscaleExitNode,
+                line.tailscaleExitNode,
             ] where !value.isEmpty {
                 values.insert(value)
             }
         }
 
         for line in profile.lines { collect(line) }
+        if !profile.tailscale.hostname.isEmpty {
+            values.insert(profile.tailscale.hostname)
+        }
         for ruleSet in profile.ruleSets where !ruleSet.url.isEmpty {
             values.insert(ruleSet.url)
         }

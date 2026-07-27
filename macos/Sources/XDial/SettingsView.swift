@@ -173,7 +173,10 @@ struct LinesTab: View {
                     Button("Trojan") { add(type: "trojan") }
                     Button("Shadowsocks") { add(type: "shadowsocks") }
                     Button("VMess") { add(type: "vmess") }
+                    // 身份是全局单份的（一个 tsnet 实例 = tailnet 里一台设备），
+                    // 多条 Tailscale 线路只会共用同一次登录和同一个出口，没有意义。
                     Button("Tailscale") { add(type: "tailscale") }
+                        .disabled(state.profile.lines.contains { $0.type == "tailscale" })
                     Divider()
                     Button(state.tr("从订阅导入…", "Import from subscription…")) {
                         showAddSub = true
@@ -220,6 +223,8 @@ struct LineRow: View {
     @SwiftUI.Binding var line: Line
     var onDelete: () -> Void
     @State private var expanded = false
+    @State private var confirmingTailscaleLogout = false
+    @State private var tailscaleLogoutError: String?
     @EnvironmentObject var state: AppState
     @ObservedObject private var net = NetworkInfo.shared
 
@@ -292,6 +297,9 @@ struct LineRow: View {
             guard !line.vmessServer.isEmpty else { return "" }
             return "\(line.vmessServer):\(line.vmessPort)"
         case "tailscale":
+            guard state.engine.tailscaleLoggedIn else {
+                return state.tr("未登录", "Not signed in")
+            }
             if !line.tailscaleExitNode.isEmpty {
                 let selected = state.engine.tailscaleExitNodes[line.id]?.first {
                     $0.ip == line.tailscaleExitNode
@@ -302,7 +310,7 @@ struct LineRow: View {
                 let onlineCount = nodes.filter(\.online).count
                 return state.tr("\(onlineCount) 个可用出口", "\(onlineCount) exits available")
             }
-            return line.tailscaleHostname.isEmpty ? "Tailnet" : line.tailscaleHostname
+            return state.engine.tailscaleAccount.isEmpty ? "Tailnet" : state.engine.tailscaleAccount
         default:
             return ""
         }
@@ -345,38 +353,7 @@ struct LineRow: View {
             secureField("UUID", $line.vmessUUID)
             intField("Alter ID", $line.vmessAltID)
         case "tailscale":
-            field("设备名", $line.tailscaleHostname, placeholder: "xdial-mac")
-            tailscaleExitNodePicker
-            toggleField("子网路由", $line.tailscaleAcceptRoutes)
-            HStack {
-                Spacer().frame(width: 60)
-                Button(state.engine.tailscaleAuthInProgress && state.engine.tailscaleAuthLineID == line.id
-                       ? state.tr("正在启动登录…", "Starting login…")
-                       : state.tr("登录 Tailscale", "Login to Tailscale")) {
-                    state.loginTailscale(lineID: line.id)
-                }
-                .controlSize(.small)
-                .disabled(state.engine.isBusy || state.engine.isConnected || state.engine.tailscaleAuthInProgress)
-                if state.engine.tailscaleAuthLineID == line.id,
-                   let authURL = state.engine.tailscaleAuthURL {
-                    Button(state.tr("打开 Tailscale 登录页", "Open Tailscale Login")) {
-                        NSWorkspace.shared.open(authURL)
-                    }
-                    .controlSize(.small)
-                }
-                Spacer()
-            }
-            Text(state.tr(
-                state.engine.isConnected
-                    ? "请先断开 XDial，再在这里完成 Tailscale 登录。"
-                    : "登录后从已批准的出口节点中选择；连接后会自动接管 Tailnet 设备和 MagicDNS。",
-                state.engine.isConnected
-                    ? "Disconnect XDial before signing in to Tailscale here."
-                    : "Sign in, then select an approved exit node. Tailnet peers and MagicDNS are routed automatically after connecting."
-            ))
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            .padding(.leading, 64)
+            tailscaleDetail
         default:
             EmptyView()
         }
@@ -395,37 +372,220 @@ struct LineRow: View {
         }
     }
 
-    private var tailscaleExitNodePicker: some View {
-        let nodes = state.engine.tailscaleExitNodes[line.id] ?? []
-        let selectedMissing = !line.tailscaleExitNode.isEmpty && !nodes.contains { $0.ip == line.tailscaleExitNode }
-        let loading = state.engine.tailscaleExitNodesLoading.contains(line.id)
-        return HStack {
-            Text("出口节点").font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-            Picker("", selection: $line.tailscaleExitNode) {
-                Text(state.tr("不使用出口节点", "No exit node")).tag("")
-                if selectedMissing {
-                    Text(state.tr("当前：\(line.tailscaleExitNode)", "Current: \(line.tailscaleExitNode)"))
-                        .tag(line.tailscaleExitNode)
-                }
-                ForEach(nodes) { node in
-                    Text("\(node.name) · \(node.ip)\(node.online ? "" : state.tr("（离线）", " (offline)"))")
-                        .tag(node.ip)
-                        .disabled(!node.online)
-                }
+    // MARK: - Tailscale 四态
+    //
+    // 登录是一次性的，选出口是天天干的 —— 两者不该并排堆在同一张表单里。
+    // 未登录时只显示登录入口，登录完成后才出现出口选择。
+
+    private var tailscaleAuthorizing: Bool {
+        state.engine.tailscaleAuthLineID == line.id
+            && (state.engine.tailscaleAuthInProgress || state.engine.tailscaleAuthURL != nil)
+    }
+
+    @ViewBuilder
+    private var tailscaleDetail: some View {
+        Group {
+            if tailscaleAuthorizing {
+                tailscaleAuthorizingView
+            } else if state.engine.tailscaleLoggedIn {
+                tailscaleSignedInView
+            } else {
+                tailscaleSignedOutView
             }
-            .labelsHidden()
-            .onChange(of: line.tailscaleExitNode) { _, _ in
-                line.verified = false
-                state.save()
-            }
-            Button {
+        }
+        .onAppear {
+            // 展开卡片时才去问一次真实登录态：启动 tsnet 是重操作，不能在
+            // 设置窗口一打开就做。已连接时 daemon 会拒绝，也就不必问。
+            if !state.engine.isConnected && !tailscaleAuthorizing {
                 state.refreshTailscaleExitNodes(lineID: line.id)
-            } label: {
-                Image(systemName: loading ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
             }
-            .buttonStyle(.borderless)
-            .help(state.tr("刷新出口节点", "Refresh exit nodes"))
-            .disabled(state.engine.isBusy || state.engine.isConnected || loading || state.engine.tailscaleAuthInProgress)
+        }
+        .onChange(of: state.engine.tailscaleDeviceName) { _, name in
+            state.persistTailscaleDeviceName(name)
+        }
+    }
+
+    private var tailscaleSignedOutView: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Button(state.tr("登录 Tailscale", "Sign in to Tailscale")) {
+                    state.loginTailscale(lineID: line.id)
+                }
+                .controlSize(.small)
+                .disabled(state.engine.isBusy || state.engine.isConnected)
+                Spacer()
+            }
+            if state.engine.isConnected {
+                Text(state.tr("需先断开 XDial 才能登录。", "Disconnect XDial first to sign in."))
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var tailscaleAuthorizingView: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text(state.tr("已在浏览器打开授权页", "Authorization page opened in your browser"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            HStack(spacing: 8) {
+                // 用户很可能顺手关掉了浏览器窗口，必须能再打开一次。
+                if let authURL = state.engine.tailscaleAuthURL {
+                    Button(state.tr("重新打开授权页", "Reopen page")) {
+                        NSWorkspace.shared.open(authURL)
+                    }
+                    .controlSize(.small)
+                }
+                Button(state.tr("取消", "Cancel")) {
+                    state.cancelTailscaleAuth()
+                }
+                .controlSize(.small)
+                Spacer()
+            }
+        }
+    }
+
+    private var tailscaleSignedInView: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(state.tr("账号", "Account")).font(.caption).foregroundStyle(.secondary)
+                    .frame(width: 60, alignment: .leading)
+                // 身份用邮箱展示：个人账号的 tailnet 域名是随机串，认不出是哪个账号。
+                Text(state.engine.tailscaleAccount.isEmpty ? "—" : state.engine.tailscaleAccount)
+                    .font(.caption)
+                Spacer()
+            }
+            HStack(spacing: 4) {
+                Text(state.tr("设备名", "Device")).font(.caption).foregroundStyle(.secondary)
+                    .frame(width: 60, alignment: .leading)
+                // 自动生成、不可编辑；仍要显示，否则在 Tailscale 后台对不上是哪台。
+                Text(tailscaleDeviceName)
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(1).truncationMode(.middle)
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(tailscaleDeviceName, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc").font(.caption2)
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .help(state.tr("复制设备名", "Copy device name"))
+                Spacer()
+            }
+            tailscaleExitNodeSection
+            HStack {
+                Spacer().frame(width: 60)
+                Button(state.tr("退出登录", "Sign out"), role: .destructive) {
+                    confirmingTailscaleLogout = true
+                }
+                .controlSize(.small)
+                .disabled(state.engine.isBusy || state.engine.isConnected)
+                Spacer()
+            }
+            if state.engine.isConnected {
+                Text(state.tr("需先断开 XDial 才能退出登录。", "Disconnect XDial first to sign out."))
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            if let err = tailscaleLogoutError {
+                Text(err).font(.caption2).foregroundStyle(.red)
+            }
+        }
+        .confirmationDialog(
+            state.tr("确认退出 Tailscale？", "Sign out of Tailscale?"),
+            isPresented: $confirmingTailscaleLogout,
+            titleVisibility: .visible
+        ) {
+            Button(state.tr("退出", "Sign out"), role: .destructive) {
+                state.logoutTailscale { ok, err in
+                    tailscaleLogoutError = ok ? nil : err
+                }
+            }
+            Button(state.tr("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(state.tr(
+                "所有 Tailscale 线路会同步退出，需要重新登录才能使用。\n设备是临时节点，下线后会自动从 Tailscale 后台移除。",
+                "All Tailscale lines sign out together and must be re-authorized.\nThe device is an ephemeral node and is removed from Tailscale automatically once offline."
+            ))
+        }
+    }
+
+    private var tailscaleDeviceName: String {
+        let running = state.engine.tailscaleDeviceName
+        return running.isEmpty ? state.profile.tailscale.hostname : running
+    }
+
+    @ViewBuilder
+    private var tailscaleExitNodeSection: some View {
+        let nodes = state.engine.tailscaleExitNodes[line.id] ?? []
+        let loading = state.engine.tailscaleExitNodesLoading.contains(line.id)
+        let selectedMissing = !line.tailscaleExitNode.isEmpty && !nodes.contains { $0.ip == line.tailscaleExitNode }
+        let offlineSelected = nodes.first { $0.ip == line.tailscaleExitNode && !$0.online }
+
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(state.tr("出口节点", "Exit node")).font(.caption).foregroundStyle(.secondary)
+                    .frame(width: 60, alignment: .leading)
+                if loading {
+                    ProgressView().controlSize(.small)
+                } else if nodes.isEmpty {
+                    Text(state.tr("无可用出口", "No exit nodes"))
+                        .font(.caption).foregroundStyle(.orange)
+                } else {
+                    Picker("", selection: $line.tailscaleExitNode) {
+                        Text(state.tr("不使用出口节点", "No exit node")).tag("")
+                        if selectedMissing {
+                            Text(state.tr("当前：\(line.tailscaleExitNode)", "Current: \(line.tailscaleExitNode)"))
+                                .tag(line.tailscaleExitNode)
+                        }
+                        ForEach(nodes) { node in
+                            Text("\(node.name) · \(node.ip)\(node.online ? "" : state.tr("（离线）", " (offline)"))")
+                                .tag(node.ip)
+                                .disabled(!node.online)
+                        }
+                    }
+                    .labelsHidden()
+                    .onChange(of: line.tailscaleExitNode) { _, _ in
+                        line.verified = false
+                        state.save()
+                    }
+                }
+                Button {
+                    state.refreshTailscaleExitNodes(lineID: line.id)
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help(state.tr("刷新出口节点", "Refresh exit nodes"))
+                .disabled(state.engine.isBusy || state.engine.isConnected || loading)
+                Spacer()
+            }
+
+            if nodes.isEmpty && !loading {
+                // 说清楚这是 tailnet 那边的事，不是 XDial 出错。
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(state.tr(
+                        "tailnet 里没有已批准的出口节点，需要在 Tailscale 后台批准。",
+                        "No approved exit nodes in your tailnet — approve one in the Tailscale admin console."
+                    ))
+                    if let doc = URL(string: "https://tailscale.com/kb/1103/exit-nodes") {
+                        Link(state.tr("如何配置 ↗", "How to configure ↗"), destination: doc)
+                    }
+                }
+                .font(.caption2).foregroundStyle(.secondary)
+                .padding(.leading, 64)
+            }
+
+            if offlineSelected != nil {
+                // 说后果，不只说状态。
+                Text(state.tr(
+                    "出口离线，走这条线路的流量会被阻断。",
+                    "Exit node is offline — traffic on this line is blocked."
+                ))
+                .font(.caption2).foregroundStyle(.orange)
+                .padding(.leading, 64)
+            }
         }
     }
 

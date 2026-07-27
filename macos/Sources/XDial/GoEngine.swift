@@ -32,13 +32,22 @@ struct TailscaleExitNode: Codable, Identifiable, Hashable {
     let os: String?
 }
 
-private struct TailscaleExitNodesPayload: Codable {
+/// daemon 的 tailscale-exit-nodes 响应与事件共用这一个结构。
+///
+/// loggedIn 为 false 不是错误：未登录是正常状态，UI 据此显示登录入口。
+private struct TailscaleStatusPayload: Codable {
     let lineID: String
-    let nodes: [TailscaleExitNode]
+    let loggedIn: Bool
+    let account: String?
+    let hostname: String?
+    let exitNodes: [TailscaleExitNode]?
 
     enum CodingKeys: String, CodingKey {
         case lineID = "line_id"
-        case nodes
+        case loggedIn = "logged_in"
+        case account
+        case hostname
+        case exitNodes = "exit_nodes"
     }
 }
 
@@ -61,6 +70,12 @@ final class GoEngine: ObservableObject {
     @Published private(set) var tailscaleAuthInProgress = false
     @Published private(set) var tailscaleExitNodes: [String: [TailscaleExitNode]] = [:]
     @Published private(set) var tailscaleExitNodesLoading: Set<String> = []
+    // 登录态是全局的：所有 Tailscale 线路共享同一次登录。
+    @Published private(set) var tailscaleLoggedIn = false
+    @Published private(set) var tailscaleAccount = ""
+    /// 实际注册到 tailnet 的设备名。首次登录由 Go 侧生成，登录成功后回传给这里，
+    /// 再由 AppState 落盘到 Profile —— 避免两侧各实现一遍生成规则。
+    @Published private(set) var tailscaleDeviceName = ""
 
     struct ParseResult: Decodable {
         let lines: [Line]
@@ -285,16 +300,38 @@ final class GoEngine: ObservableObject {
 
     // MARK: - Helper lifecycle
 
+    /// 重编自愈：bundle 里的 daemon 二进制和运行中的不一致时，让 daemon 原地
+    /// re-exec 成新版。全程零授权（respawn 走 socket，launchd 无感知）。
+    static nonisolated func syncDaemonBinary() async {
+        guard let bundled = PrivilegeManager.bundledDaemonSHA256(),
+              let info = PrivilegeManager.probeDaemonInfo(),
+              info.exeSHA256 != "unknown", info.exeSHA256 != bundled else { return }
+        appLog("daemon outdated (running \(info.exeSHA256.prefix(8)) vs bundled \(bundled.prefix(8))), respawning")
+        guard PrivilegeManager.requestRespawn() else {
+            appLog("daemon respawn refused (engine busy?), will retry on next operation")
+            return
+        }
+        for _ in 0..<25 {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            if let fresh = PrivilegeManager.probeDaemonInfo(), fresh.exeSHA256 == bundled {
+                appLog("daemon respawned to bundled binary (pid \(fresh.pid))")
+                return
+            }
+        }
+        appLog("daemon respawn did not converge, continuing with running daemon")
+    }
+
     private nonisolated func ensureHelperAsync() async -> Bool {
         guard PrivilegeManager.isInstalled else {
             await MainActor.run { [weak self] in
-                self?.lastError = "请先点击「一键配置」安装 helper"
+                self?.lastError = "请先点击「一键配置」启用后台服务"
                 self?.status = "disconnected"
             }
             return false
         }
         do {
             try PrivilegeManager.ensureHelperRunning()
+            await Self.syncDaemonBinary()
             for _ in 0..<20 {
                 if PrivilegeManager.canConnectSocket() { return true }
                 try? await Task.sleep(nanoseconds: 200_000_000)
@@ -475,16 +512,46 @@ final class GoEngine: ObservableObject {
 
     private func applyTailscaleExitNodes(_ dataStr: String) {
         guard let data = dataStr.data(using: .utf8),
-              let payload = try? JSONDecoder().decode(TailscaleExitNodesPayload.self, from: data) else {
+              let payload = try? JSONDecoder().decode(TailscaleStatusPayload.self, from: data) else {
             return
         }
-        tailscaleExitNodes[payload.lineID] = payload.nodes
         tailscaleExitNodesLoading.remove(payload.lineID)
-        if tailscaleAuthLineID == payload.lineID {
+        tailscaleLoggedIn = payload.loggedIn
+        tailscaleAccount = payload.account ?? ""
+        tailscaleDeviceName = payload.hostname ?? ""
+        tailscaleExitNodes[payload.lineID] = payload.exitNodes ?? []
+        if payload.loggedIn, tailscaleAuthLineID == payload.lineID {
             tailscaleAuthURL = nil
             tailscaleAuthInProgress = false
         }
         lastError = nil
+    }
+
+    /// 退出 tailnet 登录。身份是全局的，所以所有 Tailscale 线路会一并失效。
+    func logoutTailscale(completion: @escaping (Bool, String?) -> Void) {
+        lastError = nil
+        Task { [weak self] in
+            guard let self else { return }
+            guard await self.ensureHelperAsync(), self.ensureSocket() else {
+                completion(false, "无法连接到 helper 进程")
+                return
+            }
+            self.sendRequest(cmd: "tailscale-logout") { [weak self] resp in
+                guard let self else { return }
+                if resp.ok == true {
+                    self.tailscaleLoggedIn = false
+                    self.tailscaleAccount = ""
+                    self.tailscaleDeviceName = ""
+                    self.tailscaleExitNodes.removeAll()
+                    self.tailscaleAuthURL = nil
+                    self.tailscaleAuthLineID = nil
+                    self.tailscaleAuthInProgress = false
+                    completion(true, nil)
+                } else {
+                    completion(false, resp.message ?? "退出 Tailscale 失败")
+                }
+            }
+        }
     }
 }
 

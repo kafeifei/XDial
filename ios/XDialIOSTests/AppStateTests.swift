@@ -616,7 +616,6 @@ final class AppStateTests: XCTestCase {
             name: "Home Tailnet",
             type: "tailscale",
             enabled: false,
-            tailscaleAcceptRoutes: true,
             tailscaleExitNode: "100.64.0.99"
         ))
         app.profile = profile
@@ -1872,10 +1871,10 @@ final class AppStateTests: XCTestCase {
             name: "Tailscale Home",
             type: "tailscale",
             enabled: true,
-            tailscaleHostname: "xdial-mobile",
             tailscaleExitNode: "100.64.0.8",
             tailscaleAuthenticated: true
         ))
+        profile.tailscale.hostname = "xdial-mobile"
         profile.ruleSets = [RuleSet(
             id: "internal",
             name: "Internal",
