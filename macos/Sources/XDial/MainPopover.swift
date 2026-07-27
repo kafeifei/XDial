@@ -12,6 +12,9 @@ struct MainPopover: View {
             if !state.profile.subscriptions.isEmpty && state.isConnected {
                 subscriptionSummary
             }
+            if state.configDirty {
+                dirtyBanner
+            }
             Divider()
             statusRow
             actionRow
@@ -41,9 +44,11 @@ struct MainPopover: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             } else {
+                // 已连接时不再禁用：切模式是允许的，只是不会立刻生效 ——
+                // 由下面的 dirtyBanner 明说"重连后生效"，而不是把入口锁死。
                 Picker("", selection: SwiftUI.Binding(
                     get: { state.profile.activeModeID },
-                    set: { state.profile.activeModeID = $0; state.save() }
+                    set: { state.activateMode($0) }
                 )) {
                     ForEach(state.profile.modes) { s in
                         Text(s.name).tag(s.id)
@@ -51,10 +56,30 @@ struct MainPopover: View {
                 }
                 .pickerStyle(.menu)
                 .labelsHidden()
-                .disabled(state.isConnected || state.isBusy)
+                .disabled(state.isBusy)
             }
             Spacer()
         }
+    }
+
+    /// 配置改了但引擎还攥着旧快照 —— 必须让用户看见，并给出一步到位的出路。
+    private var dirtyBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+            Text(state.tr("配置已修改，重连后生效", "Config changed — reconnect to apply"))
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            Button(state.tr("重连", "Reconnect")) { state.reconnect() }
+                .controlSize(.small)
+                .disabled(state.isBusy || !state.canConnect)
+        }
+        .padding(6)
+        .background(Color.orange.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     @ObservedObject private var net = NetworkInfo.shared

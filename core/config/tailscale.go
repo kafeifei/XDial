@@ -107,12 +107,17 @@ func buildTailscaleEndpoint(line *Line, identity TailscaleIdentity, basePath str
 		"type":            "tailscale",
 		"tag":             tailscaleEndpointTag(line),
 		"state_directory": TailscaleStateDirectory(basePath),
-		// 常驻节点。不能 ephemeral：登录会话关闭后控制面会立刻回收 node key，
-		// 连接时复用 state 会被要求重新登录。设备不堆积由全局唯一 state +
-		// 固定 hostname 保证；退出登录走 Logout 显式删除设备记录。
+		// 常驻节点。ephemeral 恒不设（sing-box 默认 false）：登录会话关闭后控制面
+		// 会立刻回收 node key，连接时复用 state 会被要求重新登录。设备不堆积由
+		// 全局唯一 state + 固定 hostname 保证；退出登录走 Logout 显式删除设备记录。
 	}
 	if identity.Hostname != "" {
 		endpoint["hostname"] = identity.Hostname
+	}
+	// auth_key：D29 的无特权登录路径。有它 tsnet 首次启动即可自助注册节点，
+	// 没有它就退回 sing-box 自己的交互式授权 URL 流程（配置形态不变）。
+	if line.TailscaleAuthKey != "" {
+		endpoint["auth_key"] = line.TailscaleAuthKey
 	}
 	if line.TailscaleExitNode != "" {
 		endpoint["exit_node"] = line.TailscaleExitNode

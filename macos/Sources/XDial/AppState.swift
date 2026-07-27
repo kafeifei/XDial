@@ -15,6 +15,20 @@ final class AppState: ObservableObject {
     /// SMAppService 已注册但等用户在系统设置「登录项」里批准
     @Published var helperNeedsApproval: Bool = false
 
+    /// 配置已改但尚未下发引擎。
+    ///
+    /// 引擎只在 start 时拿一次 profile 快照，之后 UI 的编辑只落盘、不下发；
+    /// 若不显式暴露这个差异，用户切了模式却发现行为没变，只能怀疑是 bug。
+    /// v1 的语义是「提示 + 一键重连」：绝不在用户没点的时候自动重启数据面，
+    /// 那会造成连接期间无提示断流。
+    ///
+    /// 这里刻意用「存储位 AND 引擎仍攥着快照」而不是只靠存储位：引擎自己掉线
+    /// （链路断了、daemon 重启）时旧快照已经不存在，提示必须立刻消失，而
+    /// objectWillChange 是变更前触发的，靠事件回调去清位会慢一拍。
+    @Published private var configDirtyFlag = false
+
+    var configDirty: Bool { configDirtyFlag && engineHoldsSnapshot }
+
     @Published var language: Lang {
         didSet {
             UserDefaults.standard.set(language.rawValue, forKey: "xdial.language")
@@ -42,6 +56,15 @@ final class AppState: ObservableObject {
 
     var isConnected: Bool { engine.isConnected }
     var isBusy: Bool { engine.isBusy }
+
+    /// 引擎手里是否攥着一份 profile 快照。攥着的时候改配置才产生「双头真相」，
+    /// 未连接时改配置下次 connect 自然生效，不需要提示。
+    private var engineHoldsSnapshot: Bool {
+        switch engine.status {
+        case "connected", "connecting", "reconnecting": return true
+        default: return false
+        }
+    }
 
     var canConnect: Bool {
         guard helperInstalled, !isBusy else { return false }
@@ -200,68 +223,86 @@ final class AppState: ObservableObject {
                 changed = true
             }
         }
-        if changed { save() }
+        // verified 只是"这条线路通过过"的展示标记，不进数据面，
+        // 不能因为它把刚连上的会话标成"配置已修改"
+        if changed { save(markDirty: false) }
     }
 
     // MARK: - Connect
 
     func connect() {
         guard canConnect else { return }
-        save()
+        // 这次 save 本身就是在下发前落盘，不该把自己标成"未下发"
+        save(markDirty: false)
+        configDirtyFlag = false
         engine.start(profileJSON: buildProfileJSON())
     }
 
     func disconnect() {
+        // 引擎不再攥着旧快照，残留提示没有意义
+        configDirtyFlag = false
+        // 作废进行中的重连，免得它在用户明确要求断开之后又把连接拉起来
+        reconnectGeneration += 1
+        reconnecting = false
         engine.stop()
     }
 
-    func loginTailscale(lineID: String) {
-        save()
-        if !helperInstalled {
-            setupHelper()
+    /// 每发起一次重连就 +1。进行中的等待循环每轮比对，代次对不上就自行退场 ——
+    /// 比 Task.cancel 更严实：不会出现旧任务醒来后覆盖新任务状态。
+    private var reconnectGeneration = 0
+    private var reconnecting = false
+
+    /// 一键重连：把当前配置重新下发给引擎。
+    ///
+    /// Go 侧 Engine.Start 在 connected/connecting/reconnecting 时直接报 "already ..."，
+    /// 所以必须先 stop、等它真的落到 disconnected 再 start。等待有上限（10s），
+    /// 超时就报错而不是无限等下去。
+    func reconnect() {
+        guard canConnect, !reconnecting else { return }
+        if !engineHoldsSnapshot {
+            // 引擎手里本来就没有快照（自己掉线了），直接连即可
+            connect()
             return
         }
-        engine.loginTailscale(lineID: lineID, profileJSON: buildProfileJSON())
-    }
-
-    func refreshTailscaleExitNodes(lineID: String) {
-        save()
-        if !helperInstalled {
-            setupHelper()
-            return
-        }
-        engine.refreshTailscaleExitNodes(lineID: lineID, profileJSON: buildProfileJSON())
-    }
-
-    /// 退出 Tailscale。身份是全局的，所有 Tailscale 线路会一并回到未登录态，
-    /// 各自选中的出口节点也一并清空 —— 那些出口对新的登录不再有意义。
-    func logoutTailscale(completion: @escaping (Bool, String?) -> Void) {
-        engine.logoutTailscale { [weak self] ok, err in
-            guard let self else { return }
-            if ok {
-                self.profile.tailscale = TailscaleIdentity()
-                for i in self.profile.lines.indices where self.profile.lines[i].type == "tailscale" {
-                    self.profile.lines[i].tailscaleExitNode = ""
-                    self.profile.lines[i].verified = false
+        save(markDirty: false)
+        reconnectGeneration += 1
+        let gen = reconnectGeneration
+        reconnecting = true
+        engine.stop()
+        Task { [weak self] in
+            for _ in 0..<100 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard let self, gen == self.reconnectGeneration else { return }
+                // 必须等到 disconnected 本身：disconnecting 期间 canConnect 为 false，
+                // 这时 connect() 会静默返回，重连就悄悄失败了。
+                if self.engine.status == "disconnected" {
+                    self.reconnecting = false
+                    self.connect()
+                    return
                 }
-                self.save()
             }
-            completion(ok, err)
+            guard let self, gen == self.reconnectGeneration else { return }
+            self.reconnecting = false
+            self.engine.lastError = self.tr(
+                "重连超时：引擎未能在 10 秒内断开，请手动断开后再连接",
+                "Reconnect timed out: engine did not stop within 10s — disconnect manually and retry")
         }
     }
 
-    /// 取消进行中的授权。半成品登录态没有保留价值，直接清掉，回到未登录。
-    func cancelTailscaleAuth() {
-        engine.logoutTailscale { _, _ in }
-    }
+    // MARK: - Intents（UI 与 DebugServer 共用的唯一入口）
+    //
+    // DebugServer 绝不能自己改 profile —— 那会绕开这里的门禁与 dirty 置位，
+    // 让调试验收给出"看起来生效了"的假象。
 
-    /// 把 Go 侧实际注册用的设备名落盘。首次登录时设备名由 Go 生成，只有存下来
-    /// 之后的连接才会复用同一台设备，否则每次都会注册一台新的。
-    func persistTailscaleDeviceName(_ name: String) {
-        let trimmed = name.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, profile.tailscale.hostname != trimmed else { return }
-        profile.tailscale.hostname = trimmed
+    /// 激活模式。UI 的模式 Picker、设置窗口的激活按钮、DebugServer 的 select-mode
+    /// 全部走这一条路径。
+    @discardableResult
+    func activateMode(_ id: String) -> Bool {
+        guard profile.modes.contains(where: { $0.id == id }) else { return false }
+        guard profile.activeModeID != id else { return true }
+        profile.activeModeID = id
         save()
+        return true
     }
 
     /// 启用后台服务（SMAppService）。全生命周期只有两次用户交互，且都在首次：
@@ -320,7 +361,12 @@ final class AppState: ObservableObject {
 
     // MARK: - Persistence
 
-    func save() {
+    /// 落盘 profile。
+    ///
+    /// - Parameter markDirty: 是否把这次改动记成"引擎尚未拿到"。默认 true —— 所有
+    ///   用户编辑都算。只有两类内部写入传 false：连接前的落盘（马上就下发了），
+    ///   以及 verified 这类纯展示标记的回写（不影响数据面行为）。
+    func save(markDirty: Bool = true) {
         // 先把所有 ASCII 字段做一次全角→半角清洗（兜底）
         for i in profile.lines.indices {
             profile.lines[i].vpnServer = profile.lines[i].vpnServer.normalizedASCII()
@@ -334,6 +380,7 @@ final class AppState: ObservableObject {
             profile.lines[i].ssPassword = profile.lines[i].ssPassword.normalizedASCII()
             profile.lines[i].vmessServer = profile.lines[i].vmessServer.normalizedASCII()
             profile.lines[i].vmessUUID = profile.lines[i].vmessUUID.normalizedASCII()
+            profile.lines[i].tailscaleAuthKey = profile.lines[i].tailscaleAuthKey.normalizedASCII()
             profile.lines[i].tailscaleExitNode = profile.lines[i].tailscaleExitNode.normalizedASCII()
         }
         for i in profile.ruleSets.indices {
@@ -366,6 +413,10 @@ final class AppState: ObservableObject {
                 vault[id + "-vmess"] = sanitized.lines[i].vmessUUID
                 sanitized.lines[i].vmessUUID = ""
             }
+            if !sanitized.lines[i].tailscaleAuthKey.isEmpty {
+                vault[id + "-tsauth"] = sanitized.lines[i].tailscaleAuthKey
+                sanitized.lines[i].tailscaleAuthKey = ""
+            }
         }
         for si in sanitized.subscriptions.indices {
             let subID = sanitized.subscriptions[si].id
@@ -395,6 +446,10 @@ final class AppState: ObservableObject {
 
         guard let data = try? JSONEncoder().encode(sanitized) else { return }
         UserDefaults.standard.set(data, forKey: profileKey)
+
+        if markDirty && engineHoldsSnapshot {
+            configDirtyFlag = true
+        }
     }
 
     private func loadSaved() {
@@ -465,6 +520,7 @@ final class AppState: ObservableObject {
             if let v = vault[id + "-trojan"] { loaded.lines[i].trojanPassword = v }
             if let v = vault[id + "-ss"] { loaded.lines[i].ssPassword = v }
             if let v = vault[id + "-vmess"] { loaded.lines[i].vmessUUID = v }
+            if let v = vault[id + "-tsauth"] { loaded.lines[i].tailscaleAuthKey = v }
         }
         for si in loaded.subscriptions.indices {
             let subID = loaded.subscriptions[si].id

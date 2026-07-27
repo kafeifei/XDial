@@ -3,7 +3,6 @@ package engine
 import (
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +28,6 @@ type SingBoxProcess struct {
 	stopping   bool
 	configPath string
 	statePath  string
-	onAuth     func(string)
 	onExit     func(error)
 }
 
@@ -37,11 +35,10 @@ type SingBoxProcess struct {
 // 必需而非可选：sing-box 的启动期错误（规则集首次下载失败、路由构造失败等）
 // 都发生在 spawn 之后，check 阶段查不出来；没人盯着退出码，调用方会一直停在
 // "已连接"，用户看到的是"已连接但整机没网"。
-func NewSingBoxProcess(basePath, statePath string, onAuth func(string), onExit func(error)) *SingBoxProcess {
+func NewSingBoxProcess(basePath, statePath string, onExit func(error)) *SingBoxProcess {
 	return &SingBoxProcess{
 		configPath: filepath.Join(basePath, "sing-box.json"),
 		statePath:  statePath,
-		onAuth:     onAuth,
 		onExit:     onExit,
 	}
 }
@@ -87,7 +84,7 @@ func (s *SingBoxProcess) startConfig(cfgData []byte) error {
 		return fmt.Errorf("check config: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 
-	logWriter := &singBoxLogWriter{onAuth: s.onAuth}
+	logWriter := &singBoxLogWriter{}
 	cmd, pipeW, err := startSingBoxCmd(singboxBin, s.configPath, filepath.Dir(s.configPath), logWriter)
 	if err != nil {
 		return err
@@ -168,10 +165,8 @@ func (s *SingBoxProcess) stop(timeout time.Duration) {
 }
 
 type singBoxLogWriter struct {
-	mu      sync.Mutex
-	pending string
-	tail    []byte
-	onAuth  func(string)
+	mu   sync.Mutex
+	tail []byte
 }
 
 // Tail 返回最近 singBoxLogTailBytes 字节的输出，供异常退出时定位原因。
@@ -189,44 +184,6 @@ func (w *singBoxLogWriter) Write(p []byte) (int, error) {
 	if len(w.tail) > singBoxLogTailBytes {
 		w.tail = append(w.tail[:0], w.tail[len(w.tail)-singBoxLogTailBytes:]...)
 	}
-	w.pending += string(p)
-	var authURLs []string
-	for {
-		newline := strings.IndexByte(w.pending, '\n')
-		if newline < 0 {
-			break
-		}
-		line := w.pending[:newline]
-		w.pending = w.pending[newline+1:]
-		if authURL := parseTailscaleAuthURL(line); authURL != "" {
-			authURLs = append(authURLs, authURL)
-		}
-	}
 	w.mu.Unlock()
-
-	if w.onAuth != nil {
-		for _, authURL := range authURLs {
-			w.onAuth(authURL)
-		}
-	}
 	return len(p), nil
-}
-
-func parseTailscaleAuthURL(line string) string {
-	const marker = "Waiting for authentication:"
-	markerIndex := strings.Index(line, marker)
-	if markerIndex < 0 {
-		return ""
-	}
-	fields := strings.Fields(line[markerIndex+len(marker):])
-	if len(fields) == 0 {
-		return ""
-	}
-	candidate := strings.TrimSuffix(fields[0], "\x1b[0m")
-	candidate = strings.TrimRight(candidate, ".,")
-	parsed, err := url.Parse(candidate)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
-		return ""
-	}
-	return parsed.String()
 }

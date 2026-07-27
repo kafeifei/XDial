@@ -20,7 +20,16 @@ func TestGenerateNEConfigIncludesTailscaleEndpointWithMobileDNSDispatcher(t *tes
 			{ID: "direct", Type: config.LineTypeDirect, Enabled: true},
 			{ID: "tailnet", Type: config.LineTypeTailscale, Enabled: true},
 		},
-		Modes:        []config.Mode{{ID: "mode", DefaultLineID: "direct"}},
+		RuleSets: []config.RuleSet{
+			{ID: "ts-hosts", Type: config.RuleSetTypeManual, Enabled: true, Domains: []string{"ts.example"}},
+		},
+		// tailscale DNS 分支只对被 active Mode 引用的线路生成（INV1c 声明≠生效），
+		// 本用例验证的是"用上 Tailscale 时 dispatcher 链完整"，故显式绑定。
+		Modes: []config.Mode{{
+			ID:            "mode",
+			Bindings:      []config.RuleBinding{{RuleSetID: "ts-hosts", LineID: "tailnet"}},
+			DefaultLineID: "direct",
+		}},
 		ActiveModeID: "mode",
 		Tailscale:    config.TailscaleIdentity{Hostname: "xdial-mobile"},
 	}

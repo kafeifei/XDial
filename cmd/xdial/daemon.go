@@ -78,20 +78,6 @@ func (d *daemonCallback) OnError(code int, message string) {
 	d.clients.BroadcastEvent(Event{Event: "error", Data: message})
 }
 
-func (d *daemonCallback) OnAuthRequired(authURL string) {
-	d.clients.BroadcastEvent(Event{Event: "tailscale-auth-required", Data: authURL})
-}
-
-// OnTailscaleStatus 广播的结构与 tailscale-exit-nodes 响应完全一致，
-// 客户端只需一套解析。
-func (d *daemonCallback) OnTailscaleStatus(lineID string, status engine.TailscaleStatus) {
-	data, _ := json.Marshal(struct {
-		LineID string `json:"line_id"`
-		engine.TailscaleStatus
-	}{LineID: lineID, TailscaleStatus: status})
-	d.clients.BroadcastEvent(Event{Event: "tailscale-exit-nodes", Data: string(data)})
-}
-
 func runDaemon(socketPath string) {
 	if isAlreadyRunning(socketPath) {
 		slog.Info("another instance is already running, exiting")
@@ -222,47 +208,10 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 				client.SendResponse(Response{ID: req.ID, OK: true})
 			}
 
-		case "tailscale-auth":
-			profile, err := config.ParseProfile([]byte(req.Profile))
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
-				continue
-			}
-			line := profile.FindLine(req.LineID)
-			if line == nil || line.Type != config.LineTypeTailscale {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: "Tailscale 线路不存在"})
-				continue
-			}
-			if err := eng.StartTailscaleAuth(profile.Tailscale, line); err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-			} else {
-				client.SendResponse(Response{ID: req.ID, OK: true})
-			}
-
-		case "tailscale-exit-nodes":
-			profile, err := config.ParseProfile([]byte(req.Profile))
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
-				continue
-			}
-			line := profile.FindLine(req.LineID)
-			if line == nil || line.Type != config.LineTypeTailscale {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: "Tailscale 线路不存在"})
-				continue
-			}
-			status, err := eng.TailscaleStatus(profile.Tailscale, line)
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-			} else {
-				data, _ := json.Marshal(struct {
-					LineID string `json:"line_id"`
-					engine.TailscaleStatus
-				}{LineID: line.ID, TailscaleStatus: status})
-				client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
-			}
-
-		case "tailscale-logout":
-			if err := eng.LogoutTailscale(); err != nil {
+		// tailscale-reset-state 只清本机 tailnet state 目录（换 auth key / 换
+		// tailnet 时必需），不再有任何登录流程：D29 之后 auth key 是纯参数。
+		case "tailscale-reset-state":
+			if err := eng.ResetTailscaleState(); err != nil {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
 			} else {
 				client.SendResponse(Response{ID: req.ID, OK: true})

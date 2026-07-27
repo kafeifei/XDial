@@ -53,15 +53,6 @@ func (c *cliCallback) OnError(code int, message string) {
 	fmt.Fprintf(os.Stderr, "[error] %s\n", message)
 }
 
-func (c *cliCallback) OnAuthRequired(authURL string) {
-	if c.jsonMode {
-		data, _ := json.Marshal(map[string]any{"event": "tailscale-auth-required", "data": authURL})
-		fmt.Println(string(data))
-		return
-	}
-	fmt.Fprintf(os.Stderr, "[tailscale] Open to authenticate: %s\n", authURL)
-}
-
 func runStartCmd(args []string) {
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
 	profilePath := fs.String("f", "", "path to profile JSON file (required)")

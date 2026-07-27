@@ -52,6 +52,17 @@ type Line struct {
 	// 见 Profile.Tailscale。Line 上只留“这条线路怎么用那个 tailnet”，即选哪个出口。
 	TailscaleExitNode string `json:"tailscale_exit_node,omitempty"`
 
+	// TailscaleAuthKey 是 tailnet 的预授权密钥（D29）：纯参数，没有登录流程、
+	// 不需要任何特权，和别的线路的密码字段完全同构 —— 填上它，tsnet 首次启动
+	// 就能直接注册节点，不用把用户扔去浏览器点授权页。
+	//
+	// 只能用可复用的持久 key，不要 ephemeral key：ephemeral 节点在会话关闭后
+	// 被控制面立刻回收，下次复用 state 会被要求重新登录（见 buildTailscaleEndpoint）。
+	//
+	// 敏感值：与 VPNPassword 同级，任何对外暴露 profile 的地方（调试接口、日志）
+	// 都必须脱敏。
+	TailscaleAuthKey string `json:"tailscale_auth_key,omitempty"`
+
 	// 通用传输选项
 	TFO bool `json:"tfo,omitempty"` // TCP Fast Open
 	UDP bool `json:"udp,omitempty"` // UDP relay / over TCP
