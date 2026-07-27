@@ -17,7 +17,7 @@ make inspector  # 独立 AX 检查器 → build/xdial-inspector
 ```bash
 make test                 # Go 全量（含 libbox gVisor 数据面集成测试，-tags with_gvisor）
 make test-smoke           # sing-box 配置生成冒烟测试
-python3 test/e2e_test.py  # 端到端（需 helper daemon 已在运行）
+python3 test/e2e_test.py  # 端到端验收：Tier A 协议层 + Tier B 真实路径（需 helper daemon 在运行；--tier a 可单跑协议层，对一次性 daemon 也可用）
 ```
 
 ## UI 调试 (Debug Server)
