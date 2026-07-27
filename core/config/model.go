@@ -47,9 +47,10 @@ type Line struct {
 	VMessAltID  int    `json:"vmess_alt_id,omitempty"`
 
 	// Tailscale
-	TailscaleHostname     string `json:"tailscale_hostname,omitempty"`
-	TailscaleAcceptRoutes bool   `json:"tailscale_accept_routes,omitempty"`
-	TailscaleExitNode     string `json:"tailscale_exit_node,omitempty"`
+	//
+	// 身份（设备名、登录态、state 目录）不在这里 —— 它是整个 Profile 全局唯一的一份，
+	// 见 Profile.Tailscale。Line 上只留“这条线路怎么用那个 tailnet”，即选哪个出口。
+	TailscaleExitNode string `json:"tailscale_exit_node,omitempty"`
 
 	// 通用传输选项
 	TFO bool `json:"tfo,omitempty"` // TCP Fast Open
@@ -135,13 +136,26 @@ type Subscription struct {
 	TestInterval int                `json:"test_interval,omitempty"`
 }
 
+// TailscaleIdentity 是本机在 tailnet 中的身份，整个 Profile 全局唯一一份。
+//
+// 一个 tsnet 实例就是 tailnet 里的一台设备，两个实例不能共用同一份 state
+// （node key 不能同时活跃在两处），所以身份必须是全局的：所有 Tailscale 线路
+// 共享同一次登录、同一个 state 目录，退出登录一次全部失效。
+type TailscaleIdentity struct {
+	// Hostname 注册到 tailnet 的设备名，首次登录时自动生成后固定不变
+	// （见 GenerateTailscaleHostname）。不由用户填写 —— 手填既容易和官方
+	// 客户端注册的同名设备混淆，也无法保证唯一。
+	Hostname string `json:"hostname,omitempty"`
+}
+
 // Profile 完整配置
 type Profile struct {
-	Lines         []Line         `json:"lines"`
-	RuleSets      []RuleSet      `json:"rule_sets"`
-	Modes         []Mode         `json:"modes"`
-	Subscriptions []Subscription `json:"subscriptions,omitempty"`
-	ActiveModeID  string         `json:"active_mode_id"`
+	Lines         []Line            `json:"lines"`
+	RuleSets      []RuleSet         `json:"rule_sets"`
+	Modes         []Mode            `json:"modes"`
+	Subscriptions []Subscription    `json:"subscriptions,omitempty"`
+	ActiveModeID  string            `json:"active_mode_id"`
+	Tailscale     TailscaleIdentity `json:"tailscale,omitempty"`
 }
 
 // UnmarshalJSON 让 Profile 解码时兼容旧比喻命名的 JSON key

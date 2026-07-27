@@ -102,6 +102,12 @@ func runStartCmd(args []string) {
 
 	cb := &cliCallback{jsonMode: *jsonOutput}
 	eng := engine.New(basePath, statePath, cb)
+	// CLI 不接管系统 DNS（默认就是关的，这里显式写一遍是为了把理由钉在现场）：
+	// xdial start 是前台调试工具，不受 launchd 托管，被 kill -9 / 关掉终端窗口之后
+	// 没有任何进程会再去把系统 DNS 从已消失的 tun 上救回来，那是整机断网。代价只是
+	// CLI 下按域名分流可能不准（查询绕过 tun、结果可能被污染），换来的是"再怎么被
+	// 强杀都不会把用户的网搞死"。要验证接管本身，用 daemon 路径。
+	eng.AllowSystemDNSTakeover(false)
 
 	if err := eng.Start(profile); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", err)

@@ -12,7 +12,8 @@ final class AppState: ObservableObject {
     @Published var profile: Profile
 
     @Published var helperInstalled: Bool = false
-    @Published var helperNeedsUpdate: Bool = false
+    /// SMAppService 已注册但等用户在系统设置「登录项」里批准
+    @Published var helperNeedsApproval: Bool = false
 
     @Published var language: Lang {
         didSet {
@@ -106,6 +107,8 @@ final class AppState: ObservableObject {
         }
         loadSaved()
         checkHelper()
+        // 启动即自愈：daemon 若还是重编前的旧二进制，让它 respawn 成 bundle 里的新版
+        Task.detached { await GoEngine.syncDaemonBinary() }
         engine.syncStatus()
         // 启动时如果已连接（helper 一直在跑）也探测一次
         if engine.status == "connected" {
@@ -204,10 +207,6 @@ final class AppState: ObservableObject {
 
     func connect() {
         guard canConnect else { return }
-        if helperNeedsUpdate {
-            installHelper(thenConnect: true)
-            return
-        }
         save()
         engine.start(profileJSON: buildProfileJSON())
     }
@@ -218,33 +217,104 @@ final class AppState: ObservableObject {
 
     func loginTailscale(lineID: String) {
         save()
-        if !helperInstalled || helperNeedsUpdate {
-            installHelper()
+        if !helperInstalled {
+            setupHelper()
+            return
         }
-        guard helperInstalled, !helperNeedsUpdate else { return }
         engine.loginTailscale(lineID: lineID, profileJSON: buildProfileJSON())
     }
 
     func refreshTailscaleExitNodes(lineID: String) {
         save()
-        if !helperInstalled || helperNeedsUpdate {
-            installHelper()
+        if !helperInstalled {
+            setupHelper()
+            return
         }
-        guard helperInstalled, !helperNeedsUpdate else { return }
         engine.refreshTailscaleExitNodes(lineID: lineID, profileJSON: buildProfileJSON())
     }
 
-    func installHelper(thenConnect: Bool = false) {
+    /// 退出 Tailscale。身份是全局的，所有 Tailscale 线路会一并回到未登录态，
+    /// 各自选中的出口节点也一并清空 —— 那些出口对新的登录不再有意义。
+    func logoutTailscale(completion: @escaping (Bool, String?) -> Void) {
+        engine.logoutTailscale { [weak self] ok, err in
+            guard let self else { return }
+            if ok {
+                self.profile.tailscale = TailscaleIdentity()
+                for i in self.profile.lines.indices where self.profile.lines[i].type == "tailscale" {
+                    self.profile.lines[i].tailscaleExitNode = ""
+                    self.profile.lines[i].verified = false
+                }
+                self.save()
+            }
+            completion(ok, err)
+        }
+    }
+
+    /// 取消进行中的授权。半成品登录态没有保留价值，直接清掉，回到未登录。
+    func cancelTailscaleAuth() {
+        engine.logoutTailscale { _, _ in }
+    }
+
+    /// 把 Go 侧实际注册用的设备名落盘。首次登录时设备名由 Go 生成，只有存下来
+    /// 之后的连接才会复用同一台设备，否则每次都会注册一台新的。
+    func persistTailscaleDeviceName(_ name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, profile.tailscale.hostname != trimmed else { return }
+        profile.tailscale.hostname = trimmed
+        save()
+    }
+
+    /// 启用后台服务（SMAppService）。全生命周期只有两次用户交互，且都在首次：
+    /// 1. 旧机制迁移时清理旧安装（管理员密码，只发生在装过旧版的机器上）
+    /// 2. 系统设置「登录项」批准一次（支持 Touch ID）
+    /// 之后重编/升级由 respawn 自愈，永不再弹。
+    func setupHelper(thenConnect: Bool = false) {
+        if PrivilegeManager.legacyInstalled {
+            do {
+                try PrivilegeManager.cleanupLegacy()
+            } catch {
+                appLog("setupHelper: legacy cleanup FAILED: \(error.localizedDescription)")
+                engine.lastError = error.localizedDescription
+                return
+            }
+        }
         do {
-            try PrivilegeManager.install()
-            helperInstalled = PrivilegeManager.isInstalled
-            helperNeedsUpdate = false
-            appLog("installHelper: success, installed=\(helperInstalled)")
-            if thenConnect && helperInstalled { connect() }
+            try PrivilegeManager.register()
         } catch {
-            appLog("installHelper: FAILED: \(error.localizedDescription)")
-            engine.lastError = error.localizedDescription
-            helperInstalled = PrivilegeManager.isInstalled
+            // 已注册待批准时 register() 会抛 Operation not permitted——不是失败，
+            // 按下面的状态机继续引导批准
+            appLog("setupHelper: register threw: \(error.localizedDescription)")
+        }
+        checkHelper()
+        if helperNeedsApproval {
+            PrivilegeManager.openApprovalSettings()
+            pollHelperApproval(thenConnect: thenConnect)
+        } else if helperInstalled {
+            appLog("setupHelper: enabled")
+            if thenConnect { connect() }
+        } else {
+            engine.lastError = tr("后台服务未能启用（状态 \(PrivilegeManager.status.rawValue)），请重试",
+                                  "Failed to enable background service (status \(PrivilegeManager.status.rawValue))")
+        }
+    }
+
+    private var approvalPollTask: Task<Void, Never>?
+
+    /// 用户在系统设置里批准是异步的，轮询等它生效（最多 3 分钟）
+    private func pollHelperApproval(thenConnect: Bool) {
+        approvalPollTask?.cancel()
+        approvalPollTask = Task { [weak self] in
+            for _ in 0..<180 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+                guard let self else { return }
+                if PrivilegeManager.status == .enabled {
+                    appLog("helper approved in System Settings")
+                    self.checkHelper()
+                    if thenConnect { self.connect() }
+                    return
+                }
+            }
         }
     }
 
@@ -264,7 +334,6 @@ final class AppState: ObservableObject {
             profile.lines[i].ssPassword = profile.lines[i].ssPassword.normalizedASCII()
             profile.lines[i].vmessServer = profile.lines[i].vmessServer.normalizedASCII()
             profile.lines[i].vmessUUID = profile.lines[i].vmessUUID.normalizedASCII()
-            profile.lines[i].tailscaleHostname = profile.lines[i].tailscaleHostname.normalizedASCII()
             profile.lines[i].tailscaleExitNode = profile.lines[i].tailscaleExitNode.normalizedASCII()
         }
         for i in profile.ruleSets.indices {
@@ -547,9 +616,18 @@ final class AppState: ObservableObject {
         return p.lines.isEmpty && p.ruleSets.isEmpty && p.modes.isEmpty ? nil : p
     }
 
-    private func checkHelper() {
-        helperInstalled = PrivilegeManager.isInstalled
-        helperNeedsUpdate = PrivilegeManager.needsUpdate
+    func checkHelper() {
+        // 旧机制的 LaunchDaemon 与 SMAppService 同 label，旧 job 在位时 status
+        // 会误报 enabled。只要旧安装残留还在，就当作未配置，引导走一次性迁移
+        // （清理旧安装 → register → 系统设置批准）。
+        if PrivilegeManager.legacyInstalled {
+            helperInstalled = false
+            helperNeedsApproval = false
+            return
+        }
+        let st = PrivilegeManager.status
+        helperInstalled = (st == .enabled)
+        helperNeedsApproval = (st == .requiresApproval)
     }
 
     // MARK: - Subscription Management

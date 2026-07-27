@@ -196,8 +196,7 @@ final class DataPathProbeTests: XCTestCase {
         profile.lines.append(Line(
             id: "overlay",
             name: "Overlay",
-            type: "tailscale",
-            tailscaleAcceptRoutes: true
+            type: "tailscale"
         ))
         profile.lines.append(Line(
             id: "exit",

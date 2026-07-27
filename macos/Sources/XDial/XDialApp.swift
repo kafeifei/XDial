@@ -1,6 +1,34 @@
 import AppKit
 import SwiftUI
 
+extension Notification.Name {
+    /// DebugServer 请求打开设置窗口。
+    ///
+    /// 设置窗口平时由 popover 里的齿轮用 openWindow 打开，而 popover 只有点菜单栏
+    /// 图标才会出现 —— 那个图标是系统 status item，AXPress 和 System Events 都点不动。
+    /// 所以调试时改由常驻渲染的菜单栏 label 代为 openWindow。
+    static let xdialDebugOpenSettings = Notification.Name("xdial.debug.openSettings")
+}
+
+/// 菜单栏图标。之所以单独成 View：它常驻渲染，是 DEBUG 下唯一能稳定拿到
+/// openWindow 环境值的地方（popover 的内容只在展开时才存在）。
+private struct MenuBarLabel: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        let icon = Image(nsImage: AppIcon.menuBar())
+            .accessibilityLabel("XDial")
+        #if DEBUG
+        icon.onReceive(NotificationCenter.default.publisher(for: .xdialDebugOpenSettings)) { _ in
+            openWindow(id: "settings")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        #else
+        icon
+        #endif
+    }
+}
+
 struct XDialApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var state = AppState()
@@ -10,8 +38,7 @@ struct XDialApp: App {
             MainPopover()
                 .environmentObject(state)
         } label: {
-            Image(nsImage: AppIcon.menuBar())
-                .accessibilityLabel("XDial")
+            MenuBarLabel()
         }
         .menuBarExtraStyle(.window)
 

@@ -6,6 +6,10 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PLIST_VERSION := $(patsubst v%,%,$(VERSION))
 GO_LDFLAGS := -X main.version=$(VERSION)
 MOBILE_LIBBOX_TAGS := with_gvisor
+# SMAppService 要求签名身份跨构建稳定：ad-hoc 签名每次构建身份都变，
+# 系统会把重编后的 daemon 当新程序、要求重新批准。默认用开发者证书
+# （partial match，本机唯一），无证书环境可 SIGN_IDENTITY=- 回落 ad-hoc。
+SIGN_IDENTITY ?= Apple Development
 
 .PHONY: all cli app release restart inspector clean test test-smoke check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework appletv ios
 
@@ -16,8 +20,10 @@ define assemble_app
 	@cp $(BUILD_DIR)/xdial "$(2)/Contents/MacOS/xdial-daemon"
 	@cp macos/Info.plist "$(2)/Contents/Info.plist"
 	@cp macos/AppIcon.icns "$(2)/Contents/Resources/AppIcon.icns"
+	@cp macos/com.kafeifei.xdial.helper.plist "$(2)/Contents/Library/LaunchDaemons/"
 	@plutil -replace CFBundleShortVersionString -string "$(PLIST_VERSION)" "$(2)/Contents/Info.plist"
-	@codesign -s - -f "$(2)"
+	@codesign -f -s "$(SIGN_IDENTITY)" -i com.kafeifei.xdial.helper "$(2)/Contents/MacOS/xdial-daemon"
+	@codesign -f -s "$(SIGN_IDENTITY)" "$(2)"
 endef
 
 # with_gvisor:core/libbox 的离线数据面集成测试(dataplane_test.go)需要 sing-tun 的

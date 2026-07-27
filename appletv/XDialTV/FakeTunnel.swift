@@ -483,9 +483,10 @@ extension AppState {
                 name: "Tailscale 演示",
                 type: "tailscale",
                 enabled: true,
-                tailscaleHostname: "xdial-simulator",
                 tailscaleAuthenticated: true
             ))
+            // 设备名现在是 Profile 全局的一份，不再挂在线路上。
+            profile.tailscale.hostname = "xdial-simulator"
             changed = true
         }
         if testsOfflineTailscaleSetup,

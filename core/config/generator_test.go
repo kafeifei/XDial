@@ -53,6 +53,17 @@ func testProfile() *Profile {
 	}
 }
 
+// isTailnetRouteRule 判断一条 route 规则是不是「tailnet 内部网段 → 该 endpoint」。
+// IPv4 CGNAT 与 IPv6 ULA 缺一不可：双栈客户端优先取 AAAA，只写 IPv4 会走 direct 黑洞。
+func isTailnetRouteRule(rule map[string]interface{}, endpointTag string) bool {
+	cidrs, ok := rule["ip_cidr"].([]interface{})
+	if !ok || len(cidrs) != 2 {
+		return false
+	}
+	return cidrs[0] == "100.64.0.0/10" && cidrs[1] == "fd7a:115c:a1e0::/48" &&
+		rule["outbound"] == endpointTag
+}
+
 func TestProfileFinders(t *testing.T) {
 	p := testProfile()
 	if e := p.FindLine("vpn"); e == nil || e.Name != "VPN" {
@@ -358,18 +369,33 @@ func TestGenerateMacOSDoesNotInjectMobileOnlyNetworkSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "fd00::1/126") {
-		t.Fatal("desktop configuration contains mobile-only IPv6 TUN address")
-	}
 	var cfg SingBoxConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		t.Fatal(err)
 	}
+	if _, exists := cfg.Inbounds[0]["route_exclude_address"]; exists {
+		t.Fatal("desktop TUN excludes a VPN server address that was not requested")
+	}
+	if cfg.Inbounds[0]["stack"] != "system" || cfg.Inbounds[0]["auto_route"] != true {
+		t.Fatalf("desktop TUN must keep the auto_route/system stack: %v", cfg.Inbounds[0])
+	}
+	// 桌面 DNS 必须 hijack 后由 sing-box 应答，绝不原样转发：系统 DNS 可能
+	// 指向官方 Tailscale 的 100.100.100.100，转发到物理口 = 整机断网。
+	hijackFound := false
 	for _, rawRule := range cfg.Route["rules"].([]interface{}) {
 		rule := rawRule.(map[string]interface{})
-		if rule["protocol"] == "dns" && rule["outbound"] != "direct" {
-			t.Fatalf("desktop DNS route unexpectedly changed: %v", rule)
+		if rule["protocol"] == "dns" {
+			if rule["action"] != "hijack-dns" {
+				t.Fatalf("desktop DNS packets must be hijacked, got %v", rule)
+			}
+			hijackFound = true
 		}
+	}
+	if !hijackFound {
+		t.Fatal("desktop DNS hijack rule is missing")
+	}
+	if cfg.DNS["final"] != "public-dns" {
+		t.Fatalf("desktop DNS final must be the direct-IP DoH resolver: %v", cfg.DNS["final"])
 	}
 }
 
@@ -672,13 +698,11 @@ func TestGenerateTailscaleEndpoint(t *testing.T) {
 	p := &Profile{
 		Lines: []Line{
 			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
-			{
-				ID: "../../work", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
-				TailscaleHostname: "xdial-mac", TailscaleAcceptRoutes: true,
-			},
+			{ID: "../../work", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true},
 		},
 		Modes:        []Mode{{ID: "tailnet", Name: "Tailnet", DefaultLineID: "direct"}},
 		ActiveModeID: "tailnet",
+		Tailscale:    TailscaleIdentity{Hostname: "xdial-mac"},
 	}
 
 	data, err := GenerateSingBoxFor(p, 0, "", PlatformMacOS, "/Library/Application Support/XDial")
@@ -696,12 +720,27 @@ func TestGenerateTailscaleEndpoint(t *testing.T) {
 	if endpoint["type"] != "tailscale" || endpoint["tag"] != "tailscale-../../work" {
 		t.Fatalf("unexpected endpoint: %v", endpoint)
 	}
-	if endpoint["hostname"] != "xdial-mac" || endpoint["accept_routes"] != true {
-		t.Fatalf("tailscale options missing: %v", endpoint)
+	if endpoint["hostname"] != "xdial-mac" {
+		t.Fatalf("tailscale hostname missing: %v", endpoint)
+	}
+	// 身份是全局的：设备名来自 Profile.Tailscale，不再是 Line 的字段。
+	if _, exists := endpoint["ephemeral"]; exists {
+		t.Fatalf("tailscale endpoint must be a persistent node (ephemeral loses identity between sessions): %v", endpoint)
+	}
+	// accept_routes 会把 peer 广播的子网路由拉进来，与「Tailscale 只是一条出口线路」
+	// 的定位冲突（还可能和本地网段撞上），必须不出现。
+	if _, exists := endpoint["accept_routes"]; exists {
+		t.Fatalf("tailscale endpoint must not accept peer routes: %v", endpoint)
+	}
+	// XDial 是工具，不提供网络出口，任何 advertise 都不能出现。
+	for _, key := range []string{"advertise_routes", "advertise_exit_node", "advertise_tags"} {
+		if _, exists := endpoint[key]; exists {
+			t.Fatalf("tailscale endpoint must not advertise anything, got %s: %v", key, endpoint)
+		}
 	}
 	stateDirectory, _ := endpoint["state_directory"].(string)
-	if !strings.HasPrefix(stateDirectory, "/Library/Application Support/XDial/tailscale/") || strings.Contains(stateDirectory, "..") {
-		t.Fatalf("unsafe tailscale state directory: %q", stateDirectory)
+	if stateDirectory != "/Library/Application Support/XDial/tailscale" {
+		t.Fatalf("tailscale state must live in one global directory, got %q", stateDirectory)
 	}
 
 	for _, outbound := range cfg.Outbounds {
@@ -709,20 +748,32 @@ func TestGenerateTailscaleEndpoint(t *testing.T) {
 			t.Fatal("tailscale-only profile must not generate VPN outbound")
 		}
 	}
-	preferredFound := false
+	// Tailscale 只自动接管 tailnet 内部网段；exit node 广播的
+	// 0.0.0.0/0 绝不隐式全捞（会让模式默认出口失效）。想默认走 exit node，
+	// 把模式默认线路设为 Tailscale 线路即可（见 TestGenerateTailscaleExitNodeAsDefault）。
+	tailnetRouteFound := false
 	for _, rawRule := range cfg.Route["rules"].([]interface{}) {
 		rule := rawRule.(map[string]interface{})
-		if rule["preferred_by"] == "tailscale-../../work" && rule["outbound"] == "tailscale-../../work" {
-			preferredFound = true
-			break
+		if _, exists := rule["preferred_by"]; exists {
+			t.Fatalf("exit-node routes must not be implicitly grabbed: %v", rule)
+		}
+		if isTailnetRouteRule(rule, "tailscale-../../work") {
+			tailnetRouteFound = true
 		}
 	}
-	if !preferredFound {
-		t.Fatal("tailscale preferred route missing")
+	if !tailnetRouteFound {
+		t.Fatal("tailnet internal CGNAT route is missing")
 	}
 	servers := cfg.DNS["servers"].([]interface{})
-	if len(servers) != 2 || servers[1].(map[string]interface{})["type"] != "tailscale" {
+	if len(servers) != 3 || servers[2].(map[string]interface{})["type"] != "tailscale" {
 		t.Fatalf("tailscale DNS missing: %v", servers)
+	}
+	if servers[2].(map[string]interface{})["accept_default_resolvers"] != false {
+		t.Fatalf("tailscale DNS must explicitly disable default resolvers: %v", servers[2])
+	}
+	// tailnet 名字之外的解析回落 IP 直连 DoH，绝不依赖系统 DNS（黑洞风险）。
+	if cfg.DNS["final"] != "public-dns" {
+		t.Fatalf("desktop DNS final must be the direct-IP DoH resolver: %v", cfg.DNS["final"])
 	}
 }
 
@@ -733,12 +784,12 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
 			{
 				ID: "mobile-tailnet", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
-				TailscaleHostname: "xdial-mobile", TailscaleAcceptRoutes: true,
 				TailscaleExitNode: "exit-node",
 			},
 		},
 		Modes:        []Mode{{ID: "tailnet", Name: "Tailnet", DefaultLineID: "direct"}},
 		ActiveModeID: "tailnet",
+		Tailscale:    TailscaleIdentity{Hostname: "xdial-mobile"},
 	}
 
 	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, basePath)
@@ -756,23 +807,32 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 	if endpoint["type"] != "tailscale" || endpoint["tag"] != "tailscale-mobile-tailnet" {
 		t.Fatalf("unexpected endpoint: %v", endpoint)
 	}
-	if endpoint["state_directory"] != TailscaleStateDirectory(basePath, "mobile-tailnet") {
+	if endpoint["state_directory"] != TailscaleStateDirectory(basePath) {
 		t.Fatalf("state directory must remain inside the writable base path: %v", endpoint["state_directory"])
 	}
-	if endpoint["hostname"] != "xdial-mobile" || endpoint["accept_routes"] != true || endpoint["exit_node"] != "exit-node" {
+	if endpoint["hostname"] != "xdial-mobile" || endpoint["exit_node"] != "exit-node" {
 		t.Fatalf("mobile tailscale options differ from desktop: %v", endpoint)
 	}
+	if _, exists := endpoint["ephemeral"]; exists {
+		t.Fatalf("mobile tailscale endpoint must also be a persistent node: %v", endpoint)
+	}
+	if _, exists := endpoint["accept_routes"]; exists {
+		t.Fatalf("mobile tailscale endpoint must not accept peer routes: %v", endpoint)
+	}
 
-	preferredFound := false
+	// 移动端与桌面端保持相同语义：只接管 tailnet 内部网段。
+	tailnetRouteFound := false
 	for _, rawRule := range cfg.Route["rules"].([]interface{}) {
 		rule := rawRule.(map[string]interface{})
-		if rule["preferred_by"] == "tailscale-mobile-tailnet" && rule["outbound"] == "tailscale-mobile-tailnet" {
-			preferredFound = true
-			break
+		if _, exists := rule["preferred_by"]; exists {
+			t.Fatalf("exit-node routes must not be implicitly grabbed: %v", rule)
+		}
+		if isTailnetRouteRule(rule, "tailscale-mobile-tailnet") {
+			tailnetRouteFound = true
 		}
 	}
-	if !preferredFound {
-		t.Fatal("mobile tailscale preferred route missing")
+	if !tailnetRouteFound {
+		t.Fatal("mobile tailnet internal CGNAT route is missing")
 	}
 	servers := cfg.DNS["servers"].([]interface{})
 	if len(servers) != 3 {
@@ -818,44 +878,55 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 	}
 }
 
-func TestGenerateNEMultipleTailscaleDNSBindingsRemainIsolated(t *testing.T) {
-	basePath := t.TempDir()
-	p := &Profile{
-		Lines: []Line{
-			{ID: "direct", Type: LineTypeDirect, Enabled: true},
-			{ID: "tail-a", Type: LineTypeTailscale, Enabled: true},
-			{ID: "tail-b", Type: LineTypeTailscale, Enabled: true},
-			{ID: "disabled", Type: LineTypeTailscale, Enabled: false},
-		},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
-		ActiveModeID: "mode",
-	}
-
-	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, basePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cfg SingBoxConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatal(err)
-	}
-	servers := cfg.DNS["servers"].([]interface{})
+// 多 endpoint 的 DNS 绑定不能串台。生成器层面现在只会给出一个 endpoint
+// （见 TestGenerateRejectsMultipleEnabledTailscaleLines），所以直接测 buildNEDNS。
+func TestBuildNEDNSKeepsTailscaleBindingsIsolated(t *testing.T) {
+	dns := buildNEDNS([]string{"tailscale-tail-a", "tailscale-tail-b"})
+	servers := dns["servers"].([]map[string]interface{})
 	if len(servers) != 4 {
 		t.Fatalf("expected public + two Tailscale + dispatcher servers, got %v", servers)
 	}
-	dispatcher := servers[len(servers)-1].(map[string]interface{})
-	bindings := dispatcher["tailscale"].([]interface{})
+	dispatcher := servers[len(servers)-1]
+	bindings := dispatcher["tailscale"].([]map[string]interface{})
 	if len(bindings) != 2 {
-		t.Fatalf("only enabled Tailscale endpoints should be bound: %v", bindings)
+		t.Fatalf("每个 endpoint 都要有自己的 DNS transport: %v", bindings)
 	}
 	seen := make(map[string]string)
-	for _, rawBinding := range bindings {
-		binding := rawBinding.(map[string]interface{})
+	for _, binding := range bindings {
 		seen[binding["endpoint"].(string)] = binding["server"].(string)
 	}
 	if seen["tailscale-tail-a"] != mobileTailscaleDNSTag("tailscale-tail-a") ||
 		seen["tailscale-tail-b"] != mobileTailscaleDNSTag("tailscale-tail-b") {
 		t.Fatalf("Tailscale DNS bindings crossed endpoints: %v", seen)
+	}
+}
+
+// Tailscale 身份（state_directory / node key）全 Profile 一份，两条 enabled 线路
+// 会生成两个抢同一目录的 endpoint —— 生成阶段就必须拒绝，而不是让它"起来但连不通"。
+func TestGenerateRejectsMultipleEnabledTailscaleLines(t *testing.T) {
+	p := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{ID: "tail-a", Type: LineTypeTailscale, Enabled: true},
+			{ID: "tail-b", Type: LineTypeTailscale, Enabled: true},
+		},
+		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
+		ActiveModeID: "mode",
+	}
+
+	for _, platform := range []Platform{PlatformMacOS, PlatformNE} {
+		if _, err := GenerateSingBoxFor(p, 0, "", platform, t.TempDir()); err == nil ||
+			!strings.Contains(err.Error(), "only one enabled Tailscale line") {
+			t.Fatalf("platform %v: expected multiple-Tailscale error, got %v", platform, err)
+		}
+	}
+
+	// 停用其中一条即可恢复：未启用的线路不生成 endpoint，也就不抢目录。
+	p.Lines[2].Enabled = false
+	for _, platform := range []Platform{PlatformMacOS, PlatformNE} {
+		if _, err := GenerateSingBoxFor(p, 0, "", platform, t.TempDir()); err != nil {
+			t.Fatalf("platform %v: single enabled Tailscale line must be accepted: %v", platform, err)
+		}
 	}
 }
 
@@ -900,7 +971,14 @@ func TestGenerateNETailscaleRejectsRelativeStatePath(t *testing.T) {
 	}
 }
 
-func TestGenerateExplicitModeRuleBeforeTailscalePreferredRoute(t *testing.T) {
+// Tailscale 的自动接管范围只有 tailnet 内部网段（100.64/10）。设计定案
+// （2026-07-26，来回三次的最终结论）：
+//   - exit node 广播的 0.0.0.0/0 绝不隐式全捞（preferred_by）——那会让
+//     「模式默认出口」永远失效，用户配的"默认直连"被整个抢走；
+//   - 想让默认流量走 exit node，把模式默认线路设为 Tailscale 线路（final
+//     即 endpoint tag，见 TestGenerateTailscaleExitNodeAsDefault）；
+//   - 100.64/10 必须接管，否则按 MagicDNS 名字访问 tailnet 设备会走 direct 黑洞。
+func TestTailscaleRoutesOnlyTailnetCIDR(t *testing.T) {
 	p := &Profile{
 		Lines: []Line{
 			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
@@ -927,23 +1005,324 @@ func TestGenerateExplicitModeRuleBeforeTailscalePreferredRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	explicitIndex, preferredIndex := -1, -1
-	for i, rawRule := range cfg.Route["rules"].([]interface{}) {
+	explicitFound, tailnetFound := false, false
+	for _, rawRule := range cfg.Route["rules"].([]interface{}) {
 		rule := rawRule.(map[string]interface{})
+		if _, exists := rule["preferred_by"]; exists {
+			t.Fatalf("exit-node routes must not be implicitly grabbed: %v", rule)
+		}
 		if rule["outbound"] == "vpn" {
 			if domains, ok := rule["domain_suffix"].([]interface{}); ok && len(domains) == 1 && domains[0] == "corp.example.com" {
-				explicitIndex = i
+				explicitFound = true
 			}
 		}
-		if rule["preferred_by"] == "tailscale-ts" {
-			preferredIndex = i
+		if isTailnetRouteRule(rule, "tailscale-ts") {
+			tailnetFound = true
 		}
 	}
-	if explicitIndex < 0 || preferredIndex < 0 {
-		t.Fatalf("expected explicit VPN and Tailscale preferred rules, got %v", cfg.Route["rules"])
+	if !explicitFound {
+		t.Fatalf("expected the explicit VPN rule to survive, got %v", cfg.Route["rules"])
 	}
-	if explicitIndex >= preferredIndex {
-		t.Fatalf("explicit VPN rule at %d must precede Tailscale preferred route at %d", explicitIndex, preferredIndex)
+	if !tailnetFound {
+		t.Fatalf("tailnet internal CGNAT route is missing: %v", cfg.Route["rules"])
+	}
+	// final 归模式所有：默认直连不被 exit node 抢走。
+	if cfg.Route["final"] != "direct" {
+		t.Fatalf("mode default outbound must remain direct, got %v", cfg.Route["final"])
+	}
+}
+
+// 企业内网域名（绑定到 AnyConnect 线路的手动规则集）的解析必须交给服务端
+// 下发的企业 DNS、且查询经隧道出去：真内网名（如 oa.corp.example）在公共 DNS 上是
+// NXDOMAIN（2026-07-26 实测），解析不出来内网就"不通"。
+func TestGenerateDesktopRoutesEnterpriseDomainsToVPNDNS(t *testing.T) {
+	p := testProfile()
+	p.ActiveModeID = "overseas" // internal → vpn
+
+	data, err := GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10", "10.8.0.11"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	var enterprise map[string]interface{}
+	for _, rawServer := range cfg.DNS["servers"].([]interface{}) {
+		server := rawServer.(map[string]interface{})
+		if server["tag"] == "enterprise-dns" {
+			enterprise = server
+		}
+	}
+	if enterprise == nil {
+		t.Fatalf("enterprise DNS server missing: %v", cfg.DNS["servers"])
+	}
+	if enterprise["server"] != "10.8.0.10" || enterprise["detour"] != "vpn" {
+		t.Fatalf("enterprise DNS must query the pushed resolver through the tunnel: %v", enterprise)
+	}
+	// 桌面的 vpn outbound 是只支持 CONNECT 的本地 SOCKS 桥：UDP 会假成功后丢包，
+	// 而带 server 的 DNS 规则命中后不回落 final，内网域名会卡满超时再 SERVFAIL。
+	if enterprise["type"] != "tcp" {
+		t.Fatalf("enterprise DNS must go over TCP through the SOCKS bridge: %v", enterprise)
+	}
+	// public-dns 对内网名的 NXDOMAIN 不能被 enterprise-dns / tailscale-dns 共用。
+	if cfg.DNS["independent_cache"] != true {
+		t.Fatalf("desktop DNS cache must be per-server: %v", cfg.DNS)
+	}
+
+	rules, _ := cfg.DNS["rules"].([]interface{})
+	ruleFound := false
+	for _, rawRule := range rules {
+		rule := rawRule.(map[string]interface{})
+		if rule["server"] == "enterprise-dns" {
+			domains, _ := rule["domain_suffix"].([]interface{})
+			if len(domains) == 2 && domains[0] == "example.com" && domains[1] == "internal.corp" {
+				ruleFound = true
+			}
+		}
+	}
+	if !ruleFound {
+		t.Fatalf("VPN-bound domains must resolve via enterprise DNS: %v", rules)
+	}
+
+	// 没有企业 DNS 时（未连 AnyConnect / 服务端没下发）不得生成半残配置。
+	data, err = GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "enterprise-dns") {
+		t.Fatal("enterprise DNS must be omitted when the tunnel pushed none")
+	}
+}
+
+// splitProfileWithTailscale 是用户的真实组合：内网手动规则→AnyConnect，
+// gfwlist（URL 规则集）→Tailscale 出口，其余直连。
+func splitProfileWithTailscale() *Profile {
+	return &Profile{
+		Lines: []Line{
+			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
+			{ID: "vpn", Name: "Corp VPN", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com:8443"},
+			{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true, TailscaleExitNode: "irvine"},
+		},
+		RuleSets: []RuleSet{
+			{ID: "internal", Name: "内网", Type: RuleSetTypeManual, Enabled: true,
+				Domains: []string{"corp.example"}},
+			{ID: "gfw", Name: "GFW", Type: RuleSetTypeURL, Enabled: true,
+				URL: "https://example.com/geosite-gfw.srs"},
+			{ID: "oversea", Name: "手动出海", Type: RuleSetTypeManual, Enabled: true,
+				Domains: []string{"example.org"}},
+		},
+		Modes: []Mode{{
+			ID: "split", Name: "分流",
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
+				{RuleSetID: "gfw", LineID: "ts"},
+				{RuleSetID: "oversea", LineID: "ts"},
+			},
+			DefaultLineID: "direct",
+		}},
+		ActiveModeID: "split",
+		Tailscale:    TailscaleIdentity{Hostname: "xdial-mac"},
+	}
+}
+
+// 绑到代理型线路的域名，解析也必须经该线路出去。在本地问境内公共 DNS 拿到的是
+// 污染结果，再从境外出口连过去 —— 分流白做，还会连到墙给的假地址。
+func TestGenerateDesktopResolvesProxyBoundDomainsThroughTheLine(t *testing.T) {
+	data, err := GenerateSingBoxDesktop(splitProfileWithTailscale(), 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	// 同一条线路只生成一个 DoH server，两个规则集共用。
+	var proxyServers []map[string]interface{}
+	for _, rawServer := range cfg.DNS["servers"].([]interface{}) {
+		server := rawServer.(map[string]interface{})
+		if tag, _ := server["tag"].(string); strings.HasPrefix(tag, "proxy-dns-") {
+			proxyServers = append(proxyServers, server)
+		}
+	}
+	if len(proxyServers) != 1 {
+		t.Fatalf("expected exactly one per-line resolver, got %v", proxyServers)
+	}
+	proxy := proxyServers[0]
+	if proxy["tag"] != "proxy-dns-tailscale-ts" || proxy["type"] != "https" ||
+		proxy["server"] != "1.1.1.1" || proxy["detour"] != "tailscale-ts" {
+		t.Fatalf("per-line resolver must be a DoH query sent through the line: %v", proxy)
+	}
+
+	rules := cfg.DNS["rules"].([]interface{})
+	if len(rules) != 4 {
+		t.Fatalf("expected enterprise + two proxy + tailnet rules, got %v", rules)
+	}
+	// 顺序是语义的一部分：内网名先归企业 DNS，代理域名次之，tailnet 兜底最后。
+	if rules[0].(map[string]interface{})["server"] != "enterprise-dns" {
+		t.Fatalf("enterprise rule must come first: %v", rules)
+	}
+	urlRule := rules[1].(map[string]interface{})
+	if urlRule["server"] != "proxy-dns-tailscale-ts" || urlRule["rule_set"] != "ruleset-gfw" {
+		t.Fatalf("URL rule set must reuse the downloaded rule_set resource: %v", urlRule)
+	}
+	manualRule := rules[2].(map[string]interface{})
+	domains, _ := manualRule["domain_suffix"].([]interface{})
+	if manualRule["server"] != "proxy-dns-tailscale-ts" ||
+		len(domains) != 1 || domains[0] != "example.org" {
+		t.Fatalf("manual rule set must be inlined as domain suffixes: %v", manualRule)
+	}
+	tailnetRule := rules[3].(map[string]interface{})
+	if tailnetRule["ip_accept_any"] != true || tailnetRule["server"] != "tailscale-dns" {
+		t.Fatalf("tailnet fallback must stay last: %v", tailnetRule)
+	}
+}
+
+// direct 不算承载线路：它本就要本地视角。绑到 vpn 的手动规则集归 enterprise-dns。
+func TestGenerateDesktopKeepsDirectBoundRuleSetsOnPublicDNS(t *testing.T) {
+	p := splitProfileWithTailscale()
+	p.Modes[0].Bindings = []RuleBinding{
+		{RuleSetID: "internal", LineID: "vpn"},
+		{RuleSetID: "gfw", LineID: "direct"},
+		{RuleSetID: "oversea", LineID: "direct"},
+	}
+
+	data, err := GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "proxy-dns-") {
+		t.Fatalf("direct-bound rule sets must not get a tunneled resolver:\n%s", data)
+	}
+}
+
+// 预设模式"国内"就是这个组合：gfwlist（URL 规则集）绑 AnyConnect 线路。
+// 它既不是内网名（enterprise-dns 只收手动规则集），又曾被当作"vpn 不是代理线路"
+// 跳过，于是落到 final 的境内解析器上被污染 —— 分流白做。
+func TestGenerateDesktopResolvesVPNBoundURLRuleSetThroughTheTunnel(t *testing.T) {
+	p := splitProfileWithTailscale()
+	p.Modes[0].Bindings = []RuleBinding{
+		{RuleSetID: "internal", LineID: "vpn"},
+		{RuleSetID: "gfw", LineID: "vpn"},
+	}
+
+	data, err := GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	var vpnResolver map[string]interface{}
+	for _, rawServer := range cfg.DNS["servers"].([]interface{}) {
+		server := rawServer.(map[string]interface{})
+		if server["tag"] == "proxy-dns-vpn" {
+			vpnResolver = server
+		}
+	}
+	if vpnResolver == nil {
+		t.Fatalf("URL rule set bound to the AnyConnect line has no resolver:\n%s", data)
+	}
+	// DoH 而非 UDP：桌面的 vpn outbound 是只实现了 CONNECT 的本地 go-socks5 桥。
+	if vpnResolver["type"] != "https" || vpnResolver["server"] != "1.1.1.1" ||
+		vpnResolver["detour"] != "vpn" {
+		t.Fatalf("VPN-bound resolver must be DoH through the tunnel: %v", vpnResolver)
+	}
+
+	rules := cfg.DNS["rules"].([]interface{})
+	if len(rules) != 3 {
+		t.Fatalf("expected enterprise + vpn-url + tailnet rules, got %v", rules)
+	}
+	enterpriseRule := rules[0].(map[string]interface{})
+	if enterpriseRule["server"] != "enterprise-dns" {
+		t.Fatalf("enterprise rule must come first: %v", rules)
+	}
+	// 手动规则集仍然只归企业 DNS：内网名只有它有记录。
+	domains, _ := enterpriseRule["domain_suffix"].([]interface{})
+	if len(domains) != 1 || domains[0] != "corp.example" {
+		t.Fatalf("manual rule set bound to vpn must stay on enterprise-dns: %v", enterpriseRule)
+	}
+	urlRule := rules[1].(map[string]interface{})
+	if urlRule["server"] != "proxy-dns-vpn" || urlRule["rule_set"] != "ruleset-gfw" {
+		t.Fatalf("URL rule set must resolve through the VPN resolver: %v", urlRule)
+	}
+}
+
+// 桌面 tun 必须双栈：sing-tun 的 auto_route 没有 IPv6 地址就一条 IPv6 路由都不装，
+// IPv6 流量整体绕过 XDial —— tailnet 的 fd7a:115c:a1e0::/48 规则永不求值，
+// 经隧道解出的未污染 AAAA 反而被系统拿去直连。
+func TestGenerateDesktopTUNCapturesIPv6(t *testing.T) {
+	data, err := GenerateSingBox(testProfile(), 10800, "1.2.3.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	addresses, _ := cfg.Inbounds[0]["address"].([]interface{})
+	if len(addresses) != 2 || addresses[0] != "198.18.0.1/15" || addresses[1] != "fd00::1/126" {
+		t.Fatalf("desktop TUN must be dual-stack: %v", addresses)
+	}
+}
+
+// 规则集要从它自己所描述的路径上下载，硬编码 direct 就是从被墙链路取 gfwlist；
+// 首次下载失败是硬失败（sing-box router 启动即 FATAL），不是降级。
+func TestGenerateRuleSetDownloadDetourFollowsBinding(t *testing.T) {
+	p := testProfile()
+	p.ActiveModeID = "domestic-ss"
+
+	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	sets := cfg.Route["rule_set"].([]interface{})
+	if len(sets) != 1 {
+		t.Fatalf("expected the gfw rule set only, got %v", sets)
+	}
+	set := sets[0].(map[string]interface{})
+	if set["tag"] != "ruleset-gfw" || set["download_detour"] != "proxy-ss" {
+		t.Fatalf("rule set must download through its bound line: %v", set)
+	}
+}
+
+// Tailscale endpoint 不能当 download_detour：tsnet server 在 StartStatePostStart
+// 才启动，而 rule_set 首次下载在更早的 StartStateStart，那时 dial 必然失败。
+// direct / vpn 绑定同样退回 direct。
+func TestGenerateRuleSetDownloadDetourFallsBackToDirect(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		lineID string
+	}{
+		{"tailscale", "ts"},
+		{"vpn", "vpn"},
+		{"direct", "direct"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := splitProfileWithTailscale()
+			p.Modes[0].Bindings = []RuleBinding{{RuleSetID: "gfw", LineID: tc.lineID}}
+
+			data, err := GenerateSingBox(p, 10800, "1.2.3.4")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cfg SingBoxConfig
+			if err := json.Unmarshal(data, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			set := cfg.Route["rule_set"].([]interface{})[0].(map[string]interface{})
+			if set["download_detour"] != "direct" {
+				t.Fatalf("expected direct download detour, got %v", set)
+			}
+		})
 	}
 }
 
