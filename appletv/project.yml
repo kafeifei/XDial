@@ -13,6 +13,10 @@ targets:
     platform: tvOS
     sources:
       - XDialTVTunnel
+      # PacketTunnelProvider 用到 OnDemandManualStartContract /
+      # OneShotNetworkSettingsResult，两者都定义在这里。iOS 的同名 target
+      # 一直引用着它，tvOS 漏了，导致 tvOS 构建断裂。
+      - path: XDialTV/OnDemandStartEnvelope.swift
     info:
       path: XDialTVTunnel/Info.plist
       properties:

@@ -15,7 +15,12 @@ func singboxCheck(t *testing.T, profile *Profile, label string) {
 	if err != nil {
 		t.Fatalf("[%s] GenerateSingBox: %v", label, err)
 	}
+	singboxCheckConfig(t, data, label)
+}
 
+// singboxCheckConfig 把已生成好的配置交给 sing-box check。
+func singboxCheckConfig(t *testing.T, data []byte, label string) {
+	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "sing-box.json")
 	if err := os.WriteFile(cfgPath, data, 0644); err != nil {
@@ -137,8 +142,40 @@ func vmessLine() Line {
 func tailscaleLine() Line {
 	return Line{
 		ID: "tailscale-1", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
-		TailscaleHostname: "xdial-test", TailscaleAcceptRoutes: true,
 	}
+}
+
+func tailscaleIdentity() TailscaleIdentity {
+	return TailscaleIdentity{Hostname: "xdial-test"}
+}
+
+// 桌面连接路径（GenerateSingBoxDesktop）的产物也必须过 sing-box 的解析：
+// 它比 GenerateSingBox 多出 enterprise-dns（detour vpn）和 proxy-dns-*
+// （detour 到 Tailscale endpoint）两类 DNS server，字段写错只有 check 能发现。
+func TestGenerate_DesktopUserSplitCombination(t *testing.T) {
+	if _, err := exec.LookPath("sing-box"); err != nil {
+		t.Skip("sing-box not installed")
+	}
+	p := &Profile{
+		Lines:    []Line{directLine(), vpnLine(), tailscaleLine()},
+		RuleSets: []RuleSet{internalRuleSet(), gfwRuleSet()},
+		Modes: []Mode{{
+			ID: "split", Name: "分流",
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "vpn"},
+				{RuleSetID: "gfw", LineID: "tailscale-1"},
+			},
+			DefaultLineID: "direct",
+		}},
+		ActiveModeID: "split",
+		Tailscale:    tailscaleIdentity(),
+	}
+
+	data, err := GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10"})
+	if err != nil {
+		t.Fatalf("[desktop-split] GenerateSingBoxDesktop: %v", err)
+	}
+	singboxCheckConfig(t, data, "desktop-split")
 }
 
 func TestGenerate_Tailscale(t *testing.T) {
@@ -148,6 +185,7 @@ func TestGenerate_Tailscale(t *testing.T) {
 			ID: "tailnet", Name: "Tailnet", DefaultLineID: "direct",
 		}},
 		ActiveModeID: "tailnet",
+		Tailscale:    tailscaleIdentity(),
 	}
 	singboxCheck(t, p, "tailscale")
 }

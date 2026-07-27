@@ -1,34 +1,42 @@
+import CryptoKit
 import Foundation
+import ServiceManagement
 
+// 特权模型（Surge 同款体验）：
+// - daemon 以 SMAppService 注册，plist 与二进制都在 app bundle 内，由 launchd 以 root 运行
+// - 首次启用在系统设置「登录项」批准一次（支持 Touch ID），之后重编/升级永远免授权：
+//   launchd 直接运行 bundle 里的新二进制，信任绑定在开发者签名身份上，而非二进制快照
+// - 重编后运行中的旧 daemon 通过 respawn 命令原地 re-exec 成新二进制，全程无感
+// - 旧机制（密码安装到 /Library/PrivilegedHelperTools）只保留一次性清理入口
 enum PrivilegeManager {
     static let label = "com.kafeifei.xdial.helper"
-    static let helperDir = "/Library/PrivilegedHelperTools"
-    static let helperPath = "\(helperDir)/\(label)"
-    static let plistDir = "/Library/LaunchDaemons"
-    static let plistPath = "\(plistDir)/\(label).plist"
+    static let plistName = "com.kafeifei.xdial.helper.plist"
     static let socketPath = "/tmp/xdial.sock"
 
-    static var isInstalled: Bool {
-        FileManager.default.fileExists(atPath: plistPath)
-            && FileManager.default.fileExists(atPath: helperPath)
-    }
+    static var service: SMAppService { SMAppService.daemon(plistName: plistName) }
+
+    static var status: SMAppService.Status { service.status }
+
+    /// daemon 是否已批准并托管给 launchd（不代表进程此刻活着，KeepAlive 会拉起）
+    static var isInstalled: Bool { status == .enabled }
+
+    /// 已注册但等待用户在系统设置里批准
+    static var requiresApproval: Bool { status == .requiresApproval }
 
     static var isHelperRunning: Bool {
         canConnectSocket()
     }
 
-    static var needsUpdate: Bool {
-        guard isInstalled else { return false }
-        let src = helperSourcePath()
-        guard FileManager.default.fileExists(atPath: src) else { return false }
-        let srcAttrs = try? FileManager.default.attributesOfItem(atPath: src)
-        let dstAttrs = try? FileManager.default.attributesOfItem(atPath: helperPath)
-        let srcSize = srcAttrs?[.size] as? Int ?? 0
-        let dstSize = dstAttrs?[.size] as? Int ?? 0
-        if srcSize != dstSize { return true }
-        let srcDate = srcAttrs?[.modificationDate] as? Date ?? .distantPast
-        let dstDate = dstAttrs?[.modificationDate] as? Date ?? .distantPast
-        return srcDate > dstDate
+    static func register() throws {
+        try service.register()
+    }
+
+    static func unregister() throws {
+        try service.unregister()
+    }
+
+    static func openApprovalSettings() {
+        SMAppService.openSystemSettingsLoginItems()
     }
 
     static func ensureHelperRunning() throws {
@@ -39,89 +47,139 @@ enum PrivilegeManager {
         }
     }
 
-    // MARK: - Install / Update / Uninstall
-
-    static func install() throws {
-        let helperSource = helperSourcePath()
-        guard FileManager.default.fileExists(atPath: helperSource) else {
-            throw NSError(domain: "XDial", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "找不到 xdial 二进制: \(helperSource)"])
-        }
-
-        // plist 直接在 root shell 内用带引号的 heredoc 生成到目标路径，不经世界可写的
-        // /tmp 中转——旧做法先写 /tmp/xdial-daemon.plist 再 root cp，存在 TOCTOU 提权窗口
-        // （攻击者在窗口期替换该文件即可让 root 加载任意 LaunchDaemon）。
-        // 分隔符加引号（<<'XDIAL_PLIST_EOF'）禁止 shell 展开；plist 内容全是 app 常量，无注入面。
-        let shell = """
-        set -eu
-        mkdir -p '\(helperDir)'
-        cp '\(helperSource)' '\(helperPath)'
-        chown root:wheel '\(helperPath)'
-        chmod 0755 '\(helperPath)'
-        cat > '\(plistPath)' <<'XDIAL_PLIST_EOF'
-        \(buildPlist())
-        XDIAL_PLIST_EOF
-        chown root:wheel '\(plistPath)'
-        chmod 0644 '\(plistPath)'
-        launchctl bootout system/\(label) 2>/dev/null || true
-        launchctl bootstrap system '\(plistPath)'
-        """
-
-        if !runAdminShell(shell) {
-            throw NSError(domain: "XDial", code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "安装失败（用户取消或权限不足）"])
-        }
-
-        guard isInstalled else {
-            throw NSError(domain: "XDial", code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "安装后验证失败，请重试"])
-        }
+    /// bundle 内 daemon 二进制的 SHA256。与运行中 daemon 的 daemon-info 比对，
+    /// 不一致说明重编过 → 发 respawn 让它原地换成新二进制。
+    static func bundledDaemonSHA256() -> String? {
+        let path = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/xdial-daemon")
+        guard let data = try? Data(contentsOf: path) else { return nil }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    static func uninstall(deleteData: Bool = false) throws {
-        let removeState = deleteData ? "rm -rf '/Library/Application Support/XDial'" : ""
+    // MARK: - 旧机制残留（/Library 安装）
+
+    static let legacyHelperPath = "/Library/PrivilegedHelperTools/\(label)"
+    static let legacyPlistPath = "/Library/LaunchDaemons/\(label).plist"
+
+    static var legacyInstalled: Bool {
+        FileManager.default.fileExists(atPath: legacyPlistPath)
+            || FileManager.default.fileExists(atPath: legacyHelperPath)
+    }
+
+    /// 清掉旧安装（bootout + 删文件）。这是整个生命周期里最后一次要密码的操作，
+    /// 且只发生在从旧机制迁移的机器上。
+    static func cleanupLegacy() throws {
         let shell = """
         launchctl bootout system/\(label) 2>/dev/null || true
-        rm -f '\(plistPath)' '\(helperPath)' '\(socketPath)' '/tmp/xdial.log' '/tmp/xdial-app.log'
-        rm -rf '/tmp/xdial-engine'
-        \(removeState)
+        rm -f '\(legacyPlistPath)' '\(legacyHelperPath)'
         rm -f '/etc/sudoers.d/xdial'
         """
         if !runAdminShell(shell) {
-            throw NSError(domain: "XDial", code: 5,
-                userInfo: [NSLocalizedDescriptionKey: "卸载失败（用户取消或权限不足）"])
+            throw NSError(domain: "XDial", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "清理旧版 helper 失败（用户取消或权限不足）"])
+        }
+        guard !legacyInstalled else {
+            throw NSError(domain: "XDial", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "旧版 helper 清理后仍有残留，请重试"])
         }
     }
 
-    // MARK: - Private
-
-    private static func buildPlist() -> String {
-        """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>Label</key>
-            <string>\(label)</string>
-            <key>ProgramArguments</key>
-            <array>
-                <string>\(helperPath)</string>
-                <string>daemon</string>
-                <string>--socket</string>
-                <string>\(socketPath)</string>
-            </array>
-            <key>KeepAlive</key>
-            <true/>
-            <key>RunAtLoad</key>
-            <true/>
-            <key>StandardOutPath</key>
-            <string>/tmp/xdial.log</string>
-            <key>StandardErrorPath</key>
-            <string>/tmp/xdial.log</string>
-        </dict>
-        </plist>
-        """
+    /// 卸载：注销 SMAppService（免密）+ 清运行数据。旧机制残留另走 cleanupLegacy。
+    static func uninstall(deleteData: Bool = false) throws {
+        try? unregister()
+        if legacyInstalled {
+            try cleanupLegacy()
+        }
+        if deleteData {
+            // /Library/Application Support/XDial 是 root 属主，得借 root daemon 或
+            // 管理员权限删；daemon 已被注销，这里只能走一次管理员授权。
+            _ = runAdminShell("rm -rf '/Library/Application Support/XDial' '/tmp/xdial-engine' '/tmp/xdial.log' '\(socketPath)'")
+        }
     }
+
+    // MARK: - Daemon 探测（阻塞式，只在后台线程调用）
+
+    struct DaemonInfo: Decodable {
+        let version: String
+        let exeSHA256: String
+        let pid: Int
+
+        enum CodingKeys: String, CodingKey {
+            case version, pid
+            case exeSHA256 = "exe_sha256"
+        }
+    }
+
+    /// 询问运行中 daemon 的版本与二进制 hash。独立短连接，不掺和 GoEngine 的主 socket。
+    static func probeDaemonInfo() -> DaemonInfo? {
+        guard let data = roundTrip(cmd: "daemon-info"), let payload = data.data(using: .utf8) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(DaemonInfo.self, from: payload)
+    }
+
+    /// 请求 daemon 原地 re-exec 成 bundle 里的当前二进制。引擎忙时 daemon 会拒绝。
+    static func requestRespawn() -> Bool {
+        roundTrip(cmd: "respawn", expectData: false) != nil
+    }
+
+    /// 发一条命令并等对应响应。daemon 连接后会先推 status 事件，逐行过滤到匹配 id 为止。
+    private static func roundTrip(cmd: String, expectData: Bool = true, timeout: Double = 2) -> String? {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+
+        var tv = timeval(tv_sec: Int(timeout), tv_usec: Int32((timeout - Double(Int(timeout))) * 1_000_000))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            socketPath.withCString { cstr in
+                _ = strncpy(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self), cstr, 104)
+            }
+        }
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let connected = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.connect(fd, sockPtr, len) == 0
+            }
+        }
+        guard connected else { return nil }
+
+        let reqID = "probe-\(UInt64.random(in: 1...UInt64.max))"
+        let request = "{\"id\":\"\(reqID)\",\"cmd\":\"\(cmd)\"}\n"
+        let sent = request.withCString { cstr in
+            write(fd, cstr, strlen(cstr))
+        }
+        guard sent > 0 else { return nil }
+
+        struct ProbeResponse: Decodable {
+            let id: String?
+            let ok: Bool?
+            let data: String?
+        }
+
+        var buffer = Data()
+        let deadline = Date().addingTimeInterval(timeout)
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while Date() < deadline {
+            let n = read(fd, &chunk, chunk.count)
+            guard n > 0 else { return nil }
+            buffer.append(contentsOf: chunk[..<n])
+            while let idx = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let line = buffer[buffer.startIndex..<idx]
+                buffer = Data(buffer[(idx + 1)...])
+                guard let resp = try? JSONDecoder().decode(ProbeResponse.self, from: line),
+                      resp.id == reqID else { continue }
+                guard resp.ok == true else { return nil }
+                return expectData ? resp.data : ""
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Socket
 
     static func canConnectSocket() -> Bool {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -143,25 +201,13 @@ enum PrivilegeManager {
         }
     }
 
-    static func helperSourcePath() -> String {
-        let bundle = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/xdial-daemon").path
-        if FileManager.default.fileExists(atPath: bundle) {
-            return bundle
-        }
-        let dev = Bundle.main.bundleURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("xdial-daemon").path
-        if FileManager.default.fileExists(atPath: dev) {
-            return dev
-        }
-        return "\(NSHomeDirectory())/Codes/Vibe/XDial/build/xdial"
-    }
+    // MARK: - Private
 
     @discardableResult
     private static func runAdminShell(_ shell: String) -> Bool {
         let script = "do shell script \(appleScriptQuote(shell)) with administrator privileges"
         var err: NSDictionary?
-        let result = NSAppleScript(source: script)?.executeAndReturnError(&err)
+        _ = NSAppleScript(source: script)?.executeAndReturnError(&err)
         if let err = err {
             appLog("runAdminShell FAILED: \(err)")
         }

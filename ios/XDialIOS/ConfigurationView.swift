@@ -577,16 +577,15 @@ private struct LineEditorView: View {
             }
         case "tailscale":
             Section {
-                TextField(
-                    app.tr("设备名称（可选）", "Device name (optional)"),
-                    text: tailscaleLineBinding(index, \.tailscaleHostname)
-                )
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                Toggle(
-                    app.tr("接受子网路由", "Accept subnet routes"),
-                    isOn: tailscaleLineBinding(index, \.tailscaleAcceptRoutes)
-                )
+                // 设备名是 Profile 全局的一份，首次登录时自动生成后固定不变。
+                // 仍然展示，否则在 Tailscale 后台对不上是哪台设备。
+                LabeledContent(app.tr("设备名", "Device")) {
+                    Text(app.profile.tailscale.hostname.isEmpty
+                         ? app.tr("登录后自动生成", "Generated on sign-in")
+                         : app.profile.tailscale.hostname)
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(.secondary)
+                }
             } header: {
                 Text("Tailscale")
             } footer: {

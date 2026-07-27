@@ -26,10 +26,9 @@ struct Line: Codable, Identifiable, Hashable {
     var vmessUUID: String = ""
     var vmessAltID: Int = 0
 
-    var tailscaleHostname: String = ""
-    var tailscaleAcceptRoutes: Bool = true
+    // Tailscale 身份（设备名、登录态）是 Profile 全局唯一的一份，见 TailscaleIdentity。
+    // 线路上只留「这条线路走哪个出口」。
     var tailscaleExitNode: String = ""
-    var tailscaleAuthenticated: Bool = false
 
     // 跳过 TLS 证书验证（自签场景显式开启）。默认 false=验证证书。
     var allowInsecure: Bool = false
@@ -52,10 +51,7 @@ struct Line: Codable, Identifiable, Hashable {
         case vmessPort = "vmess_port"
         case vmessUUID = "vmess_uuid"
         case vmessAltID = "vmess_alt_id"
-        case tailscaleHostname = "tailscale_hostname"
-        case tailscaleAcceptRoutes = "tailscale_accept_routes"
         case tailscaleExitNode = "tailscale_exit_node"
-        case tailscaleAuthenticated = "tailscale_authenticated"
     }
 
     init(id: String, name: String, type: String, enabled: Bool = true, verified: Bool = false,
@@ -63,18 +59,14 @@ struct Line: Codable, Identifiable, Hashable {
          trojanServer: String = "", trojanPort: Int = 443, trojanPassword: String = "", trojanSNI: String = "",
          ssServer: String = "", ssPort: Int = 8388, ssMethod: String = "aes-256-gcm", ssPassword: String = "",
          vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0,
-         tailscaleHostname: String = "", tailscaleAcceptRoutes: Bool = true, tailscaleExitNode: String = "",
-         tailscaleAuthenticated: Bool = false,
+         tailscaleExitNode: String = "",
          allowInsecure: Bool = false) {
         self.id = id; self.name = name; self.type = type; self.enabled = enabled; self.verified = verified
         self.vpnServer = vpnServer; self.vpnUsername = vpnUsername; self.vpnPassword = vpnPassword
         self.trojanServer = trojanServer; self.trojanPort = trojanPort; self.trojanPassword = trojanPassword; self.trojanSNI = trojanSNI
         self.ssServer = ssServer; self.ssPort = ssPort; self.ssMethod = ssMethod; self.ssPassword = ssPassword
         self.vmessServer = vmessServer; self.vmessPort = vmessPort; self.vmessUUID = vmessUUID; self.vmessAltID = vmessAltID
-        self.tailscaleHostname = tailscaleHostname
-        self.tailscaleAcceptRoutes = tailscaleAcceptRoutes
         self.tailscaleExitNode = tailscaleExitNode
-        self.tailscaleAuthenticated = tailscaleAuthenticated
         self.allowInsecure = allowInsecure
     }
 
@@ -100,13 +92,7 @@ struct Line: Codable, Identifiable, Hashable {
         vmessPort = try c.decodeIfPresent(Int.self, forKey: .vmessPort) ?? 443
         vmessUUID = try c.decodeIfPresent(String.self, forKey: .vmessUUID) ?? ""
         vmessAltID = try c.decodeIfPresent(Int.self, forKey: .vmessAltID) ?? 0
-        tailscaleHostname = try c.decodeIfPresent(String.self, forKey: .tailscaleHostname) ?? ""
-        tailscaleAcceptRoutes = try c.decodeIfPresent(Bool.self, forKey: .tailscaleAcceptRoutes) ?? true
         tailscaleExitNode = try c.decodeIfPresent(String.self, forKey: .tailscaleExitNode) ?? ""
-        tailscaleAuthenticated = try c.decodeIfPresent(
-            Bool.self,
-            forKey: .tailscaleAuthenticated
-        ) ?? false
         allowInsecure = try c.decodeIfPresent(Bool.self, forKey: .allowInsecure) ?? false
     }
 }
@@ -309,12 +295,31 @@ struct Mode: Codable, Identifiable, Hashable {
     }
 }
 
+/// 本机在 tailnet 中的身份，整个 Profile 全局唯一一份。
+///
+/// 一个 tsnet 实例就是 tailnet 里的一台设备，两个实例不能共用同一份 state，
+/// 所以身份必须是全局的：所有 Tailscale 线路共享同一次登录，退出一次全部失效。
+struct TailscaleIdentity: Codable, Hashable {
+    /// 注册到 tailnet 的设备名，首次登录时自动生成后固定不变，用户不可编辑。
+    var hostname: String = ""
+
+    init(hostname: String = "") {
+        self.hostname = hostname
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        hostname = try c.decodeIfPresent(String.self, forKey: .hostname) ?? ""
+    }
+}
+
 struct Profile: Codable {
     var lines: [Line] = []
     var ruleSets: [RuleSet] = []
     var modes: [Mode] = []
     var subscriptions: [Subscription] = []
     var activeModeID: String = ""
+    var tailscale = TailscaleIdentity()
 
     enum CodingKeys: String, CodingKey {
         case lines = "lines"
@@ -322,6 +327,7 @@ struct Profile: Codable {
         case modes = "modes"
         case subscriptions
         case activeModeID = "active_mode_id"
+        case tailscale
     }
 
     init() {}
@@ -333,6 +339,7 @@ struct Profile: Codable {
         modes = try c.decodeIfPresent([Mode].self, forKey: .modes) ?? []
         subscriptions = try c.decodeIfPresent([Subscription].self, forKey: .subscriptions) ?? []
         activeModeID = try c.decodeIfPresent(String.self, forKey: .activeModeID) ?? ""
+        tailscale = try c.decodeIfPresent(TailscaleIdentity.self, forKey: .tailscale) ?? TailscaleIdentity()
     }
 }
 

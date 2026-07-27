@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -13,6 +16,53 @@ import (
 	"github.com/kafeifei/xdial/core/engine"
 	"github.com/kafeifei/xdial/core/subscription"
 )
+
+// daemonExeHash 是本进程二进制在启动时刻的内容 hash。必须启动时算一次缓存住：
+// SMAppService 模式下 daemon 从 app bundle 运行，重编后 bundle 里的文件已是新
+// 内容，运行中的老进程若现读 os.Executable() 会拿到新文件的 hash，
+// 「运行中的版本 == bundle 里的版本」永远为真，自愈更新就死了。
+var daemonExeHash = "unknown"
+
+func initDaemonExeHash() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	f, err := os.Open(exe)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return
+	}
+	daemonExeHash = fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// shortDaemonExeHash 取日志用的短 hash。initDaemonExeHash 任一步失败时
+// daemonExeHash 仍是 "unknown"（7 字节），直接切前 16 位会 panic 在启动路径上。
+func shortDaemonExeHash() string {
+	const shortLen = 16
+	if len(daemonExeHash) < shortLen {
+		return daemonExeHash
+	}
+	return daemonExeHash[:shortLen]
+}
+
+// respawnDaemon 用 bundle 里当前的二进制原地 re-exec。Go 的 net fd 全部
+// O_CLOEXEC，exec 后旧 listener/连接自动关闭，新进程重建 socket；pid 不变，
+// launchd 全程无感，不吃 ThrottleInterval。失败则退出交给 KeepAlive 兜底。
+func respawnDaemon() {
+	exe, err := os.Executable()
+	if err == nil {
+		slog.Info("respawning", "exe", exe)
+		if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
+			slog.Error("re-exec failed, exiting for launchd restart", "err", err)
+		}
+	}
+	os.Exit(0)
+}
 
 type daemonCallback struct {
 	clients *ClientSet
@@ -32,11 +82,13 @@ func (d *daemonCallback) OnAuthRequired(authURL string) {
 	d.clients.BroadcastEvent(Event{Event: "tailscale-auth-required", Data: authURL})
 }
 
-func (d *daemonCallback) OnTailscaleExitNodes(lineID string, nodes []engine.TailscaleExitNode) {
+// OnTailscaleStatus 广播的结构与 tailscale-exit-nodes 响应完全一致，
+// 客户端只需一套解析。
+func (d *daemonCallback) OnTailscaleStatus(lineID string, status engine.TailscaleStatus) {
 	data, _ := json.Marshal(struct {
-		LineID string                     `json:"line_id"`
-		Nodes  []engine.TailscaleExitNode `json:"nodes"`
-	}{LineID: lineID, Nodes: nodes})
+		LineID string `json:"line_id"`
+		engine.TailscaleStatus
+	}{LineID: lineID, TailscaleStatus: status})
 	d.clients.BroadcastEvent(Event{Event: "tailscale-exit-nodes", Data: string(data)})
 }
 
@@ -46,7 +98,7 @@ func runDaemon(socketPath string) {
 		os.Exit(0)
 	}
 
-	killOrphanSingBox()
+	initDaemonExeHash()
 
 	basePath := filepath.Join(os.TempDir(), "xdial-engine")
 	os.MkdirAll(basePath, 0700) // 内含明文节点密码的 sing-box.json，收紧目录权限
@@ -59,6 +111,27 @@ func runDaemon(socketPath string) {
 	clients := NewClientSet()
 	cb := &daemonCallback{clients: clients}
 	eng := engine.New(basePath, statePath, cb)
+	// daemon 是唯一有资格接管系统 DNS 的宿主：它由 launchd KeepAlive 托管，被
+	// SIGKILL 后会被拉起并立刻跑下面的 RestoreLeftoverDNS 自愈。
+	eng.AllowSystemDNSTakeover(true)
+
+	// 上次没恢复干净的系统 DNS 会让整机解析停在死 tun 上。必须在开始 accept 之前
+	// 自愈：这条路径就是 launchd KeepAlive 把被 SIGKILL 的 daemon 拉起来后的补救。
+	//
+	// 也必须排在 killOrphanSingBox 之前：残留场景下那个孤儿 sing-box 还在真正服务
+	// DNS（系统 DNS 指着它的 tun），先杀再恢复中间就是一整段谁都答不了查询的断网
+	// 窗口。反向没有依赖倒置：恢复只发 networksetup / dscacheutil，纯本地 IPC，不
+	// 依赖解析、不依赖数据面、也不依赖 socket 已监听。
+	eng.RestoreLeftoverDNS()
+
+	// 启动自愈只跑一次，救不回来的软失败条目（服务还在、只是当前被禁用）会一直留在状态
+	// 文件里。daemon 由 launchd KeepAlive 托管，可能几星期都不重启一次，中间用户把那块
+	// 网卡重新启用的话，它就带着一个指向已消失 tun 的 DNS 上线，而没有任何路径去救它。
+	// 周期自愈补的就是这一段：没有残留文件时一个 tick 只花一次 stat，零成本。
+	// 退出时由 eng.Close() 收摊。
+	eng.StartDNSSelfHeal()
+
+	killOrphanSingBox()
 
 	os.Remove(socketPath)
 	ln, err := net.Listen("unix", socketPath)
@@ -72,7 +145,7 @@ func runDaemon(socketPath string) {
 	// 用户"的时序问题，而 peerAllowed 在连接发生时（已登录）才判断，天然避开该竞态。
 	os.Chmod(socketPath, 0666)
 
-	slog.Info("daemon started", "socket", socketPath, "pid", os.Getpid())
+	slog.Info("daemon started", "socket", socketPath, "pid", os.Getpid(), "exe_sha256", shortDaemonExeHash())
 
 	go func() {
 		for {
@@ -94,7 +167,16 @@ func runDaemon(socketPath string) {
 	<-sig
 
 	slog.Info("shutting down")
+	// Stop 内部会先恢复系统 DNS 再停数据面，关机路径的 DNS 工作量到此封顶在一份预算
+	// （15 秒）之内。故意不再补一次 RestoreLeftoverDNS：launchd 从 SIGTERM 到 SIGKILL
+	// 只给 20 秒宽限，再叠一份预算最坏会被 SIGKILL 打断在半路——那比不做更糟（有可能
+	// 停在"一半服务已恢复、另一半刚被改动"的中间态）。恢复只成功一部分的场景交给启动
+	// 自愈：状态文件还在（restoreLocked 会把已恢复的条目剔掉、只留没救回来的），
+	// launchd KeepAlive 把 daemon 拉起来后第一件事就是 RestoreLeftoverDNS。
 	eng.Stop()
+	// 后台恢复重试到这里没有意义了：要么已经恢复成功，要么状态文件还在、下次启动
+	// 的 RestoreLeftoverDNS 会接着救。
+	eng.Close()
 	ln.Close()
 	os.Remove(socketPath)
 }
@@ -151,7 +233,7 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: "Tailscale 线路不存在"})
 				continue
 			}
-			if err := eng.StartTailscaleAuth(line); err != nil {
+			if err := eng.StartTailscaleAuth(profile.Tailscale, line); err != nil {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
 			} else {
 				client.SendResponse(Response{ID: req.ID, OK: true})
@@ -168,15 +250,22 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: "Tailscale 线路不存在"})
 				continue
 			}
-			nodes, err := eng.TailscaleExitNodes(line)
+			status, err := eng.TailscaleStatus(profile.Tailscale, line)
 			if err != nil {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
 			} else {
 				data, _ := json.Marshal(struct {
-					LineID string                     `json:"line_id"`
-					Nodes  []engine.TailscaleExitNode `json:"nodes"`
-				}{LineID: line.ID, Nodes: nodes})
+					LineID string `json:"line_id"`
+					engine.TailscaleStatus
+				}{LineID: line.ID, TailscaleStatus: status})
 				client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
+			}
+
+		case "tailscale-logout":
+			if err := eng.LogoutTailscale(); err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+			} else {
+				client.SendResponse(Response{ID: req.ID, OK: true})
 			}
 
 		case "kill-session":
@@ -185,6 +274,28 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 
 		case "status":
 			client.SendResponse(Response{ID: req.ID, OK: true, Data: eng.Status()})
+
+		case "daemon-info":
+			data, _ := json.Marshal(struct {
+				Version   string `json:"version"`
+				ExeSHA256 string `json:"exe_sha256"`
+				PID       int    `json:"pid"`
+			}{Version: version, ExeSHA256: daemonExeHash, PID: os.Getpid()})
+			client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
+
+		case "respawn":
+			// 仅在引擎空闲时允许：re-exec 后 killOrphanSingBox 会扫掉数据面，
+			// 连接中 respawn 等于静默断流。app 侧本就只在断开时发，这里兜底。
+			var st struct {
+				Status string `json:"status"`
+			}
+			if json.Unmarshal([]byte(eng.Status()), &st) == nil && st.Status != "disconnected" {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: "engine busy: " + st.Status})
+				continue
+			}
+			client.SendResponse(Response{ID: req.ID, OK: true})
+			slog.Info("respawn requested")
+			respawnDaemon()
 
 		case "parse-sub":
 			result, err := subscription.Parse(req.SubURL, req.SubContent, req.SubFormat)

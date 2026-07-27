@@ -111,9 +111,15 @@ struct MainPopover: View {
     private var actionRow: some View {
         HStack(spacing: 8) {
             if !state.helperInstalled {
-                Button("一键配置") { state.installHelper(thenConnect: true) }
-                    .keyboardShortcut(.defaultAction)
-                    .controlSize(.small)
+                if state.helperNeedsApproval {
+                    Button("去系统设置批准") { state.setupHelper(thenConnect: true) }
+                        .keyboardShortcut(.defaultAction)
+                        .controlSize(.small)
+                } else {
+                    Button("一键配置") { state.setupHelper(thenConnect: true) }
+                        .keyboardShortcut(.defaultAction)
+                        .controlSize(.small)
+                }
             } else {
                 switch state.engine.status {
                 case "connecting":
@@ -157,7 +163,7 @@ struct MainPopover: View {
                 if state.helperInstalled {
                     Button("卸载 helper 配置") {
                         try? PrivilegeManager.uninstall()
-                        state.helperInstalled = false
+                        state.checkHelper()
                     }
                 }
                 Divider()

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- SMAppService daemon：随 app bundle 分发、从 bundle 内直接运行。
+	     系统设置里批准一次后，重编/升级由 launchd 自动使用 bundle 里的新二进制，
+	     永远不再需要管理员授权（对照旧方案：每次更新都要密码重装到
+	     /Library/PrivilegedHelperTools）。 -->
+	<key>Label</key>
+	<string>com.kafeifei.xdial.helper</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/xdial-daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>xdial-daemon</string>
+		<string>daemon</string>
+		<string>--socket</string>
+		<string>/tmp/xdial.sock</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.kafeifei.xdial</string>
+	</array>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/tmp/xdial.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/xdial.log</string>
+</dict>
+</plist>
