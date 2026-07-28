@@ -115,13 +115,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         label: "com.kafeifei.xdial.tunnel.network-settings-callback"
     )
 
-    /// sing-box 的 direct/DNS 出站必须始终知道真实 Wi-Fi/蜂窝出口。
-    /// 不能把 utun 自身或 nil 当默认接口，否则会出现“系统显示已连接但没有网络”。
+    /// sing-box 的 direct/DNS 出站必须使用 NWPath 给出的完整 Underlay。
+    /// 下层 VPN 会以 utun/ipsec/ppp 出现，不能按接口名前缀删除；Go 平台层只排除
+    /// 当前 XDial 会话通过 RegisterMyInterface 明确登记的 packet tunnel。
     private var pathMonitor: NWPathMonitor?
     private var diagnosticStage = "idle"
     private var activeAttemptID = ""
-    private var physicalInterfaceName = ""
-    private var physicalInterfaceIndex = -1
+    private var defaultInterfaceName = ""
+    private var defaultInterfaceIndex = -1
     private var diagnosticSensitiveValues: [String] = []
     private let diagnosticLock = NSLock()
     private let diagnosticWriteQueue = DispatchQueue(label: "com.kafeifei.xdial.tunnel.diagnostics")
@@ -203,14 +204,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
             return
         }
 
-        // 3) 在默认路由切进 utun 之前先取得真实物理出口，并持续监听 Wi-Fi/蜂窝切换。
+        // 3) 在默认路由切进当前 utun 之前先取得已有 Underlay，并持续监听系统路径变化。
         //    sing-box 官方 Apple 客户端也用 NWPathMonitor 驱动平台接口监控。
         do {
             try startDefaultInterfaceMonitor(generation: generation)
-            recordDiagnostic("physical_interface_ready")
+            recordDiagnostic("underlay_interface_ready")
         } catch {
-            failAttempt(generation, error: error, diagnosticStage: "physical_interface_failed")
-            os_log("startTunnel: physical interface unavailable",
+            failAttempt(generation, error: error, diagnosticStage: "underlay_interface_failed")
+            os_log("startTunnel: Underlay interface unavailable",
                    log: log, type: .error)
             return
         }
@@ -1055,8 +1056,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
 
     // MARK: - NE 网络设置
 
-    /// 启动真实物理接口监控并同步等待首个结果。首个接口必须在 Libbox.Start 前
-    /// 设置，否则 route.auto_detect_interface 没有可用出口，不能把这种状态算连接成功。
+    /// 启动 Underlay 接口监控并同步等待首个结果。默认接口和完整候选列表必须在
+    /// Libbox.Start 前发布，否则 route.auto_detect_interface 没有可用出口。
     private func startDefaultInterfaceMonitor(generation: UInt64) throws {
         let monitor = NWPathMonitor()
         let ready = DispatchSemaphore(value: 0)
@@ -1075,47 +1076,78 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         monitor.start(queue: queue)
 
         guard ready.wait(timeout: .now() + 5) == .success else {
-            throw providerError(5, "等待物理网络接口超时")
+            throw providerError(5, "等待 Underlay 网络接口超时")
         }
         guard isAttemptStarting(generation) else {
             throw providerError(7, "连接启动已取消")
         }
         guard monitor.currentPath.status == .satisfied,
-              selectPhysicalInterface(from: monitor.currentPath) != nil else {
-            throw providerError(5, "没有可用的物理网络接口")
+              selectDefaultInterface(from: monitor.currentPath) != nil else {
+            throw providerError(5, "没有可用的 Underlay 网络接口")
         }
+    }
+
+    private struct PathInterfaceSnapshot: Codable {
+        let name: String
+        let index: Int
+        let type: String
     }
 
     private func updateDefaultInterface(_ path: NWPath, generation: UInt64) {
         guard let engine = engine(for: generation) else { return }
-        guard path.status == .satisfied, let interface = selectPhysicalInterface(from: path) else {
-            setPhysicalInterface(name: "", index: -1)
+        guard path.status == .satisfied, let interface = selectDefaultInterface(from: path) else {
+            setDefaultInterfaceDiagnostic(name: "", index: -1)
+            try? engine.setNetworkInterfaces("[]")
             engine.setDefaultInterface("", index: -1)
             refreshDiagnostic()
-            os_log("physical interface unavailable", log: log, type: .error)
+            os_log("Underlay interface unavailable", log: log, type: .error)
             return
         }
-        setPhysicalInterface(name: interface.name, index: interface.index)
+
+        var seenInterfaceNames = Set<String>()
+        let snapshots: [PathInterfaceSnapshot] = path.availableInterfaces.compactMap {
+            candidate -> PathInterfaceSnapshot? in
+            guard seenInterfaceNames.insert(candidate.name).inserted else { return nil }
+            return PathInterfaceSnapshot(
+                name: candidate.name,
+                index: candidate.index,
+                type: networkTypeName(candidate.type)
+            )
+        }
+        do {
+            let data = try JSONEncoder().encode(snapshots)
+            guard let json = String(data: data, encoding: .utf8) else {
+                throw providerError(5, "无法编码 Underlay 接口快照")
+            }
+            try engine.setNetworkInterfaces(json)
+        } catch {
+            setLastError("发布 Underlay 接口失败：\(error.localizedDescription)")
+            os_log("publish Underlay interfaces failed: %{public}@",
+                   log: log, type: .error, error.localizedDescription)
+        }
+
+        setDefaultInterfaceDiagnostic(name: interface.name, index: interface.index)
         engine.setDefaultInterface(interface.name, index: interface.index)
         refreshDiagnostic()
-        os_log("physical interface: %{public}@ (%d)", log: log, type: .info,
+        os_log("default Underlay interface: %{public}@ (%d)", log: log, type: .info,
                interface.name, interface.index)
     }
 
-    private func selectPhysicalInterface(from path: NWPath) -> NWInterface? {
-        let preferredTypes: [NWInterface.InterfaceType] = [.wifi, .cellular, .wiredEthernet]
-        for type in preferredTypes where path.usesInterfaceType(type) {
-            if let interface = path.availableInterfaces.first(where: {
-                $0.type == type && !isTunnelInterface($0.name)
-            }) {
-                return interface
-            }
-        }
-        return path.availableInterfaces.first(where: { !isTunnelInterface($0.name) })
+    private func selectDefaultInterface(from path: NWPath) -> NWInterface? {
+        path.availableInterfaces.first
     }
 
-    private func isTunnelInterface(_ name: String) -> Bool {
-        name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("ppp")
+    private func networkTypeName(_ type: NWInterface.InterfaceType) -> String {
+        switch type {
+        case .wifi:
+            return "wifi"
+        case .cellular:
+            return "cellular"
+        case .wiredEthernet:
+            return "ethernet"
+        default:
+            return "other"
+        }
     }
 
     /// 构造 NEPacketTunnelNetworkSettings。
@@ -1128,7 +1160,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.254.0.0"]) // /15
         // 默认路由:全部流量进隧道,由 sing-box 的 route 规则再做分流。
         ipv4.includedRoutes = [NEIPv4Route.default()]
-        // 控制连接必须始终走物理出口，不能被刚安装的默认路由套回自身。
+        // 控制连接必须始终走已有 Underlay，不能被刚安装的默认路由套回自身。
         ipv4.excludedRoutes = [
             NEIPv4Route(destinationAddress: remoteAddress, subnetMask: "255.255.255.255"),
         ]
@@ -1174,8 +1206,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     private struct DiagnosticState {
         let stage: String
         let attemptID: String
-        let physicalInterfaceName: String
-        let physicalInterfaceIndex: Int
+        let defaultInterfaceName: String
+        let defaultInterfaceIndex: Int
         let lastError: String?
     }
 
@@ -1184,8 +1216,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         activeAttemptID = attemptID
         lastError = nil
         diagnosticStage = "idle"
-        physicalInterfaceName = ""
-        physicalInterfaceIndex = -1
+        defaultInterfaceName = ""
+        defaultInterfaceIndex = -1
         diagnosticSensitiveValues = []
         diagnosticLock.unlock()
     }
@@ -1204,10 +1236,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         return value
     }
 
-    private func setPhysicalInterface(name: String, index: Int) {
+    private func setDefaultInterfaceDiagnostic(name: String, index: Int) {
         diagnosticLock.lock()
-        physicalInterfaceName = name
-        physicalInterfaceIndex = index
+        defaultInterfaceName = name
+        defaultInterfaceIndex = index
         diagnosticLock.unlock()
     }
 
@@ -1219,8 +1251,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         let state = DiagnosticState(
             stage: diagnosticStage,
             attemptID: activeAttemptID,
-            physicalInterfaceName: physicalInterfaceName,
-            physicalInterfaceIndex: physicalInterfaceIndex,
+            defaultInterfaceName: defaultInterfaceName,
+            defaultInterfaceIndex: defaultInterfaceIndex,
             lastError: lastError
         )
         diagnosticLock.unlock()
@@ -1232,7 +1264,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
             let state = captureDiagnosticState(updatingStage: stage)
             persistDiagnostic(makeDiagnosticSnapshot(from: state, includeEngine: false))
             os_log("diagnostic stage=%{public}@ interface=%{public}@",
-                   log: log, type: .info, state.stage, state.physicalInterfaceName)
+                   log: log, type: .info, state.stage, state.defaultInterfaceName)
         }
     }
 
@@ -1265,8 +1297,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         var snapshot: [String: Any] = [
             "stage": state.stage,
             "timestamp": Date().timeIntervalSince1970,
-            "physical_interface_name": state.physicalInterfaceName,
-            "physical_interface_index": state.physicalInterfaceIndex,
+            "default_interface_name": state.defaultInterfaceName,
+            "default_interface_index": state.defaultInterfaceIndex,
+            // 旧 App 仍读取这两个键；完成桌面迁移并提升诊断 schema 后删除。
+            "physical_interface_name": state.defaultInterfaceName,
+            "physical_interface_index": state.defaultInterfaceIndex,
         ]
         if !state.attemptID.isEmpty {
             snapshot["attempt_id"] = state.attemptID

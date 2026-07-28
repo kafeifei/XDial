@@ -9,7 +9,7 @@ struct MainPopover: View {
             header
             Divider()
             modeRow
-            if !state.profile.subscriptions.isEmpty && state.isConnected {
+            if !state.activeSubscriptions.isEmpty && state.isConnected {
                 subscriptionSummary
             }
             if state.configDirty {
@@ -86,7 +86,7 @@ struct MainPopover: View {
 
     private var subscriptionSummary: some View {
         VStack(alignment: .leading, spacing: 4) {
-            ForEach(state.profile.subscriptions.filter { $0.enabled }) { sub in
+            ForEach(state.activeSubscriptions) { sub in
                 HStack(spacing: 6) {
                     Text("📡").font(.caption2)
                     Text(sub.name)
@@ -137,13 +137,17 @@ struct MainPopover: View {
         HStack(spacing: 8) {
             if !state.helperInstalled {
                 if state.helperNeedsApproval {
-                    Button("去系统设置批准") { state.setupHelper(thenConnect: true) }
-                        .keyboardShortcut(.defaultAction)
-                        .controlSize(.small)
+                    Button(state.tr("去系统设置批准", "Approve in System Settings")) {
+                        state.setupHelper(thenConnect: true)
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .controlSize(.small)
                 } else {
-                    Button("一键配置") { state.setupHelper(thenConnect: true) }
-                        .keyboardShortcut(.defaultAction)
-                        .controlSize(.small)
+                    Button(state.tr("一键配置", "Set Up")) {
+                        state.setupHelper(thenConnect: true)
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .controlSize(.small)
                 }
             } else {
                 switch state.engine.status {
@@ -186,9 +190,12 @@ struct MainPopover: View {
 
             Menu {
                 if state.helperInstalled {
-                    Button("卸载 helper 配置") {
-                        try? PrivilegeManager.uninstall()
-                        state.checkHelper()
+                    Button(state.tr("卸载后台服务", "Remove Background Service")) {
+                        state.uninstall(deleteData: false) { _, error in
+                            if let error {
+                                state.engine.lastError = error
+                            }
+                        }
                     }
                 }
                 Divider()

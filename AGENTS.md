@@ -1,96 +1,105 @@
 # XDial
 
-macOS menu bar app（SwiftUI + Go），管理 VPN/代理分流。数据面 sing-box，VPN 走 AnyConnect 协议（vendored sslcon）。本文件是所有 AI 编码工具（Claude Code / Codex / Cursor）的共同事实源。
+XDial 是 macOS 菜单栏网络工具：SwiftUI 提供控制面，sing-box 提供数据面，AnyConnect
+协议由 vendored sslcon 适配。
 
-## 构建
+本文件是 Agent 的**最短执行入口**，不是仓库索引。目录、类型、函数、构建实现等能从
+源码、测试或 `Makefile` 直接得到的事实，不在这里重复维护；先用 `rg` 定位，以当前代码
+为准。
 
-```bash
-make app        # debug 构建（含 DebugServer）→ build/XDial.app
-make release    # release 构建（无 DebugServer、注入版本号）→ build/release/XDial.app，分发一律用它
-make cli        # 仅 Go CLI → build/xdial
-make restart    # 一键：杀旧实例 + make app + 启动 + 等 debug server 上线（改 UI 后验证用这个）
-make inspector  # 独立 AX 检查器 → build/xdial-inspector
-```
+## 开始工作前
 
-## 测试
+1. 动代码前完整阅读 [ARCHITECTURE.md](ARCHITECTURE.md)，尤其是三条定律、相关 ADR、
+   第 7 节禁止事项和第 9 节自检清单。
+2. 再读改动涉及的实现和测试。不要仅凭文档猜测当前代码行为。
+3. 如果实现与架构规范冲突，先判断是实现越界还是规范需要改变。未经用户明确同意，不得
+   改写架构约束来迁就实现。
 
-```bash
-make test                 # Go 全量（含 libbox gVisor 数据面集成测试，-tags with_gvisor）
-make test-smoke           # sing-box 配置生成冒烟测试
-python3 test/e2e_test.py  # 端到端验收：Tier A 协议层 + Tier B 真实路径（需 helper daemon 在运行；--tier a 可单跑协议层，对一次性 daemon 也可用）
-```
+架构的最短摘要：
 
-## UI 调试 (Debug Server)
+- **控制面与数据面分离**：XDial 表达、编译和托管；sing-box 接管、解析、裁决和转发。
+- **外部密封律**：XDial 对系统只增加一个网络叠加层，DNS、路由和分流不散落到盒外。
+- **内部正交律**：Ingress / Line / RuleSet / Mode 相互正交，Mode 是唯一连接点。
+  声明不等于生效；未被 active Mode 引用的对象不得影响本机流量。
+- **自然叠加**：启动前的网线、Wi-Fi、企业 VPN、Tailscale 等共同组成不透明 Underlay。
+  XDial 不识别产品、不重排接口，只把系统已有裁决交给 sing-box。
 
-debug build 自动在 `127.0.0.1:19876` 启动 HTTP 调试服务器（只绑回环，release 构建不包含）。**任何涉及 UI 的改动，必须用这个服务器验证，不要靠猜。**
+`core/config/invariants_test.go` 是架构约束的可执行门禁。测试变红时应修正实现；不得放宽、
+跳过、删除或给断言加特例。若确实要改变架构，先与用户对齐并更新
+`ARCHITECTURE.md`，再调整测试。
 
-### 读取状态
+## 验证边界
 
-```bash
-# 完整应用状态：engine/profile/network/windows（密码与订阅 URL 已脱敏为 ***）
-curl 127.0.0.1:19876/state
-
-# UI 元素树：每个元素的 role/title/value/enabled/坐标
-curl "127.0.0.1:19876/ax?depth=8"
-```
-
-### 操作 UI
+具体 target 及构建细节以 `Makefile` 为准。常用闭环：
 
 ```bash
-# 点击按钮（按 title/description/value 匹配）
-curl -X POST 127.0.0.1:19876/action -d '{"action":"ax-press","title":"连接"}'
-
-# 修改文本框
-curl -X POST 127.0.0.1:19876/action -d '{"action":"ax-set-value","title":"字段当前值","value":"新值"}'
-
-# 切换设置 tab（当前命名：📡 线路 / 📋 规则 / 🔀 模式 / 通用）
-curl -X POST 127.0.0.1:19876/action -d '{"action":"ax-press","title":"📋 规则"}'
-
-# 应用级操作
-curl -X POST 127.0.0.1:19876/action -d '{"action":"connect"}'
-curl -X POST 127.0.0.1:19876/action -d '{"action":"disconnect"}'
-curl -X POST 127.0.0.1:19876/action -d '{"action":"select-mode","id":"mode-id"}'
+make test
+make test-smoke
+make restart
+python3 test/e2e_test.py
 ```
 
-### 调试流程
+- UI 改动必须执行 `make restart`，再通过 Debug Server 操作和读取真实 UI 状态。
+- 网络改动必须核对真实 helper、接口、路由、DNS 和流量出口。编译成功、配置可生成或
+  `sing-box check` 通过，都不等于真实链路已工作。
+- 分发产物只能使用 `make release` 生成的 `build/release/XDial.app`；Debug 构建包含
+  本地调试接口，不得分发。
 
-1. `make restart` —— 重编 + 重启 + 等 debug server 上线，一条命令完成
-2. 用 `/state` 和 `/ax` 验证改动效果
-3. 用 `ax-press` / `ax-set-value` 模拟用户操作，验证交互逻辑
+## Debug Server
 
-### 注意
+Debug 构建只在 `127.0.0.1:19876` 提供 HTTP 接口，release 构建完全排除。统一使用
+`127.0.0.1`，不要依赖 `localhost` 的 IPv6 解析。
 
-- 服务器只在 debug build 存在（`#if DEBUG`），release build 自动排除
-- 用 `127.0.0.1:19876`（`localhost` 偶尔因 IPv6 解析失败；服务器只绑 IPv4 回环）
-- 只接受 POST /action（无 GET 别名）；Host 头必须是本机回环
-- popover 需要先点菜单栏图标才能在 AX 树中可见
-- 设置窗口需要先点齿轮按钮（`ax-press` title `gearshape`）才能打开
+```bash
+# 存活与进程
+curl -sS 127.0.0.1:19876/health
 
-## 项目结构
+# engine/profile/network/windows；敏感字段已脱敏
+curl -sS 127.0.0.1:19876/state
 
-- `macos/Sources/XDial/` — Swift 源码（SwiftUI app）
-- `cmd/xdial/` — Go CLI + daemon（特权进程以 `xdial daemon` 运行）
-- `core/` — 共享 Go 逻辑（config 生成 / engine / libbox）
-- `third_party/sslcon/` — vendored sslcon（MIT，AnyConnect 协议，含本地补丁；独立 go module）
-- `appletv/` — tvOS app（xcodegen 工程，`make appletv`）
-- `test/` — 端到端测试
-- `tools/inspector.swift` — 独立 AX 检查器（后备，需 Accessibility 权限）
+# 当前 UI 元素树
+curl -sS "127.0.0.1:19876/ax?depth=8"
 
-## 约定
+# 连接、断开、重连
+curl -sS -X POST 127.0.0.1:19876/action \
+  -d '{"action":"connect"}'
+curl -sS -X POST 127.0.0.1:19876/action \
+  -d '{"action":"disconnect"}'
+curl -sS -X POST 127.0.0.1:19876/action \
+  -d '{"action":"reconnect"}'
 
-- 概念命名：线路 Line / 规则 RuleSet / 模式 Mode（旧 JSON key 有兼容层，见 core/config/compat.go）
-- Go 代码提交前必须 `gofmt`（CI 有门禁）；vendored `third_party/` 不改不动
-- 回复用户用中文，代码标识符保持英文
+# 打开设置、选择模式
+curl -sS -X POST 127.0.0.1:19876/action \
+  -d '{"action":"open-settings"}'
+curl -sS -X POST 127.0.0.1:19876/action \
+  -d '{"action":"select-mode","id":"mode-id"}'
 
-## 架构约束规范（动代码前必读）
+# 按 /ax 返回的 title 操作 UI
+curl -sS -X POST 127.0.0.1:19876/action \
+  -d '{"action":"ax-press","title":"连接"}'
+curl -sS -X POST 127.0.0.1:19876/action \
+  -d '{"action":"ax-set-value","title":"字段当前值","value":"新值"}'
+```
 
-本仓库有两条**不可违反**的定律，它们不是风格偏好，是硬约束：
+Popover 只有在菜单栏图标被点开后才会出现在 AX 树中；设置窗口优先用
+`open-settings` 打开。helper 的安装状态、版本和进程信息也通过 `/state` 或
+`POST /action` 的 `check-helper`、`daemon-info` 检查，避免凭进程名猜测。
 
-1. **外部密封律** —— XDial 对系统只呈现一个 VPN，DNS/路由/分流全部盒内处理，不溢出到系统层。
-2. **内部正交律** —— Ingress / Line / RuleSet / Mode 四个维度互不知道对方存在，**Mode 是唯一的裁决者和连接点**。声明 ≠ 生效：未被 active Mode 引用的对象，绝不能对本机流量决策产生任何影响。
+## 仓库特有纪律
 
-完整规范见 **[ARCHITECTURE.md](ARCHITECTURE.md)** —— 含职责边界表、供给源模型（D28）、DNS 因果链、铁律、ADR 决策记录、禁止事项清单。**动任何代码前先读完，尤其是第 7 节（禁止事项）和第 9 节（自检清单）。**
+- 概念命名固定为线路 Line / 规则 RuleSet / 模式 Mode。
+- 不修改 `third_party/`。需要上游变更时使用本地补丁并留痕。
+- Go 代码提交前执行 `gofmt`。
+- 回复用户用中文，代码标识符保持英文。
+- 使用精确工程术语：分域解析、域名归因、解析视角与出口视角一致、非权威或被篡改的
+  应答、受限解析环境。不要使用含义不明确的社区俗语。
 
-CI 有一组**不变量测试**（`core/config/invariants_test.go`，INV1/INV1c/INV2/INV3/INV4/INV4b/INV6a/INV6b/INV7/INVD30）把这两条定律编码成了可执行断言。**越界的改动会让它们变红。**
+## 文档放什么
 
-这些测试红了的时候，唯一正确的反应是**改你的代码**。绝对不允许：放宽断言、给断言加特例分支、跳过/删除测试、或用任何方式绕过。**如果你确信自己的改动是对的、需要修改架构约束本身——停下来，先和用户讨论并更新 ARCHITECTURE.md，然后才动测试。** 未经用户明确同意就修改不变量测试，等同于破坏这个项目。
+- `ARCHITECTURE.md` 记录无法安全地从代码反推的内容：边界、理念、因果关系、失败语义、
+  真实事故证据、架构决策及被否决方案。
+- `AGENTS.md` 记录 Agent 必须提前知道的操作入口：阅读顺序、硬约束、验收边界和
+  Debug 接口。
+- 局部实现中容易误改的原因写在代码旁，注释解释“为什么”，不复述“做了什么”。
+- 不在文档维护目录树、类型/字段/函数清单、完整命令清单或临时任务进度；这些内容会
+  漂移，应从源码、测试、`Makefile` 和实时状态获取。

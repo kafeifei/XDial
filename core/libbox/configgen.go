@@ -36,6 +36,10 @@ type neRuleSetFetcher func(string, int64) ([]byte, error)
 // .containerURL(forSecurityApplicationGroupIdentifier:) 拿到的路径),用于拼
 // cache_file 的绝对路径,必须是扩展进程可写的目录。
 func GenerateNEConfig(profileJSON string, vpnServerIP string, basePath string) (string, error) {
+	return generateNEConfig(profileJSON, vpnServerIP, basePath, config.PlatformNE)
+}
+
+func generateNEConfig(profileJSON string, vpnServerIP string, basePath string, platform config.Platform) (string, error) {
 	profile, err := config.ParseProfile([]byte(profileJSON))
 	if err != nil {
 		return "", err
@@ -48,8 +52,8 @@ func GenerateNEConfig(profileJSON string, vpnServerIP string, basePath string) (
 		return "", err
 	}
 	// socksPort 在 NE 模式下不生效(vpn 出口固定用自研 type:"vpn",见
-	// generator.go 里 platform == PlatformNE 的分支),这里固定传 0。
-	data, err := config.GenerateSingBoxFor(profile, 0, vpnServerIP, config.PlatformNE, basePath)
+	// generator.go 里的 NetworkExtension 分支),这里固定传 0。
+	data, err := config.GenerateSingBoxFor(profile, 0, vpnServerIP, platform, basePath)
 	if err != nil {
 		return "", err
 	}

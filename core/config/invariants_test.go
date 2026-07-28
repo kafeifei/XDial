@@ -30,6 +30,7 @@ const (
 	invSocksPort   = 11080
 	invVPNServerIP = "203.0.113.9"
 	invBasePath    = "/tmp/xdial-invariants"
+	invUnderlay    = "utun-underlay"
 )
 
 // invEnterpriseDNS 模拟 AnyConnect 隧道建立后服务端下发的企业 DNS。
@@ -67,9 +68,7 @@ func invBaseProfile() *Profile {
 	}
 }
 
-// invTailscaleLine 返回一条 enabled 的 Tailscale 线路。
-// 注意：不设置 auth_key —— 该字段（Line.TailscaleAuthKey）由并行修复流新增，
-// 本文件刻意不引用，以免在字段落地前造成编译错误。
+// invTailscaleLine 模拟旧桌面 Profile 中残留的内置 Tailscale 线路。
 func invTailscaleLine() Line {
 	return Line{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true}
 }
@@ -128,7 +127,7 @@ func invStreamRuleSet() RuleSet {
 // invGenerateDesktop 生成桌面配置并解析成 map；生成失败即 Fatal。
 func invGenerateDesktop(t *testing.T, profile *Profile) map[string]interface{} {
 	t.Helper()
-	data, err := GenerateSingBoxDesktop(profile, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS)
+	data, err := GenerateSingBoxDesktop(profile, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS, invUnderlay)
 	if err != nil {
 		t.Fatalf("GenerateSingBoxDesktop 失败: %v", err)
 	}
@@ -344,15 +343,6 @@ func invActiveSubscriptions(profile *Profile) []*Subscription {
 	return out
 }
 
-func invHasEnabledTailscaleLine(profile *Profile) bool {
-	for _, line := range profile.Lines {
-		if line.Enabled && line.Type == LineTypeTailscale {
-			return true
-		}
-	}
-	return false
-}
-
 // ===========================================================================
 // INV1 —— 内部正交律：未被 active Mode 引用的对象不得影响本机流量决策
 // ===========================================================================
@@ -378,6 +368,12 @@ func TestINV1_UnreferencedObjectsDoNotAffectGeneratedConfig(t *testing.T) {
 			name: "加入未被引用的 enabled trojan 线路",
 			mutate: func(p *Profile) {
 				p.Lines = append(p.Lines, invUnusedTrojanLine())
+			},
+		},
+		{
+			name: "加入未被引用的旧 Tailscale 线路",
+			mutate: func(p *Profile) {
+				p.Lines = append(p.Lines, invTailscaleLine())
 			},
 		},
 		{
@@ -416,84 +412,29 @@ func TestINV1_UnreferencedObjectsDoNotAffectGeneratedConfig(t *testing.T) {
 	}
 }
 
-// INV1c —— Tailscale 的已知例外必须被收窄到“仅 endpoint 条目”。
+// INV1c —— 桌面 Tailscale 不再享有任何例外。
 //
-// 背景：generator.go 里 Tailscale endpoint 只要 line.Enabled 就生成（注释理由是
-// MagicDNS 就绪）。这是对 INV1 的一个例外。本测试把这个例外锁死在最小范围：
-// 未被 active Mode 引用的 Tailscale 线路，除了 endpoints 数组多一条以外，
-// **不得**在 route.rules / route.final / dns 里留下任何痕迹，也不得被任何
-// outbound（含桌面诊断用 test-out selector）引用。
-//
-// 什么改动会让它变红：任何让 Tailscale “只要 enabled 就参与裁决”的改动
-// （tailnet CIDR 路由、tailscale-dns 分域、把它塞进 selector 成员）。
-func TestINV1c_UnreferencedTailscaleLineOnlyAddsEndpoint(t *testing.T) {
+// 官方 Tailscale 客户端只能作为 XDial 启动前已经存在的 Underlay。旧 profile
+// 里残留但未被 Mode 引用的 Tailscale Line 必须和不存在逐字节等价。
+func TestINV1c_DesktopTailscaleHasNoException(t *testing.T) {
 	baseline := invGenerateDesktop(t, invBaseProfile())
+	invNormalize(baseline)
 
 	profile := invBaseProfile()
 	profile.Lines = append(profile.Lines, invTailscaleLine())
-	profile.Tailscale = TailscaleIdentity{Hostname: "xdial-invariant-test"}
 	got := invGenerateDesktop(t, profile)
+	invNormalize(got)
+	if !reflect.DeepEqual(baseline, got) {
+		t.Fatalf("旧 Tailscale 线路在桌面生成物中留下痕迹\n--- 基准 ---\n%s\n--- 实际 ---\n%s",
+			invPretty(baseline), invPretty(got))
+	}
 
-	endpointTag := "tailscale-ts"
-
-	t.Run("endpoint 条目本身允许出现", func(t *testing.T) {
-		found := false
-		for _, endpoint := range invObjectArray(got["endpoints"]) {
-			if endpoint["tag"] == endpointTag {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("期望 endpoints 里有 %q（已知例外：MagicDNS 就绪）", endpointTag)
-		}
-	})
-
-	t.Run("route.rules 不得出现引用它的条目", func(t *testing.T) {
-		if !reflect.DeepEqual(invRouteRules(t, baseline), invRouteRules(t, got)) {
-			t.Fatalf("未被引用的 Tailscale 线路改变了 route.rules\n--- 基准 ---\n%s\n--- 实际 ---\n%s",
-				invPretty(invRouteRules(t, baseline)), invPretty(invRouteRules(t, got)))
-		}
-	})
-
-	t.Run("route.final 不得改变", func(t *testing.T) {
-		baseFinal := baseline["route"].(map[string]interface{})["final"]
-		gotFinal := got["route"].(map[string]interface{})["final"]
-		if baseFinal != gotFinal {
-			t.Fatalf("route.final 被改写: %v → %v", baseFinal, gotFinal)
-		}
-	})
-
-	t.Run("dns 不得出现指向它的 server 或规则", func(t *testing.T) {
-		var offendingServerTags []string
-		for _, server := range invDNSServers(t, got) {
-			if server["endpoint"] == endpointTag || server["detour"] == endpointTag {
-				tag, _ := server["tag"].(string)
-				offendingServerTags = append(offendingServerTags, tag)
-			}
-		}
-		if len(offendingServerTags) > 0 {
-			t.Errorf("dns.servers 出现指向未被引用 Tailscale 线路的条目: %v", offendingServerTags)
-		}
-		for _, rule := range invDNSRules(got) {
-			server, _ := rule["server"].(string)
-			for _, offending := range offendingServerTags {
-				if server == offending {
-					t.Errorf("dns.rules 出现指向未被引用 Tailscale 线路的规则: %s", invPretty(rule))
-				}
-			}
-		}
-	})
-
-	t.Run("outbound 不得引用它", func(t *testing.T) {
-		for _, outbound := range invObjectArray(got["outbounds"]) {
-			for _, member := range invStrings(outbound["outbounds"]) {
-				if member == endpointTag {
-					t.Fatalf("outbound %v 把未被引用的 Tailscale 线路收作成员: %s",
-						outbound["tag"], invPretty(outbound))
-				}
-			}
-		}
-	})
+	active := invBaseProfile()
+	active.Lines = append(active.Lines, invTailscaleLine())
+	active.Modes[0].DefaultLineID = "ts"
+	if _, err := GenerateSingBoxDesktop(active, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS, invUnderlay); err == nil {
+		t.Fatal("active 的旧 Tailscale 线路应在桌面生成阶段被明确拒绝")
+	}
 }
 
 // ===========================================================================
@@ -504,8 +445,8 @@ func TestINV1c_UnreferencedTailscaleLineOnlyAddsEndpoint(t *testing.T) {
 // 每一个 dns.servers 条目要么属于显式的全局默认白名单（系统解析器 / 公共 fallback /
 // bootstrap），要么必须能追溯到 active Mode 引用的某条 Line。
 //
-// 什么改动会让它变红：给某条“存在但没被引用”的线路生成解析器（Tailscale 是当前的
-// 已知违规点）、或者硬编码一个新的公共 DNS 而不进白名单。
+// 什么改动会让它变红：给某条“存在但没被引用”的线路生成解析器，或者硬编码
+// 一个新的公共 DNS 而不进白名单。
 func TestINV2_EveryDNSServerTracesToAnActiveLine(t *testing.T) {
 	// 全局默认白名单：这三类不属于任何 Line，是盒子自身的基础设施。
 	//   system     —— type:local，仅作诊断对照，不当默认（见 generator.go 注释）
@@ -524,26 +465,10 @@ func TestINV2_EveryDNSServerTracesToAnActiveLine(t *testing.T) {
 			profile: invBaseProfile,
 		},
 		{
-			name: "Tailscale 线路被 active Mode 显式绑定",
-			profile: func() *Profile {
-				p := invBaseProfile()
-				p.Lines = append(p.Lines, invTailscaleLine())
-				p.Tailscale = TailscaleIdentity{Hostname: "xdial-invariant-test"}
-				p.RuleSets = append(p.RuleSets, RuleSet{
-					ID: "tsnet", Name: "tailnet", Type: RuleSetTypeManual, Enabled: true,
-					Domains: []string{"ts.example"},
-				})
-				p.Modes[0].Bindings = append(p.Modes[0].Bindings,
-					RuleBinding{RuleSetID: "tsnet", LineID: "ts"})
-				return p
-			},
-		},
-		{
 			name: "Tailscale 线路 enabled 但未被引用",
 			profile: func() *Profile {
 				p := invBaseProfile()
 				p.Lines = append(p.Lines, invTailscaleLine())
-				p.Tailscale = TailscaleIdentity{Hostname: "xdial-invariant-test"}
 				return p
 			},
 		},
@@ -566,12 +491,6 @@ func TestINV2_EveryDNSServerTracesToAnActiveLine(t *testing.T) {
 			cfg := invGenerateDesktop(t, profile)
 
 			activeTags := invActiveOutboundTags(profile)
-			tailscaleReferenced := false
-			for tag := range activeTags {
-				if strings.HasPrefix(tag, "tailscale-") {
-					tailscaleReferenced = true
-				}
-			}
 			// 企业 DNS 的归属：active Mode 里存在“手动规则集 → enabled AnyConnect 线路”的绑定。
 			enterpriseOwned := len(collectVPNBoundDomains(profile, profile.ActiveMode())) > 0
 
@@ -584,10 +503,6 @@ func TestINV2_EveryDNSServerTracesToAnActiveLine(t *testing.T) {
 				case tag == desktopEnterpriseDNSTag:
 					if !enterpriseOwned {
 						t.Errorf("无主 DNS server %q：active Mode 没有任何绑定到 AnyConnect 线路的手动规则集", tag)
-					}
-				case tag == "tailscale-dns":
-					if !tailscaleReferenced {
-						t.Errorf("无主 DNS server %q：active Mode 没有引用任何 Tailscale 线路", tag)
 					}
 				case strings.HasPrefix(tag, "proxy-dns-"):
 					detour := strings.TrimPrefix(tag, "proxy-dns-")
@@ -609,8 +524,8 @@ func TestINV2_EveryDNSServerTracesToAnActiveLine(t *testing.T) {
 // ===========================================================================
 //
 // 守护：架构约束「外部密封律」。桌面配置必须自己劫持并应答 DNS；一旦把原始 DNS 包
-// 以 route→direct 的形式放出盒外，系统 DNS 指向 100.100.100.100（官方 Tailscale
-// 接管）时就是黑洞，接管路由的瞬间整机断网（2026-07-26 实测）。
+// 以 route→direct 的形式放出盒外，启动前 Underlay 使用的 resolver 可能只在下层
+// 虚拟网络内可达，接管路由的瞬间就会形成解析黑洞。
 //
 // 什么改动会让它变红：把 hijack-dns 换成 route/direct、或新增一条“DNS 协议直出”的
 // 例外规则（无论理由是“兼容企业 DNS”还是“调试方便”）。
@@ -620,21 +535,6 @@ func TestINV3_DesktopSealsDNSInsideTheBox(t *testing.T) {
 		profile func() *Profile
 	}{
 		{"基准 profile", invBaseProfile},
-		{
-			name: "带 Tailscale 线路",
-			profile: func() *Profile {
-				p := invBaseProfile()
-				p.Lines = append(p.Lines, invTailscaleLine())
-				p.Tailscale = TailscaleIdentity{Hostname: "xdial-invariant-test"}
-				p.RuleSets = append(p.RuleSets, RuleSet{
-					ID: "tsnet", Name: "tailnet", Type: RuleSetTypeManual, Enabled: true,
-					Domains: []string{"ts.example"},
-				})
-				p.Modes[0].Bindings = append(p.Modes[0].Bindings,
-					RuleBinding{RuleSetID: "tsnet", LineID: "ts"})
-				return p
-			},
-		},
 		{
 			name: "带订阅",
 			profile: func() *Profile {
@@ -692,10 +592,8 @@ func TestINV3_DesktopSealsDNSInsideTheBox(t *testing.T) {
 // 什么改动会让它变红：生成器为了“更好用”偷偷加一条规则（广告拦截、私有网段直连、
 // 某个域名特判……）。白名单是唯一合法出口，加白名单必须是一次显式的、要过 review 的改动。
 
-// invRuleContext 给白名单判定提供“这份 profile 允不允许出现某类系统规则”的上下文。
-type invRuleContext struct {
-	hasTailscaleLine bool
-}
+// invRuleContext 保留为白名单判定上下文；桌面当前没有带条件的系统例外。
+type invRuleContext struct{}
 
 // invSystemRuleWhitelist 系统规则白名单（逐条注明为何是系统规则）。
 //
@@ -730,23 +628,6 @@ var invSystemRuleWhitelist = []struct {
 		match: func(rule map[string]interface{}, _ invRuleContext) bool {
 			return rule["outbound"] == testSelectorTag &&
 				invSameStringSet(invStrings(rule["domain_suffix"]), testDomains)
-		},
-	},
-	{
-		// Tailscale Line 的“自带路由”：tailnet 内部网段（CGNAT + IPv6 ULA）。
-		// 按 D28 它最终应当以一等公民身份进入 Mode 裁决（可见 / 可禁用 / 可排序），
-		// 在那之前它作为白名单条目存在，且**必须**有一条 enabled 的 Tailscale 线路
-		// 才允许出现——否则就是凭空注入。
-		reason: "Tailscale 自带 tailnet 路由（D28 供给源，待升级为一等公民规则）",
-		match: func(rule map[string]interface{}, ctx invRuleContext) bool {
-			if !ctx.hasTailscaleLine {
-				return false
-			}
-			outbound, _ := rule["outbound"].(string)
-			return rule["action"] == "route" &&
-				strings.HasPrefix(outbound, "tailscale-") &&
-				invSameStringSet(invStrings(rule["ip_cidr"]),
-					[]string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"})
 		},
 	},
 }
@@ -878,21 +759,6 @@ func TestINV4_NoHiddenRouteRules(t *testing.T) {
 			},
 		},
 		{
-			name: "带被引用的 Tailscale 线路",
-			profile: func() *Profile {
-				p := invBaseProfile()
-				p.Lines = append(p.Lines, invTailscaleLine())
-				p.Tailscale = TailscaleIdentity{Hostname: "xdial-invariant-test"}
-				p.RuleSets = append(p.RuleSets, RuleSet{
-					ID: "tsnet", Name: "tailnet", Type: RuleSetTypeManual, Enabled: true,
-					Domains: []string{"ts.example"},
-				})
-				p.Modes[0].Bindings = append(p.Modes[0].Bindings,
-					RuleBinding{RuleSetID: "tsnet", LineID: "ts"})
-				return p
-			},
-		},
-		{
 			name: "connectivity acceptance 规则集（必须走 binding 追溯，不吃白名单）",
 			profile: func() *Profile {
 				p := invBaseProfile()
@@ -915,7 +781,7 @@ func TestINV4_NoHiddenRouteRules(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			profile := testCase.profile()
 			cfg := invGenerateDesktop(t, profile)
-			ctx := invRuleContext{hasTailscaleLine: invHasEnabledTailscaleLine(profile)}
+			ctx := invRuleContext{}
 
 			for index, rule := range invRouteRules(t, cfg) {
 				if invClassifyRouteRule(profile, rule, ctx) == "" {
@@ -942,7 +808,7 @@ func TestINV4b_ModeBindingRulesPrecedeSubscriptionSuppliedRules(t *testing.T) {
 		RuleBinding{RuleSetID: "stream", SubscriptionID: "sub1"})
 
 	cfg := invGenerateDesktop(t, profile)
-	ctx := invRuleContext{hasTailscaleLine: invHasEnabledTailscaleLine(profile)}
+	ctx := invRuleContext{}
 
 	lastModeIndex, firstSubscriptionIndex := -1, -1
 	rules := invRouteRules(t, cfg)
@@ -1019,7 +885,7 @@ func TestINV6a_DanglingReferencesAreRejected(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			profile := invBaseProfile()
 			testCase.mutate(profile)
-			data, err := GenerateSingBoxDesktop(profile, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS)
+			data, err := GenerateSingBoxDesktop(profile, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS, invUnderlay)
 			if err == nil {
 				t.Fatalf("悬空引用被静默吞掉，期望返回错误。生成结果:\n%s", string(data))
 			}
@@ -1050,7 +916,7 @@ func TestINV6b_DisabledReferencesWarnButDoNotFail(t *testing.T) {
 		}
 	}
 
-	data, err := GenerateSingBoxDesktop(profile, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS)
+	data, err := GenerateSingBoxDesktop(profile, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS, invUnderlay)
 	if err != nil {
 		t.Fatalf("显式禁用不应导致生成失败: %v", err)
 	}
@@ -1107,7 +973,7 @@ func TestINVD30_DesktopRejectsMultipleActiveAnyConnectLines(t *testing.T) {
 	profile.Modes[0].Bindings = append(profile.Modes[0].Bindings,
 		RuleBinding{RuleSetID: "intranet2", LineID: "corp2"})
 
-	data, err := GenerateSingBoxDesktop(profile, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS)
+	data, err := GenerateSingBoxDesktop(profile, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS, invUnderlay)
 	if err == nil {
 		t.Fatalf("两条 active AnyConnect 线路应当被硬校验拒绝（D30）。生成结果:\n%s", string(data))
 	}
@@ -1123,11 +989,7 @@ func TestINVD30_DesktopRejectsMultipleActiveAnyConnectLines(t *testing.T) {
 // 强行要求二者对任意域名一致，等于要求 DNS 阶段就知道解析结果，逻辑上自相矛盾。
 // 因此收窄为：**只对基于域名的绑定**要求双向一致。
 //
-// 另外两个显式豁免：
-//   - direct 线路不声明解析器（它本就要本地视角），不产生 dns 分支；
-//   - tailscale-dns 用 ip_accept_any（地址类查询命中才算数）做全局分支，而不是
-//     按域名绑定展开——tailnet 名字是运行期从控制面拿的，静态配置里没有域名列表。
-//     它没有域名匹配键，因此不算“域名分支”，不参与本测试的反向追溯。
+// 唯一显式豁免：direct 线路不声明解析器（它本就要本地视角），不产生 dns 分支。
 //
 // 什么改动会让它变红：给路由加了域名绑定却忘了同步 dns.rules（分流看似生效，
 // 实际用本地解析结果去连隧道那头），或者反过来在 dns.rules 里塞了没有路由对应的域名分支。
@@ -1167,8 +1029,6 @@ func TestINV7_DomainBindingsAndDNSRulesAgree(t *testing.T) {
 		switch {
 		case lineTag == "direct":
 			continue // 直连不声明解析器，本地视角
-		case line.Type == LineTypeTailscale:
-			continue // 见上文豁免说明
 		case lineTag == "vpn" && ruleSet.Type == RuleSetTypeManual:
 			if len(ruleSet.Domains) == 0 {
 				continue
@@ -1241,5 +1101,55 @@ func TestINV7_DomainBindingsAndDNSRulesAgree(t *testing.T) {
 		if !traced {
 			t.Errorf("dns.rules[%d] 是一条追溯不到任何域名绑定的域名分支：\n%s", index, invPretty(rule))
 		}
+	}
+}
+
+// ===========================================================================
+// INV-UNDERLAY —— XDial 不识别、不选择、不重排启动前网络
+// ===========================================================================
+//
+// Underlay 可能已经包含网线、Wi-Fi 和任意数量的外部 VPN。桌面生成器只能把
+// 宿主从系统默认路由取得的快照逐字交给 sing-box，不能自行猜接口；也不能回落
+// 到会跳过 macOS 无网关 utun 的 auto_detect_interface。
+func TestINVUnderlay_DesktopForwardsSystemSnapshot(t *testing.T) {
+	cfg := invGenerateDesktop(t, invBaseProfile())
+	route, ok := cfg["route"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("route 结构无效：%s", invPretty(cfg["route"]))
+	}
+	if got := route["default_interface"]; got != invUnderlay {
+		t.Fatalf("桌面必须逐字转交系统 Underlay 快照：got=%v want=%q\n%s",
+			got, invUnderlay, invPretty(route))
+	}
+	if _, exists := route["auto_detect_interface"]; exists {
+		t.Fatalf("桌面不得回落到会跳过无网关 utun 的 auto_detect_interface：%s", invPretty(route))
+	}
+
+	outbounds, ok := cfg["outbounds"].([]interface{})
+	if !ok {
+		t.Fatalf("outbounds 结构无效：%s", invPretty(cfg["outbounds"]))
+	}
+	for _, raw := range outbounds {
+		outbound, ok := raw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("outbound 结构无效：%s", invPretty(raw))
+		}
+		if _, exists := outbound["bind_interface"]; exists {
+			t.Fatalf("XDial 不得把 outbound 绑定到产品或物理接口：%s", invPretty(outbound))
+		}
+	}
+}
+
+func TestINVUnderlay_DesktopRejectsMissingSystemSnapshot(t *testing.T) {
+	_, err := GenerateSingBoxDesktop(
+		invBaseProfile(),
+		invSocksPort,
+		invVPNServerIP,
+		invBasePath,
+		invEnterpriseDNS,
+		"",
+	)
+	if err == nil || !strings.Contains(err.Error(), "underlay interface snapshot") {
+		t.Fatalf("空 Underlay 快照必须 fail-closed，got=%v", err)
 	}
 }

@@ -20,9 +20,16 @@ final class DebugServer {
         }
         listener = l
         l.newConnectionHandler = { [weak self] c in self?.accept(c) }
-        l.stateUpdateHandler = { [port] st in
-            if case .ready = st {
+        l.stateUpdateHandler = { [port] state in
+            switch state {
+            case .ready:
                 DispatchQueue.main.async { appLog("DebugServer: ready on localhost:\(port)") }
+            case .failed(let error):
+                DispatchQueue.main.async {
+                    appLog("DebugServer: listener failed on 127.0.0.1:\(port): \(error)")
+                }
+            default:
+                break
             }
         }
         l.start(queue: .global(qos: .utility))
@@ -123,6 +130,7 @@ final class DebugServer {
         dict["helperSMStatus"] = PrivilegeManager.status.rawValue
         dict["helperLegacyInstalled"] = PrivilegeManager.legacyInstalled
         dict["daemonBundledSHA256"] = PrivilegeManager.bundledDaemonSHA256() ?? ""
+        dict["dataPlane"] = "native-sing-box-tun"
         dict["canConnect"] = s.canConnect
         dict["statusText"] = s.statusText
         dict["language"] = s.language.rawValue
@@ -159,7 +167,6 @@ final class DebugServer {
     // 密码/凭据字段一律打码；订阅 url 内嵌 token，同样按凭据处理
     private static let secretKeys: Set<String> = [
         "vpn_password", "trojan_password", "ss_password", "vmess_uuid",
-        "tailscale_auth_key",
     ]
 
     private static func redactSecrets(_ value: Any) -> Any {
@@ -342,8 +349,11 @@ final class DebugServer {
                 return ok(["ok": true, "smStatus": PrivilegeManager.status.rawValue])
             } catch {
                 state.checkHelper()
-                return ok(["ok": false, "error": error.localizedDescription,
-                           "smStatus": PrivilegeManager.status.rawValue])
+                return ok([
+                    "ok": false,
+                    "error": error.localizedDescription,
+                    "smStatus": PrivilegeManager.status.rawValue,
+                ])
             }
         case "sm-unregister":
             do {
@@ -352,8 +362,11 @@ final class DebugServer {
                 return ok(["ok": true, "smStatus": PrivilegeManager.status.rawValue])
             } catch {
                 state.checkHelper()
-                return ok(["ok": false, "error": error.localizedDescription,
-                           "smStatus": PrivilegeManager.status.rawValue])
+                return ok([
+                    "ok": false,
+                    "error": error.localizedDescription,
+                    "smStatus": PrivilegeManager.status.rawValue,
+                ])
             }
         case "check-helper":
             state.checkHelper()
@@ -376,7 +389,8 @@ final class DebugServer {
         default:
             return ("400 Bad Request", json(["error": "unknown action: \(action)",
                 "available": ["connect", "disconnect", "reconnect", "select-mode", "open-settings",
-                              "ax-press", "ax-set-value", "setup-helper", "check-helper", "daemon-info"]]))
+                              "ax-press", "ax-set-value", "setup-helper", "check-helper",
+                              "sm-register", "sm-unregister", "daemon-info"]]))
         }
     }
 
@@ -427,6 +441,8 @@ final class DebugServer {
             let texts = [
                 str(el, kAXTitleAttribute),
                 str(el, kAXDescriptionAttribute),
+                str(el, kAXRoleDescriptionAttribute),
+                str(el, kAXSubroleAttribute),
                 str(el, "AXIdentifier"),
                 str(el, kAXHelpAttribute),
                 str(el, kAXValueAttribute),

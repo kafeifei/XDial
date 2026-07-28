@@ -43,7 +43,7 @@ func NewSingBoxProcess(basePath, statePath string, onExit func(error)) *SingBoxP
 	}
 }
 
-func (s *SingBoxProcess) Start(profile *config.Profile, socksAddr, vpnServerIP string, enterpriseDNS []string) error {
+func (s *SingBoxProcess) Start(profile *config.Profile, socksAddr, vpnServerIP string, enterpriseDNS []string, underlayInterface string) error {
 	var port int
 	if socksAddr != "" {
 		_, portStr, ok := strings.Cut(socksAddr, ":")
@@ -59,7 +59,14 @@ func (s *SingBoxProcess) Start(profile *config.Profile, socksAddr, vpnServerIP s
 		return fmt.Errorf("active AnyConnect line requires a SOCKS address")
 	}
 
-	cfgData, err := config.GenerateSingBoxDesktop(profile, port, vpnServerIP, s.statePath, enterpriseDNS)
+	cfgData, err := config.GenerateSingBoxDesktop(
+		profile,
+		port,
+		vpnServerIP,
+		s.statePath,
+		enterpriseDNS,
+		underlayInterface,
+	)
 	if err != nil {
 		return fmt.Errorf("generate config: %w", err)
 	}

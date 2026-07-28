@@ -7,7 +7,6 @@ import (
 	"log"
 	"log/slog"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -217,31 +216,6 @@ func (e *Engine) Start(profile *config.Profile) error {
 	return nil
 }
 
-// ResetTailscaleState 清除本机 tailnet 身份（state 目录），下次连接时用当前
-// auth key 重新注册为一台新设备。
-//
-// D29 之后 Tailscale 是纯参数线路：auth key 只是 Line 上的一个字段，引擎不再
-// 持有任何 tsnet 会话，也就无从向控制面发注销请求。这里只做本地清除——换 auth
-// key / 换 tailnet 时必须有这一步，否则 sing-box 会直接复用已登录的旧 state，
-// 新填的 key 根本不会生效。控制面里那条旧设备记录需要用户自己在后台删。
-//
-// 身份是全局单份的，所以清除会让所有 Tailscale 线路一并重新注册。
-//
-// 要求先断开：state 目录正被运行中的 sing-box 打开，边跑边删是在拆自己脚下的
-// 地板。这不是 Line 溢出到状态机，而是"别删正在用的文件"。
-func (e *Engine) ResetTailscaleState() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if e.status != StatusDisconnected {
-		return fmt.Errorf("请先断开 XDial，再清除 Tailscale 本机状态")
-	}
-	if err := os.RemoveAll(config.TailscaleStateDirectory(e.statePath)); err != nil {
-		return fmt.Errorf("清除 Tailscale 本机状态: %w", err)
-	}
-	return nil
-}
-
 func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 	if err := e.connectInternal(ctx, profile); err != nil {
 		// ctx 被取消 = 用户主动断开，Stop 已把状态置为 Disconnected，不再报错
@@ -323,8 +297,8 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 	}
 
 	// 远程规则集必须在 sing-box 之前落成本地文件：首次下载失败会让 router 在
-	// 启动阶段直接 FATAL，而它自己能用的下载出口覆盖不到 Tailscale / vpn / direct
-	// 这几类绑定（详见 prepareRuleSets）。
+	// 启动阶段直接 FATAL，而 vpn / direct 这几类绑定需要在它启动前完成下载
+	// （详见 prepareRuleSets）。
 	prefetchCtx, cancelPrefetch := context.WithTimeout(ctx, ruleSetPrepareBudget)
 	prepared, ruleSetProblems := prepareRuleSets(
 		prefetchCtx,
@@ -346,8 +320,18 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 		}
 	}
 
+	// 只转交操作系统在 XDial TUN 启动前已经选定的默认接口。不能等 sing-box
+	// auto_route 落地后再查，也不能让 sing-tun 的 darwin auto_detect_interface
+	// 代查：后者会跳过无网关 utun，破坏 Tailscale 等既有网络层。
+	underlayInterface, err := detectUnderlayInterface(ctx)
+	if err != nil {
+		releasePartial()
+		return fmt.Errorf("Underlay 接口不可用: %w", err)
+	}
+	slog.Info("captured system Underlay", "interface", underlayInterface)
+
 	singbox := NewSingBoxProcess(e.basePath, e.statePath, e.handleSingBoxExit)
-	if err := singbox.Start(prepared, socksAddr, vpnServerIP, enterpriseDNS); err != nil {
+	if err := singbox.Start(prepared, socksAddr, vpnServerIP, enterpriseDNS, underlayInterface); err != nil {
 		releasePartial()
 		return fmt.Errorf("sing-box 启动失败: %w", err)
 	}

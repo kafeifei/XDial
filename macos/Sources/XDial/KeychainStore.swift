@@ -56,6 +56,29 @@ enum KeychainStore {
         return [:]
     }
 
+    /// 把 macOS Packet Tunnel 试验版容器里的凭据合并回普通桌面用户目录。
+    /// 合并而不是替换：保留旧桌面版本已有的订阅凭据；同名条目以较新的容器
+    /// 快照为准。全程不记录 key、value 或正文。
+    static func importSandboxVaultIfNeeded() {
+        let marker = "xdial.migratedFromSandboxVaultV1"
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: marker) else { return }
+
+        let source = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "Library/Containers/com.kafeifei.xdial/Data/.xdial/vault.json"
+            )
+        guard let data = try? Data(contentsOf: source),
+              let sandboxVault = try? JSONDecoder().decode([String: String].self, from: data)
+        else { return }
+
+        var merged = loadVault()
+        merged.merge(sandboxVault) { _, sandboxValue in sandboxValue }
+        saveVault(merged)
+        defaults.set(true, forKey: marker)
+        appLog("merged Packet Tunnel sandbox vault into desktop helper vault")
+    }
+
     // 卸载"删除所有数据"时调用：彻底移除 ~/.xdial（明文密码所在）并清 Keychain 旧迁移数据
     static func deleteVault() {
         try? FileManager.default.removeItem(at: vaultDir)

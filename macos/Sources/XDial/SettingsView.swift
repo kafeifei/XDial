@@ -108,8 +108,8 @@ struct GeneralTab: View {
                 Text(state.tr("卸载", "Uninstall"))
                     .font(.headline)
                 Text(state.tr(
-                    "停止 helper、删除 LaunchDaemon 和相关文件。",
-                    "Stop helper, remove LaunchDaemon and related files."
+                    "断开 XDial，并移除系统 VPN 配置。",
+                    "Disconnect XDial and remove its system VPN configuration."
                 ))
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -136,7 +136,7 @@ struct GeneralTab: View {
             isPresented: $confirmingUninstall,
             titleVisibility: .visible
         ) {
-            Button(state.tr("仅卸载 helper", "Uninstall helper only")) {
+            Button(state.tr("仅移除系统 VPN 配置", "Remove system VPN configuration only")) {
                 deleteDataOnUninstall = false
                 runUninstall()
             }
@@ -147,8 +147,8 @@ struct GeneralTab: View {
             Button(state.tr("取消", "Cancel"), role: .cancel) {}
         } message: {
             Text(state.tr(
-                "「卸载并删除所有数据」会清除线路、规则、模式，以及钥匙串里的密码和 Tailscale auth key。",
-                "“Uninstall and delete all data” removes lines, rules, modes, and Keychain-stored passwords and Tailscale auth keys."
+                "「卸载并删除所有数据」会清除线路、规则、模式，以及钥匙串里的密码。",
+                "“Uninstall and delete all data” removes lines, rules, modes, and Keychain-stored passwords."
             ))
         }
     }
@@ -197,10 +197,6 @@ struct LinesTab: View {
                     Button("Trojan") { add(type: "trojan") }
                     Button("Shadowsocks") { add(type: "shadowsocks") }
                     Button("VMess") { add(type: "vmess") }
-                    // 一个 tsnet 实例就是 tailnet 里的一台设备，进程内只跑一个，
-                    // 多条 Tailscale 线路只会共用它，没有意义。
-                    Button("Tailscale") { add(type: "tailscale") }
-                        .disabled(state.profile.lines.contains { $0.type == "tailscale" })
                     Divider()
                     Button(state.tr("从订阅导入…", "Import from subscription…")) {
                         showAddSub = true
@@ -225,7 +221,6 @@ struct LinesTab: View {
         case "trojan": name = "Trojan 节点"
         case "shadowsocks": name = "SS 节点"
         case "vmess": name = "VMess 节点"
-        case "tailscale": name = "Tailscale"
         default: name = "节点"
         }
         state.profile.lines.append(Line(id: id, name: name, type: type))
@@ -289,7 +284,7 @@ struct LineRow: View {
                 }
             }
         )
-        .opacity(isLocked ? 0.6 : (line.verified || line.type == "tailscale" ? 1.0 : 0.7))
+        .opacity(isLocked ? 0.6 : (line.verified ? 1.0 : 0.7))
     }
 
     private var briefInfo: String {
@@ -314,14 +309,6 @@ struct LineRow: View {
         case "vmess":
             guard !line.vmessServer.isEmpty else { return "" }
             return "\(line.vmessServer):\(line.vmessPort)"
-        case "tailscale":
-            if line.tailscaleAuthKey.isEmpty {
-                return state.tr("未填 Auth Key", "No auth key")
-            }
-            if !line.tailscaleExitNode.isEmpty {
-                return "Exit: \(line.tailscaleExitNode)"
-            }
-            return "Tailnet"
         default:
             return ""
         }
@@ -334,7 +321,6 @@ struct LineRow: View {
         case "trojan": return "Trojan"
         case "shadowsocks": return "SS"
         case "vmess": return "VMess"
-        case "tailscale": return "Tailscale"
         default: return line.type
         }
     }
@@ -363,8 +349,6 @@ struct LineRow: View {
             intField("端口", $line.vmessPort)
             secureField("UUID", $line.vmessUUID)
             intField("Alter ID", $line.vmessAltID)
-        case "tailscale":
-            tailscaleDetail
         default:
             EmptyView()
         }
@@ -380,57 +364,6 @@ struct LineRow: View {
                     .font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
-        }
-    }
-
-    // MARK: - Tailscale（D29：纯参数线路，无登录流程）
-    //
-    // 凭据是用户在 Tailscale 后台生成的 auth key，和 VPN 密码一样只是一个参数。
-    // 出口节点直接填 tailnet 内地址：列举出口需要先把 tsnet 跑起来，那是数据面的
-    // 事，配置界面不碰。
-
-    @ViewBuilder
-    private var tailscaleDetail: some View {
-        HStack(spacing: 4) {
-            secureField("Auth Key", $line.tailscaleAuthKey)
-            authKeyHintButton
-        }
-        field("出口节点", $line.tailscaleExitNode, placeholder: "100.64.0.1（留空只通 tailnet）")
-    }
-
-    // 说明文字一律收进信息泡泡，行内只留控件，避免设置界面被小字堆满。
-    @State private var showAuthKeyHint = false
-
-    private var authKeyHintButton: some View {
-        Button {
-            showAuthKeyHint.toggle()
-        } label: {
-            Image(systemName: "info.circle")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .buttonStyle(.plain)
-        .popover(isPresented: $showAuthKeyHint, arrowEdge: .bottom) {
-            VStack(alignment: .leading, spacing: 8) {
-                if let keys = URL(string: "https://login.tailscale.com/admin/settings/keys") {
-                    Link(state.tr("打开 Tailscale 后台生成 ↗", "Open Tailscale admin console ↗"),
-                         destination: keys)
-                        .font(.caption)
-                }
-                Divider()
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(state.tr("Ephemeral 必须关闭 —— 开了节点会被自动清理。",
-                                  "Ephemeral must be OFF — the node gets cleaned up otherwise."))
-                    Text(state.tr("Reusable 不必开 —— 登录状态会持久化，key 只在首次注册用一次。",
-                                  "Reusable is unnecessary — state persists; the key is used once at registration."))
-                    Text(state.tr("Key 过期不影响已注册的节点，只影响重新注册。",
-                                  "Key expiry does not affect a registered node, only re-registration."))
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            }
-            .padding(12)
-            .frame(width: 300, alignment: .leading)
         }
     }
 
@@ -1011,19 +944,23 @@ struct SubscriptionRow: View {
         let subID = sub.id
 
         Task {
-            // 并行测所有节点
             await withTaskGroup(of: (String, Int).self) { group in
                 for line in lines {
                     let name = line.name
                     let tag = "proxy-\(subID)-\(line.id)"
                     group.addTask {
-                        guard let encoded = tag.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-                              let url = URL(string: "\(base)/proxies/\(encoded)/delay?url=\(testURL)&timeout=3000") else {
+                        guard let encoded = tag.addingPercentEncoding(
+                            withAllowedCharacters: .urlPathAllowed
+                        ),
+                        let url = URL(
+                            string: "\(base)/proxies/\(encoded)/delay?url=\(testURL)&timeout=3000"
+                        ) else {
                             return (name, -1)
                         }
                         do {
                             let (data, _) = try await URLSession.shared.data(from: url)
-                            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                            if let json = try? JSONSerialization.jsonObject(with: data)
+                                as? [String: Any],
                                let delay = json["delay"] as? Int {
                                 return (name, delay)
                             }
@@ -1031,8 +968,8 @@ struct SubscriptionRow: View {
                         return (name, -1)
                     }
                 }
-                for await (name, ms) in group {
-                    await MainActor.run { delays[name] = ms }
+                for await (name, milliseconds) in group {
+                    await MainActor.run { delays[name] = milliseconds }
                 }
             }
             await MainActor.run { testing = false }

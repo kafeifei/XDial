@@ -791,7 +791,9 @@ enum TunnelDiagnosticFormatter {
         if let stage = snapshot["stage"] as? String, !stage.isEmpty {
             parts.append("stage=\(stage)")
         }
-        if let name = snapshot["physical_interface_name"] as? String, !name.isEmpty {
+        let defaultInterfaceName = nonEmptyString(snapshot["default_interface_name"])
+            ?? nonEmptyString(snapshot["physical_interface_name"])
+        if let name = defaultInterfaceName {
             parts.append("if=\(name)")
         }
         if let engine = snapshot["engine"] as? [String: Any] {
