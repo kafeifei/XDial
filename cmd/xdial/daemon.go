@@ -208,15 +208,6 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 				client.SendResponse(Response{ID: req.ID, OK: true})
 			}
 
-		// tailscale-reset-state 只清本机 tailnet state 目录（换 auth key / 换
-		// tailnet 时必需），不再有任何登录流程：D29 之后 auth key 是纯参数。
-		case "tailscale-reset-state":
-			if err := eng.ResetTailscaleState(); err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-			} else {
-				client.SendResponse(Response{ID: req.ID, OK: true})
-			}
-
 		case "kill-session":
 			eng.KillSession()
 			client.SendResponse(Response{ID: req.ID, OK: true})

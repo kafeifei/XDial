@@ -4,12 +4,12 @@ package libbox
 
 import (
 	"net/netip"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
@@ -18,18 +18,16 @@ import (
 	"github.com/sagernet/sing/common/x/list"
 )
 
-// platform.go 把 XDial 的进程内 sing-box 接到 tvOS NetworkExtension 的 packetFlow。
+// platform.go 把 XDial 的进程内 sing-box 接到 Apple NetworkExtension 的 packetFlow。
 //
 // sing-box 通过 ctx 里的 adapter.PlatformInterface 决定 TUN inbound 怎么拿到底层
 // 设备:当 UsePlatformInterface() 返回 true 时,它不会自己去 tun.New 打开一个新
 // utun,而是回调 OpenInterface,让平台把 NE 已经建立好的 packetFlow 对应的文件
-// 描述符交给 sing-box。macOS 版是外置进程 + 本地 TUN,不需要这条;tvOS 版扩展进程
-// 内没有权限自己开 utun,只能复用 NE 给的 fd,所以必须实现这个接口。
+// 描述符交给 sing-box。iOS/tvOS/macOS 扩展进程都复用 NE 给的 fd。
 //
-// 除 OpenInterface 外，默认物理接口也必须是真实值。NE 把设备默认路由送进 utun 后，
-// sing-box 的 direct/DNS 出站仍要知道当前 Wi-Fi/蜂窝接口；若这里返回 nil，控制面虽能
-// 启动，数据面却可能没有可用出口。Swift 的 NWPathMonitor 通过 SetDefaultInterface
-// 把接口名/索引喂进来，本文件负责向 sing-box 转发并处理网络切换。
+// 除 OpenInterface 外，默认接口和全部候选接口也必须来自 NWPath。这里不能把
+// utun/ipsec/ppp 一概当成“隧道”删掉：它们可能是 XDial 启动前已经存在的 Underlay。
+// 唯一应排除的是当前会话自己创建、由 RegisterMyInterface 明确登记的接口。
 
 // TunOpener 是"打开 TUN 设备"这一步的可替换缝隙。
 //
@@ -54,14 +52,16 @@ type xdPlatformInterface struct {
 	// opener 是可替换的 TUN 打开器;nil 时用 defaultTunOpener(真实 dup+tun.New)。
 	opener TunOpener
 
-	mu               sync.Mutex
-	networkManager   adapter.NetworkManager
-	defaultInterface *control.Interface
-	monitor          *platformInterfaceMonitor
-	tunInPackets     atomic.Uint64
-	tunInBytes       atomic.Uint64
-	tunOutPackets    atomic.Uint64
-	tunOutBytes      atomic.Uint64
+	mu                sync.Mutex
+	networkManager    adapter.NetworkManager
+	defaultInterface  *control.Interface
+	networkInterfaces []adapter.NetworkInterface
+	ownInterfaceName  string
+	monitor           *platformInterfaceMonitor
+	tunInPackets      atomic.Uint64
+	tunInBytes        atomic.Uint64
+	tunOutPackets     atomic.Uint64
+	tunOutBytes       atomic.Uint64
 }
 
 var _ adapter.PlatformInterface = (*xdPlatformInterface)(nil)
@@ -121,7 +121,7 @@ func (p *xdPlatformInterface) defaultTunOpener(options *tun.Options, _ option.Tu
 	return wrapTunWithDiagnostics(device, p), nil
 }
 
-// UnderNetworkExtension 返回 true:XDial tvOS 引擎始终跑在 NEPacketTunnelProvider 里。
+// UnderNetworkExtension 返回 true:XDial Apple 数据面始终跑在 NEPacketTunnelProvider 里。
 // sing-box 据此把 MTU 默认收敛到 4064 等 NE 友好参数。
 func (p *xdPlatformInterface) UnderNetworkExtension() bool { return true }
 
@@ -157,8 +157,21 @@ func (p *xdPlatformInterface) UsePlatformNetworkInterfaces() bool { return true 
 func (p *xdPlatformInterface) NetworkInterfaces() ([]adapter.NetworkInterface, error) {
 	p.mu.Lock()
 	defaultInterface := cloneInterface(p.defaultInterface)
+	ownInterfaceName := p.ownInterfaceName
+	networkInterfaces := append([]adapter.NetworkInterface(nil), p.networkInterfaces...)
 	p.mu.Unlock()
-	if defaultInterface == nil || isTunnelInterfaceName(defaultInterface.Name) {
+
+	if len(networkInterfaces) > 0 {
+		filtered := networkInterfaces[:0]
+		for _, networkInterface := range networkInterfaces {
+			if networkInterface.Name == ownInterfaceName {
+				continue
+			}
+			filtered = append(filtered, networkInterface)
+		}
+		return filtered, nil
+	}
+	if defaultInterface == nil || defaultInterface.Name == ownInterfaceName {
 		return nil, nil
 	}
 	return []adapter.NetworkInterface{{Interface: *defaultInterface}}, nil
@@ -188,8 +201,8 @@ func (p *xdPlatformInterface) SendNotification(notification *adapter.Notificatio
 
 func (p *xdPlatformInterface) MyInterfaceAddress() []netip.Addr { return nil }
 
-// platformInterfaceMonitor 把 Swift NWPathMonitor 报告的真实 Wi-Fi/蜂窝接口桥接给
-// sing-box。它必须在 Start 时先刷新接口列表，再发布初始接口，否则
+// platformInterfaceMonitor 把 Swift NWPathMonitor 报告的默认 Underlay 接口桥接给
+// sing-box。它必须在 Start 时先刷新全部接口列表，再发布初始接口，否则
 // auto_detect_interface 会看到 "no available network interface"。
 type platformInterfaceMonitor struct {
 	platform    *xdPlatformInterface
@@ -212,7 +225,7 @@ func (m *platformInterfaceMonitor) Start() error {
 		}
 	}
 	if defaultInterface == nil {
-		return E.New("platform: default physical interface not set")
+		return E.New("platform: default interface not set")
 	}
 	m.notify(defaultInterface)
 	return nil
@@ -246,6 +259,7 @@ func (m *platformInterfaceMonitor) RegisterMyInterface(interfaceName string) {
 	m.mu.Lock()
 	m.myInterface = interfaceName
 	m.mu.Unlock()
+	m.platform.setOwnInterface(interfaceName)
 }
 
 func (m *platformInterfaceMonitor) MyInterface() string {
@@ -264,11 +278,15 @@ func (m *platformInterfaceMonitor) notify(defaultInterface *control.Interface) {
 }
 
 func (p *xdPlatformInterface) setDefaultInterface(name string, index int) {
-	var updated *control.Interface
-	if name != "" && index > 0 && !isTunnelInterfaceName(name) {
-		updated = &control.Interface{Name: name, Index: index}
-	}
 	p.mu.Lock()
+	var updated *control.Interface
+	if name != "" && index > 0 {
+		if name == p.ownInterfaceName {
+			updated = p.firstUsableInterfaceLocked()
+		} else {
+			updated = &control.Interface{Name: name, Index: index}
+		}
+	}
 	old := p.defaultInterface
 	if old != nil && updated != nil && old.Name == updated.Name && old.Index == updated.Index {
 		p.mu.Unlock()
@@ -289,11 +307,87 @@ func (p *xdPlatformInterface) setDefaultInterface(name string, index int) {
 	}
 }
 
-func isTunnelInterfaceName(name string) bool {
-	name = strings.ToLower(strings.TrimSpace(name))
-	return strings.HasPrefix(name, "utun") ||
-		strings.HasPrefix(name, "ipsec") ||
-		strings.HasPrefix(name, "ppp")
+type platformNetworkInterfaceSnapshot struct {
+	Name  string `json:"name"`
+	Index int    `json:"index"`
+	Type  string `json:"type"`
+}
+
+func (p *xdPlatformInterface) setNetworkInterfaces(snapshots []platformNetworkInterfaceSnapshot) error {
+	seen := make(map[string]struct{}, len(snapshots))
+	interfaces := make([]adapter.NetworkInterface, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot.Name == "" || snapshot.Index <= 0 {
+			return E.New("platform: invalid network interface snapshot")
+		}
+		if _, exists := seen[snapshot.Name]; exists {
+			return E.New("platform: duplicate network interface: ", snapshot.Name)
+		}
+		seen[snapshot.Name] = struct{}{}
+		interfaceType, loaded := C.StringToInterfaceType[snapshot.Type]
+		if !loaded {
+			return E.New("platform: unsupported network interface type: ", snapshot.Type)
+		}
+		interfaces = append(interfaces, adapter.NetworkInterface{
+			Interface: control.Interface{
+				Name:  snapshot.Name,
+				Index: snapshot.Index,
+			},
+			Type: interfaceType,
+		})
+	}
+
+	p.mu.Lock()
+	p.networkInterfaces = interfaces
+	networkManager := p.networkManager
+	monitor := p.monitor
+	p.mu.Unlock()
+	if networkManager != nil {
+		if err := networkManager.UpdateInterfaces(); err != nil {
+			return E.Cause(err, "update platform interfaces")
+		}
+	}
+	if monitor != nil && monitor.logger != nil {
+		monitor.logger.Debug("updated platform network interfaces: ", len(interfaces))
+	}
+	return nil
+}
+
+func (p *xdPlatformInterface) setOwnInterface(name string) {
+	p.mu.Lock()
+	if p.ownInterfaceName == name {
+		p.mu.Unlock()
+		return
+	}
+	p.ownInterfaceName = name
+	if p.defaultInterface != nil && p.defaultInterface.Name == name {
+		p.defaultInterface = p.firstUsableInterfaceLocked()
+	}
+	networkManager := p.networkManager
+	monitor := p.monitor
+	defaultInterface := cloneInterface(p.defaultInterface)
+	p.mu.Unlock()
+
+	if networkManager != nil {
+		if err := networkManager.UpdateInterfaces(); err != nil && monitor != nil && monitor.logger != nil {
+			monitor.logger.Error(E.Cause(err, "remove own interface from platform interfaces"))
+		}
+	}
+	if monitor != nil {
+		monitor.notify(defaultInterface)
+	}
+}
+
+// firstUsableInterfaceLocked 返回 NWPath 顺序中的第一个下层接口。
+// 调用方必须持有 p.mu。只跳过当前 XDial 会话自己的接口，不按名字猜测产品或协议。
+func (p *xdPlatformInterface) firstUsableInterfaceLocked() *control.Interface {
+	for _, networkInterface := range p.networkInterfaces {
+		if networkInterface.Name == p.ownInterfaceName {
+			continue
+		}
+		return cloneInterface(&networkInterface.Interface)
+	}
+	return nil
 }
 
 func cloneInterface(value *control.Interface) *control.Interface {

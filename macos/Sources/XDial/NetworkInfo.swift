@@ -30,7 +30,7 @@ final class NetworkInfo: ObservableObject {
     private let clashAPI = "http://127.0.0.1:9090"
     private var probeTask: Task<Void, Never>?
 
-    /// 启动一次完整探测：本地 IP + 每条线路的 IP 信息 + 订阅主策略组
+    /// 启动一次完整探测：本地 IP + 每条活动线路的 IP 信息 + 活动订阅主策略组。
     func probeAll(lines: [Line], subscriptions: [Subscription] = [], helperConnected: Bool) {
         probeTask?.cancel()
         localIP = Self.getLocalIP() ?? ""
@@ -38,76 +38,66 @@ final class NetworkInfo: ObservableObject {
 
         probeTask = Task { [weak self] in
             guard let self else { return }
-            await MainActor.run { self.probing = true }
-            defer { Task { @MainActor in self.probing = false } }
+            self.probing = true
+            defer { self.probing = false }
 
-            // 连接时先等 Clash API 就绪
-            if helperConnected {
-                _ = await self.waitForClashAPI()
-            }
+            guard helperConnected, await self.waitForClashAPI() else { return }
 
             for line in lines where line.enabled {
                 if Task.isCancelled { return }
-                // Tailnet-only 线路没有公网出口 IP；只有配置了 Exit Node 才做公网探测。
-                if line.type == "tailscale" && line.tailscaleExitNode.isEmpty { continue }
-                let canProbe = (line.type == "direct") || helperConnected
-                if !canProbe { continue }
-                await probeLine(line: line, helperConnected: helperConnected)
+                await probeLine(line: line)
             }
-
-            // 探测订阅：通过主策略组测 IP
-            if helperConnected {
-                for sub in subscriptions where sub.enabled && !sub.lines.isEmpty {
-                    if Task.isCancelled { return }
-                    await probeSub(sub: sub)
-                }
+            for sub in subscriptions where sub.enabled && !sub.lines.isEmpty {
+                if Task.isCancelled { return }
+                await probeSub(sub: sub)
             }
         }
     }
 
     private func probeSub(sub: Subscription) async {
-        // 主策略组 tag（第一个策略组，或无策略组时的默认组）
         let mainTag: String
         if let first = sub.proxyGroups.first {
             mainTag = "sub-" + sub.id + "-" + slugify(first.name)
         } else {
             mainTag = "sub-" + sub.id
         }
-
         appLog("NetworkInfo: probing sub \(sub.name) tag=\(mainTag)")
-        let ok = await switchSelector(to: mainTag)
-        if !ok {
-            await MainActor.run {
-                var info = LineNetInfo()
-                info.error = "无法切换出口"
-                info.probedAt = Date()
-                self.perLine[sub.id] = info
-            }
-            return
+        perLine[sub.id] = await probe(tag: mainTag)
+    }
+
+    private func probeLine(line: Line) async {
+        let tag = outboundTag(for: line)
+        appLog("NetworkInfo: probing \(line.name) tag=\(tag)")
+        perLine[line.id] = await probe(tag: tag)
+    }
+
+    private func probe(tag: String) async -> LineNetInfo {
+        var info = LineNetInfo()
+        info.probedAt = Date()
+
+        guard await switchSelector(to: tag) else {
+            info.error = "无法切换出口"
+            return info
         }
         try? await Task.sleep(nanoseconds: 200_000_000)
 
-        let r = await fetchIPInfo()
-        await MainActor.run {
-            var info = LineNetInfo()
-            info.probedAt = Date()
-            info.ip = r.ip
-            info.region = r.region
-            info.error = r.error
-            self.perLine[sub.id] = info
-        }
+        let result = await fetchIPInfo()
+        info.ip = result.ip
+        info.region = result.region
+        info.error = result.error
+        return info
     }
 
-    /// 必须与 Go 端 core/config/generator.go 的 slugify 完全一致：
-    /// 只允许 ASCII a-z/A-Z/0-9，其他字符（含中文）一律变 '-'，再小写、截 16。
-    /// Swift 的 isLetter/isNumber 接受 Unicode，会让中文组名生成与 Go 不同的 tag → selector 切换失败。
-    private func slugify(_ s: String) -> String {
+    /// 必须与 Go 端 core/config/generator.go 的 slugify 完全一致。
+    private func slugify(_ value: String) -> String {
         var mapped = ""
-        mapped.reserveCapacity(s.count)
-        for ch in s.unicodeScalars {
-            let v = ch.value
-            if (v >= 0x61 && v <= 0x7A) || (v >= 0x41 && v <= 0x5A) || (v >= 0x30 && v <= 0x39) {
-                mapped.unicodeScalars.append(ch)
+        mapped.reserveCapacity(value.count)
+        for scalar in value.unicodeScalars {
+            let v = scalar.value
+            if (v >= 0x61 && v <= 0x7A)
+                || (v >= 0x41 && v <= 0x5A)
+                || (v >= 0x30 && v <= 0x39) {
+                mapped.unicodeScalars.append(scalar)
             } else {
                 mapped.append("-")
             }
@@ -116,21 +106,20 @@ final class NetworkInfo: ObservableObject {
         return truncated.lowercased()
     }
 
-    /// 轮询 Clash API 直到就绪（最多 5 秒）
     private func waitForClashAPI() async -> Bool {
         guard let url = URL(string: "\(clashAPI)/proxies/test-out") else { return false }
         for i in 0..<25 {
             if Task.isCancelled { return false }
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 1
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 1
             do {
-                let (_, resp) = try await URLSession.shared.data(for: req)
-                if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                let (_, response) = try await URLSession.shared.data(for: request)
+                if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                     appLog("NetworkInfo: Clash API ready after \(i * 200)ms")
                     return true
                 }
             } catch {
-                // 没起来，等等再试
+                // 数据面还没就绪，继续在总预算内轮询。
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
@@ -138,48 +127,19 @@ final class NetworkInfo: ObservableObject {
         return false
     }
 
-    private func probeLine(line: Line, helperConnected: Bool) async {
-        let tag = outboundTag(for: line)
-        appLog("NetworkInfo: probing \(line.name) tag=\(tag)")
-
-        // 通过 Clash API 切 selector 到目标出口（仅连接时）
-        if helperConnected {
-            let ok = await switchSelector(to: tag)
-            if !ok {
-                await MainActor.run {
-                    var info = self.perLine[line.id] ?? LineNetInfo()
-                    info.error = "无法切换出口"
-                    info.probedAt = Date()
-                    self.perLine[line.id] = info
-                }
-                return
-            }
-            // selector 切换后稍等一下，让连接生效
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-
-        let r = await fetchIPInfo()
-        await MainActor.run {
-            var info = LineNetInfo()
-            info.probedAt = Date()
-            info.ip = r.ip
-            info.region = r.region
-            info.error = r.error
-            self.perLine[line.id] = info
-        }
-    }
-
     /// PUT /proxies/test-out {"name": tag}
     private func switchSelector(to tag: String) async -> Bool {
         guard let url = URL(string: "\(clashAPI)/proxies/test-out") else { return false }
-        var req = URLRequest(url: url)
-        req.httpMethod = "PUT"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 3
-        guard let body = try? JSONSerialization.data(withJSONObject: ["name": tag]) else { return false }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 3
+        guard let body = try? JSONSerialization.data(withJSONObject: ["name": tag]) else {
+            return false
+        }
         do {
-            let (_, resp) = try await URLSession.shared.upload(for: req, from: body)
-            if let http = resp as? HTTPURLResponse {
+            let (_, response) = try await URLSession.shared.upload(for: request, from: body)
+            if let http = response as? HTTPURLResponse {
                 appLog("NetworkInfo: selector → \(tag), HTTP \(http.statusCode)")
                 return http.statusCode == 204 || http.statusCode == 200
             }
@@ -190,41 +150,39 @@ final class NetworkInfo: ObservableObject {
     }
 
     private func fetchIPInfo() async -> (ip: String, region: String, error: String) {
-        // 每次新建 URLSession 避免连接复用（确保走当前 selector 选中的出口）
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        cfg.urlCache = nil
-        cfg.httpShouldUsePipelining = false
-        cfg.httpMaximumConnectionsPerHost = 1
-        let session = URLSession(configuration: cfg)
+        // 每次新建会话，避免复用切换 selector 前的连接。
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.urlCache = nil
+        configuration.httpShouldUsePipelining = false
+        configuration.httpMaximumConnectionsPerHost = 1
+        let session = URLSession(configuration: configuration)
         defer { session.finishTasksAndInvalidate() }
 
         let services: [(String, (Data) -> (String, String)?)] = [
             ("https://api.ip.sb/geoip", parseIPSB),
-            ("http://ip-api.com/json/?lang=\(language.ipAPILang)&fields=status,query,country,regionName,city", parseIPAPI),
+            (
+                "http://ip-api.com/json/?lang=\(language.ipAPILang)&fields=status,query,country,regionName,city",
+                parseIPAPI
+            ),
         ]
-        var lastErr = "无法获取 IP"
-        for (urlStr, parser) in services {
-            guard let url = URL(string: urlStr) else { continue }
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 6
-            req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-            req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-            appLog("NetworkInfo: GET \(urlStr)")
+        var lastError = "无法获取 IP"
+        for (urlString, parser) in services {
+            guard let url = URL(string: urlString) else { continue }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 6
+            request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+            request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             do {
-                let (data, _) = try await session.data(for: req)
+                let (data, _) = try await session.data(for: request)
                 if let (ip, region) = parser(data) {
-                    appLog("NetworkInfo: got ip=\(ip) region=\(region)")
                     return (ip, region, "")
                 }
-                appLog("NetworkInfo: parse failed for \(urlStr)")
             } catch {
-                appLog("NetworkInfo: \(urlStr) failed: \(error.localizedDescription)")
-                lastErr = error.localizedDescription
-                continue
+                lastError = error.localizedDescription
             }
         }
-        return ("", "", lastErr)
+        return ("", "", lastError)
     }
 
     private func parseIPAPI(_ data: Data) -> (String, String)? {
@@ -232,7 +190,9 @@ final class NetworkInfo: ObservableObject {
               info.status == "success" else { return nil }
         var parts: [String] = []
         if !info.country.isEmpty { parts.append(info.country) }
-        if !info.regionName.isEmpty && info.regionName != info.country { parts.append(info.regionName) }
+        if !info.regionName.isEmpty && info.regionName != info.country {
+            parts.append(info.regionName)
+        }
         if !info.city.isEmpty && info.city != info.regionName { parts.append(info.city) }
         return (info.query, parts.joined(separator: " "))
     }
@@ -241,23 +201,22 @@ final class NetworkInfo: ObservableObject {
         guard let info = try? JSONDecoder().decode(IPSBResp.self, from: data),
               !info.ip.isEmpty else { return nil }
         var parts: [String] = []
-        if let c = info.country { parts.append(c) }
-        if let r = info.region, info.region != info.country { parts.append(r) }
-        if let city = info.city, info.city != info.region { parts.append(city) }
+        if let country = info.country { parts.append(country) }
+        if let region = info.region, region != info.country { parts.append(region) }
+        if let city = info.city, city != info.region { parts.append(city) }
         return (info.ip, parts.joined(separator: " "))
     }
 
-    /// 与 Go 侧 resolveOutboundTag 保持一致
+    /// 与 Go 侧 resolveOutboundTag 保持一致。
     private func outboundTag(for line: Line) -> String {
         switch line.type {
         case "direct": return "direct"
         case "vpn": return "vpn"
-        case "tailscale": return "tailscale-" + line.id
         default: return "proxy-" + line.id
         }
     }
 
-    /// 通过 getifaddrs 获取活跃 IPv4 接口地址（非 loopback / 非 utun）
+    /// 通过 getifaddrs 获取活跃 IPv4 接口地址（非 loopback / 非 utun）。
     static func getLocalIP() -> String? {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
@@ -267,7 +226,6 @@ final class NetworkInfo: ObservableObject {
         while true {
             let interface = ptr.pointee
             let flags = Int32(interface.ifa_flags)
-            // POSIX 允许接口没有地址（ifa_addr 为 NULL），必须先检查再 deref，否则崩溃
             if let addrPtr = interface.ifa_addr {
                 let addr = addrPtr.pointee
                 if (flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING),
@@ -278,12 +236,21 @@ final class NetworkInfo: ObservableObject {
                        !name.hasPrefix("bridge"), !name.hasPrefix("llw"),
                        !name.hasPrefix("anpi") {
                         var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                        let s = addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                            getnameinfo(sa, socklen_t(addr.sa_len),
-                                        &hostname, socklen_t(NI_MAXHOST),
-                                        nil, 0, NI_NUMERICHOST)
+                        let result = addrPtr.withMemoryRebound(
+                            to: sockaddr.self,
+                            capacity: 1
+                        ) { socketAddress in
+                            getnameinfo(
+                                socketAddress,
+                                socklen_t(addr.sa_len),
+                                &hostname,
+                                socklen_t(NI_MAXHOST),
+                                nil,
+                                0,
+                                NI_NUMERICHOST
+                            )
                         }
-                        if s == 0 {
+                        if result == 0 {
                             let ip = String(cString: hostname)
                             if !ip.isEmpty { return ip }
                         }

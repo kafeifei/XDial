@@ -116,10 +116,22 @@ func (l *Libbox) SetTunFD(fd int) {
 	l.platform.tunFD = fd
 }
 
-// SetDefaultInterface 接收 Swift NWPathMonitor 报告的真实物理出口。
-// 必须在 Start 前至少调用一次；网络从 Wi-Fi/蜂窝之间切换时继续调用即可。
+// SetDefaultInterface 接收 Swift NWPathMonitor 报告的默认 Underlay 接口。
+// 它可以是网线、Wi-Fi，也可以是启动 XDial 前已经存在的 utun；平台层只排除
+// RegisterMyInterface 明确登记的 XDial 自身接口。
 func (l *Libbox) SetDefaultInterface(name string, index int) {
 	l.platform.setDefaultInterface(name, index)
+}
+
+// SetNetworkInterfaces 接收 NWPath.availableInterfaces 的完整快照。
+// JSON 形如 [{"name":"utun13","index":21,"type":"other"},{"name":"en0","index":7,"type":"wifi"}]。
+// 不能只发物理接口：下层 VPN 正是以虚拟接口组成 XDial 的 Underlay。
+func (l *Libbox) SetNetworkInterfaces(interfacesJSON string) error {
+	var snapshots []platformNetworkInterfaceSnapshot
+	if err := stdjson.Unmarshal([]byte(interfacesJSON), &snapshots); err != nil {
+		return fmt.Errorf("decode platform network interfaces: %w", err)
+	}
+	return l.platform.setNetworkInterfaces(snapshots)
 }
 
 // SetTunOpener 替换 TUN 打开器(默认走 dup(tunFD)+tun.New 的真实路径)。

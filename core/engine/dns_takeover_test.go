@@ -99,8 +99,8 @@ func (f *fakeDNSRunner) Run(ctx context.Context, name string, args ...string) (s
 		}
 		out := fmt.Sprintf("   route to: %s\ndestination: %s\n       mask: 128.0.0.0\n", dnsTakeoverAddress, destination)
 		if gateway != "" {
-			// 真机上 gateway 行只在 RTF_GATEWAY 路由上出现；link 路由（Tailscale 那条
-			// default link#43 utun13）压根不打印这一行。
+			// 真机上 gateway 行只在 RTF_GATEWAY 路由上出现；下层虚拟接口的 link
+			// 路由不打印这一行。
 			out += fmt.Sprintf("    gateway: %s\n", gateway)
 		}
 		return out + fmt.Sprintf("  interface: %s\n", iface), nil
@@ -383,7 +383,7 @@ func TestDNSTakeoverAddressIsTunAddressPlusOne(t *testing.T) {
 		Modes:        []config.Mode{{ID: "m1", Name: "默认", DefaultLineID: "dir"}},
 		ActiveModeID: "m1",
 	}
-	data, err := config.GenerateSingBoxDesktop(profile, 1080, "", t.TempDir(), nil)
+	data, err := config.GenerateSingBoxDesktop(profile, 1080, "", t.TempDir(), nil, "en0")
 	if err != nil {
 		t.Fatalf("generate sing-box config: %v", err)
 	}
@@ -1609,9 +1609,9 @@ func TestDNSTakeoverSkippedWhenRouteNotOnTun(t *testing.T) {
 	}
 }
 
-// 就绪判据三态之二：出接口是 utun，但 route get 没有 gateway 行 —— 命中的是一条 link
-// 路由。本机上真实存在这种竞争路由：官方 Tailscale 客户端装的 default link#43 utun13。
-// 光看"出接口是不是 utun"会把它误判成我们的 tun 已就绪，接管过去就是整机解析黑洞。
+// 就绪判据三态之二：出接口是 utun，但 route get 没有 gateway 行 —— 命中的是一条
+// 下层 link 路由。光看"出接口是不是 utun"会把它误判成我们的 tun 已就绪，接管过去
+// 就是整机解析黑洞。
 func TestDNSTakeoverSkippedWhenRouteHasNoGateway(t *testing.T) {
 	runner := newFakeDNSRunner("Wi-Fi")
 	runner.current["Wi-Fi"] = "1.1.1.1"

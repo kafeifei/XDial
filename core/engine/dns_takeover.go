@@ -26,9 +26,9 @@ import (
 // {"protocol":"dns","action":"hijack-dns"} 接住并交给 sing-box 内部解析链应答。
 // sing-box 官方 libbox 的 GetDNSServerAddress 用的就是 Addr().Next()，同款约定。
 //
-// 至于为什么非得接管系统 DNS：LAN 网关是 on-link 直达、官方 Tailscale 的
-// 100.100.100.100 有自己的 host route，两者都天然绕过 tun 路由，应用拿到的是污染
-// 结果，按域名分流随之失准。
+// 至于为什么非得接管系统 DNS：启动前 Underlay 的 resolver 可能通过 on-link 路由
+// 或下层虚拟接口直达，天然绕过 tun；应用拿到的解析视角就可能与 Mode 选择的出口
+// 视角不一致，按域名分流随之失准。
 const dnsTakeoverAddress = "198.18.0.2"
 
 // dnsTakeoverGateway 是 tun 自己的 IPv4 地址，也就是接管地址的前一个地址（对齐
@@ -38,9 +38,8 @@ const dnsTakeoverAddress = "198.18.0.2"
 // 198.18.0.0/15 这条接口路由，而是 8 条覆盖全 IPv4 的 sub-range（1.0.0.0/8、
 // 2.0.0.0/7 … 128.0.0.0/1），每条都是 RTF_GATEWAY 且 gateway 就是这个 tun 地址。
 // 接管地址 198.18.0.2 命中的是其中的 128.0.0.0/1。所以「路由已就绪」的充分判据是
-// route -n get 打印的 gateway 行等于这个地址 —— 别的 utun（官方 Tailscale 客户端
-// 装的 default link#43 utun13 之类）是 link 路由，route get 根本不打印 gateway 行，
-// 天然被这条判据拒掉。
+// route -n get 打印的 gateway 行等于这个地址 —— 其他下层虚拟接口可能安装 link
+// 路由，route get 不打印 gateway 行，天然被这条判据拒掉。
 const dnsTakeoverGateway = "198.18.0.1"
 
 // dnsTakeoverPrefix 是 tun 占的那一整段，用作「这个 DNS 地址是不是我们写进去的」的结构性
@@ -839,8 +838,8 @@ func (t *dnsTakeover) hijackedServices(ctx context.Context, services []string, a
 //
 // 判据是「route -n get 打印的 gateway 行 == tun 自己的 IPv4 地址」，理由见
 // dnsTakeoverGateway：auto_route 装的 sub-range 路由都是 RTF_GATEWAY 且下一跳就是
-// 这个地址，而本机上和它竞争的其它 utun 路由（官方 Tailscale 客户端的
-// default link#43 utun13）是 link 路由，route get 不打印 gateway 行，天然被拒。
+// 这个地址，而本机上和它竞争的其他下层虚拟接口可能安装 link 路由；route get
+// 不打印 gateway 行，天然被拒。
 // 出接口仍要求是 utun：gateway 对上而接口不是 tun 只能是路由表处于半装状态。
 func (t *dnsTakeover) waitTunRoute(budget context.Context) error {
 	deadline := time.Now().Add(orDuration(t.probeWindow, dnsRouteProbeWindow))
@@ -853,8 +852,8 @@ func (t *dnsTakeover) waitTunRoute(budget context.Context) error {
 		case err != nil:
 			detail = err.Error()
 		case gateway == "":
-			// 没有 gateway 行 = 命中的是某条 link 路由（典型就是官方 Tailscale 那条
-			// default link#43 utun13），不是我们 tun 的 sub-range 路由。
+			// 没有 gateway 行 = 命中的是某条下层 link 路由，不是我们 tun 的
+			// sub-range 路由。
 			detail = fmt.Sprintf("命中的是 %s 上的 link 路由，不是 tun 的 sub-range 路由", iface)
 		case gateway != dnsTakeoverGateway:
 			detail = fmt.Sprintf("下一跳 %s 不是 tun 地址 %s", gateway, dnsTakeoverGateway)
@@ -915,10 +914,10 @@ func (t *dnsTakeover) routeTarget(budget context.Context) (string, string, error
 //
 // 带 * 前缀的服务改 DNS 没有意义（networksetup 也会报错），所以不进 enabled。
 //
-// 故意不做任何设备过滤：Wi-Fi / 有线之外，Surge、Tailscale、各家 VPN 客户端装的那些
-// 虚拟网络服务也全都要接管。这是有意决定，不是漏筛 —— SystemConfiguration 的
-// resolver 顺序是按服务序（ServiceOrder）来的，只改物理网卡的话，任何一个排在前面的
-// 虚拟服务都会继续把查询接走，接管等于没做，按域名分流照旧失准。
+// 故意不做任何设备或产品过滤：Wi-Fi、有线和启动前已经存在的虚拟网络服务都要应用
+// 同一个 sing-box DNS 地址。这是有意决定，不是漏筛 —— SystemConfiguration 的
+// resolver 顺序是按服务序（ServiceOrder）来的，只改部分服务的话，任何一个排在前面的
+// 服务都会继续把查询接走，接管等于没做，按域名分流照旧失准。
 //
 // 代价是知情接受的：每条 -setdnsservers 都是一次 SystemConfiguration 提交，会唤醒
 // 其它 VPN 客户端的配置监视器；它们要是在我们接管期间自己回写 DNS，我们恢复时会拿

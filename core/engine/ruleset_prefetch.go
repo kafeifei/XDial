@@ -48,17 +48,15 @@ var srsMagic = []byte{0x53, 0x52, 0x53}
 //
 //   - 订阅节点 / 策略组 / 代理线路：可以，outbound 在 preStart 的 StartStateStart
 //     就已 Start，交给 sing-box 自己下（本函数跳过这些）。
-//   - Tailscale endpoint：不行，tsnet 要到 StartStatePostStart 才 Start，规则集
-//     取内容时它还没有 tailnet 地址和 netstack。
 //   - vpn：不行，桌面的 vpn outbound 是本地 go-socks5 桥，sing-box 把域名原样
-//     CONNECT 过去，桥用 net.ResolveIPAddr("ip", …) 走物理链路的系统 DNS 解析
-//     （可能已被官方 Tailscale 接管成 100.100.100.100，也可能返回 IPv6，而
-//     VPNBridge.DialTCP 只收 IPv4），解出来的地址还可能是被污染的。
+//     CONNECT 过去，桥用 net.ResolveIPAddr("ip", …) 走启动前 Underlay 的系统 DNS
+//     解析（也可能返回 IPv6，而 VPNBridge.DialTCP 只收 IPv4），解出来的地址还可能
+//     与隧道内的解析视角不一致。
 //   - direct：规则集描述的往往正是走不通的那批域名（gfwlist 的 .srs 就托管在
 //     raw.githubusercontent.com），从它自己描述的被墙路径上下载必然失败。
 //
-// daemon 这一侧没有上述限制：绑 VPN 的规则集经企业 DNS + 隧道抓，其余用物理链路
-// 抓（此时 sing-box 还没起，物理链路就是干净的直连）。落盘后写成 file:// URL，
+// daemon 这一侧没有上述限制：绑 VPN 的规则集经企业 DNS + 隧道抓，其余用启动前
+// 已存在的 Underlay 抓。落盘后写成 file:// URL，
 // 生成器输出 {"type":"local","path":...}，与 NE 端已有做法一致。
 //
 // 抓不到时按「旧缓存 → 停用该规则」降级并回报：那条规则的流量退回模式默认出口，
@@ -156,7 +154,7 @@ func ruleSetPrefetchTargets(profile *config.Profile, mode *config.Mode) []ruleSe
 	return targets
 }
 
-// ruleSetFetcher 持有两条下载路径：物理链路直连，以及经 AnyConnect 隧道。
+// ruleSetFetcher 持有两条下载路径：启动前 Underlay，以及经 AnyConnect 隧道。
 type ruleSetFetcher struct {
 	direct *http.Client
 	// vpn 为 nil 表示本次连接没有 AnyConnect 隧道可用。
@@ -170,8 +168,8 @@ type tunnelDialer func(ctx context.Context, addr string) (net.Conn, error)
 func newRuleSetFetcher(bridge *VPNBridge, enterpriseDNS []string) *ruleSetFetcher {
 	fetcher := &ruleSetFetcher{
 		direct: &http.Client{Transport: &http.Transport{
-			// 预取发生在 sing-box 起来之前，此刻的物理链路没有被 tun 接管，
-			// 这里的"直连"就是字面意义的直连。
+			// 预取发生在 sing-box 起来之前，此刻系统网络就是启动前已经叠加好的
+			// Underlay；XDial 不识别也不拆解其中有哪些网络产品。
 			DialContext:       (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 			DisableKeepAlives: true,
 		}},
@@ -335,7 +333,7 @@ func writeRuleSetCache(localPath string, content []byte) error {
 	return nil
 }
 
-// ruleSetCacheDirectory 规则集缓存目录，与 Tailscale state 同挂在 statePath 下。
+// ruleSetCacheDirectory 返回 daemon 自己管理的规则集缓存目录。
 func ruleSetCacheDirectory(statePath string) string {
 	return filepath.Join(statePath, "rulesets")
 }

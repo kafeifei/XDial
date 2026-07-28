@@ -38,8 +38,8 @@ func gfwProfile(url string, line config.Line, binding config.RuleBinding) *confi
 	}
 }
 
-func tailscaleLine() config.Line {
-	return config.Line{ID: "ts", Type: config.LineTypeTailscale, Enabled: true}
+func directRuleSetLine() config.Line {
+	return config.Line{ID: "direct", Type: config.LineTypeDirect, Enabled: true}
 }
 
 func prepareForTest(t *testing.T, profile *config.Profile, dir string) (*config.Profile, []string) {
@@ -49,15 +49,15 @@ func prepareForTest(t *testing.T, profile *config.Profile, dir string) (*config.
 	return prepareRuleSets(ctx, profile, dir, newRuleSetFetcher(nil, nil))
 }
 
-// 绑到 Tailscale 的规则集 sing-box 自己下不了（tsnet 在 StartStatePostStart 才起），
-// 必须由 daemon 抓成本地文件。
-func TestPrepareRuleSetsMaterializesTailscaleBoundSet(t *testing.T) {
+// 绑到 direct 的规则集描述的往往正是 Underlay 取不到的内容；为避免 sing-box
+// 首次下载失败导致整个启动失败，daemon 先抓成本地文件。
+func TestPrepareRuleSetsMaterializesDirectBoundSet(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write(srsPayload())
 	}))
 	defer server.Close()
 
-	profile := gfwProfile(server.URL+"/gfw.srs", tailscaleLine(), config.RuleBinding{LineID: "ts"})
+	profile := gfwProfile(server.URL+"/gfw.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	dir := t.TempDir()
 	prepared, problems := prepareForTest(t, profile, dir)
 	if len(problems) != 0 {
@@ -91,10 +91,10 @@ func TestPreparedRuleSetGeneratesLocalResource(t *testing.T) {
 	}))
 	defer server.Close()
 
-	profile := gfwProfile(server.URL+"/gfw.srs", tailscaleLine(), config.RuleBinding{LineID: "ts"})
+	profile := gfwProfile(server.URL+"/gfw.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	prepared, _ := prepareForTest(t, profile, t.TempDir())
 
-	data, err := config.GenerateSingBoxDesktop(prepared, 0, "", t.TempDir(), nil)
+	data, err := config.GenerateSingBoxDesktop(prepared, 0, "", t.TempDir(), nil, "en0")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestPrepareRuleSetsDisablesUnavailableSet(t *testing.T) {
 	}))
 	defer server.Close()
 
-	profile := gfwProfile(server.URL+"/gfw.srs", tailscaleLine(), config.RuleBinding{LineID: "ts"})
+	profile := gfwProfile(server.URL+"/gfw.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	prepared, problems := prepareForTest(t, profile, t.TempDir())
 	if len(problems) != 1 {
 		t.Fatalf("problems = %v, want 1", problems)
@@ -140,7 +140,7 @@ func TestPrepareRuleSetsDisablesUnavailableSet(t *testing.T) {
 		t.Fatalf("caller profile was mutated")
 	}
 
-	data, err := config.GenerateSingBoxDesktop(prepared, 0, "", t.TempDir(), nil)
+	data, err := config.GenerateSingBoxDesktop(prepared, 0, "", t.TempDir(), nil, "en0")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestPrepareRuleSetsRejectsNonRuleSetContent(t *testing.T) {
 	defer server.Close()
 
 	dir := t.TempDir()
-	profile := gfwProfile(server.URL+"/gfw.srs", tailscaleLine(), config.RuleBinding{LineID: "ts"})
+	profile := gfwProfile(server.URL+"/gfw.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	prepared, problems := prepareForTest(t, profile, dir)
 	if len(problems) != 1 || prepared.RuleSets[0].Enabled {
 		t.Fatalf("garbage content should be rejected, problems=%v", problems)
@@ -177,7 +177,7 @@ func TestPrepareRuleSetsFallsBackToStaleCache(t *testing.T) {
 	defer server.Close()
 
 	dir := t.TempDir()
-	profile := gfwProfile(server.URL+"/gfw.srs", tailscaleLine(), config.RuleBinding{LineID: "ts"})
+	profile := gfwProfile(server.URL+"/gfw.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	stalePath := ruleSetCachePath(dir, &profile.RuleSets[0], "binary")
 	if err := os.WriteFile(stalePath, srsPayload(), 0o600); err != nil {
 		t.Fatal(err)
@@ -206,7 +206,7 @@ func TestPrepareRuleSetsReusesFreshCache(t *testing.T) {
 	defer server.Close()
 
 	dir := t.TempDir()
-	profile := gfwProfile(server.URL+"/gfw.srs", tailscaleLine(), config.RuleBinding{LineID: "ts"})
+	profile := gfwProfile(server.URL+"/gfw.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	if _, problems := prepareForTest(t, profile, dir); len(problems) != 0 {
 		t.Fatalf("first pass failed: %v", problems)
 	}
@@ -235,7 +235,7 @@ func TestPrepareRuleSetsSkipsProxyBoundSets(t *testing.T) {
 	}{
 		{
 			name:    "subscription",
-			line:    tailscaleLine(),
+			line:    directRuleSetLine(),
 			binding: config.RuleBinding{SubscriptionID: "sub"},
 		},
 		{
@@ -261,7 +261,7 @@ func TestPrepareRuleSetsSkipsProxyBoundSets(t *testing.T) {
 	}
 }
 
-// 绑到 VPN 线路但隧道不可用（fetcher 没有桥）时不能悄悄退回物理链路直连：
+// 绑到 VPN 线路但隧道不可用（fetcher 没有桥）时不能悄悄退回启动前 Underlay：
 // 那正是被墙的那条路，而且用户要的是"经隧道取"。
 func TestPrepareRuleSetsVPNBoundRequiresBridge(t *testing.T) {
 	var hits atomic.Int32

@@ -151,34 +151,33 @@ func tailscaleIdentity() TailscaleIdentity {
 
 // 桌面连接路径（GenerateSingBoxDesktop）的产物也必须过 sing-box 的解析：
 // 它比 GenerateSingBox 多出 enterprise-dns（detour vpn）和 proxy-dns-*
-// （detour 到 Tailscale endpoint）两类 DNS server，字段写错只有 check 能发现。
+// （detour 到代理线路）两类 DNS server，字段写错只有 check 能发现。
 func TestGenerate_DesktopUserSplitCombination(t *testing.T) {
 	if _, err := exec.LookPath("sing-box"); err != nil {
 		t.Skip("sing-box not installed")
 	}
 	p := &Profile{
-		Lines:    []Line{directLine(), vpnLine(), tailscaleLine()},
+		Lines:    []Line{directLine(), vpnLine(), trojanLine()},
 		RuleSets: []RuleSet{internalRuleSet(), gfwRuleSet()},
 		Modes: []Mode{{
 			ID: "split", Name: "分流",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
-				{RuleSetID: "gfw", LineID: "tailscale-1"},
+				{RuleSetID: "gfw", LineID: "trojan-1"},
 			},
 			DefaultLineID: "direct",
 		}},
 		ActiveModeID: "split",
-		Tailscale:    tailscaleIdentity(),
 	}
 
-	data, err := GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10"})
+	data, err := GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10"}, "en0")
 	if err != nil {
 		t.Fatalf("[desktop-split] GenerateSingBoxDesktop: %v", err)
 	}
 	singboxCheckConfig(t, data, "desktop-split")
 }
 
-func TestGenerate_Tailscale(t *testing.T) {
+func TestGenerate_NETailscale(t *testing.T) {
 	p := &Profile{
 		Lines: []Line{directLine(), tailscaleLine()},
 		Modes: []Mode{{
@@ -187,7 +186,29 @@ func TestGenerate_Tailscale(t *testing.T) {
 		ActiveModeID: "tailnet",
 		Tailscale:    tailscaleIdentity(),
 	}
-	singboxCheck(t, p, "tailscale")
+	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir())
+	if err != nil {
+		t.Fatalf("[tailscale-ne] GenerateSingBoxFor: %v", err)
+	}
+
+	// xdial-mobile 是 App 内注册的 libbox DNS transport，命令行 sing-box 不认识。
+	// 这里只把 DNS 替换为标准 transport，让官方 validator 继续覆盖 Tailscale
+	// endpoint 和其余原生配置字段；自定义 transport 由 core/libbox 测试覆盖。
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("[tailscale-ne] decode: %v", err)
+	}
+	cfg["dns"] = map[string]interface{}{
+		"servers": []map[string]interface{}{{
+			"type": "udp", "tag": mobilePublicDNSTag, "server": "1.1.1.1", "server_port": 53,
+		}},
+		"final": mobilePublicDNSTag,
+	}
+	checkData, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatalf("[tailscale-ne] encode validator config: %v", err)
+	}
+	singboxCheckConfig(t, checkData, "tailscale-ne")
 }
 
 // 1. 纯手动线路，无订阅（原有功能）

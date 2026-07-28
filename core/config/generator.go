@@ -34,9 +34,10 @@ const (
 
 // Platform 决定 sing-box 配置生成的目标运行环境。
 //
-// PlatformMacOS(零值)= 现有桌面场景:sing-box 作为外部子进程运行,靠 tun +
-// auto_route 抓包、auto_detect_interface 选物理网卡、clash_api 暴露 controller、
-// cache_file 用相对路径(子进程 cwd 下)。
+// PlatformMacOS(零值)= 桌面场景:sing-box 作为外部子进程运行,靠 tun +
+// auto_route 抓包、route.default_interface 绑定到宿主在启动前从系统默认路由
+// 读取的 Underlay，
+// clash_api 暴露 controller、cache_file 用相对路径(子进程 cwd 下)。
 //
 // PlatformNE = tvOS/iOS 的 NetworkExtension 场景:sing-box 作为库跑在扩展进程内,
 // 无 root、无子进程、路由由 NEPacketTunnelNetworkSettings 在 Swift 侧接管,读包来源
@@ -50,29 +51,47 @@ const (
 	PlatformNE
 )
 
-// GenerateSingBox 保留原有签名作为 macOS 模式的包装函数,现有调用方(如
-// core/engine.SingBoxProcess.Start)无需改动。
+func (p Platform) isNetworkExtension() bool {
+	return p == PlatformNE
+}
+
+func (p Platform) isDesktop() bool {
+	return p == PlatformMacOS
+}
+
+// GenerateSingBox 保留原有签名供配置单测与兼容调用。真实桌面连接必须走
+// GenerateSingBoxDesktop，并传入启动前的系统默认接口快照。
 func GenerateSingBox(profile *Profile, socksPort int, vpnServerIP string) ([]byte, error) {
-	return GenerateSingBoxFor(profile, socksPort, vpnServerIP, PlatformMacOS, "")
+	return GenerateSingBoxDesktop(profile, socksPort, vpnServerIP, "", nil, "en0")
 }
 
 // GenerateSingBoxDesktop 是桌面连接路径的入口：AnyConnect 隧道先建立、拿到
 // 服务端下发的企业 DNS 后才生成配置，绑定到 VPN 线路的内网域名（如 oa.corp.example）
 // 只在企业 DNS 有记录，必须经隧道向它查询，公共 DoH 上是 NXDOMAIN。
-func GenerateSingBoxDesktop(profile *Profile, socksPort int, vpnServerIP, basePath string, enterpriseDNS []string) ([]byte, error) {
-	return generateSingBox(profile, socksPort, vpnServerIP, PlatformMacOS, basePath, enterpriseDNS)
+// underlayInterface 不是用户配置，也不是产品识别结果；它只能来自数据面启动前
+// 操作系统默认路由的接口。空值必须报错，不能回落到 sing-tun 在 macOS 上会跳过
+// 无网关 utun 的 auto_detect_interface。
+func GenerateSingBoxDesktop(profile *Profile, socksPort int, vpnServerIP, basePath string, enterpriseDNS []string, underlayInterface string) ([]byte, error) {
+	return generateSingBox(profile, socksPort, vpnServerIP, PlatformMacOS, basePath, enterpriseDNS, underlayInterface)
 }
 
 // GenerateSingBoxFor 生成 sing-box JSON 配置,platform 决定平台相关字段的取舍。
 //
-// basePath 仅在 PlatformNE 下使用,作为沙盒内绝对目录,用来拼出 cache_file 的绝对
-// 路径(basePath/cache.db)。PlatformMacOS 下 basePath 被忽略,cache_file 沿用现有
-// 相对路径 "cache.db"。
-func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, platform Platform, basePath string) ([]byte, error) {
-	return generateSingBox(profile, socksPort, vpnServerIP, platform, basePath, nil)
+// basePath 在 NetworkExtension 平台下使用,作为沙盒内绝对目录,用来拼出
+// cache_file 的绝对路径(basePath/cache.db)。PlatformMacOS 下 basePath 被忽略,
+// cache_file 沿用现有相对路径 "cache.db"。
+func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, platform Platform, basePath string, underlayInterfaces ...string) ([]byte, error) {
+	if len(underlayInterfaces) > 1 {
+		return nil, fmt.Errorf("expected at most one underlay interface snapshot")
+	}
+	var underlayInterface string
+	if len(underlayInterfaces) == 1 {
+		underlayInterface = underlayInterfaces[0]
+	}
+	return generateSingBox(profile, socksPort, vpnServerIP, platform, basePath, nil, underlayInterface)
 }
 
-func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platform Platform, basePath string, enterpriseDNS []string) ([]byte, error) {
+func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platform Platform, basePath string, enterpriseDNS []string, underlayInterface string) ([]byte, error) {
 	mode := profile.ActiveMode()
 	if mode == nil {
 		return nil, fmt.Errorf("no active mode")
@@ -85,6 +104,17 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 	}
 	activeLineIDs, activeSubscriptionIDs := effectiveActiveTargetIDs(profile, mode)
 	activeVPNIDs := effectiveActiveVPNLineIDs(profile, mode)
+	if platform.isDesktop() {
+		for lineID := range activeLineIDs {
+			line := profile.FindLine(lineID)
+			if line != nil && line.Enabled && line.Type == LineTypeTailscale {
+				return nil, fmt.Errorf(
+					"desktop Tailscale lines have been removed; run the official Tailscale client as Underlay instead: %q",
+					line.Name,
+				)
+			}
+		}
+	}
 	// D30：sslcon 是包级单例，一个进程只能维持一条 AnyConnect 隧道，而所有 VPN
 	// 线路共享 "vpn" 这一个 outbound tag。两条不同的 active VPN 线路会让第二条的
 	// 流量静默钻进第一条的隧道（违反 Line 隔离）。所有平台一律硬校验报错，
@@ -101,7 +131,7 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 			"server":      "127.0.0.1",
 			"server_port": socksPort,
 		}
-		if platform == PlatformNE {
+		if platform.isNetworkExtension() {
 			// NE 模式下 sing-box 是库,跑在同一进程里,"vpn" 出口是
 			// core/libbox/vpn_outbound.go 注册的自研 outbound(直接拨
 			// VPNBridge,不经本地 SOCKS5 中转);macOS 模式下 sing-box 是
@@ -114,44 +144,35 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 		outbounds = append(outbounds, vpnOutbound)
 	}
 
-	// Tailscale 身份（state_directory、node key、设备名）全 Profile 只有一份，
-	// 两条 enabled 线路会生成两个 endpoint 抢同一个目录，互相踩掉登录态。
-	// 与 AnyConnect 多线路守卫同理：宁可拒绝生成，也不要"起来了但连不通"。
-	enabledTailscaleLines := 0
-	for _, line := range profile.Lines {
-		if line.Enabled && line.Type == LineTypeTailscale {
-			enabledTailscaleLines++
-		}
-	}
-	if enabledTailscaleLines > 1 {
-		return nil, fmt.Errorf("only one enabled Tailscale line is supported: %d lines would share one state directory", enabledTailscaleLines)
-	}
-
-	// Tailscale 标签分两份，对应架构约束的「声明≠生效」（INV1c）：
-	//
-	// endpoints 只要线路 enabled 就生成 —— 节点得先在 tailnet 注册、tsnet 得先
-	// 就绪，MagicDNS 才有解析能力可供 Mode 调用。这是「声明」，是本条唯一的例外。
-	//
-	// activeTailscaleTags 只收「同时被 active Mode 引用」的线路，它才是「生效」：
-	// tailnet CIDR 路由、tailscale-dns 解析权、诊断 selector 成员，全部只认它。
-	// 否则一条配了但当前模式没用的 Tailscale 线路会抢走 100.64/10 的路由和
-	// tailnet 名字的解析权 —— 那正是 preferred_by 全局劫持的翻版。
 	var endpoints []map[string]interface{}
 	var activeTailscaleTags []string
-	for _, line := range profile.Lines {
-		if !line.Enabled || line.Type != LineTypeTailscale {
-			continue
+	if platform == PlatformNE {
+		// 移动端暂时保留原有 Tailscale endpoint；两个桌面平台都不生成相关
+		// 数据面对象，官方 Tailscale 客户端只作为启动前已经存在的 Underlay。
+		enabledTailscaleLines := 0
+		for _, line := range profile.Lines {
+			if line.Enabled && line.Type == LineTypeTailscale {
+				enabledTailscaleLines++
+			}
 		}
-		if platform == PlatformNE && (basePath == "" || !path.IsAbs(basePath)) {
+		if enabledTailscaleLines > 1 {
+			return nil, fmt.Errorf("only one enabled Tailscale line is supported: %d lines would share one state directory", enabledTailscaleLines)
+		}
+		if enabledTailscaleLines > 0 && (basePath == "" || !path.IsAbs(basePath)) {
 			return nil, fmt.Errorf("network extension Tailscale state directory is unavailable")
 		}
-		endpoint, err := buildTailscaleEndpoint(&line, profile.Tailscale, basePath)
-		if err != nil {
-			return nil, err
-		}
-		endpoints = append(endpoints, endpoint)
-		if activeLineIDs[line.ID] {
-			activeTailscaleTags = append(activeTailscaleTags, tailscaleEndpointTag(&line))
+		for _, line := range profile.Lines {
+			if !line.Enabled || line.Type != LineTypeTailscale {
+				continue
+			}
+			endpoint, err := buildTailscaleEndpoint(&line, profile.Tailscale, basePath)
+			if err != nil {
+				return nil, err
+			}
+			endpoints = append(endpoints, endpoint)
+			if activeLineIDs[line.ID] {
+				activeTailscaleTags = append(activeTailscaleTags, tailscaleEndpointTag(&line))
+			}
 		}
 	}
 
@@ -191,7 +212,6 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 			}
 			selectorMembers = append(selectorMembers, tag)
 		}
-		selectorMembers = append(selectorMembers, activeTailscaleTags...)
 		outbounds = append(outbounds, map[string]interface{}{
 			"type":      "selector",
 			"tag":       testSelectorTag,
@@ -221,10 +241,10 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 		}
 	}
 
-	// 两个平台的系统 DNS 包都走 hijack-dns：桌面交给 buildDNS 的解析链
-	// （tailnet 分域 → 公共 DoH），NE 交给 xdial-mobile dispatcher。
+	// 两个平台的系统 DNS 包都走 hijack-dns：桌面交给 buildDNS 的解析链，
+	// NE 交给 xdial-mobile dispatcher。
 	routeRules := buildSystemRouteRules(platform == PlatformMacOS)
-	if platform == PlatformNE {
+	if platform.isNetworkExtension() {
 		routeRules = buildNESystemRouteRules()
 	}
 	ruleSetResources := sbCollectRuleSets(profile, mode, subTagMap, validTags)
@@ -274,14 +294,9 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 		}
 	}
 
-	// Tailscale 只自动接管 tailnet 内部地址（MagicDNS 解析出的设备地址），
-	// 其余流量的归属完全由用户的显式规则和模式默认出口决定。
-	//
-	// 历史教训（2026-07 反复两次）：曾用 preferred_by 把 exit node 广播的
-	// 0.0.0.0/0 整个捞给 Tailscale——它让「模式默认出口」永远失效，用户配好
-	// 的"默认直连"全部被抢走。想要"默认流量走 exit node"，正确做法是把模式
-	// 默认线路设为 Tailscale 线路（final 即 endpoint tag），而不是靠隐式全捞。
-	routeRules = append(routeRules, buildTailscaleInternalRouteRules(activeTailscaleTags)...)
+	if platform == PlatformNE {
+		routeRules = append(routeRules, buildTailscaleInternalRouteRules(activeTailscaleTags)...)
+	}
 
 	// 默认出口。悬空引用已在 inspectModeReferences 里报错拒绝，这里能走到回落
 	// direct 的只剩"对象存在但被禁用/参数不全"一种情况，且已经产生了对应的
@@ -304,26 +319,35 @@ func generateSingBox(profile *Profile, socksPort int, vpnServerIP string, platfo
 		"rules": routeRules,
 		"final": defaultTag,
 	}
-	if platform == PlatformNE {
+	if platform.isNetworkExtension() {
 		// 节点域名和 Tailscale 控制面必须能在首次登录前解析，不能递归进入
 		// 尚未就绪的企业或 Tailscale 分域 resolver。
 		route["default_domain_resolver"] = mobilePublicDNSTag
 	} else {
-		// 桌面同理：出站域名（节点地址、Tailscale 控制面）的解析不能依赖
-		// 系统 DNS（可能指向官方 Tailscale 的 100.100.100.100 黑洞）。
+		// 桌面出站域名统一交给盒内公共解析器，避免依赖 XDial 启动前的
+		// 系统 resolver 状态。
 		route["default_domain_resolver"] = desktopPublicDNSTag
 	}
-	// 两个平台都必须选择真实物理出口。NE 只接管“哪些设备流量进 utun”，并不会
-	// 替 sing-box 的 direct/DNS 出站选择 Wi-Fi/蜂窝接口；移动端由 NWPathMonitor
-	// 经 PlatformInterface 提供接口信息。
-	route["auto_detect_interface"] = true
+	// Underlay 选择仍属于操作系统与 sing-box 数据面。桌面宿主只把启动前系统
+	// 默认路由已经选定的接口原样转交给 sing-box；它不识别 Wi-Fi、网线或任何
+	// VPN 产品。不能在桌面回落 auto_detect_interface：sing-tun 0.8.9 的 darwin
+	// 实现会跳过没有 RTF_GATEWAY 的 utun 默认路由，破坏自然叠加。
+	if platform == PlatformMacOS {
+		underlayInterface = strings.TrimSpace(underlayInterface)
+		if underlayInterface == "" {
+			return nil, fmt.Errorf("desktop underlay interface snapshot is unavailable")
+		}
+		route["default_interface"] = underlayInterface
+	} else {
+		// Apple 移动端由 NWPathMonitor 经 PlatformInterface 提供系统网络变化。
+		route["auto_detect_interface"] = true
+	}
 	if len(ruleSetResources) > 0 {
 		route["rule_set"] = ruleSetResources
 	}
 	dnsConfig := buildNEDNS(activeTailscaleTags)
-	if platform != PlatformNE {
+	if !platform.isNetworkExtension() {
 		dnsConfig = buildDNS(
-			firstString(activeTailscaleTags),
 			enterpriseDNS,
 			collectVPNBoundDomains(profile, mode),
 			collectProxyBoundDNSTargets(profile, mode, subTagMap, validTags),
@@ -392,7 +416,7 @@ func effectiveActiveVPNLineIDs(profile *Profile, mode *Mode) map[string]bool {
 // 路径,库内运行没有子进程 cwd,相对路径会落到只读的 app bundle 目录。
 func buildExperimental(platform Platform, basePath string) map[string]interface{} {
 	cachePath := "cache.db"
-	if platform == PlatformNE {
+	if platform.isNetworkExtension() {
 		cachePath = path.Join(basePath, "cache.db")
 	}
 	exp := map[string]interface{}{
@@ -413,10 +437,10 @@ func buildTUNInbound(vpnServerIP string, platform Platform) map[string]interface
 	// IPv4 与 IPv6 地址都必须给：
 	// NE 端决定哪些族的包进 packetFlow；桌面端 sing-tun 的 auto_route 把整段
 	// IPv6 路由构造包在 len(Inet6Address) > 0 里，没有 v6 地址就一条 v6 路由都
-	// 不装，IPv6 流量整体从物理口绕过 XDial——tailnet 的 fd7a:115c:a1e0::/48
-	// 路由规则永不求值，DNS 经隧道解出的未污染 AAAA 反而被系统 Happy Eyeballs
-	// 拿去直连。AnyConnect bridge 当前仅支持 IPv4，纯 IPv6 目标会在 vpn
-	// outbound 明确失败；关键是不能绕过隧道直出。
+	// 不装，IPv6 流量会整体绕过 XDial，Mode 里的 IPv6 规则永不求值，DNS 经指定
+	// 出口得到的 AAAA 也可能被系统 Happy Eyeballs 从盒外连接。AnyConnect bridge
+	// 当前仅支持 IPv4，纯 IPv6 目标会在 vpn outbound 明确失败；关键是不能绕过
+	// 数据面直出。
 	addresses := []string{"198.18.0.1/15", "fd00::1/126"}
 	inbound := map[string]interface{}{
 		"type":    "tun",
@@ -427,7 +451,7 @@ func buildTUNInbound(vpnServerIP string, platform Platform) map[string]interface
 	// NE 模式由 gVisor 在进程内终止来自 packetFlow 的连接。明确指定 stack，确保
 	// 发布包若漏掉 with_gvisor 构建标签会在启动阶段直接失败，而不是静默退回到
 	// 依赖系统接口名称的 system stack 后假连接。
-	if platform == PlatformNE {
+	if platform.isNetworkExtension() {
 		inbound["stack"] = "gvisor"
 		return inbound
 	}
@@ -441,10 +465,10 @@ func buildTUNInbound(vpnServerIP string, platform Platform) map[string]interface
 }
 
 // desktopPublicDNSTag 是桌面端的默认解析器：IP 直连的 DoH（阿里 223.5.5.5）。
-// 不能用 type:local（系统 DNS）当默认——系统 DNS 可能被官方 Tailscale 客户端
-// 改成 100.100.100.100，该地址只在它的 utun 上有意义，XDial 接管路由后从物理
-// 口发出去就是黑洞，整机 DNS 全灭（2026-07-26 实测）。DoH 走 IP 直连不需要
-// bootstrap 解析，加密通道也躲开 UDP 53 明文污染。
+// 不能用 type:local（系统 DNS）当默认——启动前 Underlay 的 resolver 可能只在
+// 下层虚拟接口中可达，XDial 接管路由后再把原始查询强制直出会形成解析黑洞。
+// DoH 使用 IP 地址，不需要 bootstrap 解析；其 detour 仍由 sing-box 按当前
+// Underlay 选择，不由 XDial 绑定接口。
 const desktopPublicDNSTag = "public-dns"
 const desktopEnterpriseDNSTag = "enterprise-dns"
 
@@ -549,7 +573,6 @@ func collectVPNBoundDomains(profile *Profile, mode *Mode) []string {
 }
 
 func buildDNS(
-	tailscaleTag string,
 	enterpriseDNS []string,
 	enterpriseDomains []string,
 	proxyTargets []proxyDNSTarget,
@@ -565,8 +588,8 @@ func buildDNS(
 	}
 	var rules []map[string]interface{}
 
-	// 企业域名 → 企业 DNS（查询本身经 AnyConnect 隧道出去）。放在最前：
-	// 内网名不去打扰 tailnet 分域，也绝不落到公共 DoH（那里是 NXDOMAIN）。
+	// 企业域名 → 企业 DNS（查询本身经 AnyConnect 隧道出去）。放在最前，
+	// 绝不落到公共 DoH（那里是 NXDOMAIN）。
 	if len(enterpriseDNS) > 0 && len(enterpriseDomains) > 0 {
 		servers = append(servers, map[string]interface{}{
 			"tag": desktopEnterpriseDNSTag,
@@ -583,8 +606,8 @@ func buildDNS(
 		})
 	}
 
-	// 承载线路上的域名 → 经该线路的 DoH 解析。排在企业规则之后、tailnet
-	// 兜底之前：内网名的归属已定，而这里的域名（gfwlist 等）本就不是 tailnet 名字。
+	// 承载线路上的域名 → 经该线路的 DoH 解析。排在企业规则之后：
+	// 内网名的归属已定。
 	// 统一用 DoH（TCP/443 CONNECT）而非 UDP：detour 可能是 "vpn"，桌面那头是只
 	// 实现了 CONNECT 的本地 go-socks5 桥（同 enterprise-dns 的 tcp 理由）。
 	seenProxyServer := map[string]bool{}
@@ -608,29 +631,10 @@ func buildDNS(
 		rules = append(rules, rule)
 	}
 
-	if tailscaleTag != "" {
-		servers = append(servers, map[string]interface{}{
-			"type":     "tailscale",
-			"tag":      "tailscale-dns",
-			"endpoint": tailscaleTag,
-			// false = 只解析 tailnet 自家名字，其余域名回落 final。
-			// 显式写死，不依赖 sing-box 的默认值（翻转即变成全局 DNS 接管）。
-			"accept_default_resolvers": false,
-		})
-		// ip_accept_any 是"地址限制"规则：只有 A/AAAA/HTTPS 查询会走它，
-		// 且要 tailscale-dns 真返回地址才算命中，否则继续往后落到 final。
-		// 已知边界：MX/TXT/SRV 等非地址类 qtype 不匹配此规则，直接落 final，
-		// 即 tailnet 名字的非地址记录查不到。tailnet 用不到这些记录，不处理。
-		rules = append(rules, map[string]interface{}{
-			"ip_accept_any": true, "server": "tailscale-dns",
-		})
-	}
-
 	config := map[string]interface{}{
 		"servers": servers,
 		"final":   desktopPublicDNSTag,
-		// 按 (域名, server) 分别缓存。共用一份缓存时，public-dns 对 tailnet 名字
-		// 的 NXDOMAIN 会被后续查询直接命中，tailscale-dns 永远没机会应答。
+		// 按 (域名, server) 分别缓存，避免不同线路的解析视角互相污染。
 		"independent_cache": true,
 	}
 	if len(rules) > 0 {
@@ -682,8 +686,8 @@ func buildSystemRouteRules(includeDesktopDiagnostics bool) []map[string]interfac
 	rules := []map[string]interface{}{
 		{"action": "sniff"},
 		// DNS 由 sing-box 拦截并自己应答（与 NE 端同款），绝不把原始 DNS 包
-		// 转发到物理口——系统 DNS 指向 100.100.100.100（官方 Tailscale 接管）
-		// 时，转发出去就是黑洞，接管路由的瞬间整机断网。
+		// 强制直出——启动前 Underlay 的 resolver 可能只在下层虚拟接口中可达，
+		// 错误选择接口会形成解析黑洞。
 		{"protocol": "dns", "action": "hijack-dns"},
 	}
 	if includeDesktopDiagnostics {
@@ -857,16 +861,16 @@ func sbCollectRuleSets(
 // 下载失败是硬失败不是降级 —— sing-box 的 router 在启动阶段直接 FATAL 退出。
 //
 // 但绑定线路不是都能用，能当 detour 的只有订阅节点/策略组和代理线路：
-//   - Tailscale endpoint 的 tsnet server 在 StartStatePostStart 才 Start，而
+//   - 移动端 Tailscale endpoint 的 tsnet server 在 StartStatePostStart 才 Start，而
 //     rule_set 首次下载发生在更早的 StartStateStart（box.preStart → Router.Start），
 //     那时 endpoint 还没有 tailnet 地址和 netstack，拿它当 detour 必然失败。
 //   - vpn 出口在桌面是本地 go-socks5 桥：sing-box 把域名原样 CONNECT 过去，桥用
-//     系统 DNS（可能已被官方 Tailscale 接管）解析，还可能解出 IPv6 而
+//     启动前系统 resolver 解析，其视角可能与隧道不一致，还可能解出 IPv6 而
 //     VPNBridge.DialTCP 只收 IPv4。不可靠，同样退回 direct。
 //
-// 剩下退回 direct 的那些（Tailscale/vpn/direct 绑定）在桌面连接路径上不会真的走到
-// 这里下载：daemon 已在启动 sing-box 前把它们抓成本地文件（engine.prepareRuleSets），
-// 生成的是 type:local。这个兜底只覆盖没有预取的调用方（移动端、测试）。
+// 桌面的 vpn/direct 绑定不会真的走到这里下载：daemon 已在启动 sing-box 前把它们
+// 抓成本地文件（engine.prepareRuleSets），生成的是 type:local。这个 direct 兜底
+// 主要覆盖移动端和测试调用方。
 func sbDownloadDetour(
 	profile *Profile,
 	binding *RuleBinding,
@@ -1085,7 +1089,7 @@ func buildSubscriptionOutbounds(sub *Subscription, platform Platform) ([]map[str
 			case "url-test", "urltest":
 				ob["type"] = "urltest"
 				url := ""
-				if platform != PlatformNE {
+				if !platform.isNetworkExtension() {
 					url = g.URL
 				}
 				if url == "" {
@@ -1128,7 +1132,7 @@ func buildSubscriptionOutbounds(sub *Subscription, platform Platform) ([]map[str
 		default:
 			group["type"] = "urltest"
 			url := ""
-			if platform != PlatformNE {
+			if !platform.isNetworkExtension() {
 				url = sub.TestURL
 			}
 			if url == "" {

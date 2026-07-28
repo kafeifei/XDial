@@ -43,7 +43,7 @@ final class AppState: ObservableObject {
     }
 
     let engine = GoEngine.shared
-    private var engineSub: AnyCancellable?
+    private var engineSubs = Set<AnyCancellable>()
 
     private let profileKey = "xdial.profile"
     private let keychainPrefix = "xdial-line-"
@@ -101,9 +101,62 @@ final class AppState: ObservableObject {
         profile.modes.first { $0.id == profile.activeModeID }
     }
 
+    var activeSubscriptions: [Subscription] {
+        guard let mode = activeMode else { return [] }
+        var ids = Set(mode.bindings.compactMap {
+            $0.subscriptionID.isEmpty ? nil : $0.subscriptionID
+        })
+        if !mode.defaultSubscriptionID.isEmpty {
+            ids.insert(mode.defaultSubscriptionID)
+        }
+        return profile.subscriptions.filter { ids.contains($0.id) && $0.enabled }
+    }
+
+    /// macOS Packet Tunnel 试验版启用了 App Sandbox，配置因此落在容器目录。
+    /// 桌面端回到 root helper 后，进程重新使用正常用户目录；这里做一次有界迁移，
+    /// 只搬 XDial 自己的 profile/语言/登录项开关，不触碰任何系统网络配置。
+    private static func importSandboxPreferencesIfNeeded() {
+        let marker = "xdial.migratedFromSandboxProfileV1"
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: marker) else { return }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let source = home.appendingPathComponent(
+            "Library/Containers/com.kafeifei.xdial/Data/Library/Preferences/com.kafeifei.xdial.plist"
+        )
+        guard let values = NSDictionary(contentsOf: source),
+              let profileData = values["xdial.profile"] as? Data else { return }
+
+        let destination = home.appendingPathComponent(
+            "Library/Preferences/com.kafeifei.xdial.plist"
+        )
+        let sourceValues = try? source.resourceValues(forKeys: [.contentModificationDateKey])
+        let destinationValues = try? destination.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        )
+        let sourceDate = sourceValues?.contentModificationDate ?? .distantPast
+        let destinationDate = destinationValues?.contentModificationDate ?? .distantPast
+
+        // 已经在非沙盒版本里改过更新配置时，不用更旧的试验版快照覆盖它。
+        if defaults.data(forKey: "xdial.profile") == nil || sourceDate > destinationDate {
+            defaults.set(profileData, forKey: "xdial.profile")
+            if let language = values["xdial.language"] as? String {
+                defaults.set(language, forKey: "xdial.language")
+            }
+            if let launchAtLogin = values["xdial.launchAtLogin"] as? Bool {
+                defaults.set(launchAtLogin, forKey: "xdial.launchAtLogin")
+            }
+            KeychainStore.importSandboxVaultIfNeeded()
+            appLog("migrated Packet Tunnel sandbox profile into desktop helper app")
+        }
+        defaults.set(true, forKey: marker)
+    }
+
     init() {
         // 先用 bootstrap 初始化，loadSaved 后会被覆盖
         self.profile = Profile.bootstrap()
+
+        Self.importSandboxPreferencesIfNeeded()
 
         // 语言：先读已保存，没有则用系统语言
         if let savedLang = UserDefaults.standard.string(forKey: "xdial.language"),
@@ -114,26 +167,23 @@ final class AppState: ObservableObject {
         }
         self.launchAtLogin = UserDefaults.standard.bool(forKey: "xdial.launchAtLogin")
 
-        var lastStatus = ""
-        engineSub = engine.objectWillChange.sink { [weak self] _ in
-            guard let self else { return }
-            self.objectWillChange.send()
-            let cur = self.engine.status
-            // 只在变成 connected 时探测；断开不测
-            if cur != lastStatus && cur == "connected" {
-                lastStatus = cur
+        engine.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &engineSubs)
+        engine.$status
+            .removeDuplicates()
+            .sink { [weak self] status in
+                guard let self, status == "connected" else { return }
                 self.probeNetwork()
                 self.markUsedLinesVerified()
-            } else if cur != lastStatus {
-                lastStatus = cur
             }
-        }
+            .store(in: &engineSubs)
         loadSaved()
         checkHelper()
         // 启动即自愈：daemon 若还是重编前的旧二进制，让它 respawn 成 bundle 里的新版
         Task.detached { await GoEngine.syncDaemonBinary() }
         engine.syncStatus()
-        // 启动时如果已连接（helper 一直在跑）也探测一次
+        // 启动时如果 helper 一直在跑且已连接，也探测一次。
         if engine.status == "connected" {
             probeNetwork()
         }
@@ -153,12 +203,10 @@ final class AppState: ObservableObject {
         if let defaultLineID = activeMode?.defaultLineID, !defaultLineID.isEmpty {
             usedIDs.insert(defaultLineID)
         }
-        let activeLines = profile.lines.filter {
-            usedIDs.contains($0.id) || ($0.enabled && $0.type == "tailscale")
-        }
+        let activeLines = profile.lines.filter { usedIDs.contains($0.id) }
         NetworkInfo.shared.probeAll(
             lines: activeLines,
-            subscriptions: profile.subscriptions,
+            subscriptions: activeSubscriptions,
             helperConnected: true
         )
     }
@@ -197,7 +245,6 @@ final class AppState: ObservableObject {
             UserDefaults.standard.removeObject(forKey: profileKey)
             UserDefaults.standard.removeObject(forKey: "xdial.language")
             UserDefaults.standard.removeObject(forKey: "xdial.launchAtLogin")
-            // 彻底删除 ~/.xdial（明文密码所在）+ Keychain 旧数据，而不只是把 vault 覆盖成空
             KeychainStore.deleteVault()
             try? FileManager.default.removeItem(atPath: appLogPath())
         }
@@ -334,8 +381,10 @@ final class AppState: ObservableObject {
             appLog("setupHelper: enabled")
             if thenConnect { connect() }
         } else {
-            engine.lastError = tr("后台服务未能启用（状态 \(PrivilegeManager.status.rawValue)），请重试",
-                                  "Failed to enable background service (status \(PrivilegeManager.status.rawValue))")
+            engine.lastError = tr(
+                "后台服务未能启用（状态 \(PrivilegeManager.status.rawValue)），请重试",
+                "Failed to enable background service (status \(PrivilegeManager.status.rawValue))"
+            )
         }
     }
 
@@ -380,8 +429,6 @@ final class AppState: ObservableObject {
             profile.lines[i].ssPassword = profile.lines[i].ssPassword.normalizedASCII()
             profile.lines[i].vmessServer = profile.lines[i].vmessServer.normalizedASCII()
             profile.lines[i].vmessUUID = profile.lines[i].vmessUUID.normalizedASCII()
-            profile.lines[i].tailscaleAuthKey = profile.lines[i].tailscaleAuthKey.normalizedASCII()
-            profile.lines[i].tailscaleExitNode = profile.lines[i].tailscaleExitNode.normalizedASCII()
         }
         for i in profile.ruleSets.indices {
             profile.ruleSets[i].url = profile.ruleSets[i].url.normalizedASCII()
@@ -412,10 +459,6 @@ final class AppState: ObservableObject {
             if !sanitized.lines[i].vmessUUID.isEmpty {
                 vault[id + "-vmess"] = sanitized.lines[i].vmessUUID
                 sanitized.lines[i].vmessUUID = ""
-            }
-            if !sanitized.lines[i].tailscaleAuthKey.isEmpty {
-                vault[id + "-tsauth"] = sanitized.lines[i].tailscaleAuthKey
-                sanitized.lines[i].tailscaleAuthKey = ""
             }
         }
         for si in sanitized.subscriptions.indices {
@@ -520,7 +563,6 @@ final class AppState: ObservableObject {
             if let v = vault[id + "-trojan"] { loaded.lines[i].trojanPassword = v }
             if let v = vault[id + "-ss"] { loaded.lines[i].ssPassword = v }
             if let v = vault[id + "-vmess"] { loaded.lines[i].vmessUUID = v }
-            if let v = vault[id + "-tsauth"] { loaded.lines[i].tailscaleAuthKey = v }
         }
         for si in loaded.subscriptions.indices {
             let subID = loaded.subscriptions[si].id
@@ -548,6 +590,31 @@ final class AppState: ObservableObject {
                 didMigrate = true
                 appLog("loadSaved: sanitized control chars in rule set \(loaded.ruleSets[i].id)")
             }
+        }
+
+        // 桌面端不再内置 Tailscale。旧配置里的线路和引用在加载时一次性迁出；
+        // 官方客户端仍可作为 XDial 启动前已经存在的 Underlay。
+        let removedLineIDs = Set(loaded.lines.filter { $0.type == "tailscale" }.map(\.id))
+        if !removedLineIDs.isEmpty {
+            loaded.lines.removeAll { removedLineIDs.contains($0.id) }
+            let fallbackLineID: String
+            if let direct = loaded.lines.first(where: { $0.enabled && $0.type == "direct" }) {
+                fallbackLineID = direct.id
+            } else if let enabled = loaded.lines.first(where: { $0.enabled }) {
+                fallbackLineID = enabled.id
+            } else {
+                loaded.lines.append(Line(id: "direct", name: "直连", type: "direct",
+                                         enabled: true, verified: true))
+                fallbackLineID = "direct"
+            }
+            for i in loaded.modes.indices {
+                loaded.modes[i].bindings.removeAll { removedLineIDs.contains($0.lineID) }
+                if removedLineIDs.contains(loaded.modes[i].defaultLineID) {
+                    loaded.modes[i].defaultLineID = fallbackLineID
+                }
+            }
+            didMigrate = true
+            appLog("loadSaved: removed deprecated desktop Tailscale lines")
         }
 
         self.profile = loaded
@@ -691,8 +758,7 @@ final class AppState: ObservableObject {
 
     func checkHelper() {
         // 旧机制的 LaunchDaemon 与 SMAppService 同 label，旧 job 在位时 status
-        // 会误报 enabled。只要旧安装残留还在，就当作未配置，引导走一次性迁移
-        // （清理旧安装 → register → 系统设置批准）。
+        // 会误报 enabled。只要旧安装残留还在，就当作未配置，引导走一次性迁移。
         if PrivilegeManager.legacyInstalled {
             helperInstalled = false
             helperNeedsApproval = false

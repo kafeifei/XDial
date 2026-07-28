@@ -51,7 +51,9 @@ final class GoEngine: ObservableObject {
     }
 
     var isConnected: Bool { status == "connected" }
-    var isBusy: Bool { status == "connecting" || status == "disconnecting" || status == "reconnecting" }
+    var isBusy: Bool {
+        status == "connecting" || status == "disconnecting" || status == "reconnecting"
+    }
 
     // MARK: - Public API
 
@@ -94,16 +96,27 @@ final class GoEngine: ObservableObject {
             let ok = await self?.ensureHelperAsync() ?? false
             await MainActor.run {
                 guard let self, ok else {
-                    completion(.failure(NSError(domain: "XDial", code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "Cannot connect to helper"])))
+                    completion(.failure(NSError(
+                        domain: "XDial",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Cannot connect to helper"]
+                    )))
                     return
                 }
                 guard self.ensureSocket() else {
-                    completion(.failure(NSError(domain: "XDial", code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "Socket not available"])))
+                    completion(.failure(NSError(
+                        domain: "XDial",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Socket not available"]
+                    )))
                     return
                 }
-                self.sendSubRequest(url: url, content: content, format: format, completion: completion)
+                self.sendSubRequest(
+                    url: url,
+                    content: content,
+                    format: format,
+                    completion: completion
+                )
             }
         }
     }
@@ -187,8 +200,11 @@ final class GoEngine: ObservableObject {
                 completion(.success(result))
             } else {
                 let msg = resp.message ?? "parse failed"
-                completion(.failure(NSError(domain: "XDial", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: msg])))
+                completion(.failure(NSError(
+                    domain: "XDial",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: msg]
+                )))
             }
         }
 
@@ -248,7 +264,7 @@ final class GoEngine: ObservableObject {
         }
     }
 
-    // MARK: - Socket (private)
+    // MARK: - Socket
 
     private func ensureSocket() -> Bool {
         if fd >= 0 { return true }
@@ -265,7 +281,11 @@ final class GoEngine: ObservableObject {
         addr.sun_family = sa_family_t(AF_UNIX)
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             socketPath.withCString { cstr in
-                _ = strncpy(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self), cstr, 104)
+                _ = strncpy(
+                    UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self),
+                    cstr,
+                    104
+                )
             }
         }
 
@@ -326,7 +346,9 @@ final class GoEngine: ObservableObject {
         while let idx = readBuffer.firstIndex(of: UInt8(ascii: "\n")) {
             let line = readBuffer[readBuffer.startIndex..<idx]
             readBuffer = Data(readBuffer[(idx + 1)...])
-            guard let resp = try? JSONDecoder().decode(DaemonResponse.self, from: line) else { continue }
+            guard let resp = try? JSONDecoder().decode(DaemonResponse.self, from: line) else {
+                continue
+            }
             handleMessage(resp)
         }
     }
@@ -387,7 +409,6 @@ final class GoEngine: ObservableObject {
             lastError = e
         }
     }
-
 }
 
 private struct DaemonResponse: Decodable {
