@@ -68,9 +68,12 @@ func invBaseProfile() *Profile {
 	}
 }
 
-// invTailscaleLine 模拟旧桌面 Profile 中残留的内置 Tailscale 线路。
+// invTailscaleLine 是一条已配置但是否生效仍由 active Mode 决定的内置线路。
 func invTailscaleLine() Line {
-	return Line{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true}
+	return Line{
+		ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
+		TailscaleExitNode: "exit-node-id",
+	}
 }
 
 // invUnusedTrojanLine 是一条 enabled 但不被任何 active Mode 引用的线路。
@@ -412,10 +415,10 @@ func TestINV1_UnreferencedObjectsDoNotAffectGeneratedConfig(t *testing.T) {
 	}
 }
 
-// INV1c —— 桌面 Tailscale 不再享有任何例外。
+// INV1c —— 桌面 Tailscale 是盒内普通 Line，不享有隐式生效的例外。
 //
-// 官方 Tailscale 客户端只能作为 XDial 启动前已经存在的 Underlay。旧 profile
-// 里残留但未被 Mode 引用的 Tailscale Line 必须和不存在逐字节等价。
+// 未被 Mode 引用时必须和不存在逐字节等价；被引用时只生成一个无系统接口、无隐藏
+// 路由、无持久 Auth Key 的 sing-box endpoint。
 func TestINV1c_DesktopTailscaleHasNoException(t *testing.T) {
 	baseline := invGenerateDesktop(t, invBaseProfile())
 	invNormalize(baseline)
@@ -425,15 +428,71 @@ func TestINV1c_DesktopTailscaleHasNoException(t *testing.T) {
 	got := invGenerateDesktop(t, profile)
 	invNormalize(got)
 	if !reflect.DeepEqual(baseline, got) {
-		t.Fatalf("旧 Tailscale 线路在桌面生成物中留下痕迹\n--- 基准 ---\n%s\n--- 实际 ---\n%s",
+		t.Fatalf("未引用的 Tailscale 线路在桌面生成物中留下痕迹\n--- 基准 ---\n%s\n--- 实际 ---\n%s",
 			invPretty(baseline), invPretty(got))
 	}
 
 	active := invBaseProfile()
-	active.Lines = append(active.Lines, invTailscaleLine())
+	tailscaleLine := invTailscaleLine()
+	tailscaleLine.TailscaleAuthKey = "must-not-enter-desktop-config"
+	active.Lines = append(active.Lines, tailscaleLine)
 	active.Modes[0].DefaultLineID = "ts"
-	if _, err := GenerateSingBoxDesktop(active, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS, invUnderlay); err == nil {
-		t.Fatal("active 的旧 Tailscale 线路应在桌面生成阶段被明确拒绝")
+	cfg := invGenerateDesktop(t, active)
+
+	endpoints, ok := cfg["endpoints"].([]interface{})
+	if !ok || len(endpoints) != 1 {
+		t.Fatalf("active Tailscale 必须且只能生成一个 endpoint: %v", cfg["endpoints"])
+	}
+	endpoint := endpoints[0].(map[string]interface{})
+	if endpoint["type"] != "tailscale" || endpoint["tag"] != "tailscale-ts" {
+		t.Fatalf("Tailscale endpoint 身份错误: %v", endpoint)
+	}
+	if endpoint["system_interface"] != false || endpoint["accept_routes"] != false {
+		t.Fatalf("桌面 Tailscale endpoint 必须显式保持在 sing-box 盒内: %v", endpoint)
+	}
+	for _, forbidden := range []string{"auth_key", "advertise_routes", "advertise_exit_node"} {
+		if _, exists := endpoint[forbidden]; exists {
+			t.Fatalf("桌面 Tailscale endpoint 不得包含 %s: %v", forbidden, endpoint)
+		}
+	}
+
+	route := cfg["route"].(map[string]interface{})
+	for _, rawRule := range route["rules"].([]interface{}) {
+		rule := rawRule.(map[string]interface{})
+		if rule["outbound"] == "tailscale-ts" && reflect.DeepEqual(rule["ip_cidr"], []interface{}{"100.64.0.0/10"}) {
+			t.Fatalf("Tailscale Line 不得注入隐藏 tailnet 路由: %v", rule)
+		}
+	}
+}
+
+// INV1d —— 同一份持久 identity 不能同时被两个 endpoint 实例打开。
+func TestINV1d_OnlyOneActiveTailscaleLine(t *testing.T) {
+	profile := invBaseProfile()
+	first := invTailscaleLine()
+	second := invTailscaleLine()
+	second.ID = "ts-2"
+	second.Name = "Tailnet 2"
+	profile.Lines = append(profile.Lines, first, second)
+	profile.RuleSets = append(profile.RuleSets, RuleSet{
+		ID: "tailnet-only", Name: "Tailnet Only", Type: RuleSetTypeManual,
+		Enabled: true, Domains: []string{"tailnet.example"},
+	})
+	profile.Modes[0].DefaultLineID = first.ID
+	profile.Modes[0].Bindings = append(profile.Modes[0].Bindings, RuleBinding{
+		RuleSetID: "tailnet-only",
+		LineID:    second.ID,
+	})
+
+	_, err := GenerateSingBoxDesktop(
+		profile,
+		invSocksPort,
+		invVPNServerIP,
+		invBasePath,
+		invEnterpriseDNS,
+		invUnderlay,
+	)
+	if err == nil || !strings.Contains(err.Error(), "only one active Tailscale line") {
+		t.Fatalf("两条 active Tailscale 必须在生成阶段拒绝，got %v", err)
 	}
 }
 
@@ -1140,6 +1199,42 @@ func TestINVUnderlay_DesktopForwardsSystemSnapshot(t *testing.T) {
 	}
 }
 
+func TestINVUnderlay_TransparentProxyForwardsSystemSnapshot(t *testing.T) {
+	data, err := GenerateSingBoxTransparentProxy(
+		invBaseProfile(),
+		29876,
+		"session-user",
+		"session-password",
+		invBasePath,
+		invUnderlay,
+		[]string{"100.100.100.100"},
+	)
+	if err != nil {
+		t.Fatalf("GenerateSingBoxTransparentProxy 失败: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("生成的配置不是合法 JSON: %v", err)
+	}
+	route, ok := cfg["route"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("route 结构无效：%s", invPretty(cfg["route"]))
+	}
+	if got := route["default_interface"]; got != invUnderlay {
+		t.Fatalf("Transparent Proxy 必须逐字转交系统 Underlay 快照：got=%v want=%q\n%s",
+			got, invUnderlay, invPretty(route))
+	}
+	if _, exists := route["auto_detect_interface"]; exists {
+		t.Fatalf("Transparent Proxy 不得重新猜测默认接口：%s", invPretty(route))
+	}
+	for _, raw := range cfg["outbounds"].([]interface{}) {
+		outbound := raw.(map[string]interface{})
+		if _, exists := outbound["bind_interface"]; exists {
+			t.Fatalf("Transparent Proxy 不得为单条 outbound 选择接口：%s", invPretty(outbound))
+		}
+	}
+}
+
 func TestINVUnderlay_DesktopRejectsMissingSystemSnapshot(t *testing.T) {
 	_, err := GenerateSingBoxDesktop(
 		invBaseProfile(),
@@ -1151,5 +1246,17 @@ func TestINVUnderlay_DesktopRejectsMissingSystemSnapshot(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "underlay interface snapshot") {
 		t.Fatalf("空 Underlay 快照必须 fail-closed，got=%v", err)
+	}
+	_, err = GenerateSingBoxTransparentProxy(
+		invBaseProfile(),
+		29876,
+		"session-user",
+		"session-password",
+		invBasePath,
+		"",
+		[]string{"100.100.100.100"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "underlay interface snapshot") {
+		t.Fatalf("Transparent Proxy 空 Underlay 快照必须 fail-closed，got=%v", err)
 	}
 }

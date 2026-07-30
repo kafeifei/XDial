@@ -177,11 +177,30 @@ func TestGenerate_DesktopUserSplitCombination(t *testing.T) {
 	singboxCheckConfig(t, data, "desktop-split")
 }
 
+func TestGenerate_DesktopTailscale(t *testing.T) {
+	if _, err := exec.LookPath("sing-box"); err != nil {
+		t.Skip("sing-box not installed")
+	}
+	p := &Profile{
+		Lines: []Line{directLine(), tailscaleLine()},
+		Modes: []Mode{{
+			ID: "tailnet", Name: "Tailnet", DefaultLineID: "tailscale-1",
+		}},
+		ActiveModeID: "tailnet",
+		Tailscale:    tailscaleIdentity(),
+	}
+	data, err := GenerateSingBoxDesktop(p, 0, "", t.TempDir(), nil, "en0")
+	if err != nil {
+		t.Fatalf("[tailscale-desktop] GenerateSingBoxDesktop: %v", err)
+	}
+	singboxCheckConfig(t, data, "tailscale-desktop")
+}
+
 func TestGenerate_NETailscale(t *testing.T) {
 	p := &Profile{
 		Lines: []Line{directLine(), tailscaleLine()},
 		Modes: []Mode{{
-			ID: "tailnet", Name: "Tailnet", DefaultLineID: "direct",
+			ID: "tailnet", Name: "Tailnet", DefaultLineID: "tailscale-1",
 		}},
 		ActiveModeID: "tailnet",
 		Tailscale:    tailscaleIdentity(),

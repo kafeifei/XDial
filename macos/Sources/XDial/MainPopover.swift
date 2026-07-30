@@ -3,6 +3,7 @@ import SwiftUI
 struct MainPopover: View {
     @EnvironmentObject var state: AppState
     @Environment(\.openWindow) private var openWindow
+    @State private var showTransaction = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -17,10 +18,106 @@ struct MainPopover: View {
             }
             Divider()
             statusRow
+            if let report = state.engine.connectionReport {
+                transactionSummary(report)
+            }
             actionRow
         }
         .padding(12)
         .frame(width: 300)
+    }
+
+    private func transactionSummary(
+        _ report: ConnectionReport
+    ) -> some View {
+        DisclosureGroup(isExpanded: $showTransaction) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(report.tasks) { task in
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Image(systemName: taskIcon(task.state))
+                                .foregroundStyle(taskColor(task.state))
+                                .frame(width: 12)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(task.name)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                if task.state == .failed,
+                                   let error = task.error {
+                                    Text(error.message)
+                                        .font(.caption2)
+                                        .foregroundStyle(.red)
+                                        .fixedSize(
+                                            horizontal: false,
+                                            vertical: true
+                                        )
+                                }
+                            }
+                            Spacer()
+                            Text(taskStateText(task.state))
+                                .font(.caption2)
+                                .foregroundStyle(taskColor(task.state))
+                        }
+                    }
+                    if report.rollbackComplete {
+                        Divider()
+                        Label(
+                            report.systemTakeoverRemoved
+                                ? state.tr(
+                                    "已回滚，系统网络接管已移除",
+                                    "Rolled back; system takeover removed"
+                                )
+                                : state.tr(
+                                    "回滚未能证明系统网络已恢复",
+                                    "Rollback could not prove network recovery"
+                                ),
+                            systemImage: report.systemTakeoverRemoved
+                                ? "arrow.uturn.backward.circle.fill"
+                                : "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(
+                            report.systemTakeoverRemoved
+                                ? Color.secondary
+                                : Color.red
+                        )
+                    } else if let rollbackError = report.rollbackError {
+                        Divider()
+                        Label(
+                            rollbackError.message,
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .frame(maxHeight: 180)
+            .padding(.top, 5)
+        } label: {
+            HStack {
+                Text(state.tr("连接检查", "Connection checklist"))
+                    .font(.caption)
+                Spacer()
+                Text(transactionStateText(report.state))
+                    .font(.caption2)
+                    .foregroundStyle(
+                        report.state == .failed ? .red : .secondary
+                    )
+            }
+        }
+        .onChange(of: report.transactionID) {
+            showTransaction = true
+        }
+        .onChange(of: report.state) {
+            if report.state == .failed ||
+                report.state == .rollingBack ||
+                report.state == .preparing ||
+                report.state == .committing {
+                showTransaction = true
+            }
+        }
     }
 
     private var header: some View {
@@ -82,8 +179,6 @@ struct MainPopover: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
-    @ObservedObject private var net = NetworkInfo.shared
-
     private var subscriptionSummary: some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(state.activeSubscriptions) { sub in
@@ -93,19 +188,6 @@ struct MainPopover: View {
                         .font(.caption)
                         .lineLimit(1)
                     Spacer()
-                    if let info = net.perLine[sub.id] {
-                        if !info.ip.isEmpty {
-                            Text(info.summary)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        } else if !info.error.isEmpty {
-                            Text(info.error)
-                                .font(.caption2)
-                                .foregroundStyle(.red)
-                                .lineLimit(1)
-                        }
-                    }
                 }
             }
         }
@@ -135,46 +217,30 @@ struct MainPopover: View {
 
     private var actionRow: some View {
         HStack(spacing: 8) {
-            if !state.helperInstalled {
-                if state.helperNeedsApproval {
-                    Button(state.tr("去系统设置批准", "Approve in System Settings")) {
-                        state.setupHelper(thenConnect: true)
-                    }
+            switch state.engine.status {
+            case "connecting":
+                Button("连接中…") {}
+                    .controlSize(.small)
+                    .disabled(true)
+            case "connected":
+                Button("断开") { state.disconnect() }
+                    .tint(.red)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            case "reconnecting":
+                Button("重连中…") { state.disconnect() }
+                    .tint(.orange)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            case "disconnecting":
+                Button("断开中…") {}
+                    .controlSize(.small)
+                    .disabled(true)
+            default:
+                Button("连接") { state.connect() }
                     .keyboardShortcut(.defaultAction)
                     .controlSize(.small)
-                } else {
-                    Button(state.tr("一键配置", "Set Up")) {
-                        state.setupHelper(thenConnect: true)
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .controlSize(.small)
-                }
-            } else {
-                switch state.engine.status {
-                case "connecting":
-                    Button("连接中…") {}
-                        .controlSize(.small)
-                        .disabled(true)
-                case "connected":
-                    Button("断开") { state.disconnect() }
-                        .tint(.red)
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                case "reconnecting":
-                    Button("重连中…") { state.disconnect() }
-                        .tint(.orange)
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                case "disconnecting":
-                    Button("断开中…") {}
-                        .controlSize(.small)
-                        .disabled(true)
-                default:
-                    Button("连接") { state.connect() }
-                        .keyboardShortcut(.defaultAction)
-                        .controlSize(.small)
-                        .disabled(!state.canConnect)
-                }
+                    .disabled(!state.canConnect)
             }
 
             Spacer()
@@ -197,6 +263,10 @@ struct MainPopover: View {
                             }
                         }
                     }
+                } else {
+                    Button(state.tr("配置后台服务", "Set Up Background Service")) {
+                        state.setupHelper()
+                    }
                 }
                 Divider()
                 Button("退出 XDial") { NSApp.terminate(nil) }
@@ -212,6 +282,66 @@ struct MainPopover: View {
         if state.isConnected { return .green }
         if state.isBusy { return .orange }
         return .secondary
+    }
+
+    private func taskIcon(_ taskState: ConnectionTaskState) -> String {
+        switch taskState {
+        case .pending:
+            "circle"
+        case .running, .committing, .rollingBack:
+            "clock.fill"
+        case .ready, .committed:
+            "checkmark.circle.fill"
+        case .rolledBack:
+            "arrow.uturn.backward.circle.fill"
+        case .failed:
+            "xmark.octagon.fill"
+        case .skipped:
+            "minus.circle"
+        }
+    }
+
+    private func taskColor(_ taskState: ConnectionTaskState) -> Color {
+        switch taskState {
+        case .ready, .committed:
+            .green
+        case .running, .committing, .rollingBack:
+            .orange
+        case .failed:
+            .red
+        default:
+            .secondary
+        }
+    }
+
+    private func taskStateText(_ taskState: ConnectionTaskState) -> String {
+        switch taskState {
+        case .pending: state.tr("等待", "Pending")
+        case .running: state.tr("准备中", "Preparing")
+        case .ready: state.tr("就绪", "Ready")
+        case .committing: state.tr("提交中", "Committing")
+        case .committed: state.tr("已提交", "Committed")
+        case .rollingBack: state.tr("回滚中", "Rolling back")
+        case .rolledBack: state.tr("已回滚", "Rolled back")
+        case .failed: state.tr("失败", "Failed")
+        case .skipped: state.tr("跳过", "Skipped")
+        }
+    }
+
+    private func transactionStateText(
+        _ transactionState: ConnectionTransactionState
+    ) -> String {
+        switch transactionState {
+        case .planning: state.tr("生成计划", "Planning")
+        case .preparing: state.tr("准备依赖", "Preparing")
+        case .readyToCommit: state.tr("等待提交", "Ready")
+        case .committing: state.tr("接管网络", "Committing")
+        case .committed: state.tr("完成", "Committed")
+        case .rollingBack: state.tr("正在回滚", "Rolling back")
+        case .rolledBack: state.tr("已回滚", "Rolled back")
+        case .failed: state.tr("失败", "Failed")
+        case .cancelled: state.tr("已取消", "Cancelled")
+        }
     }
 
     private func formatDuration(_ seconds: Int) -> String {

@@ -64,6 +64,15 @@ func isTailnetRouteRule(rule map[string]interface{}, endpointTag string) bool {
 		rule["outbound"] == endpointTag
 }
 
+func sliceContainsString(values []interface{}, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
+}
+
 func TestProfileFinders(t *testing.T) {
 	p := testProfile()
 	if e := p.FindLine("vpn"); e == nil || e.Name != "VPN" {
@@ -77,6 +86,21 @@ func TestProfileFinders(t *testing.T) {
 	}
 	if v := p.VPNLine(); v == nil || v.VPNServer == "" {
 		t.Fatal("VPNLine failed")
+	}
+}
+
+func TestBuildLineRuntimeCatalogIncludesTailscaleEndpointTag(t *testing.T) {
+	profile := &Profile{Lines: []Line{
+		{ID: "direct", Name: "Direct", Type: LineTypeDirect, Enabled: true},
+		{ID: "tailnet", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true},
+		{ID: "disabled", Name: "Disabled", Type: LineTypeTrojan, Enabled: false},
+	}}
+	catalog := BuildLineRuntimeCatalog(profile)
+	if len(catalog.Lines) != 2 {
+		t.Fatalf("unexpected runtime line catalog: %+v", catalog)
+	}
+	if catalog.Lines[0].Tag != "direct" || catalog.Lines[1].Tag != "tailscale-tailnet" {
+		t.Fatalf("runtime catalog drifted from generated tags: %+v", catalog)
 	}
 }
 
@@ -702,19 +726,62 @@ func TestGenerateMacOSModeUnchanged(t *testing.T) {
 	}
 }
 
-func TestGenerateDesktopRejectsActiveTailscaleLine(t *testing.T) {
+func TestGenerateDesktopTailscaleEndpoint(t *testing.T) {
+	basePath := t.TempDir()
 	p := &Profile{
 		Lines: []Line{
 			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
-			{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true},
+			{
+				ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
+				TailscaleExitNode: "exit-node",
+				TailscaleAuthKey:  "must-not-be-persisted",
+			},
 		},
 		Modes:        []Mode{{ID: "tailnet", Name: "Tailnet", DefaultLineID: "ts"}},
 		ActiveModeID: "tailnet",
+		Tailscale:    TailscaleIdentity{Hostname: "xdial-desktop"},
 	}
 
-	_, err := GenerateSingBoxDesktop(p, 0, "", t.TempDir(), nil, "en0")
-	if err == nil || !strings.Contains(err.Error(), "desktop Tailscale lines have been removed") {
-		t.Fatalf("expected explicit desktop Tailscale rejection, got %v", err)
+	data, err := GenerateSingBoxDesktop(p, 0, "", basePath, nil, "en0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Endpoints) != 1 {
+		t.Fatalf("expected one desktop Tailscale endpoint, got %d", len(cfg.Endpoints))
+	}
+	endpoint := cfg.Endpoints[0]
+	if endpoint["type"] != "tailscale" ||
+		endpoint["tag"] != "tailscale-ts" ||
+		endpoint["state_directory"] != TailscaleStateDirectory(basePath) ||
+		endpoint["hostname"] != "xdial-desktop" ||
+		endpoint["exit_node"] != "exit-node" {
+		t.Fatalf("unexpected desktop Tailscale endpoint: %v", endpoint)
+	}
+	if endpoint["system_interface"] != false || endpoint["accept_routes"] != false {
+		t.Fatalf("desktop Tailscale endpoint must stay inside the existing sing-box layer: %v", endpoint)
+	}
+	for _, forbidden := range []string{"auth_key"} {
+		if _, exists := endpoint[forbidden]; exists {
+			t.Fatalf("desktop Tailscale endpoint must not contain %s: %v", forbidden, endpoint)
+		}
+	}
+	selectorFound := false
+	for _, outbound := range cfg.Outbounds {
+		if outbound["tag"] != testSelectorTag {
+			continue
+		}
+		selectorFound = true
+		members := outbound["outbounds"].([]interface{})
+		if !sliceContainsString(members, "tailscale-ts") {
+			t.Fatalf("desktop diagnostic selector does not contain Tailscale endpoint: %v", outbound)
+		}
+	}
+	if !selectorFound {
+		t.Fatal("desktop diagnostic selector is missing")
 	}
 }
 
@@ -765,8 +832,8 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 	if _, exists := endpoint["ephemeral"]; exists {
 		t.Fatalf("mobile tailscale endpoint must also be a persistent node: %v", endpoint)
 	}
-	if _, exists := endpoint["accept_routes"]; exists {
-		t.Fatalf("mobile tailscale endpoint must not accept peer routes: %v", endpoint)
+	if endpoint["system_interface"] != false || endpoint["accept_routes"] != false {
+		t.Fatalf("mobile tailscale endpoint must stay inside the existing sing-box layer: %v", endpoint)
 	}
 
 	// 移动端与桌面端保持相同语义：只接管 tailnet 内部网段。
@@ -850,28 +917,35 @@ func TestBuildNEDNSKeepsTailscaleBindingsIsolated(t *testing.T) {
 	}
 }
 
-// Tailscale 身份（state_directory / node key）全 Profile 一份，两条 enabled 线路
+// Tailscale 身份（state_directory / node key）全 Profile 一份，两条 active 线路
 // 会生成两个抢同一目录的 endpoint —— 生成阶段就必须拒绝，而不是让它"起来但连不通"。
-func TestGenerateNERejectsMultipleEnabledTailscaleLines(t *testing.T) {
+func TestGenerateNERejectsMultipleActiveTailscaleLines(t *testing.T) {
 	p := &Profile{
 		Lines: []Line{
 			{ID: "direct", Type: LineTypeDirect, Enabled: true},
 			{ID: "tail-a", Type: LineTypeTailscale, Enabled: true},
 			{ID: "tail-b", Type: LineTypeTailscale, Enabled: true},
 		},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
+		RuleSets: []RuleSet{{
+			ID: "tail-b-rules", Type: RuleSetTypeManual, Enabled: true,
+			Domains: []string{"tail-b.example"},
+		}},
+		Modes: []Mode{{
+			ID: "mode", DefaultLineID: "tail-a",
+			Bindings: []RuleBinding{{RuleSetID: "tail-b-rules", LineID: "tail-b"}},
+		}},
 		ActiveModeID: "mode",
 	}
 
 	if _, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "only one enabled Tailscale line") {
+		!strings.Contains(err.Error(), "only one active Tailscale line") {
 		t.Fatalf("expected multiple-Tailscale error, got %v", err)
 	}
 
-	// 停用其中一条即可恢复：未启用的线路不生成 endpoint，也就不抢目录。
+	// 停用其中一条即可恢复：disabled 的线路不生成 endpoint，也就不抢目录。
 	p.Lines[2].Enabled = false
 	if _, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir()); err != nil {
-		t.Fatalf("single enabled Tailscale line must be accepted on NE: %v", err)
+		t.Fatalf("single active Tailscale line must be accepted on NE: %v", err)
 	}
 }
 
@@ -906,7 +980,7 @@ func TestGenerateNETailscaleRejectsRelativeStatePath(t *testing.T) {
 			{ID: "direct", Type: LineTypeDirect, Enabled: true},
 			{ID: "ts", Type: LineTypeTailscale, Enabled: true},
 		},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
+		Modes:        []Mode{{ID: "mode", DefaultLineID: "ts"}},
 		ActiveModeID: "mode",
 	}
 
@@ -1589,7 +1663,7 @@ func TestCollectProfileWarningsReportsUnavailableTargets(t *testing.T) {
 	}
 }
 
-// D29：auth_key 作为纯参数下发；节点必须保持常驻（绝不 ephemeral）。
+// 旧移动端 Profile 仍兼容 auth_key 纯参数；节点必须保持常驻（绝不 ephemeral）。
 func TestGenerateNETailscaleEndpointCarriesAuthKeyAndStaysPersistent(t *testing.T) {
 	p := &Profile{
 		Lines: []Line{
@@ -1631,5 +1705,100 @@ func TestGenerateNETailscaleEndpointCarriesAuthKeyAndStaysPersistent(t *testing.
 	}
 	if _, ok := withoutKey.Endpoints[0]["auth_key"]; ok {
 		t.Fatalf("empty auth key must not emit the option: %v", withoutKey.Endpoints[0])
+	}
+}
+
+func TestGenerateTransparentProxyUsesAuthenticatedLoopbackSOCKSWithSystemUnderlay(t *testing.T) {
+	p := &Profile{
+		Lines:        []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
+		ActiveModeID: "mode",
+	}
+	data, err := GenerateSingBoxTransparentProxy(
+		p,
+		29876,
+		"session-user",
+		"session-password",
+		t.TempDir(),
+		"utun-underlay",
+		[]string{"100.100.100.100"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Inbounds) != 1 {
+		t.Fatalf("unexpected inbounds: %v", cfg.Inbounds)
+	}
+	inbound := cfg.Inbounds[0]
+	if inbound["type"] != "socks" ||
+		inbound["listen"] != "127.0.0.1" ||
+		inbound["listen_port"] != float64(29876) {
+		t.Fatalf("unexpected Transparent Proxy ingress: %v", inbound)
+	}
+	users := inbound["users"].([]interface{})
+	user := users[0].(map[string]interface{})
+	if user["username"] != "session-user" ||
+		user["password"] != "session-password" {
+		t.Fatalf("loopback SOCKS credentials missing: %v", users)
+	}
+	if got := cfg.Route["default_interface"]; got != "utun-underlay" {
+		t.Fatalf("Transparent Proxy must forward the system Underlay snapshot: %v", cfg.Route)
+	}
+	if _, exists := cfg.Route["auto_detect_interface"]; exists {
+		t.Fatalf("Transparent Proxy must preserve system per-destination routing: %v", cfg.Route)
+	}
+	rules := cfg.Route["rules"].([]interface{})
+	if len(rules) != 3 ||
+		rules[0].(map[string]interface{})["action"] != "sniff" ||
+		rules[1].(map[string]interface{})["action"] != "hijack-dns" ||
+		rules[2].(map[string]interface{})["action"] != "resolve" ||
+		rules[2].(map[string]interface{})["server"] != transparentSystemDNSTag {
+		t.Fatalf("Transparent Proxy must not resolve globally before Mode rules: %v", rules)
+	}
+	if cfg.Route["default_domain_resolver"] != transparentSystemDNSTag ||
+		cfg.DNS["final"] != transparentSystemDNSTag {
+		t.Fatalf("Transparent Proxy must use the startup system DNS snapshot: dns=%v route=%v", cfg.DNS, cfg.Route)
+	}
+}
+
+func TestGenerateTransparentProxyRejectsMissingSessionCredentials(t *testing.T) {
+	p := &Profile{
+		Lines:        []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
+		ActiveModeID: "mode",
+	}
+	if _, err := GenerateSingBoxTransparentProxy(
+		p,
+		29876,
+		"",
+		"password",
+		t.TempDir(),
+		"utun-underlay",
+		[]string{"100.100.100.100"},
+	); err == nil {
+		t.Fatal("missing loopback SOCKS credentials were accepted")
+	}
+}
+
+func TestGenerateTransparentProxyRejectsMissingSystemUnderlay(t *testing.T) {
+	p := &Profile{
+		Lines:        []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
+		ActiveModeID: "mode",
+	}
+	if _, err := GenerateSingBoxTransparentProxy(
+		p,
+		29876,
+		"session-user",
+		"session-password",
+		t.TempDir(),
+		"",
+		[]string{"100.100.100.100"},
+	); err == nil || !strings.Contains(err.Error(), "underlay interface snapshot") {
+		t.Fatalf("missing system Underlay was accepted: %v", err)
 	}
 }

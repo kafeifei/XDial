@@ -398,7 +398,7 @@ func TestSmoke_BasicSplit(t *testing.T) {
 	r.requestAndAssert("internal.example.com", "vpn")
 	r.requestAndAssert("twitter.com", "proxy-my-trojan")
 	r.requestAndAssert("facebook.com", "proxy-my-trojan")
-	r.requestAndAssert("baidu.com", "direct")
+	r.requestAndAssert("unmatched.test", "direct")
 }
 
 func TestSmoke_DefaultVPN(t *testing.T) {
@@ -709,7 +709,7 @@ func TestSmoke_DirectBinding(t *testing.T) {
 		},
 		RuleSets: []RuleSet{
 			{ID: "china", Name: "国内", Type: RuleSetTypeManual, Enabled: true,
-				Domains: []string{"baidu.com", "qq.com"}},
+				Domains: []string{"cn-one.test", "cn-two.test"}},
 		},
 		Modes: []Mode{{
 			ID: "main",
@@ -724,8 +724,8 @@ func TestSmoke_DirectBinding(t *testing.T) {
 	r := newSmokeRunner(t, profile)
 	defer r.stop()
 
-	r.requestAndAssert("baidu.com", "direct")
-	r.requestAndAssert("qq.com", "direct")
+	r.requestAndAssert("cn-one.test", "direct")
+	r.requestAndAssert("cn-two.test", "direct")
 	r.requestAndAssert("google.com", "vpn")
 }
 
@@ -835,7 +835,7 @@ func TestSmoke_SubscribeBasic(t *testing.T) {
 	// 订阅 group 默认为 selector，默认选第一个节点
 	r.requestAndAssert("google.com", "proxy-sub1-n1")
 	r.requestAndAssert("youtube.com", "proxy-sub1-n1")
-	r.requestAndAssert("baidu.com", "direct")
+	r.requestAndAssert("unmatched.test", "direct")
 }
 
 func TestSmoke_SubscribeWithGroups(t *testing.T) {
@@ -973,7 +973,7 @@ func TestSmoke_SubscribeMixed(t *testing.T) {
 	// gfw 走订阅节点
 	r.requestAndAssert("google.com", "proxy-sub1-n1")
 	// 未匹配走 direct
-	r.requestAndAssert("baidu.com", "direct")
+	r.requestAndAssert("unmatched.test", "direct")
 }
 
 func TestSmoke_SubscribeDefault(t *testing.T) {
@@ -1129,7 +1129,7 @@ func TestSmoke_SubscribeMultiSubscription(t *testing.T) {
 
 	r.requestAndAssert("google.com", "proxy-sub-a-n1")
 	r.requestAndAssert("netflix.com", "proxy-sub-b-n1")
-	r.requestAndAssert("baidu.com", "direct")
+	r.requestAndAssert("unmatched.test", "direct")
 }
 
 func TestSmoke_SubscribeUrltest(t *testing.T) {

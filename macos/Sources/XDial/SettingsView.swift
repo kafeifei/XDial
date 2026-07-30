@@ -188,7 +188,6 @@ struct LinesTab: View {
                 }
                 .padding(10)
             }
-            .onAppear { state.probeNetwork() }
             Divider()
             HStack {
                 Spacer()
@@ -197,6 +196,7 @@ struct LinesTab: View {
                     Button("Trojan") { add(type: "trojan") }
                     Button("Shadowsocks") { add(type: "shadowsocks") }
                     Button("VMess") { add(type: "vmess") }
+                    Button("Tailscale") { add(type: "tailscale") }
                     Divider()
                     Button(state.tr("从订阅导入…", "Import from subscription…")) {
                         showAddSub = true
@@ -221,6 +221,7 @@ struct LinesTab: View {
         case "trojan": name = "Trojan 节点"
         case "shadowsocks": name = "SS 节点"
         case "vmess": name = "VMess 节点"
+        case "tailscale": name = "Tailscale"
         default: name = "节点"
         }
         state.profile.lines.append(Line(id: id, name: name, type: type))
@@ -229,6 +230,9 @@ struct LinesTab: View {
 
     private func delete(_ line: Line) {
         if line.type == "direct" { return }
+        if line.type == "tailscale" {
+            state.engine.stopTailscaleSetup(lineID: line.id)
+        }
         state.profile.lines.removeAll { $0.id == line.id }
         state.save()
     }
@@ -238,10 +242,150 @@ struct LinesTab: View {
     }
 }
 
+private struct RuntimeResourceBadge: View {
+    let kind: String
+    let resourceID: String
+    let enabled: Bool
+    @EnvironmentObject private var state: AppState
+
+    private var report: ConnectionReport? {
+        state.engine.connectionReport
+    }
+
+    private var runtimeState: ConnectionResourceRuntimeState {
+        .resolve(
+            enabled: enabled,
+            report: report,
+            kind: kind,
+            resourceID: resourceID
+        )
+    }
+
+    private var task: ConnectionTaskReport? {
+        report?.task(kind: kind, resourceID: resourceID)
+    }
+
+    var body: some View {
+        Label(label, systemImage: icon)
+            .font(.caption2)
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .help(helpText)
+            .accessibilityLabel(helpText)
+    }
+
+    private var label: String {
+        switch runtimeState {
+        case .disabled:
+            return state.tr("已停用", "Disabled")
+        case .notObserved:
+            return state.tr("尚未运行", "Not run")
+        case .notPlanned:
+            return state.tr("本次未使用", "Not in use")
+        case let .task(taskState):
+            switch taskState {
+            case .pending:
+                return state.tr("等待", "Waiting")
+            case .running:
+                return state.tr("检查中", "Checking")
+            case .ready:
+                return report?.state == .committed
+                    ? state.tr("运行中", "Running")
+                    : state.tr("已就绪", "Ready")
+            case .committing:
+                return state.tr("提交中", "Committing")
+            case .committed:
+                return state.tr("已接管", "Committed")
+            case .rollingBack:
+                return state.tr("正在回滚", "Rolling back")
+            case .rolledBack:
+                return report?.state == .cancelled
+                    ? state.tr("已断开", "Disconnected")
+                    : state.tr("已回滚", "Rolled back")
+            case .failed:
+                return state.tr("失败", "Failed")
+            case .skipped:
+                return state.tr("已跳过", "Skipped")
+            }
+        }
+    }
+
+    private var icon: String {
+        switch runtimeState {
+        case .disabled, .notObserved, .notPlanned:
+            return "circle"
+        case let .task(taskState):
+            switch taskState {
+            case .pending:
+                return "circle"
+            case .running, .committing, .rollingBack:
+                return "clock.fill"
+            case .ready, .committed:
+                return "checkmark.circle.fill"
+            case .rolledBack:
+                return "arrow.uturn.backward.circle.fill"
+            case .failed:
+                return "xmark.octagon.fill"
+            case .skipped:
+                return "minus.circle"
+            }
+        }
+    }
+
+    private var color: Color {
+        switch runtimeState {
+        case .disabled, .notObserved, .notPlanned:
+            return .secondary
+        case let .task(taskState):
+            switch taskState {
+            case .pending, .rolledBack, .skipped:
+                return .secondary
+            case .running, .committing, .rollingBack:
+                return .orange
+            case .ready, .committed:
+                return .green
+            case .failed:
+                return .red
+            }
+        }
+    }
+
+    private var helpText: String {
+        if let message = task?.error?.message, !message.isEmpty {
+            return message
+        }
+        switch runtimeState {
+        case .disabled:
+            return state.tr(
+                "这条线路在配置中已停用。",
+                "This line is disabled in the profile."
+            )
+        case .notObserved:
+            return state.tr(
+                "还没有连接事务可以证明这条线路的运行状态。",
+                "No connection transaction has observed this resource yet."
+            )
+        case .notPlanned:
+            return state.tr(
+                "这条线路没有被本次运行中的 Mode 引用。",
+                "This resource is not referenced by the runtime Mode."
+            )
+        case .task:
+            return label
+        }
+    }
+}
+
 struct LineRow: View {
     @SwiftUI.Binding var line: Line
     var onDelete: () -> Void
     @State private var expanded = false
+    @State private var tailscaleStatus: TailscaleRuntimeStatus?
+    @State private var tailscaleError: String?
+    @State private var tailscaleBusy = false
+    @State private var showAuthKey = false
+    @State private var authKey = ""
+    @State private var pollGeneration = 0
     @EnvironmentObject var state: AppState
     @ObservedObject private var net = NetworkInfo.shared
 
@@ -255,8 +399,11 @@ struct LineRow: View {
             onDelete: isLocked ? nil : onDelete,
             enabled: Binding(get: { line.enabled }, set: { if !isLocked { line.enabled = $0; state.save() } }),
             header: {
-                Image(systemName: line.verified ? "checkmark.seal.fill" : "checkmark.seal")
-                    .foregroundStyle(.secondary)
+                RuntimeResourceBadge(
+                    kind: "line",
+                    resourceID: line.id,
+                    enabled: line.enabled
+                )
 
                 Text(line.name)
                     .font(.system(size: 13, weight: .medium))
@@ -274,6 +421,7 @@ struct LineRow: View {
             },
             detail: {
                 VStack(alignment: .leading, spacing: 4) {
+                    runtimeFailure
                     HStack {
                         Text("名称").font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
                         TextField("名称", text: $line.name)
@@ -284,20 +432,54 @@ struct LineRow: View {
                 }
             }
         )
-        .opacity(isLocked ? 0.6 : (line.verified ? 1.0 : 0.7))
+        .opacity(line.enabled ? 1.0 : 0.65)
+    }
+
+    @ViewBuilder
+    private var runtimeFailure: some View {
+        if let task = state.engine.connectionReport?.task(
+            kind: "line",
+            resourceID: line.id
+        ),
+           task.state == .failed,
+           let error = task.error {
+            Label(
+                error.message,
+                systemImage: "exclamationmark.octagon.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.red)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.bottom, 4)
+        }
     }
 
     private var briefInfo: String {
-        // 已探测：显示真实出口 IP/地区
-        if let info = net.perLine[line.id], !info.summary.isEmpty {
+        // 出口地址只是当前连接事务的 Provider 观察；运行状态只看上方 badge。
+        if let info = net.observation(
+            for: line.id,
+            transactionID: state.engine.connectionReport?.transactionID
+        ), !info.summary.isEmpty {
             return info.summary
         }
-        // 仅启用且当前在探测时显示"检测中"
-        if net.probing && line.enabled {
-            return "检测中…"
-        }
-        // 未启用或已探测但无结果：显示静态配置
+        // 没有本次事务的有效观察时，只显示静态配置。
         switch line.type {
+        case "tailscale":
+            if let status = tailscaleStatus {
+                if status.isRunning {
+                    if line.tailscaleExitNode.isEmpty {
+                        return state.tr("已登录 · 未选择出口", "Signed in · No exit node")
+                    }
+                    if let node = status.exitNodes.first(where: { $0.ip == line.tailscaleExitNode }) {
+                        return node.online
+                            ? state.tr("已登录 · \(node.name)", "Signed in · \(node.name)")
+                            : state.tr("出口节点离线", "Exit node offline")
+                    }
+                    return state.tr("出口节点不可用", "Exit node unavailable")
+                }
+                return state.tr("需要登录", "Sign-in required")
+            }
+            return state.tr("登录状态未检查", "Sign-in status not checked")
         case "vpn":
             return line.vpnServer
         case "trojan":
@@ -321,8 +503,33 @@ struct LineRow: View {
         case "trojan": return "Trojan"
         case "shadowsocks": return "SS"
         case "vmess": return "VMess"
+        case "tailscale": return "Tailscale"
         default: return line.type
         }
+    }
+
+    private var tailscaleStatusColor: Color {
+        if tailscaleStatus?.isRunning == true {
+            if !line.tailscaleExitNode.isEmpty,
+               tailscaleStatus?.exitNodes.first(where: { $0.ip == line.tailscaleExitNode })?.online != true {
+                return .orange
+            }
+            return .green
+        }
+        if tailscaleStatus != nil || tailscaleError != nil {
+            return .orange
+        }
+        return .gray
+    }
+
+    private var tailscaleStatusLabel: String {
+        if tailscaleStatus?.isRunning == true {
+            return state.tr("已登录", "Signed in")
+        }
+        if tailscaleStatus != nil {
+            return state.tr("需要登录", "Sign-in required")
+        }
+        return state.tr("尚未检查", "Not checked")
     }
 
     @ViewBuilder
@@ -349,8 +556,331 @@ struct LineRow: View {
             intField("端口", $line.vmessPort)
             secureField("UUID", $line.vmessUUID)
             intField("Alter ID", $line.vmessAltID)
+        case "tailscale":
+            tailscaleDetail
         default:
             EmptyView()
+        }
+    }
+
+    private var tailscaleDetail: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Divider()
+
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(tailscaleStatusColor)
+                    .frame(width: 8, height: 8)
+                Text(tailscaleStatusLabel)
+                    .font(.system(size: 12, weight: .medium))
+                Spacer()
+                if tailscaleBusy {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button {
+                        refreshTailscaleStatus()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.plain)
+                    .help(state.tr("刷新状态", "Refresh status"))
+                }
+            }
+
+            if let error = tailscaleError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let status = tailscaleStatus, status.isRunning {
+                tailscaleSignedInFields(status)
+            } else {
+                tailscaleSignInFields
+            }
+        }
+        .padding(.top, 2)
+        .onChange(of: state.engine.status) { _, newStatus in
+            if newStatus == "disconnected" {
+                // 数据面连接会关闭隔离的 setup session。这里只清掉旧显示；
+                // 重新创建会话必须来自用户点击刷新、登录或 Auth Key。
+                tailscaleStatus = nil
+                tailscaleError = nil
+                tailscaleBusy = false
+            } else {
+                pollGeneration += 1
+            }
+        }
+    }
+
+    private var tailscaleSignInFields: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(state.tr(
+                "登录只用于在本机建立一份持久的 Tailscale 身份，不会启动系统 VPN。",
+                "Sign-in creates one persistent local Tailscale identity and does not start a system VPN."
+            ))
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            Button {
+                beginTailscaleLogin()
+            } label: {
+                Label(
+                    state.tr("在浏览器中登录", "Sign In in Browser"),
+                    systemImage: "safari"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(tailscaleBusy || state.engine.status != "disconnected")
+            .accessibilityIdentifier("tailscale-browser-login")
+
+            DisclosureGroup(
+                state.tr("使用 Auth Key", "Use Auth Key"),
+                isExpanded: $showAuthKey
+            ) {
+                VStack(alignment: .leading, spacing: 6) {
+                    SecureField("tskey-auth-…", text: $authKey)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .accessibilityIdentifier("tailscale-auth-key")
+                    Text(state.tr(
+                        "只用于这一次注册；提交后立即清空，不写入配置、钥匙串或日志。",
+                        "Used once for registration, then cleared. It is not saved to the profile, Keychain, or logs."
+                    ))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    Button(state.tr("使用 Auth Key 注册", "Register with Auth Key")) {
+                        registerTailscaleAuthKey()
+                    }
+                    .disabled(
+                        authKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || tailscaleBusy
+                            || state.engine.status != "disconnected"
+                    )
+                }
+                .padding(.top, 5)
+            }
+            .font(.caption)
+        }
+    }
+
+    @ViewBuilder
+    private func tailscaleSignedInFields(_ status: TailscaleRuntimeStatus) -> some View {
+        HStack {
+            Text(state.tr("设备", "Device"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 70, alignment: .leading)
+            Text(state.profile.tailscale.hostname)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+            Spacer()
+        }
+
+        HStack {
+            Text(state.tr("出口节点", "Exit Node"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 70, alignment: .leading)
+            Picker("", selection: Binding(
+                get: { line.tailscaleExitNode },
+                set: {
+                    line.tailscaleExitNode = $0
+                    state.save()
+                }
+            )) {
+                Text(state.tr("不使用", "None")).tag("")
+                if !line.tailscaleExitNode.isEmpty,
+                   !status.exitNodes.contains(where: { $0.ip == line.tailscaleExitNode }) {
+                    Text(state.tr(
+                        "已保存但当前不可用",
+                        "Saved but unavailable"
+                    )).tag(line.tailscaleExitNode)
+                }
+                ForEach(status.exitNodes) { node in
+                    Text(exitNodeLabel(node))
+                        .tag(node.ip)
+                        .disabled(!node.online)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .accessibilityIdentifier("tailscale-exit-node-picker")
+        }
+
+        if !line.tailscaleExitNode.isEmpty,
+           status.exitNodes.first(where: { $0.ip == line.tailscaleExitNode })?.online != true {
+            Label(
+                state.tr(
+                    "所选出口节点当前不可用；连接会明确失败，不会回落到其他出口。",
+                    "The selected exit node is unavailable. Connection will fail instead of falling back."
+                ),
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.orange)
+        }
+
+        HStack {
+            Spacer()
+            Button(state.tr("退出登录", "Sign Out"), role: .destructive) {
+                logoutTailscale()
+            }
+            .disabled(tailscaleBusy)
+        }
+    }
+
+    private func exitNodeLabel(_ node: TailscaleRuntimeExitNode) -> String {
+        var label = node.name.isEmpty ? node.ip : node.name
+        if !node.online {
+            label += state.tr("（离线）", " (Offline)")
+        }
+        return label
+    }
+
+    private func prepareTailscale(authKey: String = "") {
+        guard line.type == "tailscale", !tailscaleBusy else { return }
+        guard state.engine.status == "disconnected" else {
+            tailscaleError = state.tr(
+                "请先断开 XDial，再配置 Tailscale 登录状态。",
+                "Disconnect XDial before configuring Tailscale sign-in."
+            )
+            return
+        }
+        tailscaleBusy = true
+        tailscaleError = nil
+        state.engine.prepareTailscale(
+            profileJSON: state.buildProfileJSON(),
+            lineID: line.id,
+            authKey: authKey
+        ) { result in
+            tailscaleBusy = false
+            applyTailscaleResult(result)
+        }
+    }
+
+    private func refreshTailscaleStatus() {
+        // setup session 会在连接数据面或 helper 重启时被关闭。刷新必须具备
+        // 自愈能力：重建隔离会话并读取同一份持久身份，而不是查询旧会话。
+        prepareTailscale()
+    }
+
+    private func beginTailscaleLogin() {
+        guard !tailscaleBusy else { return }
+        tailscaleBusy = true
+        tailscaleError = nil
+        // 设置窗口或 helper 重启后，旧卡片可能还在但 setup session 已经结束。
+        // 登录按钮先重建会话，不能假设 onAppear 曾成功执行。
+        state.engine.prepareTailscale(
+            profileJSON: state.buildProfileJSON(),
+            lineID: line.id
+        ) { result in
+            switch result {
+            case let .failure(error):
+                tailscaleBusy = false
+                tailscaleError = error.localizedDescription
+            case let .success(status):
+                tailscaleStatus = status
+                if status.isRunning {
+                    tailscaleBusy = false
+                    return
+                }
+                if let url = validatedAuthURL(status.authURL) {
+                    tailscaleBusy = false
+                    NSWorkspace.shared.open(url)
+                    startTailscalePolling()
+                    return
+                }
+                requestTailscaleLoginURL()
+            }
+        }
+    }
+
+    private func requestTailscaleLoginURL() {
+        state.engine.beginTailscaleLogin(lineID: line.id) { result in
+            tailscaleBusy = false
+            switch result {
+            case let .failure(error):
+                tailscaleError = error.localizedDescription
+            case let .success(status):
+                tailscaleStatus = status
+                if let url = validatedAuthURL(status.authURL) {
+                    NSWorkspace.shared.open(url)
+                    startTailscalePolling()
+                } else if !status.isRunning {
+                    tailscaleError = state.tr(
+                        "没有取得有效的登录入口，请重试。",
+                        "No valid sign-in URL was returned. Please try again."
+                    )
+                }
+            }
+        }
+    }
+
+    private func registerTailscaleAuthKey() {
+        let transientKey = authKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !transientKey.isEmpty else { return }
+        authKey = ""
+        prepareTailscale(authKey: transientKey)
+    }
+
+    private func logoutTailscale() {
+        guard !tailscaleBusy else { return }
+        tailscaleBusy = true
+        tailscaleError = nil
+        state.engine.logoutTailscale(lineID: line.id) { result in
+            tailscaleBusy = false
+            applyTailscaleResult(result)
+        }
+    }
+
+    private func applyTailscaleResult(_ result: Result<TailscaleRuntimeStatus, Error>) {
+        switch result {
+        case .success(let status):
+            tailscaleStatus = status
+            tailscaleError = nil
+        case .failure(let error):
+            tailscaleError = error.localizedDescription
+        }
+    }
+
+    private func validatedAuthURL(_ raw: String) -> URL? {
+        guard let url = URL(string: raw),
+              url.scheme?.lowercased() == "https",
+              url.host != nil else {
+            return nil
+        }
+        return url
+    }
+
+    private func startTailscalePolling() {
+        pollGeneration += 1
+        scheduleTailscalePoll(generation: pollGeneration, remaining: 90)
+    }
+
+    private func scheduleTailscalePoll(generation: Int, remaining: Int) {
+        guard remaining > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            guard expanded, generation == pollGeneration else { return }
+            state.engine.tailscaleStatus(lineID: line.id) { result in
+                guard expanded, generation == pollGeneration else { return }
+                switch result {
+                case .success(let status):
+                    tailscaleStatus = status
+                    tailscaleError = nil
+                    if !status.isRunning {
+                        scheduleTailscalePoll(
+                            generation: generation,
+                            remaining: remaining - 1
+                        )
+                    }
+                case .failure(let error):
+                    tailscaleError = error.localizedDescription
+                }
+            }
         }
     }
 
@@ -757,21 +1287,9 @@ struct SubscriptionRow: View {
     var onDelete: () -> Void
     @State private var expanded = false
     @State private var refreshing = false
-    @State private var testing = false
-    @State private var delays: [String: Int] = [:]
     @EnvironmentObject var state: AppState
-    @ObservedObject private var net = NetworkInfo.shared
 
     private var groupCount: Int { sub.proxyGroups.count }
-    private var ruleCount: Int { sub.rules.count }
-    private var probeInfo: String {
-        guard let info = net.perLine[sub.id] else { return "" }
-        if !info.error.isEmpty { return info.error }
-        if info.ip.isEmpty { return "" }
-        var s = info.ip
-        if !info.region.isEmpty { s += " (\(info.region))" }
-        return s
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -781,25 +1299,25 @@ struct SubscriptionRow: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 12)
 
+                RuntimeResourceBadge(
+                    kind: "subscription",
+                    resourceID: sub.id,
+                    enabled: sub.enabled
+                )
+
                 Text(sub.name)
                     .font(.system(size: 13, weight: .medium))
 
-                if !probeInfo.isEmpty {
-                    Text(probeInfo)
+                if groupCount > 0 {
+                    Text("\(groupCount)\(state.tr("组", "g"))")
                         .font(.caption).foregroundStyle(.secondary)
-                        .lineLimit(1).truncationMode(.middle)
-                } else {
-                    if groupCount > 0 {
-                        Text("\(groupCount)\(state.tr("组", "g"))")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Text("\(sub.lines.count)\(state.tr("节点", "n"))")
-                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Text("\(sub.lines.count)\(state.tr("节点", "n"))")
+                    .font(.caption).foregroundStyle(.secondary)
 
-                    if sub.updatedAt > 0 {
-                        Text(formatDate(sub.updatedAt))
-                            .font(.caption2).foregroundStyle(.tertiary)
-                    }
+                if sub.updatedAt > 0 {
+                    Text(formatDate(sub.updatedAt))
+                        .font(.caption2).foregroundStyle(.tertiary)
                 }
 
                 Spacer()
@@ -849,39 +1367,11 @@ struct SubscriptionRow: View {
                             .font(.caption2).foregroundStyle(.tertiary).textCase(.uppercase)
                         // id 用 offset 而不是 name，订阅原始 YAML 里允许重名策略组，
                         // 用 name 当 id 会导致 SwiftUI ForEach 重复 key 渲染错乱
-                        ForEach(Array(sub.proxyGroups.enumerated()), id: \.offset) { idx, group in
-                            groupRow(group: group, idx: idx)
+                        ForEach(Array(sub.proxyGroups.enumerated()), id: \.offset) { _, group in
+                            groupRow(group: group)
                         }
                     }
 
-                    // === 测速 ===
-                    Divider()
-                    HStack {
-                        Button {
-                            testAllNodes()
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "bolt.fill").font(.caption2)
-                                Text(state.tr("测速", "Test")).font(.caption)
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .disabled(testing || !state.engine.isConnected)
-
-                        if testing {
-                            ProgressView().controlSize(.small)
-                            Text(state.tr("测速中…", "Testing…"))
-                                .font(.caption2).foregroundStyle(.secondary)
-                        } else if !delays.isEmpty {
-                            let ok = delays.values.filter { $0 > 0 }.count
-                            let fail = delays.values.filter { $0 < 0 }.count
-                            Text("\(ok) ✓  \(fail) ✗")
-                                .font(.caption2).foregroundStyle(.secondary)
-                        }
-
-                        Spacer()
-                    }
                 }
                 .padding(.leading, 18)
             }
@@ -902,9 +1392,7 @@ struct SubscriptionRow: View {
     }
 
     @ViewBuilder
-    private func groupRow(group: SubProxyGroup, idx: Int) -> some View {
-        let selected = group.proxies.first ?? ""
-
+    private func groupRow(group: SubProxyGroup) -> some View {
         HStack {
             Text(group.name)
                 .font(.system(size: 12, weight: .medium))
@@ -912,8 +1400,12 @@ struct SubscriptionRow: View {
 
             Spacer()
 
-            MenuButton(selected, delays: delays, items: group.proxies) { _ in
-                // TODO: Clash API 切换
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(groupTypeLabel(group.type))
+                    .font(.caption)
+                Text("\(group.proxies.count)\(state.tr("节点", " nodes"))")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
             .frame(maxWidth: 180, alignment: .trailing)
         }
@@ -926,53 +1418,6 @@ struct SubscriptionRow: View {
         case "fallback": return "fallback"
         case "load-balance": return "balance"
         default: return type
-        }
-    }
-
-    private func delayLabel(_ name: String) -> String {
-        guard let ms = delays[name] else { return name }
-        if ms < 0 { return "\(name)  ⏱ timeout" }
-        return "\(name)  ⏱ \(ms)ms"
-    }
-
-    private func testAllNodes() {
-        guard state.engine.isConnected else { return }
-        testing = true
-        let base = "http://127.0.0.1:9090"
-        let testURL = "https://www.gstatic.com/generate_204"
-        let lines = sub.lines
-        let subID = sub.id
-
-        Task {
-            await withTaskGroup(of: (String, Int).self) { group in
-                for line in lines {
-                    let name = line.name
-                    let tag = "proxy-\(subID)-\(line.id)"
-                    group.addTask {
-                        guard let encoded = tag.addingPercentEncoding(
-                            withAllowedCharacters: .urlPathAllowed
-                        ),
-                        let url = URL(
-                            string: "\(base)/proxies/\(encoded)/delay?url=\(testURL)&timeout=3000"
-                        ) else {
-                            return (name, -1)
-                        }
-                        do {
-                            let (data, _) = try await URLSession.shared.data(from: url)
-                            if let json = try? JSONSerialization.jsonObject(with: data)
-                                as? [String: Any],
-                               let delay = json["delay"] as? Int {
-                                return (name, delay)
-                            }
-                        } catch {}
-                        return (name, -1)
-                    }
-                }
-                for await (name, milliseconds) in group {
-                    await MainActor.run { delays[name] = milliseconds }
-                }
-            }
-            await MainActor.run { testing = false }
         }
     }
 

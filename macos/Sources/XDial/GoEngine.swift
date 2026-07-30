@@ -27,16 +27,19 @@ func appLog(_ msg: String) {
 final class GoEngine: ObservableObject {
     static let shared = GoEngine()
 
+    private let transparentProxy = TransparentProxyManager.shared
     private let socketPath = "/tmp/xdial.sock"
     private var fd: Int32 = -1
     private var readSource: DispatchSourceRead?
     private var readBuffer = Data()
     private var requestSeq: UInt64 = 0
     private var pendingCallbacks: [String: (DaemonResponse) -> Void] = [:]
+    private var transparentProxySystemStatus = "disconnected"
 
     @Published private(set) var status: String = "disconnected"
     @Published var lastError: String?
     @Published private(set) var connectedAt: Date?
+    @Published private(set) var connectionReport: ConnectionReport?
 
     struct ParseResult: Decodable {
         let lines: [Line]
@@ -55,79 +58,187 @@ final class GoEngine: ObservableObject {
         status == "connecting" || status == "disconnecting" || status == "reconnecting"
     }
 
+    private init() {
+        transparentProxy.statusHandler = { [weak self] status, error in
+            Task { @MainActor in
+                self?.applyTransparentProxyStatus(status, error: error)
+            }
+        }
+        transparentProxy.reportHandler = { [weak self] report in
+            Task { @MainActor in
+                self?.applyConnectionReport(report)
+            }
+        }
+        connectionReport = ConnectionReportJournal.read()
+    }
+
     // MARK: - Public API
 
     func start(profileJSON: String) {
         lastError = nil
-        status = "connecting"
-        let json = profileJSON
-        Task.detached { [weak self] in
-            let ok = await self?.ensureHelperAsync() ?? false
-            await MainActor.run {
-                guard let self, ok else { return }
-                guard self.ensureSocket() else {
-                    self.lastError = "无法连接到 helper 进程"
-                    self.status = "disconnected"
-                    return
-                }
-                self.sendRequest(cmd: "start", profile: json)
-            }
-        }
+        transparentProxySystemStatus = "connecting"
+        reconcileTransparentProxyStatus()
+        transparentProxy.start(profileJSON: profileJSON)
     }
 
+#if DEBUG
+    func injectFailureOnNextStart(_ stage: String) -> Bool {
+        transparentProxy.injectFailureOnNextStart(stage)
+    }
+#endif
+
+    func prepareSystemExtension(
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        transparentProxy.prepareSystemExtension(completion: completion)
+    }
+
+    func probeLineOutboundAddress(
+        transactionID: String,
+        lineID: String,
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        transparentProxy.probeLineOutboundAddress(
+            transactionID: transactionID,
+            lineID: lineID,
+            completion: completion
+        )
+    }
+
+    #if DEBUG
+    func routingProbeSnapshot(
+        transactionID: String,
+        probeID: String,
+        completion: @escaping (
+            Result<ProviderRoutingProbeSnapshot, Error>
+        ) -> Void
+    ) {
+        transparentProxy.routingProbeSnapshot(
+            transactionID: transactionID,
+            probeID: probeID,
+            completion: completion
+        )
+    }
+
+    func beginRouteProbe(
+        transactionID: String,
+        host: String,
+        timeoutMS: Int,
+        completion: @escaping (
+            Result<ProviderBegunRouteProbe, Error>
+        ) -> Void
+    ) {
+        transparentProxy.beginRouteProbe(
+            transactionID: transactionID,
+            host: host,
+            timeoutMS: timeoutMS,
+            completion: completion
+        )
+    }
+    #endif
+
     func stop() {
-        appLog("stop() called, fd=\(self.fd), status=\(self.status)")
-        guard ensureSocket() else {
-            appLog("stop: ensureSocket failed")
-            status = "disconnected"
-            connectedAt = nil
-            return
-        }
-        sendRequest(cmd: "stop") { [weak self] resp in
-            if resp.ok != true {
-                self?.lastError = resp.message
-            }
-        }
+        appLog("stop() called for Transparent Proxy, status=\(status)")
+        transparentProxy.stop()
     }
 
     func parseSubscription(url: String, content: String = "", format: String = "auto",
                            completion: @escaping (Result<ParseResult, Error>) -> Void) {
-        Task.detached { [weak self] in
+        Task { [weak self] in
             let ok = await self?.ensureHelperAsync() ?? false
-            await MainActor.run {
-                guard let self, ok else {
-                    completion(.failure(NSError(
-                        domain: "XDial",
-                        code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "Cannot connect to helper"]
-                    )))
-                    return
-                }
-                guard self.ensureSocket() else {
-                    completion(.failure(NSError(
-                        domain: "XDial",
-                        code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "Socket not available"]
-                    )))
-                    return
-                }
-                self.sendSubRequest(
-                    url: url,
-                    content: content,
-                    format: format,
-                    completion: completion
-                )
+            guard let self, ok else {
+                completion(.failure(NSError(
+                    domain: "XDial",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Cannot connect to helper"]
+                )))
+                return
             }
+            guard self.ensureSocket() else {
+                completion(.failure(NSError(
+                    domain: "XDial",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Socket not available"]
+                )))
+                return
+            }
+            self.sendSubRequest(
+                url: url,
+                content: content,
+                format: format,
+                completion: completion
+            )
         }
     }
 
     func syncStatus() {
-        closeSocket()
-        guard PrivilegeManager.isHelperRunning, openSocket() else { return }
-        sendRequest(cmd: "status") { [weak self] resp in
-            if resp.ok == true, let data = resp.data {
-                self?.applyStatusData(data)
-            }
+        transparentProxy.syncStatus()
+    }
+
+    func prepareTailscale(
+        profileJSON: String,
+        lineID: String,
+        authKey: String = "",
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        performTailscaleStatusRequest(
+            cmd: "tailscale-prepare",
+            profile: profileJSON,
+            lineID: lineID,
+            authKey: authKey,
+            completion: completion
+        )
+    }
+
+    func tailscaleStatus(
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        performTailscaleStatusRequest(
+            cmd: "tailscale-status",
+            lineID: lineID,
+            completion: completion
+        )
+    }
+
+    func beginTailscaleLogin(
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        performTailscaleStatusRequest(
+            cmd: "tailscale-login",
+            lineID: lineID,
+            completion: completion
+        )
+    }
+
+    func logoutTailscale(
+        lineID: String,
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        performTailscaleStatusRequest(
+            cmd: "tailscale-logout",
+            lineID: lineID,
+            completion: completion
+        )
+    }
+
+    func stopTailscaleSetup(
+        lineID: String,
+        completion: (() -> Void)? = nil
+    ) {
+        guard ensureSocket() else {
+            completion?()
+            return
+        }
+        let sent = sendRequest(
+            cmd: "tailscale-stop-setup",
+            fields: ["line_id": lineID]
+        ) { _ in
+            completion?()
+        }
+        if !sent {
+            completion?()
         }
     }
 
@@ -140,6 +251,7 @@ final class GoEngine: ObservableObject {
 
     @discardableResult
     private func sendRequest(cmd: String, profile: String? = nil,
+                             fields: [String: String] = [:],
                              callback: ((DaemonResponse) -> Void)? = nil) -> Bool {
         guard fd >= 0 else {
             appLog("sendRequest(\(cmd)): fd < 0")
@@ -149,6 +261,9 @@ final class GoEngine: ObservableObject {
         let reqID = nextID()
         var obj: [String: String] = ["id": reqID, "cmd": cmd]
         if let profile { obj["profile"] = profile }
+        for (key, value) in fields {
+            obj[key] = value
+        }
 
         guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return false }
         data.append(UInt8(ascii: "\n"))
@@ -176,6 +291,58 @@ final class GoEngine: ObservableObject {
         let retry = data.withUnsafeBytes { write(fd, $0.baseAddress!, data.count) }
         appLog("sendRequest(\(cmd)): retry wrote \(retry) bytes")
         return retry >= 0
+    }
+
+    private func performTailscaleStatusRequest(
+        cmd: String,
+        profile: String? = nil,
+        lineID: String,
+        authKey: String = "",
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        Task { [weak self] in
+            let ok = await self?.ensureHelperAsync() ?? false
+            guard let self, ok, self.ensureSocket() else {
+                completion(.failure(self?.requestError("无法连接到 helper 进程")
+                    ?? NSError(domain: "XDial", code: -1)))
+                return
+            }
+            var fields = ["line_id": lineID]
+            if !authKey.isEmpty {
+                fields["auth_key"] = authKey
+            }
+            let sent = self.sendRequest(
+                cmd: cmd,
+                profile: profile,
+                fields: fields
+            ) { response in
+                guard response.ok == true,
+                      let raw = response.data?.data(using: .utf8) else {
+                    completion(.failure(self.requestError(
+                        response.message ?? "Tailscale 请求失败"
+                    )))
+                    return
+                }
+                do {
+                    completion(.success(
+                        try JSONDecoder().decode(TailscaleRuntimeStatus.self, from: raw)
+                    ))
+                } catch {
+                    completion(.failure(self.requestError("Tailscale 状态无效")))
+                }
+            }
+            if !sent {
+                completion(.failure(self.requestError("无法发送 Tailscale 请求")))
+            }
+        }
+    }
+
+    private func requestError(_ message: String) -> NSError {
+        NSError(
+            domain: "XDial",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
     }
 
     private func sendSubRequest(url: String, content: String, format: String,
@@ -330,16 +497,7 @@ final class GoEngine: ObservableObject {
             return
         }
         closeSocket()
-        if openSocket() {
-            sendRequest(cmd: "status") { [weak self] resp in
-                if resp.ok == true, let data = resp.data {
-                    self?.applyStatusData(data)
-                }
-            }
-        } else {
-            status = "disconnected"
-            connectedAt = nil
-        }
+        _ = openSocket()
     }
 
     private func processLines() {
@@ -367,18 +525,11 @@ final class GoEngine: ObservableObject {
         appLog("event: \(event) data=\(data ?? "")")
         switch event {
         case "status":
-            if let data {
-                applyStatusData(data)
-            }
+            // helper 不再拥有桌面数据面。它仍服务于订阅解析、Tailscale 登录等
+            // 控制面请求，但不得用旧 sing-box Engine 的状态覆盖系统扩展。
+            break
         case "error":
-            lastError = data
-            if status == "connecting" || status == "disconnecting" {
-                sendRequest(cmd: "status") { [weak self] resp in
-                    if resp.ok == true, let data = resp.data {
-                        self?.applyStatusData(data)
-                    }
-                }
-            }
+            appLog("ignored legacy helper data-plane error: \(data ?? "")")
         default:
             break
         }
@@ -394,19 +545,37 @@ final class GoEngine: ObservableObject {
         }
     }
 
-    private func applyStatusData(_ dataStr: String) {
-        guard let data = dataStr.data(using: .utf8),
-              let msg = try? JSONDecoder().decode(EngineStatus.self, from: data) else { return }
+    private func applyTransparentProxyStatus(
+        _ newStatus: String,
+        error: String?
+    ) {
+        transparentProxySystemStatus = newStatus
+        reconcileTransparentProxyStatus()
+        if let error, !error.isEmpty {
+            appLog("Transparent Proxy error: \(error)")
+            lastError = error
+        }
+    }
+
+    private func applyConnectionReport(_ report: ConnectionReport) {
+        connectionReport = report
+        reconcileTransparentProxyStatus()
+    }
+
+    private func reconcileTransparentProxyStatus() {
         let old = status
-        status = msg.status
-        if msg.status == "connected" && old != "connected" {
+        let resolved = TransparentProxyRuntimeGate.resolve(
+            systemStatus: transparentProxySystemStatus,
+            report: connectionReport,
+            activeTransactionID: transparentProxy.activeTransactionID,
+            previousStatus: old
+        )
+        status = resolved
+        if resolved == "connected" && old != "connected" {
             connectedAt = Date()
             lastError = nil
-        } else if msg.status == "disconnected" {
+        } else if resolved == "disconnected" {
             connectedAt = nil
-        }
-        if let e = msg.error, !e.isEmpty {
-            lastError = e
         }
     }
 }

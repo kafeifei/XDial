@@ -1,0 +1,84 @@
+name: XDialNEProbe
+options:
+  deploymentTarget:
+    macOS: "15.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: UVZM439VGU
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+targets:
+  XDialNEProbeExtension:
+    type: system-extension
+    platform: macOS
+    sources:
+      - Extension
+      - ../../macos/TransparentProxyExtension/TCPFlowSOCKSRelay.swift
+      - ../../macos/TransparentProxyExtension/UDPFlowSOCKSRelay.swift
+      - ../../macos/TransparentProxyExtension/SOCKSCredentials.swift
+    info:
+      path: Extension/Info.plist
+      properties:
+        CFBundleDisplayName: XDial NE Probe
+        CFBundlePackageType: SYSX
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "12"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        NetworkExtension:
+          NEProviderClasses:
+            com.apple.networkextension.app-proxy: "$(PRODUCT_MODULE_NAME).ProbeProxyProvider"
+        NSSystemExtensionUsageDescription: 验证 XDial Transparent Proxy 与现有网络层能否共存。
+    entitlements:
+      path: Extension/XDialNEProbeExtension.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - app-proxy-provider
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
+        # sysextd 会先按文件名定位扩展，再检查 Info.plist，因此产物名必须与
+        # bundle identifier 完全一致。
+        PRODUCT_NAME: com.kafeifei.xdial.ne-probe.extension
+        ENABLE_APP_SANDBOX: YES
+        CODE_SIGN_ENTITLEMENTS: Extension/XDialNEProbeExtension.entitlements
+    dependencies:
+      - framework: ../../build/frameworks/macos/Libbox.xcframework
+        embed: false
+      - sdk: libresolv.tbd
+      - sdk: NetworkExtension.framework
+      - sdk: Security.framework
+
+  XDialNEProbe:
+    type: application
+    platform: macOS
+    sources:
+      - Host
+    info:
+      path: Host/Info.plist
+      properties:
+        CFBundleDisplayName: XDial NE Probe
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "12"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        LSUIElement: true
+        NSSystemExtensionUsageDescription: 验证 XDial Transparent Proxy 与现有网络层能否共存。
+    entitlements:
+      path: Host/XDialNEProbe.entitlements
+      properties:
+        com.apple.developer.system-extension.install: true
+        com.apple.developer.networking.networkextension:
+          - app-proxy-provider
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe
+        PRODUCT_NAME: XDialNEProbe
+        CODE_SIGN_ENTITLEMENTS: Host/XDialNEProbe.entitlements
+    dependencies:
+      - target: XDialNEProbeExtension
+        embed: true
+        codeSign: true
+      - sdk: NetworkExtension.framework
+      - sdk: SystemExtensions.framework
