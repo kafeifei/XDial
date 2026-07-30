@@ -3,41 +3,77 @@ import XCTest
 final class AutomaticReconnectRetryPolicyTests: XCTestCase {
     func testRetriesOnlyCompletedUnderlayEgressFailure() {
         let policy = AutomaticReconnectRetryPolicy(
-            delays: [2, 5, 10]
+            delays: [2, 5, 10, 20, 30]
         )
         let report = failedReport(
             code: ConnectionFailureCode.underlayEgressUnavailable
         )
 
         XCTAssertEqual(
-            policy.delay(after: report, retryIndex: 0),
+            policy.delay(
+                after: report,
+                attemptsUsed: 0,
+                trigger: .underlayChange
+            ),
             2
         )
         XCTAssertEqual(
-            policy.delay(after: report, retryIndex: 1),
+            policy.delay(
+                after: report,
+                attemptsUsed: 1,
+                trigger: .underlayChange
+            ),
             5
         )
         XCTAssertEqual(
-            policy.delay(after: report, retryIndex: 2),
-            10
+            policy.delay(
+                after: report,
+                attemptsUsed: 4,
+                trigger: .underlayChange
+            ),
+            30
         )
-        XCTAssertNil(policy.delay(after: report, retryIndex: 3))
+        XCTAssertNil(policy.delay(
+            after: report,
+            attemptsUsed: 5,
+            trigger: .underlayChange
+        ))
+        XCTAssertEqual(policy.maxAttempts, 5)
+        XCTAssertEqual(policy.stableResetInterval, 300)
     }
 
-    func testDoesNotRetryLineOrHandshakeFailures() {
+    func testUnexpectedDisconnectRecoveryCanRetryACompletedLineFailure() {
+        let policy = AutomaticReconnectRetryPolicy()
+        let report = failedReport(
+            code: "tailscale-peer-handshake-failed"
+        )
+
+        XCTAssertEqual(
+            policy.delay(
+                after: report,
+                attemptsUsed: 0,
+                trigger: .unexpectedDisconnect
+            ),
+            2
+        )
+    }
+
+    func testUnderlayRecoveryDoesNotRetryLineOrHandshakeFailures() {
         let policy = AutomaticReconnectRetryPolicy()
 
         XCTAssertNil(policy.delay(
             after: failedReport(
                 code: "tailscale-peer-handshake-failed"
             ),
-            retryIndex: 0
+            attemptsUsed: 0,
+            trigger: .underlayChange
         ))
         XCTAssertNil(policy.delay(
             after: failedReport(
                 code: "tailscale-exit-node-unavailable"
             ),
-            retryIndex: 0
+            attemptsUsed: 0,
+            trigger: .underlayChange
         ))
     }
 
@@ -50,8 +86,20 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
 
         XCTAssertNil(policy.delay(
             after: report,
-            retryIndex: 0
+            attemptsUsed: 0,
+            trigger: .unexpectedDisconnect
         ))
+    }
+
+    func testFiveAttemptBudgetHasNoSixthDelay() {
+        let policy = AutomaticReconnectRetryPolicy()
+        XCTAssertEqual(
+            (0 ..< 5).compactMap {
+                policy.delayForNextAttempt(attemptsUsed: $0)
+            },
+            [2, 5, 10, 20, 30]
+        )
+        XCTAssertNil(policy.delayForNextAttempt(attemptsUsed: 5))
     }
 
     private func failedReport(code: String) -> ConnectionReport {

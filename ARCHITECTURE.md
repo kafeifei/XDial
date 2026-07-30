@@ -349,7 +349,18 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   名、类型或 VPN 产品决定策略。重连只替换运行时 Underlay 快照，不修改 Line / RuleSet /
   Mode。系统路径收敛不等于下层数据面已经恢复真实出口；仅当本次失败被结构化归因为
   `underlay-egress-unavailable`，且 Rollback 已完成、系统接管已移除时，宿主才可按
-  2 / 5 / 10 秒做三次有界重试。Line 登录、节点、握手或规则失败不得被这条重试掩盖。
+  2 / 5 / 10 / 20 / 30 秒做至多五次有界重试。Line 登录、节点、握手或规则失败不得被
+  **Underlay 切换**这条重试掩盖。
+- **已提交会话的意外断线恢复**：一次已经进入 `committed` 并真实发布为 `connected`
+  的会话，如果 Provider 或线路在用户没有执行断开的情况下掉线，宿主保留同一份用户
+  连接意图，在系统接管已移除后启动有界自动重连。这个恢复序列也使用五次总预算；
+  恢复事务中的 Line / 握手失败必须原样写入报告和断线历史，但可以继续消耗剩余预算，
+  不能静默无限拉起。短暂“连上又掉”不重置预算；只有同一事务连续稳定运行满五分钟才
+  清零。用户主动断开立即取消恢复，且不触发新的重连。
+- **断线事实源**：每次意外断线都要在用户私有目录留下有界结构化记录，至少包含断线
+  时间、原事务与 Mode、结构化原因、系统最后断线错误、每次重连的时间/事务 ID，以及
+  最终恢复、失败或耗尽预算的结果。Debug Server 只读暴露这份记录；日志不能反过来
+  推动重连状态机。
 - **启动与失败语义**：完整 sing-box 实例及 active Tailscale Line 的真实出口探测必须
   先成功，之后才能提交 Transparent Proxy 网络设置。启动失败不得安装半成品网络配置；
   已接管 flow 的转发失败必须关闭该 flow，不得回落系统直连。用户显式断开后，系统回到
@@ -490,6 +501,31 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   失败、用户取消和 Provider 异常退出；每种场景都必须证明未引用对象没有副作用、Commit
   前系统网络未被接管、Rollback 逆序完成、原 Underlay 仍可用。还必须证明连接不依赖
   打开设置页或展开某张 Line 卡片。
+
+### D37 — 平台安装是一笔独立、幂等且不接管流量的事务
+
+- **与连接事务分离**：应用位置、包签名、特权 helper 和 System Extension 是持久的
+  平台前置条件，不属于某个 Mode 编译出的 `ConnectionPlan`。它们由独立的
+  `InstallationReport` 表达；安装成功不能推导任意 Line、RuleSet、DNS 或真实出口已经
+  就绪，连接事务也不得通过打开设置页来补做安装。
+- **自动定位与替换**：从 `/Applications` 之外启动时，XDial 复制自身到
+  `/Applications/XDial.app`，核对主程序、helper 和 System Extension 的完整签名及
+  bundle identity 后重新启动。已存在同一签名身份的旧版本可以自动替换，但必须先保留
+  临时备份，新版本二次验签成功后才清除；签名或 bundle identity 不一致时禁止覆盖。
+  下载目录里的原文件不删除。
+- **唯一流程**：首次启动和升级都依次验证当前 bundle、注册并验证 helper、激活并验证
+  System Extension。macOS 要求人工批准时，状态停在准确任务并自动打开对应系统设置；
+  批准后继续原事务。Tailscale 配置和完整连接只消费“安装已就绪”这一事实，不得各自
+  临时注册 helper 或扩展，也不得把 `helper socket`、`extension not found` 之类底层
+  错误当成产品流程。
+- **副作用边界**：安装事务可以写入 app bundle、注册持久 helper、激活
+  System Extension，但绝不能创建或启用 `NETransparentProxyManager` 网络配置、启动
+  sing-box、建立 Line 会话、下载 RuleSet、读取或改变 Underlay、提交 DNS/路由或接管
+  用户流量。只有 D36 的连接事务可以执行唯一的系统网络 Commit。
+- **事实与恢复**：UI、Debug Server 和连接门禁消费同一份无凭据
+  `InstallationReport`，禁止解析日志推动流程。每个步骤必须幂等；进程中断后从当前
+  macOS 结构化状态重新执行。安装包替换失败恢复旧 app，helper 或扩展失败则保留原
+  Underlay，并停在失败项供重试。
 
 ### D-DNS — DNS 分域归属由 Mode 裁决
 

@@ -255,18 +255,10 @@ struct MainPopover: View {
             .foregroundStyle(.secondary)
 
             Menu {
-                if state.helperInstalled {
-                    Button(state.tr("卸载后台服务", "Remove Background Service")) {
-                        state.uninstall(deleteData: false) { _, error in
-                            if let error {
-                                state.engine.lastError = error
-                            }
-                        }
-                    }
-                } else {
-                    Button(state.tr("配置后台服务", "Set Up Background Service")) {
-                        state.setupHelper()
-                    }
+                Button(
+                    state.tr("安装状态…", "Installation Status…")
+                ) {
+                    state.installation.present()
                 }
                 Divider()
                 Button("退出 XDial") { NSApp.terminate(nil) }

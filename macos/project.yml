@@ -38,9 +38,12 @@ targets:
         NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和模式交给 sing-box 统一执行。
     settings:
       base:
-        PRODUCT_NAME: XDialTransparentProxy
+        # Apple requires a Network Extension system extension's filename to
+        # match its bundle identifier exactly. PRODUCT_NAME controls the
+        # outer .systemextension filename.
+        PRODUCT_NAME: "$(PRODUCT_BUNDLE_IDENTIFIER)"
         MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "73"
+        CURRENT_PROJECT_VERSION: "77"
         ENABLE_APP_SANDBOX: YES
       configs:
         Debug:
@@ -87,7 +90,7 @@ targets:
       base:
         PRODUCT_NAME: XDial
         MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "73"
+        CURRENT_PROJECT_VERSION: "77"
         ENABLE_USER_SCRIPT_SANDBOXING: NO
       configs:
         Debug:
@@ -103,9 +106,6 @@ targets:
           OTHER_CODE_SIGN_FLAGS: "--timestamp"
           ENABLE_HARDENED_RUNTIME: YES
     dependencies:
-      - target: XDialTransparentProxy
-        embed: true
-        codeSign: true
       - framework: ../build/frameworks/macos/Libbox.xcframework
         embed: false
       - sdk: libresolv.tbd
@@ -113,6 +113,42 @@ targets:
       - sdk: SystemExtensions.framework
       - sdk: SystemConfiguration.framework
     postBuildScripts:
+      - name: Embed private RuleSet presets
+        script: |
+          set -eu
+          preset_source="${XDIAL_RULE_SET_PRESETS_FILE:-${SRCROOT}/PrivateConfig/RuleSetPresets.json}"
+          preset_dir="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+          preset_destination="${preset_dir}/RuleSetPresets.json"
+          if [ -f "${preset_source}" ]; then
+            mkdir -p "${preset_dir}"
+            cp "${preset_source}" "${preset_destination}"
+          else
+            rm -f "${preset_destination}"
+          fi
+      - name: Embed configuration-matched System Extension
+        script: |
+          set -eu
+          extension_name="${XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER}.systemextension"
+          extension_source="${BUILT_PRODUCTS_DIR}/${extension_name}"
+          extension_dir="${TARGET_BUILD_DIR}/${SYSTEM_EXTENSIONS_FOLDER_PATH}"
+          test -d "${extension_source}"
+          mkdir -p "${extension_dir}"
+          rm -rf \
+            "${extension_dir}/XDialTransparentProxy.systemextension" \
+            "${extension_dir}/com.kafeifei.xdial.ne-probe.extension.systemextension" \
+            "${extension_dir}/com.kafeifei.xdial.transparent-proxy.systemextension"
+          /usr/bin/ditto \
+            "${extension_source}" \
+            "${extension_dir}/${extension_name}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+            "${extension_dir}/${extension_name}/Contents/Info.plist")" \
+            = "${XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER}"
+          /usr/bin/codesign --verify --deep --strict \
+            "${extension_dir}/${extension_name}"
+        inputFiles:
+          - "$(BUILT_PRODUCTS_DIR)/$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER).systemextension"
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(SYSTEM_EXTENSIONS_FOLDER_PATH)/$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER).systemextension"
       - name: Embed and sign XDial helper
         script: |
           set -eu

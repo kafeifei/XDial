@@ -129,8 +129,76 @@ struct RuleSet: Codable, Identifiable, Hashable {
     var enabled: Bool = true
     var url: String = ""
     var format: String = "auto"
+    /// 仅用于 URL RuleSet。true 表示匹配远程列表之外的目标，例如
+    /// “海外 IP”复用国内 IP 列表并取反，不需要维护一份容易漂移的世界 CIDR 副本。
+    var invert: Bool = false
     var domains: [String] = []
     var cidrs: [String] = []
+
+    init(
+        id: String,
+        name: String,
+        type: String,
+        enabled: Bool = true,
+        url: String = "",
+        format: String = "auto",
+        invert: Bool = false,
+        domains: [String] = [],
+        cidrs: [String] = []
+    ) {
+        self.id = id
+        self.name = name
+        self.type = type
+        self.enabled = enabled
+        self.url = url
+        self.format = format
+        self.invert = invert
+        self.domains = domains
+        self.cidrs = cidrs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case type
+        case enabled
+        case url
+        case format
+        case invert
+        case domains
+        case cidrs
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        type = try values.decode(String.self, forKey: .type)
+        enabled = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .enabled
+        ) ?? true
+        url = try values.decodeIfPresent(
+            String.self,
+            forKey: .url
+        ) ?? ""
+        format = try values.decodeIfPresent(
+            String.self,
+            forKey: .format
+        ) ?? "auto"
+        invert = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .invert
+        ) ?? false
+        domains = try values.decodeIfPresent(
+            [String].self,
+            forKey: .domains
+        ) ?? []
+        cidrs = try values.decodeIfPresent(
+            [String].self,
+            forKey: .cidrs
+        ) ?? []
+    }
 
     /// 清洗单条域名/CIDR 条目：剥掉所有控制与格式类字符（粘贴常混入
     /// \u{03}、零宽空格、BOM 等，Cc/Cf 两类都在 controlCharacters 集合里），

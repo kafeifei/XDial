@@ -152,6 +152,24 @@ final class DebugServer {
            let object = try? JSONSerialization.jsonObject(with: data) {
             dict["connectionReport"] = object
         }
+        if let data = try? JSONEncoder().encode(
+            s.installation.report
+        ),
+        let object = try? JSONSerialization.jsonObject(with: data) {
+            dict["installationReport"] = object
+        }
+        if let data = try? JSONEncoder().encode(
+            TransparentProxyManager.shared.automaticReconnectState
+        ),
+        let object = try? JSONSerialization.jsonObject(with: data) {
+            dict["automaticReconnect"] = object
+        }
+        if let data = try? JSONEncoder().encode(
+            ReconnectIncidentJournal.read()
+        ),
+        let object = try? JSONSerialization.jsonObject(with: data) {
+            dict["reconnectIncidents"] = object
+        }
 
         if let d = try? JSONEncoder().encode(s.profile),
            let p = try? JSONSerialization.jsonObject(with: d) {

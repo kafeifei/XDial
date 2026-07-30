@@ -104,8 +104,11 @@ curl -sS -X POST 127.0.0.1:19876/action \
   -d '{"action":"ax-set-value","title":"字段当前值","value":"新值"}'
 ```
 
+`/state.installationReport` 是当前平台安装事务的事实来源；
 `/state.connectionReport` 是本次连接事务的事实来源：它包含动态计划、逐任务状态、错误、
-事件顺序及回滚结果。诊断连接失败时先读这里，不得从文本日志反推控制流。
+事件顺序及回滚结果。诊断安装或连接失败时先读对应报告，不得从文本日志反推控制流。
+安装报告就绪只证明 app、helper 和 System Extension 前置条件，不证明网络配置、Line、
+RuleSet、DNS 或真实出口已经工作。
 `/state.network.perLine` 只是由当前 Provider 事务产生、按 `transactionID` 绑定的易失
 出口地址观察；它不表示 Line 运行状态，断开、Mode 或 transaction 改变时会清空。
 逐域名归因使用 `begin-route-probe` 后读取 `routing-probe-snapshot`；不得用页面显示、

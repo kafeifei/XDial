@@ -3,38 +3,79 @@ import Foundation
 enum ConnectionFailureCode {
     static let underlayEgressUnavailable =
         "underlay-egress-unavailable"
+    static let providerSessionLost = "provider-session-lost"
 }
 
-/// Underlay 切换通知只证明系统路由、NWPath 与 DNS 快照已经收敛，不证明
-/// 下层数据面已经能承载真实连接。自动重建只对这个结构化瞬态错误做有界重试；
-/// Line 登录、节点、握手等错误必须原样失败，不能被重试掩盖。
+enum AutomaticReconnectTrigger: String, Codable {
+    case underlayChange = "underlay-change"
+    case unexpectedDisconnect = "unexpected-disconnect"
+}
+
+struct AutomaticReconnectRuntimeState: Codable, Equatable {
+    let inProgress: Bool
+    let trigger: AutomaticReconnectTrigger?
+    let attemptsUsed: Int
+    let maxAttempts: Int
+    let stableResetAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case inProgress = "in_progress"
+        case trigger
+        case attemptsUsed = "attempts_used"
+        case maxAttempts = "max_attempts"
+        case stableResetAt = "stable_reset_at"
+    }
+}
+
+/// 自动重连是同一份用户连接意图的有界恢复，不是静默无限拉起。
+///
+/// Underlay 改变后的自动重建仍只重试结构化的 Underlay 瞬态故障；
+/// 已稳定提交的会话意外断线则允许对本次恢复事务做有界重试。无论哪种来源，
+/// 预算都是五次，且必须连续稳定五分钟才会清零。
 struct AutomaticReconnectRetryPolicy {
     private let delays: [TimeInterval]
+    let stableResetInterval: TimeInterval
 
-    init(delays: [TimeInterval] = [2, 5, 10]) {
+    init(
+        delays: [TimeInterval] = [2, 5, 10, 20, 30],
+        stableResetInterval: TimeInterval = 5 * 60
+    ) {
         self.delays = delays
+        self.stableResetInterval = stableResetInterval
+    }
+
+    var maxAttempts: Int {
+        delays.count
     }
 
     func delay(
         after report: ConnectionReport,
-        retryIndex: Int
+        attemptsUsed: Int,
+        trigger: AutomaticReconnectTrigger
     ) -> TimeInterval? {
         guard
             report.state == .failed,
             report.rollbackComplete,
-            report.systemTakeoverRemoved,
-            report.error?.code ==
-                ConnectionFailureCode.underlayEgressUnavailable
+            report.systemTakeoverRemoved
         else {
             return nil
         }
-        return delay(retryIndex: retryIndex)
+        switch trigger {
+        case .underlayChange:
+            guard report.error?.code ==
+                ConnectionFailureCode.underlayEgressUnavailable else {
+                return nil
+            }
+        case .unexpectedDisconnect:
+            break
+        }
+        return delayForNextAttempt(attemptsUsed: attemptsUsed)
     }
 
-    func delay(retryIndex: Int) -> TimeInterval? {
-        guard delays.indices.contains(retryIndex) else {
+    func delayForNextAttempt(attemptsUsed: Int) -> TimeInterval? {
+        guard delays.indices.contains(attemptsUsed) else {
             return nil
         }
-        return delays[retryIndex]
+        return delays[attemptsUsed]
     }
 }

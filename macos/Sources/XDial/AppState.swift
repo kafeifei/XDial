@@ -42,6 +42,7 @@ final class AppState: ObservableObject {
     }
 
     let engine = GoEngine.shared
+    let installation = InstallationCoordinator.shared
     private var engineSubs = Set<AnyCancellable>()
 
     private let profileKey = "xdial.profile"
@@ -49,12 +50,152 @@ final class AppState: ObservableObject {
     private let subKeychainPrefix = "xdial-sub-"
     private var cachedVault: [String: String] = [:]
 
+    /// Tailscale 的登录/节点发现属于配置态，不是 LineRow 的视图状态。
+    ///
+    /// 关闭设置窗口不能丢掉刚读取的状态；浏览器登录轮询也不能因为卡片被收起而停止。
+    /// 这里不持久化 auth URL 或节点列表，App 重启后由显式配置操作重新读取；运行中的
+    /// Line 是否已连接则始终由 committed ConnectionReport 决定。
+    @Published private var tailscaleConfigurationStatuses:
+        [String: TailscaleRuntimeStatus] = [:]
+    @Published private var tailscaleConfigurationErrors:
+        [String: String] = [:]
+    @Published private var tailscaleConfigurationBusyLineIDs:
+        Set<String> = []
+    private var tailscaleConfigurationPollGenerations:
+        [String: Int] = [:]
+
     func tr(_ zh: String, _ en: String) -> String {
         language == .zh ? zh : en
     }
 
     var isConnected: Bool { engine.isConnected }
     var isBusy: Bool { engine.isBusy }
+
+    func tailscaleConfigurationStatus(
+        for lineID: String
+    ) -> TailscaleRuntimeStatus? {
+        tailscaleConfigurationStatuses[lineID]
+    }
+
+    func tailscaleConfigurationError(
+        for lineID: String
+    ) -> String? {
+        tailscaleConfigurationErrors[lineID]
+    }
+
+    func isTailscaleConfigurationBusy(
+        for lineID: String
+    ) -> Bool {
+        tailscaleConfigurationBusyLineIDs.contains(lineID)
+    }
+
+    func setTailscaleConfigurationStatus(
+        _ status: TailscaleRuntimeStatus,
+        for lineID: String
+    ) {
+        tailscaleConfigurationStatuses[lineID] = status
+        tailscaleConfigurationErrors.removeValue(forKey: lineID)
+    }
+
+    func setTailscaleConfigurationError(
+        _ error: String?,
+        for lineID: String
+    ) {
+        if let error, !error.isEmpty {
+            tailscaleConfigurationErrors[lineID] = error
+        } else {
+            tailscaleConfigurationErrors.removeValue(forKey: lineID)
+        }
+    }
+
+    func setTailscaleConfigurationBusy(
+        _ busy: Bool,
+        for lineID: String
+    ) {
+        if busy {
+            tailscaleConfigurationBusyLineIDs.insert(lineID)
+        } else {
+            tailscaleConfigurationBusyLineIDs.remove(lineID)
+        }
+    }
+
+    func startTailscaleConfigurationPolling(
+        lineID: String,
+        attempts: Int = 90
+    ) {
+        let generation =
+            (tailscaleConfigurationPollGenerations[lineID] ?? 0) + 1
+        tailscaleConfigurationPollGenerations[lineID] = generation
+        scheduleTailscaleConfigurationPoll(
+            lineID: lineID,
+            generation: generation,
+            remaining: attempts
+        )
+    }
+
+    func cancelTailscaleConfigurationPolling(
+        lineID: String
+    ) {
+        tailscaleConfigurationPollGenerations[lineID] =
+            (tailscaleConfigurationPollGenerations[lineID] ?? 0) + 1
+        tailscaleConfigurationBusyLineIDs.remove(lineID)
+    }
+
+    private func scheduleTailscaleConfigurationPoll(
+        lineID: String,
+        generation: Int,
+        remaining: Int
+    ) {
+        guard remaining > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            [weak self] in
+            guard let self else { return }
+            guard
+                self.tailscaleConfigurationPollGenerations[lineID]
+                    == generation
+            else {
+                return
+            }
+            self.engine.tailscaleStatus(lineID: lineID) {
+                [weak self] result in
+                guard let self else { return }
+                guard
+                    self.tailscaleConfigurationPollGenerations[lineID]
+                        == generation
+                else {
+                    return
+                }
+                switch result {
+                case let .success(status):
+                    self.setTailscaleConfigurationStatus(
+                        status,
+                        for: lineID
+                    )
+                    if status.isRunning {
+                        self.setTailscaleConfigurationBusy(
+                            false,
+                            for: lineID
+                        )
+                        return
+                    }
+                    self.scheduleTailscaleConfigurationPoll(
+                        lineID: lineID,
+                        generation: generation,
+                        remaining: remaining - 1
+                    )
+                case let .failure(error):
+                    self.setTailscaleConfigurationBusy(
+                        false,
+                        for: lineID
+                    )
+                    self.setTailscaleConfigurationError(
+                        error.localizedDescription,
+                        for: lineID
+                    )
+                }
+            }
+        }
+    }
 
     /// 引擎手里是否攥着一份 profile 快照。攥着的时候改配置才产生「双头真相」，
     /// 未连接时改配置下次 connect 自然生效，不需要提示。
@@ -67,6 +208,7 @@ final class AppState: ObservableObject {
 
     var canConnect: Bool {
         guard !isBusy else { return false }
+        guard installation.isReady else { return false }
         guard let s = activeMode else { return false }
         // 必须有效的 VPN 凭据（如果模式用到 VPN）
         for binding in s.bindings {
@@ -182,6 +324,18 @@ final class AppState: ObservableObject {
         engine.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &engineSubs)
+        installation.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &engineSubs)
+        installation.$report
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.checkHelper()
+                }
+            }
+            .store(in: &engineSubs)
         engine.$status
             .combineLatest(engine.$connectionReport)
             .sink { [weak self] _, _ in
@@ -203,8 +357,7 @@ final class AppState: ObservableObject {
             .store(in: &engineSubs)
         loadSaved()
         checkHelper()
-        // 启动即自愈：daemon 若还是重编前的旧二进制，让它 respawn 成 bundle 里的新版
-        Task.detached { await GoEngine.syncDaemonBinary() }
+        installation.start()
         engine.syncStatus()
         #if DEBUG
         Self.current = self
@@ -374,6 +527,11 @@ final class AppState: ObservableObject {
     // MARK: - Connect
 
     func connect() {
+        guard installation.isReady else {
+            installation.start()
+            installation.present()
+            return
+        }
         guard canConnect else { return }
         NetworkInfo.shared.clear()
         // 这次 save 本身就是在下发前落盘，不该把自己标成"未下发"
@@ -383,6 +541,9 @@ final class AppState: ObservableObject {
         let tailscaleLineIDs = profile.lines
             .filter { $0.type == "tailscale" }
             .map(\.id)
+        for lineID in tailscaleLineIDs {
+            cancelTailscaleConfigurationPolling(lineID: lineID)
+        }
         stopTailscaleSetupSessions(
             lineIDs: tailscaleLineIDs,
             profileJSON: profileJSON
@@ -473,60 +634,33 @@ final class AppState: ObservableObject {
         return true
     }
 
-    /// 启用后台服务（SMAppService）。全生命周期只有两次用户交互，且都在首次：
-    /// 1. 旧机制迁移时清理旧安装（管理员密码，只发生在装过旧版的机器上）
-    /// 2. 系统设置「登录项」批准一次（支持 Touch ID）
-    /// 之后重编/升级由 respawn 自愈，永不再弹。
+    /// 兼容既有 UI / Debug intent；实际执行统一进入完整安装事务。
     func setupHelper(thenConnect: Bool = false) {
-        if PrivilegeManager.legacyInstalled {
-            do {
-                try PrivilegeManager.cleanupLegacy()
-            } catch {
-                appLog("setupHelper: legacy cleanup FAILED: \(error.localizedDescription)")
-                engine.lastError = error.localizedDescription
-                return
-            }
-        }
-        do {
-            try PrivilegeManager.register()
-        } catch {
-            // 已注册待批准时 register() 会抛 Operation not permitted——不是失败，
-            // 按下面的状态机继续引导批准
-            appLog("setupHelper: register threw: \(error.localizedDescription)")
-        }
-        checkHelper()
-        if helperNeedsApproval {
-            PrivilegeManager.openApprovalSettings()
-            pollHelperApproval(thenConnect: thenConnect)
-        } else if helperInstalled {
-            appLog("setupHelper: enabled")
-            if thenConnect { connect() }
-        } else {
-            engine.lastError = tr(
-                "后台服务未能启用（状态 \(PrivilegeManager.status.rawValue)），请重试",
-                "Failed to enable background service (status \(PrivilegeManager.status.rawValue))"
-            )
-        }
-    }
-
-    private var approvalPollTask: Task<Void, Never>?
-
-    /// 用户在系统设置里批准是异步的，轮询等它生效（最多 3 分钟）
-    private func pollHelperApproval(thenConnect: Bool) {
-        approvalPollTask?.cancel()
-        approvalPollTask = Task { [weak self] in
+        installation.retry()
+        guard thenConnect else { return }
+        Task { [weak self] in
             for _ in 0..<180 {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if Task.isCancelled { return }
                 guard let self else { return }
-                if PrivilegeManager.status == .enabled {
-                    appLog("helper approved in System Settings")
-                    self.checkHelper()
-                    if thenConnect { self.connect() }
+                if self.installation.isReady {
+                    self.connect()
+                    return
+                }
+                if self.installation.report.state == .failed {
                     return
                 }
             }
         }
+    }
+
+    @discardableResult
+    func requireInstallationReady() -> Bool {
+        guard installation.isReady else {
+            installation.start()
+            installation.present()
+            return false
+        }
+        return true
     }
 
     // MARK: - Persistence

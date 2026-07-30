@@ -103,6 +103,9 @@ type RuleSet struct {
 	// URL 规则（远程规则集）
 	URL    string `json:"url,omitempty"`
 	Format string `json:"format,omitempty"`
+	// Invert 只作用于 URL RuleSet 的匹配条件。它让“海外 IP”可以复用
+	// 国内 IP 列表并取反，避免维护一份庞大且容易漂移的补集。
+	Invert bool `json:"invert,omitempty"`
 
 	// 手动规则
 	Domains []string `json:"domains,omitempty"`

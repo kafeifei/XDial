@@ -1,5 +1,21 @@
 import AppKit
 
+switch ApplicationRelocator.prepareForLaunch() {
+case .continueLaunch:
+    break
+case .relaunching:
+    exit(0)
+case let .failed(message):
+    _ = NSApplication.shared
+    let alert = NSAlert()
+    alert.messageText = "XDial 无法完成安装"
+    alert.informativeText = message
+    alert.alertStyle = .critical
+    alert.addButton(withTitle: "退出")
+    alert.runModal()
+    exit(1)
+}
+
 let me = NSRunningApplication.current
 let others = NSRunningApplication.runningApplications(
     withBundleIdentifier: me.bundleIdentifier ?? ""

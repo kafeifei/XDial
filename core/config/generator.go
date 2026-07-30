@@ -640,6 +640,7 @@ type proxyDNSTarget struct {
 	lineTag    string
 	domains    []string
 	ruleSetTag string
+	invert     bool
 }
 
 // collectProxyBoundDNSTargets 收集活动模式里"解析必须经该线路出去"的规则集。
@@ -696,7 +697,11 @@ func collectProxyBoundDNSTargets(
 			if ruleSet.URL == "" {
 				continue
 			}
-			targets = append(targets, proxyDNSTarget{lineTag: lineTag, ruleSetTag: sbRuleSetTag(ruleSet)})
+			targets = append(targets, proxyDNSTarget{
+				lineTag:    lineTag,
+				ruleSetTag: sbRuleSetTag(ruleSet),
+				invert:     ruleSet.Invert,
+			})
 		}
 	}
 	return targets
@@ -781,6 +786,9 @@ func buildDNS(
 		rule := map[string]interface{}{"server": serverTag}
 		if target.ruleSetTag != "" {
 			rule["rule_set"] = target.ruleSetTag
+			if target.invert {
+				rule["invert"] = true
+			}
 		} else {
 			rule["domain_suffix"] = target.domains
 		}
@@ -917,10 +925,12 @@ func buildTransparentProxyDNS(
 			}
 			ensureResolver(resolverTag, outTag)
 			if dnsRulesOpen {
-				rules = append(rules, map[string]interface{}{
+				rule := map[string]interface{}{
 					"rule_set": sbRuleSetTag(ruleSet),
 					"server":   resolverTag,
-				})
+				}
+				applyURLRuleSetInvert(rule, ruleSet)
+				rules = append(rules, rule)
 			}
 		}
 	}
@@ -1130,6 +1140,8 @@ func compileTransparentProxyRuleSet(ruleSet *RuleSet, outTag string) []map[strin
 			"rule_set": sbRuleSetTag(ruleSet),
 			"outbound": outTag,
 		}
+		applyURLRuleSetInvert(match, ruleSet)
+		applyURLRuleSetInvert(route, ruleSet)
 		switch ruleSet.RuntimeMatchKind {
 		case RuleSetMatchDomain:
 			match["action"] = "resolve"
@@ -1221,10 +1233,12 @@ func buildRouteRule(c *RuleSet, outTag string) map[string]interface{} {
 		if c.URL == "" {
 			return nil
 		}
-		return map[string]interface{}{
+		rule := map[string]interface{}{
 			"rule_set": sbRuleSetTag(c),
 			"outbound": outTag,
 		}
+		applyURLRuleSetInvert(rule, c)
+		return rule
 	case RuleSetTypeManual:
 		rule := map[string]interface{}{
 			"outbound": outTag,
@@ -1241,6 +1255,12 @@ func buildRouteRule(c *RuleSet, outTag string) map[string]interface{} {
 		return rule
 	}
 	return nil
+}
+
+func applyURLRuleSetInvert(rule map[string]interface{}, ruleSet *RuleSet) {
+	if ruleSet != nil && ruleSet.Type == RuleSetTypeURL && ruleSet.Invert {
+		rule["invert"] = true
+	}
 }
 
 // sbCollectRuleSets 收集 sing-box 配置层的 rule_set 资源块（route.rule_set 数组里

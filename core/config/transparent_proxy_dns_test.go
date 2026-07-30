@@ -227,6 +227,48 @@ func TestTransparentProxyDefaultLineOwnsFinalResolution(t *testing.T) {
 	assertTransparentProxyHasNoMobileDNSFallback(t, raw)
 }
 
+func TestTransparentProxyInvertedURLIPRuleKeepsSystemResolutionAndInvertsRoute(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{
+				ID:             "japan",
+				Type:           LineTypeTrojan,
+				Enabled:        true,
+				TrojanServer:   "192.0.2.10",
+				TrojanPort:     443,
+				TrojanPassword: "secret",
+				TrojanSNI:      "proxy.example",
+			},
+		},
+		RuleSets: []RuleSet{{
+			ID:               "outside-cn",
+			Type:             RuleSetTypeURL,
+			Enabled:          true,
+			URL:              "file:///tmp/cn.srs",
+			Format:           "binary",
+			Invert:           true,
+			RuntimeMatchKind: RuleSetMatchIP,
+		}},
+		Modes: []Mode{{
+			ID: "mode",
+			Bindings: []RuleBinding{{
+				RuleSetID: "outside-cn",
+				LineID:    "japan",
+			}},
+			DefaultLineID: "direct",
+		}},
+		ActiveModeID: "mode",
+	}
+
+	cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
+	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
+		`{"action":"resolve","server":"xdial-system-dns"}`,
+		`{"invert":true,"outbound":"proxy-japan","rule_set":"ruleset-outside-cn"}`,
+		`{"action":"resolve","server":"xdial-system-dns"}`,
+	})
+}
+
 func generateTransparentProxyDNSTestConfig(t *testing.T, profile *Profile) (SingBoxConfig, []byte) {
 	t.Helper()
 	raw, err := GenerateSingBoxTransparentProxy(

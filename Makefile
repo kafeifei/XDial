@@ -99,6 +99,10 @@ cli: $(PATCHED_WORKFILE)
 # debug 构建(含 DebugServer,仅本地开发用,不得分发)
 app: cli libbox-macos-xcframework
 	cd macos && xcodegen generate
+	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Debug \
+		-destination 'platform=macOS,arch=arm64' \
+		-derivedDataPath $(BUILD_DIR)/macos-xcode \
+		build
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration Debug \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
@@ -112,6 +116,10 @@ release: libbox-macos-xcframework
 	@mkdir -p $(BUILD_DIR)
 	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -trimpath -ldflags "$(GO_LDFLAGS) -s -w" -o $(BUILD_DIR)/xdial ./cmd/xdial/
 	cd macos && xcodegen generate
+	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Release \
+		-destination 'platform=macOS,arch=arm64' \
+		-derivedDataPath $(BUILD_DIR)/macos-xcode-release \
+		build
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration Release \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode-release \
