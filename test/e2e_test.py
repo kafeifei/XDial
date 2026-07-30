@@ -267,19 +267,28 @@ def test_invalid_profile_rejected(client: DaemonClient):
 
 def test_dangling_ref_fail_closed(client: DaemonClient):
     resp = client.request("start", profile=json.dumps(dangling_profile(new_keys=True)))
-    if not resp.get("ok"):
-        raise Failure(f"start 同步拒绝（应异步 fail-closed）: {resp.get('message')}")
-    err = client.wait_error_then_disconnected(timeout=RPC_TIMEOUT)
+    if resp.get("ok"):
+        err = client.wait_error_then_disconnected(timeout=RPC_TIMEOUT)
+    else:
+        err = resp.get("message", "")
+        if client.status() != "disconnected":
+            raise Failure("同步拒绝悬空引用后引擎没有保持 disconnected")
     if "ghost" not in err:
         raise Failure(f"fail-closed 报错未指出悬空引用: {err}")
 
 
 def test_old_key_compat_fail_closed(client: DaemonClient):
     resp = client.request("start", profile=json.dumps(dangling_profile(new_keys=False)))
-    if not resp.get("ok"):
-        # 旧 key 若解码失败会在这里以 invalid profile 拒绝 —— 那是兼容层坏了
-        raise Failure(f"旧 key profile 未通过兼容层解码: {resp.get('message')}")
-    err = client.wait_error_then_disconnected(timeout=RPC_TIMEOUT)
+    if resp.get("ok"):
+        err = client.wait_error_then_disconnected(timeout=RPC_TIMEOUT)
+    else:
+        err = resp.get("message", "")
+        # 旧 key 若解码失败会以 invalid profile 拒绝；结构校验同步失败则证明
+        # 兼容层已经把旧字段归一化成了同一份 Mode 引用。
+        if "invalid profile" in err:
+            raise Failure(f"旧 key profile 未通过兼容层解码: {err}")
+        if client.status() != "disconnected":
+            raise Failure("同步拒绝旧 key 悬空引用后引擎没有保持 disconnected")
     if "ghost" not in err:
         raise Failure(f"旧 key profile 的 fail-closed 报错不对: {err}")
 

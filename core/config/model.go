@@ -52,9 +52,9 @@ type Line struct {
 	// 见 Profile.Tailscale。Line 上只留“这条线路怎么用那个 tailnet”，即选哪个出口。
 	TailscaleExitNode string `json:"tailscale_exit_node,omitempty"`
 
-	// TailscaleAuthKey 是 tailnet 的预授权密钥（D29）：纯参数，没有登录流程、
-	// 不需要任何特权，和别的线路的密码字段完全同构 —— 填上它，tsnet 首次启动
-	// 就能直接注册节点，不用把用户扔去浏览器点授权页。
+	// TailscaleAuthKey 仅为旧移动端 Profile 兼容字段。D33 桌面控制面不得持久化它；
+	// Auth Key 只在用户显式注册请求里瞬时进入 setup session，日常桌面配置生成会忽略
+	// 这个字段。
 	//
 	// 只能用可复用的持久 key，不要 ephemeral key：ephemeral 节点在会话关闭后
 	// 被控制面立刻回收，下次复用 state 会被要求重新登录（见 buildTailscaleEndpoint）。
@@ -81,6 +81,18 @@ const (
 	RuleSetTypeManual RuleSetType = "manual"
 )
 
+// RuleSetMatchKind 是 NetworkExtension 在严格下载并解析远程规则集后写入的
+// 单次生成元数据。它不属于用户配置，也不会持久化；Transparent Proxy 用它
+// 区分“先按 Line 解析域名”和“先按系统 DNS 得到 IP”这两个阶段。
+type RuleSetMatchKind string
+
+const (
+	RuleSetMatchUnknown RuleSetMatchKind = ""
+	RuleSetMatchDomain  RuleSetMatchKind = "domain"
+	RuleSetMatchIP      RuleSetMatchKind = "ip"
+	RuleSetMatchMixed   RuleSetMatchKind = "mixed"
+)
+
 // RuleSet 规则：匹配哪些流量
 type RuleSet struct {
 	ID      string      `json:"id"`
@@ -95,6 +107,8 @@ type RuleSet struct {
 	// 手动规则
 	Domains []string `json:"domains,omitempty"`
 	CIDRs   []string `json:"cidrs,omitempty"`
+
+	RuntimeMatchKind RuleSetMatchKind `json:"-"`
 }
 
 // RuleBinding 模式中的一条绑定：规则→线路（或订阅）

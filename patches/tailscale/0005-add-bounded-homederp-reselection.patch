@@ -1,0 +1,2083 @@
+From: XDial maintainers
+Subject: [PATCH] magicsock,ipnlocal: add bounded HomeDERP reselection
+
+An old peer can retain a live DERP route which no longer matches control's
+cached node snapshot. Rotating the discovery key does not repair that state:
+the peer may consume the full update and still later apply a stale DERPHome
+mutation to its live endpoint.
+
+Add one narrow Prepare-only recovery primitive. It selects the lowest-latency
+measured alternate region, connects it as an auxiliary DERP, waits for the
+current connection generation to receive ServerInfo, promotes it atomically as
+the home until explicit lifecycle invalidation or magicsock close, and publishes
+matching NetInfo. The LocalBackend wrapper commits only while the same control
+client, node identity, and current-generation NetInfo baseline remain current.
+It binds that NetInfo to a payload-free receipt. The receipt becomes accepted
+only when a lite map HTTP request actually snapshots the same NetInfo revision
+and PreferredDERP and receives a successful response. A later different
+NetInfo is reported as superseded rather than mistaken for delivery. The
+server-provided SelfNode HomeDERP remains diagnostic because the protocol has
+no synchronous peer-consumption acknowledgement.
+
+The operation does not expose region IDs outside the patched module and does
+not claim peer recovery. A fresh WireGuard handshake and real-egress probe
+remain the caller's only success criteria.
+
+diff --git a/control/controlclient/auto.go b/control/controlclient/auto.go
+index 16b82aa..cc130f1 100644
+--- a/control/controlclient/auto.go
++++ b/control/controlclient/auto.go
+@@ -69,6 +69,9 @@ func (c *Auto) updateRoutine() {
+ 		gen := c.lastUpdateGen
+ 		ctx := c.mapCtx
+ 		needUpdate := gen > 0 && gen != lastUpdateGenInformed && c.loggedIn
++		if needUpdate && gen > c.xdialLastUpdateAttemptedGen {
++			c.xdialLastUpdateAttemptedGen = gen
++		}
+ 		c.mu.Unlock()
+ 
+ 		if !needUpdate {
+@@ -82,9 +85,14 @@ func (c *Auto) updateRoutine() {
+ 		}
+ 
+ 		t0 := c.clock.Now()
+-		err := c.direct.SendUpdate(ctx)
++		netInfoSnapshot, err := c.direct.xdialSendUpdate(ctx)
+ 		d := time.Since(t0).Round(time.Millisecond)
+ 		if err != nil {
++			c.mu.Lock()
++			if gen > c.xdialLastUpdateFailedGen {
++				c.xdialLastUpdateFailedGen = gen
++			}
++			c.mu.Unlock()
+ 			if ctx.Err() == nil {
+ 				c.direct.logf("lite map update error after %v: %v", d, err)
+ 			}
+@@ -94,6 +102,9 @@ func (c *Auto) updateRoutine() {
+ 		bo.BackOff(ctx, nil)
+ 		c.direct.logf("[v1] successful lite map update in %v", d)
+ 
++		c.mu.Lock()
++		c.xdialRecordHTTPAcceptedLocked(gen, netInfoSnapshot)
++		c.mu.Unlock()
+ 		lastUpdateGenInformed = gen
+ 	}
+ }
+@@ -122,6 +133,10 @@ type Auto struct {
+ 	observerQueue execqueue.ExecQueue
+ 	shutdownFn    func() // to be called prior to shutdown or nil
+ 
++	// xdialNetInfoMu serializes a Direct NetInfo mutation with creation of its
++	// XDial receipt. It is never held together with mu.
++	xdialNetInfoMu sync.Mutex
++
+ 	mu sync.Mutex // mutex guards the following fields
+ 
+ 	started      bool   // whether [Auto.Start] has been called
+@@ -133,6 +148,14 @@ type Auto struct {
+ 	// the server.
+ 	lastUpdateGen updateGen
+ 
++	// These XDial-only generations make the otherwise asynchronous lite map
++	// update boundary observable without exposing any request payload.
++	xdialLastNetInfoReceipt          XDialNetInfoReceipt
++	xdialLastUpdateAttemptedGen      updateGen
++	xdialLastUpdateFailedGen         updateGen
++	xdialLastHTTPAccepted            xdialLiteMapAck
++	xdialHTTPAcceptedByPreferredDERP map[int]xdialLiteMapAck
++
+ 	lastStatus atomic.Pointer[Status]
+ 
+ 	paused         bool        // whether we should stop making HTTP requests
+@@ -252,20 +275,41 @@ func (c *Auto) start() {
+ //
+ // It should be called whenever there's something new to tell the server.
+ func (c *Auto) updateControl() {
++	c.updateControlForNetInfo(nil)
++}
++
++func (c *Auto) updateControlForNetInfo(
++	netInfo *xdialNetInfoSnapshot,
++) XDialNetInfoReceipt {
+ 	gen := nextUpdateGen()
+ 	c.mu.Lock()
+ 	if gen < c.lastUpdateGen {
+ 		// This update is out of date.
++		if netInfo != nil {
++			// The newer already-scheduled update snapshots Direct after this
++			// NetInfo was stored, so it is the generation that covers it.
++			receipt := c.xdialReceiptLocked(
++				c.lastUpdateGen,
++				*netInfo,
++			)
++			c.mu.Unlock()
++			return receipt
++		}
+ 		c.mu.Unlock()
+-		return
++		return XDialNetInfoReceipt{}
+ 	}
+ 	c.lastUpdateGen = gen
++	var receipt XDialNetInfoReceipt
++	if netInfo != nil {
++		receipt = c.xdialReceiptLocked(gen, *netInfo)
++	}
+ 	c.mu.Unlock()
+ 
+ 	select {
+ 	case c.updateCh <- struct{}{}:
+ 	default:
+ 	}
++	return receipt
+ }
+ 
+ // cancelAuthCtxLocked is like cancelAuthCtx, but assumes the caller holds c.mu.
+@@ -562,15 +606,35 @@ func (c *Auto) SetHostinfo(hi *tailcfg.Hostinfo) {
+ }
+ 
+ func (c *Auto) SetNetInfo(ni *tailcfg.NetInfo) {
++	_ = c.XDialSetNetInfoWithReceipt(ni)
++}
++
++// XDialSetNetInfoWithReceipt preserves SetNetInfo's de-duplication while
++// returning a payload-free receipt for the exact Direct snapshot. The receipt
++// is completed only by a lite map request that actually carried that snapshot
++// and received a successful HTTP response.
++func (c *Auto) XDialSetNetInfoWithReceipt(
++	ni *tailcfg.NetInfo,
++) XDialNetInfoReceipt {
+ 	if ni == nil {
+ 		panic("nil NetInfo")
+ 	}
+-	if !c.direct.SetNetInfo(ni) {
+-		return
++	c.xdialNetInfoMu.Lock()
++	defer c.xdialNetInfoMu.Unlock()
++
++	changed := c.direct.SetNetInfo(ni)
++	snapshot := c.direct.xdialNetInfoSnapshot()
++	if !changed {
++		c.mu.Lock()
++		receipt := c.xdialLastNetInfoReceipt
++		c.mu.Unlock()
++		if receipt.xdialMatches(c, snapshot) {
++			return receipt
++		}
+ 	}
+ 
+ 	// Send new NetInfo to server
+-	c.updateControl()
++	return c.updateControlForNetInfo(&snapshot)
+ }
+ 
+ // SetTKAHead updates the TKA head hash that map-request infrastructure sends.
+diff --git a/control/controlclient/direct.go b/control/controlclient/direct.go
+index a9b125c..d064c4c 100644
+--- a/control/controlclient/direct.go
++++ b/control/controlclient/direct.go
+@@ -104,6 +104,7 @@ type Direct struct {
+ 	expiry                  time.Time         // or zero value if none/unknown
+ 	hostinfo                *tailcfg.Hostinfo // always non-nil
+ 	netinfo                 *tailcfg.NetInfo
++	xdialNetInfoRevision    uint64
+ 	endpoints               []tailcfg.Endpoint
+ 	tkaHead                 string
+ 	lastPingURL             string // last PingRequest.URL received, for dup suppression
+@@ -411,6 +412,7 @@ func (c *Direct) SetNetInfo(ni *tailcfg.NetInfo) bool {
+ 		return false
+ 	}
+ 	c.netinfo = ni.Clone()
++	c.xdialNetInfoRevision++
+ 	c.logf("NetInfo: %v", ni)
+ 	return true
+ }
+@@ -827,7 +829,7 @@ func (c *Direct) SetEndpoints(endpoints []tailcfg.Endpoint) (changed bool) {
+ // It always returns a non-nil error describing the reason for the failure or
+ // why the request ended.
+ func (c *Direct) PollNetMap(ctx context.Context, nu NetmapUpdater) error {
+-	return c.sendMapRequest(ctx, true, nu)
++	return c.sendMapRequest(ctx, true, nu, nil)
+ }
+ 
+ type rememberLastNetmapUpdater struct {
+@@ -841,7 +843,7 @@ func (nu *rememberLastNetmapUpdater) UpdateFullNetmap(nm *netmap.NetworkMap) {
+ // FetchNetMapForTest fetches the netmap once.
+ func (c *Direct) FetchNetMapForTest(ctx context.Context) (*netmap.NetworkMap, error) {
+ 	var nu rememberLastNetmapUpdater
+-	err := c.sendMapRequest(ctx, false, &nu)
++	err := c.sendMapRequest(ctx, false, &nu, nil)
+ 	if err == nil && nu.last == nil {
+ 		return nil, errors.New("[unexpected] sendMapRequest success without callback")
+ 	}
+@@ -852,7 +854,15 @@ func (c *Direct) FetchNetMapForTest(ctx context.Context) (*netmap.NetworkMap, er
+ // does not fetch anything. It returns an error if the server did not return a
+ // successful 200 OK response.
+ func (c *Direct) SendUpdate(ctx context.Context) error {
+-	return c.sendMapRequest(ctx, false, nil)
++	return c.sendMapRequest(ctx, false, nil, nil)
++}
++
++func (c *Direct) xdialSendUpdate(
++	ctx context.Context,
++) (xdialNetInfoSnapshot, error) {
++	var snapshot xdialNetInfoSnapshot
++	err := c.sendMapRequest(ctx, false, nil, &snapshot)
++	return snapshot, err
+ }
+ 
+ // SetDiscoPublicKey updates the disco public key in local state.
+@@ -891,7 +901,12 @@ type ControlTime struct {
+ // and as such always returns a non-nil error.
+ //
+ // If nu is nil, OmitPeers will be set to true.
+-func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu NetmapUpdater) error {
++func (c *Direct) sendMapRequest(
++	ctx context.Context,
++	isStreaming bool,
++	nu NetmapUpdater,
++	xdialSnapshot *xdialNetInfoSnapshot,
++) error {
+ 	if c.panicOnUse {
+ 		panic("tainted client")
+ 	}
+@@ -914,6 +929,9 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
+ 	serverNoiseKey := c.serverNoiseKey
+ 	discoKey := c.discoPubKey
+ 	hi := c.hostInfoLocked()
++	if xdialSnapshot != nil {
++		*xdialSnapshot = c.xdialNetInfoSnapshotLocked()
++	}
+ 	backendLogID := hi.BackendLogID
+ 	connectionHandleForTest := c.connectionHandleForTest
+ 	tkaHead := c.tkaHead
+diff --git a/control/controlclient/xdial_update.go b/control/controlclient/xdial_update.go
+new file mode 100644
+index 0000000..066b350
+--- /dev/null
++++ b/control/controlclient/xdial_update.go
+@@ -0,0 +1,149 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package controlclient
++
++type xdialNetInfoSnapshot struct {
++	revision      uint64
++	present       bool
++	preferredDERP int
++}
++
++func (c *Direct) xdialNetInfoSnapshotLocked() xdialNetInfoSnapshot {
++	snapshot := xdialNetInfoSnapshot{
++		revision: c.xdialNetInfoRevision,
++		present:  c.netinfo != nil,
++	}
++	if c.netinfo != nil {
++		snapshot.preferredDERP = c.netinfo.PreferredDERP
++	}
++	return snapshot
++}
++
++func (c *Direct) xdialNetInfoSnapshot() xdialNetInfoSnapshot {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.xdialNetInfoSnapshotLocked()
++}
++
++type xdialLiteMapAck struct {
++	generation updateGen
++	netInfo    xdialNetInfoSnapshot
++}
++
++// XDialNetInfoReceipt binds one NetInfo value to the control update generation
++// that covers it. Its fields intentionally remain private so no DERP identifier
++// or request payload can leave the patched module.
++type XDialNetInfoReceipt struct {
++	client          *Auto
++	generation      updateGen
++	netInfoRevision uint64
++	preferredDERP   int
++	netInfoPresent  bool
++}
++
++// XDialNetInfoReceiptState reports only bounded lifecycle facts. HTTPAccepted
++// means a lite map request carrying this receipt's NetInfo snapshot received a
++// successful HTTP response and its body was drained. It does not claim another
++// peer consumed a resulting network map.
++type XDialNetInfoReceiptState struct {
++	Observable   bool
++	Queued       bool
++	Attempted    bool
++	HTTPAccepted bool
++	Failed       bool
++	Superseded   bool
++	ClientClosed bool
++}
++
++func (c *Auto) xdialReceiptLocked(
++	generation updateGen,
++	snapshot xdialNetInfoSnapshot,
++) XDialNetInfoReceipt {
++	receipt := XDialNetInfoReceipt{
++		client:          c,
++		generation:      generation,
++		netInfoRevision: snapshot.revision,
++		preferredDERP:   snapshot.preferredDERP,
++		netInfoPresent:  snapshot.present,
++	}
++	c.xdialLastNetInfoReceipt = receipt
++	return receipt
++}
++
++func (r XDialNetInfoReceipt) xdialMatches(
++	client *Auto,
++	snapshot xdialNetInfoSnapshot,
++) bool {
++	return r.client == client &&
++		r.generation > 0 &&
++		r.netInfoRevision == snapshot.revision &&
++		r.netInfoPresent == snapshot.present &&
++		(!snapshot.present ||
++			r.preferredDERP == snapshot.preferredDERP)
++}
++
++func (c *Auto) xdialRecordHTTPAcceptedLocked(
++	generation updateGen,
++	snapshot xdialNetInfoSnapshot,
++) {
++	ack := xdialLiteMapAck{
++		generation: generation,
++		netInfo:    snapshot,
++	}
++	if generation >= c.xdialLastHTTPAccepted.generation {
++		c.xdialLastHTTPAccepted = ack
++	}
++	if !snapshot.present {
++		return
++	}
++	if c.xdialHTTPAcceptedByPreferredDERP == nil {
++		c.xdialHTTPAcceptedByPreferredDERP =
++			make(map[int]xdialLiteMapAck)
++	}
++	previous :=
++		c.xdialHTTPAcceptedByPreferredDERP[snapshot.preferredDERP]
++	if generation >= previous.generation &&
++		snapshot.revision >= previous.netInfo.revision {
++		c.xdialHTTPAcceptedByPreferredDERP[snapshot.preferredDERP] =
++			ack
++	}
++}
++
++// State samples this receipt without waiting or performing network I/O.
++func (r XDialNetInfoReceipt) State() XDialNetInfoReceiptState {
++	if r.client == nil || r.generation == 0 {
++		return XDialNetInfoReceiptState{}
++	}
++	c := r.client
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	state := XDialNetInfoReceiptState{
++		Observable:   true,
++		Queued:       true,
++		Attempted:    c.xdialLastUpdateAttemptedGen >= r.generation,
++		Failed:       c.xdialLastUpdateFailedGen >= r.generation,
++		ClientClosed: c.closed,
++	}
++	if r.netInfoPresent {
++		ack :=
++			c.xdialHTTPAcceptedByPreferredDERP[r.preferredDERP]
++		state.HTTPAccepted =
++			ack.generation >= r.generation &&
++				ack.netInfo.revision >= r.netInfoRevision &&
++				ack.netInfo.present &&
++				ack.netInfo.preferredDERP == r.preferredDERP
++	}
++	if state.HTTPAccepted {
++		state.Failed = false
++		return state
++	}
++	latest := c.xdialLastHTTPAccepted
++	state.Superseded =
++		latest.generation >= r.generation &&
++			latest.netInfo.revision >= r.netInfoRevision &&
++			(!latest.netInfo.present ||
++				latest.netInfo.preferredDERP != r.preferredDERP)
++	return state
++}
+diff --git a/control/controlclient/xdial_update_test.go b/control/controlclient/xdial_update_test.go
+new file mode 100644
+index 0000000..2bfb4d5
+--- /dev/null
++++ b/control/controlclient/xdial_update_test.go
+@@ -0,0 +1,88 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package controlclient
++
++import "testing"
++
++func TestXDialNetInfoReceiptRequiresExactHTTPAcceptedSnapshot(
++	t *testing.T,
++) {
++	c := &Auto{}
++	snapshot := xdialNetInfoSnapshot{
++		revision:      7,
++		present:       true,
++		preferredDERP: 2,
++	}
++	c.mu.Lock()
++	receipt := c.xdialReceiptLocked(12, snapshot)
++	c.xdialLastUpdateAttemptedGen = 12
++	c.xdialLastUpdateFailedGen = 12
++	c.mu.Unlock()
++
++	state := receipt.State()
++	if !state.Observable || !state.Queued || !state.Attempted ||
++		!state.Failed || state.HTTPAccepted || state.Superseded {
++		t.Fatalf("failed attempt state = %+v", state)
++	}
++
++	c.mu.Lock()
++	c.xdialRecordHTTPAcceptedLocked(
++		11,
++		snapshot,
++	)
++	c.mu.Unlock()
++	state = receipt.State()
++	if state.HTTPAccepted {
++		t.Fatalf("older generation accepted receipt: %+v", state)
++	}
++
++	c.mu.Lock()
++	c.xdialRecordHTTPAcceptedLocked(
++		12,
++		xdialNetInfoSnapshot{
++			revision:      8,
++			present:       true,
++			preferredDERP: 3,
++		},
++	)
++	c.mu.Unlock()
++	state = receipt.State()
++	if state.HTTPAccepted || !state.Superseded {
++		t.Fatalf("different NetInfo snapshot = %+v", state)
++	}
++
++	c.mu.Lock()
++	c.xdialRecordHTTPAcceptedLocked(13, snapshot)
++	c.mu.Unlock()
++	state = receipt.State()
++	if !state.HTTPAccepted || state.Failed || state.Superseded {
++		t.Fatalf("exact accepted state = %+v", state)
++	}
++}
++
++func TestXDialNetInfoReceiptIsBoundToClientAndRevision(t *testing.T) {
++	c := &Auto{}
++	snapshot := xdialNetInfoSnapshot{
++		revision:      4,
++		present:       true,
++		preferredDERP: 5,
++	}
++	c.mu.Lock()
++	receipt := c.xdialReceiptLocked(9, snapshot)
++	c.mu.Unlock()
++
++	if !receipt.xdialMatches(c, snapshot) {
++		t.Fatal("receipt did not match its client snapshot")
++	}
++	if receipt.xdialMatches(&Auto{}, snapshot) {
++		t.Fatal("receipt crossed control clients")
++	}
++	snapshot.revision++
++	if receipt.xdialMatches(c, snapshot) {
++		t.Fatal("receipt crossed NetInfo revisions")
++	}
++	if state := (XDialNetInfoReceipt{}).State(); state.Observable {
++		t.Fatalf("zero receipt became observable: %+v", state)
++	}
++}
+diff --git a/ipn/ipnlocal/local.go b/ipn/ipnlocal/local.go
+index 6518e37..e0480bc 100644
+--- a/ipn/ipnlocal/local.go
++++ b/ipn/ipnlocal/local.go
+@@ -247,6 +247,10 @@ type LocalBackend struct {
+ 
+ 	peerAPIPorts syncs.AtomicValue[map[netip.Addr]int] // can be read without b.mu held; TODO(nickkhyl): remove or move to nodeBackend?
+ 
++	// xdialNetInfoSendMu serializes control NetInfo sends with a bounded
++	// HomeDERP commit. It must be acquired before mu.
++	xdialNetInfoSendMu sync.Mutex
++
+ 	// The mutex protects the following elements.
+ 	mu syncs.Mutex
+ 
+@@ -1741,6 +1745,10 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
+ 			b.logf("[v1] TKA sync error: %v", err)
+ 		}
+ 		b.mu.Lock()
++		if b.cc != c {
++			b.logf("Ignoring SetControlClientStatus from old client after TKA sync")
++			return
++		}
+ 		// As we stepped outside of the lock, it's possible for b.cc
+ 		// to now be nil.
+ 		if b.cc != nil {
+@@ -5922,8 +5930,12 @@ func (b *LocalBackend) Logout(ctx context.Context, actor ipnauth.Actor) error {
+ // setNetInfo sets b.hostinfo.NetInfo to ni, and passes ni along to the
+ // controlclient, if one exists.
+ func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
++	b.xdialNetInfoSendMu.Lock()
++
+ 	b.mu.Lock()
++	ni = b.MagicConn().XDialNormalizeNetInfoForControl(ni)
+ 	cc := b.cc
++	ccAuto := b.ccAuto
+ 	controlGeneration := b.xdialControlNetInfo.generation
+ 	var refresh bool
+ 	if b.MagicConn().DERPs() > 0 || testenv.InTest() {
+@@ -5954,17 +5966,28 @@ func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
+ 	b.mu.Unlock()
+ 
+ 	if cc == nil {
++		b.xdialNetInfoSendMu.Unlock()
+ 		return
+ 	}
+-	cc.SetNetInfo(ni)
++	var receipt controlclient.XDialNetInfoReceipt
++	if ccAuto != nil {
++		receipt = ccAuto.XDialSetNetInfoWithReceipt(ni)
++	} else {
++		cc.SetNetInfo(ni)
++	}
+ 
+ 	// Client.SetNetInfo is synchronous and has no result. Reaching this point
+ 	// proves that the captured client received the call. Attribute it only to
+ 	// the generation that was current when the call began, so a late return
+ 	// from an old client cannot make a replacement look ready.
+ 	b.mu.Lock()
+-	b.xdialControlNetInfo.didSet(controlGeneration, ni.PreferredDERP)
++	b.xdialControlNetInfo.didSet(
++		controlGeneration,
++		ni.PreferredDERP,
++		receipt,
++	)
+ 	b.mu.Unlock()
++	b.xdialNetInfoSendMu.Unlock()
+ 
+ 	if refresh {
+ 		b.RefreshExitNode()
+diff --git a/ipn/ipnlocal/xdial_derp_reselection.go b/ipn/ipnlocal/xdial_derp_reselection.go
+new file mode 100644
+index 0000000..ea96496
+--- /dev/null
++++ b/ipn/ipnlocal/xdial_derp_reselection.go
+@@ -0,0 +1,280 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package ipnlocal
++
++import (
++	"context"
++	"errors"
++	"time"
++
++	"github.com/sagernet/tailscale/control/controlclient"
++	"github.com/sagernet/tailscale/types/key"
++	"github.com/sagernet/tailscale/types/netmap"
++)
++
++// XDialDERPHomeReselection reports only bounded relations. No DERP region,
++// endpoint, node key, tailnet name, or credential leaves the patched module.
++type XDialDERPHomeReselection struct {
++	ControlGeneration                   uint64
++	AlternatePrepared                   bool
++	HomePromoted                        bool
++	ControlClientNotified               bool
++	ControlUpdateObservable             bool
++	ControlUpdateQueued                 bool
++	ControlUpdateAttempted              bool
++	ControlUpdateHTTPAccepted           bool
++	ControlUpdateFailed                 bool
++	ControlUpdateSuperseded             bool
++	ControlViewAligned                  bool
++	FailureCode                         string
++	PrecommitBaselineChecked            bool
++	PlanNodeMatchesCurrent              bool
++	ControlSelfPresent                  bool
++	ControlSelfNodeMatchesCurrent       bool
++	ControlSelfHomeMatchesPlanOriginal  bool
++	ControlSelfHomeMatchesPlanAlternate bool
++	ControlNetInfoSetForCurrentClient   bool
++	ControlNetInfoMatchesPlanOriginal   bool
++	ControlNetInfoMatchesPlanAlternate  bool
++}
++
++type xdialControlUpdateFacts struct {
++	observable   bool
++	queued       bool
++	attempted    bool
++	httpAccepted bool
++	failed       bool
++	superseded   bool
++}
++
++func xdialControlUpdateFactsFromState(
++	state controlclient.XDialNetInfoReceiptState,
++) xdialControlUpdateFacts {
++	return xdialControlUpdateFacts{
++		observable:   state.Observable,
++		queued:       state.Queued,
++		attempted:    state.Attempted,
++		httpAccepted: state.HTTPAccepted,
++		failed:       state.Failed,
++		superseded:   state.Superseded,
++	}
++}
++
++func xdialLocalControlBaselineMatches(
++	planNodeMatches bool,
++	netInfoSetForCurrentClient bool,
++	netInfoPreferredDERP int,
++	originalDERP int,
++) bool {
++	return planNodeMatches &&
++		netInfoSetForCurrentClient &&
++		netInfoPreferredDERP == originalDERP
++}
++
++type xdialControlBaselineFacts struct {
++	selfPresent          bool
++	nodeMatches          bool
++	homeMatchesOriginal  bool
++	homeMatchesAlternate bool
++}
++
++func xdialControlBaseline(
++	netMap *netmap.NetworkMap,
++	nodeKey key.NodePublic,
++	originalDERP int,
++	alternateDERP int,
++) xdialControlBaselineFacts {
++	facts := xdialControlBaselineFacts{
++		selfPresent: netMap != nil && netMap.SelfNode.Valid(),
++	}
++	if !facts.selfPresent {
++		return facts
++	}
++	facts.nodeMatches = netMap.SelfNode.Key() == nodeKey
++	if !facts.nodeMatches {
++		return facts
++	}
++	facts.homeMatchesOriginal =
++		netMap.SelfNode.HomeDERP() == originalDERP
++	facts.homeMatchesAlternate =
++		netMap.SelfNode.HomeDERP() == alternateDERP
++	return facts
++}
++
++// XDialReselectHomeDERP performs one bounded Prepare-only home change. It
++// commits only while the same control client and node identity remain current.
++// The server-provided SelfNode HomeDERP is sampled for diagnostics but is not
++// used as a synchronous acknowledgement: SetNetInfo has no such protocol
++// contract. A fresh handshake and real egress remain the caller's success gate.
++func (b *LocalBackend) XDialReselectHomeDERP(
++	ctx context.Context,
++) (result XDialDERPHomeReselection, err error) {
++	if ctx == nil {
++		return result, errors.New("reselection context is nil")
++	}
++
++	b.mu.Lock()
++	controlClient := b.cc
++	controlGeneration := b.xdialControlNetInfo.generation
++	nodeKey := key.NodePublic{}
++	if controlClient != nil &&
++		controlGeneration != 0 &&
++		b.pm != nil &&
++		b.hasNodeKeyLocked() {
++		nodeKey = b.pm.CurrentPrefs().Persist().PublicNodeKey()
++	}
++	b.mu.Unlock()
++	result.ControlGeneration = controlGeneration
++	if controlClient == nil || controlGeneration == 0 {
++		return result, errors.New("current control client is unavailable")
++	}
++	if nodeKey.IsZero() {
++		return result, errors.New("current node key is unavailable")
++	}
++
++	mc := b.MagicConn()
++	if mc == nil {
++		return result, errors.New("magicsock is unavailable")
++	}
++	plan, err := mc.XDialPrepareHomeDERPReselection(ctx)
++	if err != nil {
++		return result, err
++	}
++	cancelPlan := true
++	defer func() {
++		if cancelPlan {
++			mc.XDialCancelHomeDERPReselection(plan)
++		}
++	}()
++	if err := ctx.Err(); err != nil {
++		return result, err
++	}
++	result.AlternatePrepared = true
++
++	b.xdialNetInfoSendMu.Lock()
++	b.mu.Lock()
++	if err := ctx.Err(); err != nil {
++		b.mu.Unlock()
++		b.xdialNetInfoSendMu.Unlock()
++		return result, err
++	}
++	sameControl :=
++		b.cc == controlClient &&
++			b.xdialControlNetInfo.generation == controlGeneration
++	sameNode :=
++		b.hasNodeKeyLocked() &&
++			b.pm.CurrentPrefs().Persist().PublicNodeKey() == nodeKey
++	if !sameControl || !sameNode {
++		b.mu.Unlock()
++		b.xdialNetInfoSendMu.Unlock()
++		return result, errors.New("control or node identity changed during DERP preparation")
++	}
++	netMap := b.NetMap()
++	originalDERP := plan.XDialOriginalDERP()
++	alternateDERP := plan.XDialAlternateDERP()
++	planNodeMatches := plan.XDialNodeKey() == nodeKey
++	controlBaseline := xdialControlBaseline(
++		netMap,
++		nodeKey,
++		originalDERP,
++		alternateDERP,
++	)
++	netInfoSet :=
++		b.xdialControlNetInfo.setGeneration == controlGeneration
++	netInfoPreferredDERP := b.xdialControlNetInfo.setPreferredDERP
++	result.PrecommitBaselineChecked = true
++	result.PlanNodeMatchesCurrent = planNodeMatches
++	result.ControlSelfPresent = controlBaseline.selfPresent
++	result.ControlSelfNodeMatchesCurrent = controlBaseline.nodeMatches
++	result.ControlSelfHomeMatchesPlanOriginal =
++		controlBaseline.homeMatchesOriginal
++	result.ControlSelfHomeMatchesPlanAlternate =
++		controlBaseline.homeMatchesAlternate
++	result.ControlNetInfoSetForCurrentClient = netInfoSet
++	result.ControlNetInfoMatchesPlanOriginal =
++		netInfoSet && netInfoPreferredDERP == originalDERP
++	result.ControlNetInfoMatchesPlanAlternate =
++		netInfoSet && netInfoPreferredDERP == alternateDERP
++	sameBaseline := xdialLocalControlBaselineMatches(
++		planNodeMatches,
++		netInfoSet,
++		netInfoPreferredDERP,
++		originalDERP,
++	)
++	if !sameBaseline {
++		b.mu.Unlock()
++		b.xdialNetInfoSendMu.Unlock()
++		result.FailureCode = "local_control_baseline_mismatch"
++		return result, nil
++	}
++	commit, commitErr := mc.XDialCommitHomeDERPReselection(ctx, plan)
++	b.mu.Unlock()
++	b.xdialNetInfoSendMu.Unlock()
++	if commitErr != nil {
++		return result, commitErr
++	}
++	cancelPlan = false
++	result.AlternatePrepared = commit.AlternatePrepared
++	result.HomePromoted = commit.HomePromoted
++	if !commit.NetInfoCallbackScheduled {
++		return result, nil
++	}
++
++	ticker := time.NewTicker(25 * time.Millisecond)
++	defer ticker.Stop()
++	for {
++		b.mu.Lock()
++		sameControl =
++			b.cc == controlClient &&
++				b.xdialControlNetInfo.generation == controlGeneration
++		sameNode =
++			b.hasNodeKeyLocked() &&
++				b.pm.CurrentPrefs().Persist().PublicNodeKey() == nodeKey
++		notified :=
++			b.xdialControlNetInfo.setGeneration == controlGeneration &&
++				b.xdialControlNetInfo.setPreferredDERP == alternateDERP
++		updateReceipt := b.xdialControlNetInfo.setReceipt
++		b.mu.Unlock()
++		if notified {
++			result.ControlClientNotified = true
++			updateFacts := xdialControlUpdateFactsFromState(
++				updateReceipt.State(),
++			)
++			result.ControlUpdateObservable = updateFacts.observable
++			result.ControlUpdateQueued = updateFacts.queued
++			result.ControlUpdateAttempted = updateFacts.attempted
++			result.ControlUpdateHTTPAccepted =
++				updateFacts.httpAccepted
++			result.ControlUpdateFailed = updateFacts.failed
++			result.ControlUpdateSuperseded =
++				updateFacts.superseded
++		}
++		if !sameControl || !sameNode {
++			return result, nil
++		}
++		if notified {
++			netMap := b.NetMap()
++			aligned :=
++				netMap != nil &&
++					netMap.SelfNode.Valid() &&
++					netMap.SelfNode.Key() == nodeKey &&
++					netMap.SelfNode.HomeDERP() == alternateDERP
++			result.ControlViewAligned = aligned
++			if result.ControlUpdateHTTPAccepted ||
++				!result.ControlUpdateObservable ||
++				!result.ControlUpdateQueued {
++				return result, nil
++			}
++		}
++
++		select {
++		case <-ctx.Done():
++			// The local promotion and any observed control call are facts.
++			// Return them without converting an observation timeout into a
++			// false claim that the operation never happened.
++			return result, nil
++		case <-ticker.C:
++		}
++	}
++}
+diff --git a/ipn/ipnlocal/xdial_derp_reselection_test.go b/ipn/ipnlocal/xdial_derp_reselection_test.go
+new file mode 100644
+index 0000000..2ecc515
+--- /dev/null
++++ b/ipn/ipnlocal/xdial_derp_reselection_test.go
+@@ -0,0 +1,262 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package ipnlocal
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/tailscale/control/controlclient"
++	"github.com/sagernet/tailscale/tailcfg"
++	"github.com/sagernet/tailscale/types/key"
++	"github.com/sagernet/tailscale/types/netmap"
++)
++
++func TestXDialDERPHomeReselectionRequiresCurrentControlClient(t *testing.T) {
++	var backend LocalBackend
++	result, err := backend.XDialReselectHomeDERP(context.Background())
++	if err == nil {
++		t.Fatal("reselection unexpectedly succeeded without a control client")
++	}
++	if result.ControlGeneration != 0 ||
++		result.AlternatePrepared ||
++		result.HomePromoted ||
++		result.ControlClientNotified ||
++		result.ControlUpdateObservable ||
++		result.ControlUpdateQueued ||
++		result.ControlUpdateAttempted ||
++		result.ControlUpdateHTTPAccepted ||
++		result.ControlUpdateFailed ||
++		result.ControlUpdateSuperseded ||
++		result.ControlViewAligned {
++		t.Fatalf(
++			"reselection mutated state without a control client: %+v",
++			result,
++		)
++	}
++}
++
++func TestXDialControlUpdateFactsPreserveReceiptState(
++	t *testing.T,
++) {
++	tests := []struct {
++		name  string
++		state controlclient.XDialNetInfoReceiptState
++		want  xdialControlUpdateFacts
++	}{
++		{
++			name: "not observable",
++		},
++		{
++			name: "queued",
++			state: controlclient.XDialNetInfoReceiptState{
++				Observable: true,
++				Queued:     true,
++			},
++			want: xdialControlUpdateFacts{
++				observable: true,
++				queued:     true,
++			},
++		},
++		{
++			name: "attempted and failed",
++			state: controlclient.XDialNetInfoReceiptState{
++				Observable: true,
++				Queued:     true,
++				Attempted:  true,
++				Failed:     true,
++			},
++			want: xdialControlUpdateFacts{
++				observable: true,
++				queued:     true,
++				attempted:  true,
++				failed:     true,
++			},
++		},
++		{
++			name: "superseded",
++			state: controlclient.XDialNetInfoReceiptState{
++				Observable: true,
++				Queued:     true,
++				Attempted:  true,
++				Superseded: true,
++			},
++			want: xdialControlUpdateFacts{
++				observable: true,
++				queued:     true,
++				attempted:  true,
++				superseded: true,
++			},
++		},
++		{
++			name: "target accepted",
++			state: controlclient.XDialNetInfoReceiptState{
++				Observable:   true,
++				Queued:       true,
++				Attempted:    true,
++				HTTPAccepted: true,
++			},
++			want: xdialControlUpdateFacts{
++				observable:   true,
++				queued:       true,
++				attempted:    true,
++				httpAccepted: true,
++			},
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := xdialControlUpdateFactsFromState(
++				tt.state,
++			)
++			if got != tt.want {
++				t.Fatalf("facts = %+v, want %+v", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestXDialLocalControlBaselineUsesCurrentGenerationNetInfo(
++	t *testing.T,
++) {
++	tests := []struct {
++		name            string
++		planNodeMatches bool
++		netInfoSet      bool
++		preferredDERP   int
++		originalDERP    int
++		want            bool
++	}{
++		{
++			name:            "matching current generation",
++			planNodeMatches: true,
++			netInfoSet:      true,
++			preferredDERP:   2,
++			originalDERP:    2,
++			want:            true,
++		},
++		{
++			name:          "plan identity changed",
++			netInfoSet:    true,
++			preferredDERP: 2,
++			originalDERP:  2,
++		},
++		{
++			name:            "current generation has no NetInfo",
++			planNodeMatches: true,
++			preferredDERP:   2,
++			originalDERP:    2,
++		},
++		{
++			name:            "NetInfo no longer matches original",
++			planNodeMatches: true,
++			netInfoSet:      true,
++			preferredDERP:   3,
++			originalDERP:    2,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := xdialLocalControlBaselineMatches(
++				tt.planNodeMatches,
++				tt.netInfoSet,
++				tt.preferredDERP,
++				tt.originalDERP,
++			)
++			if got != tt.want {
++				t.Fatalf("baseline match = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestXDialControlHomeMatchesExactBaseline(t *testing.T) {
++	nodeKey := key.NewNode().Public()
++	otherKey := key.NewNode().Public()
++	netMap := &netmap.NetworkMap{
++		SelfNode: (&tailcfg.Node{
++			Key:      nodeKey,
++			HomeDERP: 2,
++		}).View(),
++	}
++	tests := []struct {
++		name          string
++		netMap        *netmap.NetworkMap
++		nodeKey       key.NodePublic
++		originalDERP  int
++		alternateDERP int
++		want          xdialControlBaselineFacts
++	}{
++		{
++			name:          "exact baseline",
++			netMap:        netMap,
++			nodeKey:       nodeKey,
++			originalDERP:  2,
++			alternateDERP: 3,
++			want: xdialControlBaselineFacts{
++				selfPresent:         true,
++				nodeMatches:         true,
++				homeMatchesOriginal: true,
++			},
++		},
++		{
++			name:          "already at alternate",
++			netMap:        netMap,
++			nodeKey:       nodeKey,
++			originalDERP:  3,
++			alternateDERP: 2,
++			want: xdialControlBaselineFacts{
++				selfPresent:          true,
++				nodeMatches:          true,
++				homeMatchesAlternate: true,
++			},
++		},
++		{
++			name:          "missing map",
++			nodeKey:       nodeKey,
++			originalDERP:  2,
++			alternateDERP: 3,
++		},
++		{
++			name:          "invalid self",
++			netMap:        &netmap.NetworkMap{},
++			nodeKey:       nodeKey,
++			originalDERP:  2,
++			alternateDERP: 3,
++		},
++		{
++			name:          "different node",
++			netMap:        netMap,
++			nodeKey:       otherKey,
++			originalDERP:  2,
++			alternateDERP: 3,
++			want: xdialControlBaselineFacts{
++				selfPresent: true,
++			},
++		},
++		{
++			name:          "unrelated home",
++			netMap:        netMap,
++			nodeKey:       nodeKey,
++			originalDERP:  3,
++			alternateDERP: 4,
++			want: xdialControlBaselineFacts{
++				selfPresent: true,
++				nodeMatches: true,
++			},
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := xdialControlBaseline(
++				tt.netMap,
++				tt.nodeKey,
++				tt.originalDERP,
++				tt.alternateDERP,
++			); got != tt.want {
++				t.Fatalf("baseline match = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
+diff --git a/ipn/ipnlocal/xdial_diagnostics.go b/ipn/ipnlocal/xdial_diagnostics.go
+index 8938c56..6cd1c40 100644
+--- a/ipn/ipnlocal/xdial_diagnostics.go
++++ b/ipn/ipnlocal/xdial_diagnostics.go
+@@ -3,6 +3,8 @@
+ 
+ package ipnlocal
+ 
++import "github.com/sagernet/tailscale/control/controlclient"
++
+ // XDialControlNetInfoDiagnostics is a bounded snapshot of the current control
+ // client's NetInfo lifecycle. It contains no NetInfo body or DERP identifier.
+ type XDialControlNetInfoDiagnostics struct {
+@@ -17,6 +19,7 @@ type xdialControlNetInfoTracker struct {
+ 	resetGeneration  uint64
+ 	setGeneration    uint64
+ 	setPreferredDERP int
++	setReceipt       controlclient.XDialNetInfoReceipt
+ }
+ 
+ func (t *xdialControlNetInfoTracker) nextControlClient() uint64 {
+@@ -30,12 +33,17 @@ func (t *xdialControlNetInfoTracker) didReset(generation uint64) {
+ 	}
+ }
+ 
+-func (t *xdialControlNetInfoTracker) didSet(generation uint64, preferredDERP int) {
++func (t *xdialControlNetInfoTracker) didSet(
++	generation uint64,
++	preferredDERP int,
++	receipt controlclient.XDialNetInfoReceipt,
++) {
+ 	if generation != t.generation {
+ 		return
+ 	}
+ 	t.setGeneration = generation
+ 	t.setPreferredDERP = preferredDERP
++	t.setReceipt = receipt
+ }
+ 
+ func (t *xdialControlNetInfoTracker) snapshot(
+diff --git a/ipn/ipnlocal/xdial_diagnostics_test.go b/ipn/ipnlocal/xdial_diagnostics_test.go
+index 3277ea0..5ea9a16 100644
+--- a/ipn/ipnlocal/xdial_diagnostics_test.go
++++ b/ipn/ipnlocal/xdial_diagnostics_test.go
+@@ -3,13 +3,18 @@
+ 
+ package ipnlocal
+ 
+-import "testing"
++import (
++	"testing"
++
++	"github.com/sagernet/tailscale/control/controlclient"
++)
+ 
+ func TestXDialControlNetInfoTrackerGeneration(t *testing.T) {
+ 	var tracker xdialControlNetInfoTracker
+ 	first := tracker.nextControlClient()
+ 	tracker.didReset(first)
+-	tracker.didSet(first, 7)
++	var firstReceipt controlclient.XDialNetInfoReceipt
++	tracker.didSet(first, 7, firstReceipt)
+ 
+ 	got := tracker.snapshot(true, "match")
+ 	if !got.ClientPresent || !got.ResetForCurrentClient ||
+@@ -19,18 +24,22 @@ func TestXDialControlNetInfoTrackerGeneration(t *testing.T) {
+ 
+ 	second := tracker.nextControlClient()
+ 	tracker.didReset(second)
+-	tracker.didSet(first, 8)
++	tracker.didSet(first, 8, controlclient.XDialNetInfoReceipt{})
+ 	got = tracker.snapshot(true, "mismatch")
+ 	if !got.ClientPresent || !got.ResetForCurrentClient ||
+ 		got.SetForCurrentClient || got.PreferredDERPRelation != "unknown" {
+ 		t.Fatalf("stale SetNetInfo was attributed to replacement: %+v", got)
+ 	}
+ 
+-	tracker.didSet(second, 9)
++	var secondReceipt controlclient.XDialNetInfoReceipt
++	tracker.didSet(second, 9, secondReceipt)
+ 	got = tracker.snapshot(true, "mismatch")
+ 	if !got.SetForCurrentClient || got.PreferredDERPRelation != "mismatch" {
+ 		t.Fatalf("current SetNetInfo missing: %+v", got)
+ 	}
++	if tracker.setReceipt != secondReceipt {
++		t.Fatal("current receipt was not retained")
++	}
+ 
+ 	got = tracker.snapshot(false, "match")
+ 	if got.ClientPresent || got.ResetForCurrentClient ||
+diff --git a/wgengine/magicsock/derp.go b/wgengine/magicsock/derp.go
+index 2eb215c..c76bc35 100644
+--- a/wgengine/magicsock/derp.go
++++ b/wgengine/magicsock/derp.go
+@@ -176,6 +176,7 @@ func (c *Conn) maybeSetNearestDERP(report *netcheck.Report) (preferredDERP int)
+ 	c.mu.Lock()
+ 	myDerp := c.myDerp
+ 	c.mu.Unlock()
++
+ 	if !connectedToControl {
+ 		if myDerp != 0 {
+ 			metricDERPHomeNoChangeNoControl.Add(1)
+@@ -198,7 +199,10 @@ func (c *Conn) maybeSetNearestDERP(report *netcheck.Report) (preferredDERP int)
+ 			"magicsock: home DERP changing from derp-%d [%dms] to derp-%d [%dms]",
+ 			c.myDerp, report.RegionLatency[myDerp].Milliseconds(), preferredDERP, report.RegionLatency[preferredDERP].Milliseconds())
+ 	}
+-	if !c.setNearestDERP(preferredDERP) {
++	wantDERP, actualDERP := c.setNearestDERPResult(preferredDERP)
++	if wantDERP {
++		preferredDERP = actualDERP
++	} else {
+ 		preferredDERP = 0
+ 	}
+ 	return
+@@ -216,8 +220,26 @@ func (c *Conn) derpRegionCodeLocked(regionID int) string {
+ 
+ // c.mu must NOT be held.
+ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
++	wantDERP, _ = c.setNearestDERPResult(derpNum)
++	return wantDERP
++}
++
++// c.mu must NOT be held.
++func (c *Conn) setNearestDERPResult(derpNum int) (
++	wantDERP bool,
++	actualDERP int,
++) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
++	if pinnedDERP := c.xdialNormalizePinnedDERPLocked(); pinnedDERP != 0 {
++		derpNum = pinnedDERP
++	}
++	wantDERP = c.setNearestDERPLocked(derpNum)
++	return wantDERP, c.myDerp
++}
++
++// c.mu must be held.
++func (c *Conn) setNearestDERPLocked(derpNum int) (wantDERP bool) {
+ 	if !c.wantDerpLocked() {
+ 		c.myDerp = 0
+ 		c.health.SetMagicSockDERPHome(0, c.homeless)
+@@ -778,6 +800,18 @@ func (c *Conn) SetDERPMap(dm *tailcfg.DERPMap) {
+ 	c.derpMapAtomic.Store(dm)
+ 	old := c.derpMap
+ 	c.derpMap = dm
++	if c.xdialPinnedDERP != 0 {
++		oldPinned := old
++		if oldPinned == nil ||
++			dm == nil ||
++			dm.Regions[c.xdialPinnedDERP] == nil ||
++			!reflect.DeepEqual(
++				oldPinned.Regions[c.xdialPinnedDERP],
++				dm.Regions[c.xdialPinnedDERP],
++			) {
++			c.clearXDialDERPReselectionLocked()
++		}
++	}
+ 	if dm == nil {
+ 		c.closeAllDerpLocked("derp-disabled")
+ 		return
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+index cc06200..89ba9f8 100644
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -376,10 +376,15 @@ type Conn struct {
+ 	privateKey         key.NodePrivate               // WireGuard private key for this node
+ 	everHadKey         bool                          // whether we ever had a non-zero private key
+ 	myDerp             int                           // nearest DERP region ID; 0 means none/unknown
+-	homeless           bool                          // if true, don't try to find & stay conneted to a DERP home (myDerp will stay 0)
+-	derpStarted        chan struct{}                 // closed on first connection to DERP; for tests & cleaner Close
+-	activeDerp         map[int]activeDerp            // DERP regionID -> connection to a node in that region
+-	prevDerp           map[int]*syncs.WaitGroupChan
++
++	xdialPinnedDERP            int    // non-zero after one bounded XDial recovery
++	xdialDERPReselectionSeq    uint64 // number of bounded attempts in this Conn
++	xdialDERPReselectionActive uint64 // active two-phase attempt, or zero
++
++	homeless    bool               // if true, don't try to find & stay conneted to a DERP home (myDerp will stay 0)
++	derpStarted chan struct{}      // closed on first connection to DERP; for tests & cleaner Close
++	activeDerp  map[int]activeDerp // DERP regionID -> connection to a node in that region
++	prevDerp    map[int]*syncs.WaitGroupChan
+ 
+ 	// derpRoute contains optional alternate routes to use as an
+ 	// optimization instead of contacting a peer via their home
+@@ -1140,6 +1145,9 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
+ func (c *Conn) callNetInfoCallback(ni *tailcfg.NetInfo) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
++	if pinnedDERP := c.xdialNormalizePinnedDERPLocked(); pinnedDERP != 0 {
++		ni.PreferredDERP = pinnedDERP
++	}
+ 	if ni.BasicallyEqual(c.netInfoLast) {
+ 		return
+ 	}
+@@ -1147,6 +1155,9 @@ func (c *Conn) callNetInfoCallback(ni *tailcfg.NetInfo) {
+ }
+ 
+ func (c *Conn) callNetInfoCallbackLocked(ni *tailcfg.NetInfo) {
++	if pinnedDERP := c.xdialNormalizePinnedDERPLocked(); pinnedDERP != 0 {
++		ni.PreferredDERP = pinnedDERP
++	}
+ 	c.netInfoLast = ni
+ 	if c.netInfoFunc != nil {
+ 		c.dlogf("[v1] magicsock: netInfo update: %+v", ni)
+@@ -2779,6 +2790,7 @@ func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
+ 	if newKey.Equal(oldKey) {
+ 		return nil
+ 	}
++	c.clearXDialDERPReselectionLocked()
+ 	c.privateKey = newKey
+ 	c.havePrivateKey.Store(!newKey.IsZero())
+ 
+@@ -3852,6 +3864,9 @@ func (c *Conn) SetConnectionCounter(fn netlogfunc.ConnectionCounter) {
+ func (c *Conn) SetHomeless(v bool) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
++	if v {
++		c.clearXDialDERPReselectionLocked()
++	}
+ 	c.homeless = v
+ 
+ 	if v && c.myDerp != 0 {
+diff --git a/wgengine/magicsock/xdial_derp_reselection.go b/wgengine/magicsock/xdial_derp_reselection.go
+new file mode 100644
+index 0000000..b147e93
+--- /dev/null
++++ b/wgengine/magicsock/xdial_derp_reselection.go
+@@ -0,0 +1,324 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"time"
++
++	"github.com/sagernet/tailscale/derp/derphttp"
++	"github.com/sagernet/tailscale/net/netcheck"
++	"github.com/sagernet/tailscale/tailcfg"
++	"github.com/sagernet/tailscale/types/key"
++)
++
++const xdialNetcheckFreshness = 30 * time.Second
++
++// XDialDERPHomeReselectionPlan is an opaque, single-use plan. Its fields stay
++// private so region and identity details cannot cross the package boundary.
++type XDialDERPHomeReselectionPlan struct {
++	conn            *Conn
++	attemptID       uint64
++	originalDERP    int
++	alternateDERP   int
++	privateKey      key.NodePublic
++	alternateClient *derphttp.Client
++	committed       bool
++}
++
++// XDialDERPHomeReselectionCommit reports only local commit facts.
++type XDialDERPHomeReselectionCommit struct {
++	AlternatePrepared        bool
++	HomePromoted             bool
++	NetInfoCallbackScheduled bool
++}
++
++// c.mu must be held.
++func (c *Conn) clearXDialDERPReselectionLocked() {
++	c.xdialPinnedDERP = 0
++	c.xdialDERPReselectionActive = 0
++}
++
++// c.mu must be held.
++func (c *Conn) xdialNormalizePinnedDERPLocked() int {
++	pinnedDERP := c.xdialPinnedDERP
++	if pinnedDERP == 0 {
++		return 0
++	}
++	if c.closed ||
++		c.homeless ||
++		c.privateKey.IsZero() ||
++		c.myDerp != pinnedDERP ||
++		c.derpMap == nil ||
++		c.derpMap.Regions[pinnedDERP] == nil {
++		c.clearXDialDERPReselectionLocked()
++		return 0
++	}
++	return pinnedDERP
++}
++
++// XDialNormalizeNetInfoForControl clones ni and applies the HomeDERP that is
++// valid at the control-send boundary. A callback queued before a reselection
++// commit must not publish its stale PreferredDERP after that commit.
++func (c *Conn) XDialNormalizeNetInfoForControl(
++	ni *tailcfg.NetInfo,
++) *tailcfg.NetInfo {
++	if ni == nil {
++		return nil
++	}
++	normalized := ni.Clone()
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if pinnedDERP := c.xdialNormalizePinnedDERPLocked(); pinnedDERP != 0 {
++		normalized.PreferredDERP = pinnedDERP
++	}
++	return normalized
++}
++
++func xdialPickAlternateDERP(
++	current int,
++	report *netcheck.Report,
++	derpMap *tailcfg.DERPMap,
++) int {
++	if current == 0 || report == nil || derpMap == nil {
++		return 0
++	}
++	var selected int
++	var selectedLatency time.Duration
++	for regionID, latency := range report.RegionLatency {
++		if regionID == current || latency <= 0 {
++			continue
++		}
++		region := derpMap.Regions[regionID]
++		if region == nil ||
++			region.Avoid ||
++			region.NoMeasureNoHome ||
++			len(region.Nodes) == 0 {
++			continue
++		}
++		if selected == 0 ||
++			latency < selectedLatency ||
++			(latency == selectedLatency && regionID < selected) {
++			selected = regionID
++			selectedLatency = latency
++		}
++	}
++	return selected
++}
++
++// c.mu must be held.
++func (c *Conn) xdialDERPReselectionReadyLocked(
++	plan *XDialDERPHomeReselectionPlan,
++) (bool, error) {
++	switch {
++	case plan == nil || plan.conn != c:
++		return false, errors.New("DERP reselection plan is invalid")
++	case plan.committed:
++		return false, errors.New("DERP reselection plan was already committed")
++	case c.xdialDERPReselectionActive != plan.attemptID:
++		return false, errors.New("DERP reselection attempt is no longer active")
++	case c.closed:
++		return false, errors.New("magicsock is closed")
++	case c.privateKey.IsZero() ||
++		c.privateKey.Public() != plan.privateKey:
++		return false, errors.New("node key changed during DERP preparation")
++	case c.myDerp != plan.originalDERP:
++		return false, errors.New("home DERP changed during DERP preparation")
++	case c.derpMap == nil ||
++		c.derpMap.Regions[plan.alternateDERP] == nil:
++		return false, errors.New("alternate DERP is no longer in the map")
++	}
++	active, ok := c.activeDerp[plan.alternateDERP]
++	if !ok || active.c != plan.alternateClient {
++		return false, errors.New("alternate DERP connection generation changed")
++	}
++	return active.protocolReady, nil
++}
++
++// XDialPrepareHomeDERPReselection prepares one measured alternate DERP
++// without changing HomeDERP or publishing NetInfo.
++func (c *Conn) XDialPrepareHomeDERPReselection(
++	ctx context.Context,
++) (plan *XDialDERPHomeReselectionPlan, err error) {
++	if ctx == nil {
++		return nil, errors.New("reselection context is nil")
++	}
++	report := c.lastNetCheckReport.Load()
++	if report == nil || report.Now.IsZero() {
++		return nil, errors.New("fresh netcheck is unavailable")
++	}
++	age := time.Since(report.Now)
++	if age < 0 || age > xdialNetcheckFreshness {
++		return nil, fmt.Errorf("netcheck is stale")
++	}
++
++	c.mu.Lock()
++	if c.xdialDERPReselectionSeq != 0 {
++		c.mu.Unlock()
++		return nil, errors.New("home DERP reselection was already attempted")
++	}
++	c.xdialDERPReselectionSeq++
++	c.xdialDERPReselectionActive = c.xdialDERPReselectionSeq
++	plan = &XDialDERPHomeReselectionPlan{
++		conn:         c,
++		attemptID:    c.xdialDERPReselectionActive,
++		originalDERP: c.myDerp,
++		privateKey:   c.privateKey.Public(),
++	}
++	plan.alternateDERP = xdialPickAlternateDERP(
++		c.myDerp,
++		report,
++		c.derpMap,
++	)
++	switch {
++	case c.closed:
++		err = errors.New("magicsock is closed")
++	case c.privateKey.IsZero():
++		err = errors.New("node key is unavailable")
++	case c.netInfoLast == nil || c.netInfoFunc == nil:
++		err = errors.New("NetInfo publisher is unavailable")
++	case plan.alternateDERP == 0:
++		err = errors.New("no measured alternate DERP is available")
++	}
++	c.mu.Unlock()
++	if err != nil {
++		c.XDialCancelHomeDERPReselection(plan)
++		return nil, err
++	}
++
++	if c.derpWriteChanForRegion(
++		plan.alternateDERP,
++		key.NodePublic{},
++	) == nil {
++		c.XDialCancelHomeDERPReselection(plan)
++		return nil, errors.New("alternate DERP connection could not start")
++	}
++	c.mu.Lock()
++	active, ok := c.activeDerp[plan.alternateDERP]
++	if ok {
++		plan.alternateClient = active.c
++	}
++	c.mu.Unlock()
++	if plan.alternateClient == nil {
++		c.XDialCancelHomeDERPReselection(plan)
++		return nil, errors.New("alternate DERP client is unavailable")
++	}
++
++	ticker := time.NewTicker(25 * time.Millisecond)
++	defer ticker.Stop()
++	for {
++		c.mu.Lock()
++		ready, readyErr := c.xdialDERPReselectionReadyLocked(plan)
++		c.mu.Unlock()
++		if readyErr != nil {
++			c.XDialCancelHomeDERPReselection(plan)
++			return nil, readyErr
++		}
++		if ready {
++			return plan, nil
++		}
++		select {
++		case <-ctx.Done():
++			c.XDialCancelHomeDERPReselection(plan)
++			return nil, ctx.Err()
++		case <-ticker.C:
++		}
++	}
++}
++
++// XDialCommitHomeDERPReselection atomically promotes a prepared alternate,
++// pins it until an explicit lifecycle invalidation or Conn close, and
++// schedules matching NetInfo.
++func (c *Conn) XDialCommitHomeDERPReselection(
++	ctx context.Context,
++	plan *XDialDERPHomeReselectionPlan,
++) (result XDialDERPHomeReselectionCommit, err error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if ctx == nil {
++		return result, errors.New("reselection context is nil")
++	}
++	if err := ctx.Err(); err != nil {
++		return result, err
++	}
++	ready, err := c.xdialDERPReselectionReadyLocked(plan)
++	if err != nil {
++		return result, err
++	}
++	if !ready {
++		return result, errors.New("alternate DERP lost protocol readiness")
++	}
++	if c.netInfoLast == nil || c.netInfoFunc == nil {
++		return result, errors.New("NetInfo publisher is unavailable")
++	}
++
++	now := time.Now()
++	if original, ok := c.activeDerp[plan.originalDERP]; ok &&
++		original.lastWrite != nil {
++		*original.lastWrite = now
++		c.activeDerp[plan.originalDERP] = original
++	}
++	c.xdialPinnedDERP = plan.alternateDERP
++	if !c.setNearestDERPLocked(plan.alternateDERP) {
++		c.xdialPinnedDERP = 0
++		return result, errors.New("alternate DERP could not become home")
++	}
++	ni := c.netInfoLast.Clone()
++	ni.PreferredDERP = plan.alternateDERP
++	c.callNetInfoCallbackLocked(ni)
++	c.scheduleCleanStaleDerpLocked()
++
++	plan.committed = true
++	c.xdialDERPReselectionActive = 0
++	result.AlternatePrepared = true
++	result.HomePromoted = true
++	result.NetInfoCallbackScheduled = true
++	return result, nil
++}
++
++// XDialCancelHomeDERPReselection invalidates an uncommitted plan without
++// changing HomeDERP or NetInfo. The auxiliary DERP is left to normal cleanup.
++func (c *Conn) XDialCancelHomeDERPReselection(
++	plan *XDialDERPHomeReselectionPlan,
++) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if plan == nil ||
++		plan.conn != c ||
++		plan.committed ||
++		c.xdialDERPReselectionActive != plan.attemptID {
++		return
++	}
++	c.xdialDERPReselectionActive = 0
++}
++
++// XDialAlternateDERP returns the opaque plan's internal candidate for
++// same-module control-view observation. It must never cross the app boundary.
++func (p *XDialDERPHomeReselectionPlan) XDialAlternateDERP() int {
++	if p == nil {
++		return 0
++	}
++	return p.alternateDERP
++}
++
++// XDialOriginalDERP returns the plan's baseline HomeDERP for same-module
++// causal validation. It must never cross the app boundary.
++func (p *XDialDERPHomeReselectionPlan) XDialOriginalDERP() int {
++	if p == nil {
++		return 0
++	}
++	return p.originalDERP
++}
++
++// XDialNodeKey returns the plan's node identity for same-module validation.
++// It must never cross the app boundary.
++func (p *XDialDERPHomeReselectionPlan) XDialNodeKey() key.NodePublic {
++	if p == nil {
++		return key.NodePublic{}
++	}
++	return p.privateKey
++}
+diff --git a/wgengine/magicsock/xdial_derp_reselection_test.go b/wgengine/magicsock/xdial_derp_reselection_test.go
+new file mode 100644
+index 0000000..abb51f6
+--- /dev/null
++++ b/wgengine/magicsock/xdial_derp_reselection_test.go
+@@ -0,0 +1,400 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/sagernet/tailscale/net/netcheck"
++	"github.com/sagernet/tailscale/tailcfg"
++	"github.com/sagernet/tailscale/types/key"
++)
++
++func xdialTestDERPMap() *tailcfg.DERPMap {
++	return &tailcfg.DERPMap{
++		Regions: map[int]*tailcfg.DERPRegion{
++			2: {
++				RegionID: 2,
++				Nodes:    []*tailcfg.DERPNode{{RegionID: 2}},
++			},
++			3: {
++				RegionID: 3,
++				Nodes:    []*tailcfg.DERPNode{{RegionID: 3}},
++			},
++			4: {
++				RegionID: 4,
++				Nodes:    []*tailcfg.DERPNode{{RegionID: 4}},
++			},
++			5: {
++				RegionID: 5,
++				Avoid:    true,
++				Nodes:    []*tailcfg.DERPNode{{RegionID: 5}},
++			},
++			6: {
++				RegionID:        6,
++				NoMeasureNoHome: true,
++				Nodes:           []*tailcfg.DERPNode{{RegionID: 6}},
++			},
++		},
++	}
++}
++
++func TestXDialPickAlternateDERPUsesLowestMeasuredLatency(t *testing.T) {
++	report := &netcheck.Report{
++		RegionLatency: map[int]time.Duration{
++			2: 20 * time.Millisecond,
++			3: 30 * time.Millisecond,
++			4: 10 * time.Millisecond,
++			5: 5 * time.Millisecond,
++			6: 1 * time.Millisecond,
++		},
++	}
++	if got := xdialPickAlternateDERP(
++		2,
++		report,
++		xdialTestDERPMap(),
++	); got != 4 {
++		t.Fatalf("alternate DERP = %d, want lowest eligible region 4", got)
++	}
++}
++
++func TestXDialPickAlternateDERPRejectsUnmeasuredAndUnknown(t *testing.T) {
++	report := &netcheck.Report{
++		RegionLatency: map[int]time.Duration{
++			2: 20 * time.Millisecond,
++			3: 0,
++			7: 10 * time.Millisecond,
++		},
++	}
++	if got := xdialPickAlternateDERP(
++		2,
++		report,
++		xdialTestDERPMap(),
++	); got != 0 {
++		t.Fatalf("alternate DERP = %d, want none", got)
++	}
++}
++
++func TestXDialCommitHomeDERPReselectionIsAtomic(t *testing.T) {
++	c := newConn(t.Logf)
++	privateKey := key.NewNode()
++	originalClient := newXDialTestDERPClient(t, privateKey)
++	alternateClient := newXDialTestDERPClient(t, privateKey)
++	oldWrite := time.Now().Add(-2 * time.Minute)
++	callback := make(chan *tailcfg.NetInfo, 1)
++	plan := &XDialDERPHomeReselectionPlan{
++		conn:            c,
++		attemptID:       1,
++		originalDERP:    2,
++		alternateDERP:   4,
++		privateKey:      privateKey.Public(),
++		alternateClient: alternateClient,
++	}
++
++	c.mu.Lock()
++	c.privateKey = privateKey
++	c.myDerp = 2
++	c.derpMap = xdialTestDERPMap()
++	c.derpMapAtomic.Store(c.derpMap)
++	c.activeDerp = map[int]activeDerp{
++		2: {
++			c:         originalClient,
++			lastWrite: &oldWrite,
++		},
++		4: {
++			c:             alternateClient,
++			lastWrite:     new(time.Time),
++			protocolReady: true,
++		},
++	}
++	c.netInfoLast = &tailcfg.NetInfo{PreferredDERP: 2}
++	c.netInfoFunc = func(ni *tailcfg.NetInfo) { callback <- ni }
++	c.xdialDERPReselectionSeq = 1
++	c.xdialDERPReselectionActive = 1
++	c.mu.Unlock()
++
++	result, err := c.XDialCommitHomeDERPReselection(
++		context.Background(),
++		plan,
++	)
++	if err != nil {
++		t.Fatalf("commit failed: %v", err)
++	}
++	if !result.AlternatePrepared ||
++		!result.HomePromoted ||
++		!result.NetInfoCallbackScheduled {
++		t.Fatalf("incomplete commit result: %+v", result)
++	}
++	select {
++	case ni := <-callback:
++		if ni.PreferredDERP != 4 {
++			t.Fatalf("callback PreferredDERP = %d, want 4", ni.PreferredDERP)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("NetInfo callback was not scheduled")
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.myDerp != 4 || c.xdialPinnedDERP != 4 {
++		t.Fatalf("home=%d pin=%d, want 4", c.myDerp, c.xdialPinnedDERP)
++	}
++	if oldWrite.Before(time.Now().Add(-time.Minute)) {
++		t.Fatalf("original HomeDERP grace was not refreshed: %v", oldWrite)
++	}
++}
++
++func TestXDialPinnedDERPWinsOverInflightReport(t *testing.T) {
++	c := newConn(t.Logf)
++	privateKey := key.NewNode()
++	c.mu.Lock()
++	c.privateKey = privateKey
++	c.derpMap = xdialTestDERPMap()
++	c.myDerp = 4
++	c.xdialPinnedDERP = 4
++	c.mu.Unlock()
++	report := &netcheck.Report{
++		PreferredDERP: 2,
++		RegionLatency: map[int]time.Duration{
++			2: 10 * time.Millisecond,
++			4: 20 * time.Millisecond,
++		},
++	}
++	if got := c.maybeSetNearestDERP(report); got != 4 {
++		t.Fatalf("in-flight report selected DERP %d, want pinned 4", got)
++	}
++
++	callback := make(chan *tailcfg.NetInfo, 2)
++	c.mu.Lock()
++	c.netInfoLast = &tailcfg.NetInfo{
++		PreferredDERP: 4,
++		LinkType:      "wired",
++	}
++	c.netInfoFunc = func(ni *tailcfg.NetInfo) { callback <- ni }
++	c.mu.Unlock()
++	c.callNetInfoCallback(&tailcfg.NetInfo{
++		PreferredDERP: 2,
++		LinkType:      "wifi",
++	})
++	select {
++	case ni := <-callback:
++		if ni.PreferredDERP != 4 {
++			t.Fatalf("precomputed NetInfo published DERP %d, want pinned 4", ni.PreferredDERP)
++		}
++		if ni.LinkType != "wifi" {
++			t.Fatalf("precomputed NetInfo link type = %q, want wifi", ni.LinkType)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("precomputed NetInfo callback was not scheduled")
++	}
++	c.mu.Lock()
++	if c.netInfoLast.PreferredDERP != 4 {
++		t.Fatalf(
++			"cached NetInfo DERP = %d, want pinned 4",
++			c.netInfoLast.PreferredDERP,
++		)
++	}
++	c.mu.Unlock()
++
++	c.callNetInfoCallback(&tailcfg.NetInfo{
++		PreferredDERP: 2,
++		LinkType:      "wifi",
++	})
++	select {
++	case ni := <-callback:
++		t.Fatalf("equivalent normalized NetInfo was republished: %+v", ni)
++	case <-time.After(50 * time.Millisecond):
++	}
++	c.mu.Lock()
++	cachedPreferredDERP := c.netInfoLast.PreferredDERP
++	c.mu.Unlock()
++	if cachedPreferredDERP != 4 {
++		t.Fatalf(
++			"equivalent stale NetInfo reversed cache to DERP %d",
++			cachedPreferredDERP,
++		)
++	}
++
++	stale := &tailcfg.NetInfo{
++		PreferredDERP: 2,
++		LinkType:      "cellular",
++	}
++	normalized := c.XDialNormalizeNetInfoForControl(stale)
++	if stale.PreferredDERP != 2 {
++		t.Fatalf("control normalization mutated input DERP to %d", stale.PreferredDERP)
++	}
++	if normalized == stale {
++		t.Fatal("control normalization returned the input pointer")
++	}
++	if normalized.PreferredDERP != 4 || normalized.LinkType != "cellular" {
++		t.Fatalf("control normalization = %+v, want DERP 4 cellular", normalized)
++	}
++}
++
++func TestXDialPrepareHomeDERPReselectionRequiresFreshNetcheck(t *testing.T) {
++	c := newConn(t.Logf)
++	_, err := c.XDialPrepareHomeDERPReselection(t.Context())
++	if err == nil {
++		t.Fatal("reselection unexpectedly succeeded without a netcheck")
++	}
++}
++
++func TestXDialCommitHomeDERPReselectionHonorsCanceledContext(t *testing.T) {
++	c := newConn(t.Logf)
++	privateKey := key.NewNode()
++	alternateClient := newXDialTestDERPClient(t, privateKey)
++	callback := make(chan *tailcfg.NetInfo, 1)
++	plan := &XDialDERPHomeReselectionPlan{
++		conn:            c,
++		attemptID:       1,
++		originalDERP:    2,
++		alternateDERP:   4,
++		privateKey:      privateKey.Public(),
++		alternateClient: alternateClient,
++	}
++	c.mu.Lock()
++	c.privateKey = privateKey
++	c.myDerp = 2
++	c.derpMap = xdialTestDERPMap()
++	c.activeDerp = map[int]activeDerp{
++		4: {
++			c:             alternateClient,
++			lastWrite:     new(time.Time),
++			protocolReady: true,
++		},
++	}
++	c.netInfoLast = &tailcfg.NetInfo{PreferredDERP: 2}
++	c.netInfoFunc = func(ni *tailcfg.NetInfo) { callback <- ni }
++	c.xdialDERPReselectionSeq = 1
++	c.xdialDERPReselectionActive = 1
++	c.mu.Unlock()
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	result, err := c.XDialCommitHomeDERPReselection(ctx, plan)
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("commit error = %v, want context canceled", err)
++	}
++	if result != (XDialDERPHomeReselectionCommit{}) {
++		t.Fatalf("canceled commit returned facts: %+v", result)
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.myDerp != 2 ||
++		c.xdialPinnedDERP != 0 ||
++		plan.committed ||
++		c.netInfoLast.PreferredDERP != 2 {
++		t.Fatalf(
++			"canceled commit mutated home=%d pin=%d committed=%v netInfo=%d",
++			c.myDerp,
++			c.xdialPinnedDERP,
++			plan.committed,
++			c.netInfoLast.PreferredDERP,
++		)
++	}
++	select {
++	case ni := <-callback:
++		t.Fatalf("canceled commit published NetInfo: %+v", ni)
++	default:
++	}
++}
++
++func TestXDialPrivateKeyChangeInvalidatesReselection(t *testing.T) {
++	oldKey := key.NewNode()
++	newKey := key.NewNode()
++	tests := []struct {
++		name           string
++		newKey         key.NodePrivate
++		wantPin        int
++		wantActive     uint64
++		wantPublicZero bool
++	}{
++		{
++			name:       "same key",
++			newKey:     oldKey,
++			wantPin:    4,
++			wantActive: 1,
++		},
++		{
++			name:       "changed key",
++			newKey:     newKey,
++			wantPin:    0,
++			wantActive: 0,
++		},
++		{
++			name:           "zero key",
++			newKey:         key.NodePrivate{},
++			wantPin:        0,
++			wantActive:     0,
++			wantPublicZero: true,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			c := newConn(t.Logf)
++			c.mu.Lock()
++			c.privateKey = oldKey
++			c.xdialPinnedDERP = 4
++			c.xdialDERPReselectionSeq = 1
++			c.xdialDERPReselectionActive = 1
++			c.mu.Unlock()
++
++			if err := c.SetPrivateKey(tt.newKey); err != nil {
++				t.Fatalf("SetPrivateKey failed: %v", err)
++			}
++			c.mu.Lock()
++			defer c.mu.Unlock()
++			if c.xdialPinnedDERP != tt.wantPin ||
++				c.xdialDERPReselectionActive != tt.wantActive ||
++				c.xdialDERPReselectionSeq != 1 {
++				t.Fatalf(
++					"pin=%d active=%d seq=%d, want pin=%d active=%d seq=1",
++					c.xdialPinnedDERP,
++					c.xdialDERPReselectionActive,
++					c.xdialDERPReselectionSeq,
++					tt.wantPin,
++					tt.wantActive,
++				)
++			}
++			if c.privateKey.IsZero() != tt.wantPublicZero {
++				t.Fatalf(
++					"public key zero=%v, want %v",
++					c.privateKey.IsZero(),
++					tt.wantPublicZero,
++				)
++			}
++		})
++	}
++}
++
++func TestXDialHomelessInvalidatesReselection(t *testing.T) {
++	c := newConn(t.Logf)
++	c.mu.Lock()
++	c.privateKey = key.NewNode()
++	c.derpMap = xdialTestDERPMap()
++	c.myDerp = 4
++	c.xdialPinnedDERP = 4
++	c.xdialDERPReselectionSeq = 1
++	c.xdialDERPReselectionActive = 1
++	c.mu.Unlock()
++
++	c.SetHomeless(true)
++	c.mu.Lock()
++	if c.myDerp != 0 ||
++		c.xdialPinnedDERP != 0 ||
++		c.xdialDERPReselectionActive != 0 ||
++		c.xdialDERPReselectionSeq != 1 {
++		t.Fatalf(
++			"home=%d pin=%d active=%d seq=%d after homeless",
++			c.myDerp,
++			c.xdialPinnedDERP,
++			c.xdialDERPReselectionActive,
++			c.xdialDERPReselectionSeq,
++		)
++	}
++	c.mu.Unlock()
++
++}

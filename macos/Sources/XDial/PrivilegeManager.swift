@@ -117,6 +117,21 @@ enum PrivilegeManager {
         return try? JSONDecoder().decode(DaemonInfo.self, from: payload)
     }
 
+    /// Network Extension 以 root 运行，同名 App Group 会映射到 root 容器。
+    /// helper 只读转发扩展侧的权威事务报告，宿主再镜像到自己的容器供 UI 使用。
+    static func probeProviderConnectionReport() -> ConnectionReport? {
+        guard
+            let raw = roundTrip(
+                cmd: "connection-report",
+                timeout: 0.2
+            ),
+            let data = raw.data(using: .utf8)
+        else {
+            return nil
+        }
+        return try? ConnectionReportCodec.decode(data)
+    }
+
     /// 请求 daemon 原地 re-exec 成 bundle 里的当前二进制。引擎忙时 daemon 会拒绝。
     static func requestRespawn() -> Bool {
         roundTrip(cmd: "respawn", expectData: false) != nil

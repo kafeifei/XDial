@@ -1,0 +1,56 @@
+From: XDial maintainers
+Subject: [PATCH] ipnlocal: expose bounded control generation
+
+Peer recovery must not combine samples from two different control clients.
+Expose the existing monotonic tracker generation alongside the bounded
+NetInfo readiness facts. The number is process-local and contains no identity,
+endpoint, DERP region or credential material.
+
+---
+ ipn/ipnlocal/xdial_diagnostics.go      | 2 ++
+ ipn/ipnlocal/xdial_diagnostics_test.go | 5 +++--
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/ipn/ipnlocal/xdial_diagnostics.go b/ipn/ipnlocal/xdial_diagnostics.go
+index 6cd1c40..1f298f3 100644
+--- a/ipn/ipnlocal/xdial_diagnostics.go
++++ b/ipn/ipnlocal/xdial_diagnostics.go
+@@ -8,6 +8,7 @@
+ // XDialControlNetInfoDiagnostics is a bounded snapshot of the current control
+ // client's NetInfo lifecycle. It contains no NetInfo body or DERP identifier.
+ type XDialControlNetInfoDiagnostics struct {
++	Generation            uint64
+ 	ClientPresent         bool
+ 	ResetForCurrentClient bool
+ 	SetForCurrentClient   bool
+@@ -57,6 +58,7 @@ func (t *xdialControlNetInfoTracker) snapshot(
+ 		preferredDERPRelation = "unknown"
+ 	}
+ 	return XDialControlNetInfoDiagnostics{
++		Generation:            current,
+ 		ClientPresent:         clientPresent,
+ 		ResetForCurrentClient: reset,
+ 		SetForCurrentClient:   set,
+diff --git a/ipn/ipnlocal/xdial_diagnostics_test.go b/ipn/ipnlocal/xdial_diagnostics_test.go
+index 5ea9a16..afc004e 100644
+--- a/ipn/ipnlocal/xdial_diagnostics_test.go
++++ b/ipn/ipnlocal/xdial_diagnostics_test.go
+@@ -17,7 +17,8 @@ func TestXDialControlNetInfoTrackerGeneration(t *testing.T) {
+ 	tracker.didSet(first, 7, firstReceipt)
+ 
+ 	got := tracker.snapshot(true, "match")
+-	if !got.ClientPresent || !got.ResetForCurrentClient ||
++	if got.Generation != first ||
++		!got.ClientPresent || !got.ResetForCurrentClient ||
+ 		!got.SetForCurrentClient || got.PreferredDERPRelation != "match" {
+ 		t.Fatalf("first control generation = %+v", got)
+ 	}
+@@ -26,7 +27,7 @@ func TestXDialControlNetInfoTrackerGeneration(t *testing.T) {
+ 	tracker.didReset(second)
+ 	tracker.didSet(first, 8, controlclient.XDialNetInfoReceipt{})
+ 	got = tracker.snapshot(true, "mismatch")
+-	if !got.ClientPresent || !got.ResetForCurrentClient ||
++	if got.Generation != second || !got.ClientPresent || !got.ResetForCurrentClient ||
+ 		got.SetForCurrentClient || got.PreferredDERPRelation != "unknown" {
+ 		t.Fatalf("stale SetNetInfo was attributed to replacement: %+v", got)
+ 	}

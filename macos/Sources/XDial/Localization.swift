@@ -11,14 +11,6 @@ enum Lang: String, Codable, CaseIterable {
         }
     }
 
-    /// ip-api.com 支持的语言代码
-    var ipAPILang: String {
-        switch self {
-        case .zh: return "zh-CN"
-        case .en: return "en"
-        }
-    }
-
     static var system: Lang {
         let pref = Locale.preferredLanguages.first ?? "en"
         return pref.hasPrefix("zh") ? .zh : .en

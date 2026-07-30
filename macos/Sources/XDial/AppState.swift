@@ -31,13 +31,12 @@ final class AppState: ObservableObject {
 
     @Published var language: Lang {
         didSet {
-            UserDefaults.standard.set(language.rawValue, forKey: "xdial.language")
-            NetworkInfo.shared.language = language
+            xdialDefaults.set(language.rawValue, forKey: "xdial.language")
         }
     }
     @Published var launchAtLogin: Bool {
         didSet {
-            UserDefaults.standard.set(launchAtLogin, forKey: "xdial.launchAtLogin")
+            xdialDefaults.set(launchAtLogin, forKey: "xdial.launchAtLogin")
             updateLaunchAtLogin()
         }
     }
@@ -67,7 +66,7 @@ final class AppState: ObservableObject {
     }
 
     var canConnect: Bool {
-        guard helperInstalled, !isBusy else { return false }
+        guard !isBusy else { return false }
         guard let s = activeMode else { return false }
         // 必须有效的 VPN 凭据（如果模式用到 VPN）
         for binding in s.bindings {
@@ -88,10 +87,23 @@ final class AppState: ObservableObject {
     var statusText: String {
         switch engine.status {
         case "connected": return tr("已连接", "Connected")
-        case "connecting": return tr("正在连接…", "Connecting…")
+        case "connecting":
+            if let task = engine.connectionReport?.currentTask {
+                return task.name
+            }
+            return tr("正在连接…", "Connecting…")
         case "disconnecting": return tr("正在断开…", "Disconnecting…")
-        case "reconnecting": return tr("正在重连…", "Reconnecting…")
+        case "reconnecting":
+            if let task = engine.connectionReport?.currentTask {
+                return task.name
+            }
+            return tr("正在重连…", "Reconnecting…")
         default:
+            if let report = engine.connectionReport,
+               let failure = report.error,
+               !failure.message.isEmpty {
+                return failure.message
+            }
             if let err = engine.lastError { return err }
             return tr("未连接", "Not Connected")
         }
@@ -117,7 +129,7 @@ final class AppState: ObservableObject {
     /// 只搬 XDial 自己的 profile/语言/登录项开关，不触碰任何系统网络配置。
     private static func importSandboxPreferencesIfNeeded() {
         let marker = "xdial.migratedFromSandboxProfileV1"
-        let defaults = UserDefaults.standard
+        let defaults = xdialDefaults
         guard !defaults.bool(forKey: marker) else { return }
 
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -159,23 +171,34 @@ final class AppState: ObservableObject {
         Self.importSandboxPreferencesIfNeeded()
 
         // 语言：先读已保存，没有则用系统语言
-        if let savedLang = UserDefaults.standard.string(forKey: "xdial.language"),
+        if let savedLang = xdialDefaults.string(forKey: "xdial.language"),
            let lang = Lang(rawValue: savedLang) {
             self.language = lang
         } else {
             self.language = .system
         }
-        self.launchAtLogin = UserDefaults.standard.bool(forKey: "xdial.launchAtLogin")
+        self.launchAtLogin = xdialDefaults.bool(forKey: "xdial.launchAtLogin")
 
         engine.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &engineSubs)
         engine.$status
-            .removeDuplicates()
-            .sink { [weak self] status in
-                guard let self, status == "connected" else { return }
-                self.probeNetwork()
-                self.markUsedLinesVerified()
+            .combineLatest(engine.$connectionReport)
+            .sink { [weak self] _, _ in
+                // @Published 在 willSet 时发送。延后一轮再读取两份属性，避免把
+                // “旧 status + 新 report”或“新 status + 旧 report”拼成假事实。
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let status = self.engine.status
+                    let report = self.engine.connectionReport
+                    if status == "connected", let report {
+                        self.markUsedLinesVerified(report: report)
+                    }
+                    self.synchronizeLineObservations(
+                        status: status,
+                        report: report
+                    )
+                }
             }
             .store(in: &engineSubs)
         loadSaved()
@@ -183,10 +206,6 @@ final class AppState: ObservableObject {
         // 启动即自愈：daemon 若还是重编前的旧二进制，让它 respawn 成 bundle 里的新版
         Task.detached { await GoEngine.syncDaemonBinary() }
         engine.syncStatus()
-        // 启动时如果 helper 一直在跑且已连接，也探测一次。
-        if engine.status == "connected" {
-            probeNetwork()
-        }
         #if DEBUG
         Self.current = self
         Self.debugServer.start()
@@ -197,18 +216,87 @@ final class AppState: ObservableObject {
     private static let debugServer = DebugServer()
     #endif
 
-    func probeNetwork() {
-        guard engine.status == "connected" else { return }
-        var usedIDs = Set(activeMode?.bindings.map { $0.lineID } ?? [])
-        if let defaultLineID = activeMode?.defaultLineID, !defaultLineID.isEmpty {
-            usedIDs.insert(defaultLineID)
+    /// 出口观察只能跟随 Provider 已提交的 ConnectionReport。
+    /// 当前正在编辑的 Profile、设置页生命周期和旧 helper 都不是运行事实来源。
+    private func synchronizeLineObservations(
+        status: String,
+        report: ConnectionReport?
+    ) {
+        guard let runtime = ConnectionReportRuntimeFacts.committedLines(
+            status: status,
+            report: report
+        ) else {
+            NetworkInfo.shared.clear()
+            return
         }
-        let activeLines = profile.lines.filter { usedIDs.contains($0.id) }
-        NetworkInfo.shared.probeAll(
-            lines: activeLines,
-            subscriptions: activeSubscriptions,
-            helperConnected: true
+        let pending = NetworkInfo.shared.begin(
+            transactionID: runtime.transactionID,
+            lineIDs: runtime.lineIDs
         )
+        probeLineObservationsSequentially(
+            pending[...],
+            transactionID: runtime.transactionID
+        )
+    }
+
+    /// Provider 只允许一个出口探测租约。宿主按 ConnectionPlan 顺序串行发送，
+    /// 既保持报告顺序稳定，也避免把并发拒绝误显示为 Line 故障。
+    private func probeLineObservationsSequentially(
+        _ pending: ArraySlice<String>,
+        transactionID: String
+    ) {
+        guard let lineID = pending.first else { return }
+        guard isCurrentObservationTransaction(transactionID) else {
+            return
+        }
+        engine.probeLineOutboundAddress(
+            transactionID: transactionID,
+            lineID: lineID
+        ) { [weak self] result in
+            guard let self else { return }
+            guard self.isCurrentObservationTransaction(
+                transactionID
+            ) else {
+                return
+            }
+            switch result {
+            case let .success(address):
+                NetworkInfo.shared.recordAddress(
+                    address,
+                    lineID: lineID,
+                    transactionID: transactionID
+                )
+            case let .failure(error):
+                let errorCode =
+                    (error as? ProviderDiagnosticsHostError)?.code
+                        ?? "provider-line-probe-failed"
+                NetworkInfo.shared.recordFailure(
+                    code: errorCode,
+                    lineID: lineID,
+                    transactionID: transactionID
+                )
+            }
+            self.probeLineObservationsSequentially(
+                pending.dropFirst(),
+                transactionID: transactionID
+            )
+        }
+    }
+
+    private func isCurrentObservationTransaction(
+        _ transactionID: String
+    ) -> Bool {
+        guard
+            let report = engine.connectionReport,
+            report.transactionID == transactionID,
+            ConnectionReportRuntimeFacts.committedLines(
+                status: engine.status,
+                report: report
+            )?.transactionID == transactionID
+        else {
+            return false
+        }
+        return true
     }
 
     private func updateLaunchAtLogin() {
@@ -242,9 +330,9 @@ final class AppState: ObservableObject {
         }
         // 4. 可选：删除用户数据
         if deleteData {
-            UserDefaults.standard.removeObject(forKey: profileKey)
-            UserDefaults.standard.removeObject(forKey: "xdial.language")
-            UserDefaults.standard.removeObject(forKey: "xdial.launchAtLogin")
+            xdialDefaults.removeObject(forKey: profileKey)
+            xdialDefaults.removeObject(forKey: "xdial.language")
+            xdialDefaults.removeObject(forKey: "xdial.launchAtLogin")
             KeychainStore.deleteVault()
             try? FileManager.default.removeItem(atPath: appLogPath())
         }
@@ -252,16 +340,24 @@ final class AppState: ObservableObject {
         completion(true, nil)
     }
 
-    private var lastVerifiedAt: String = ""
+    private var lastVerifiedTransactionID = ""
 
-    private func markUsedLinesVerified() {
-        guard let s = activeMode else { return }
-        let key = s.id
-        if lastVerifiedAt == key { return }
-        lastVerifiedAt = key
-
-        var usedIDs = Set(s.bindings.map { $0.lineID })
-        if !s.defaultLineID.isEmpty { usedIDs.insert(s.defaultLineID) }
+    private func markUsedLinesVerified(report: ConnectionReport) {
+        guard
+            let runtime = ConnectionReportRuntimeFacts.committedLines(
+                status: engine.status,
+                report: report
+            ),
+            engine.connectionReport?.transactionID ==
+                runtime.transactionID
+        else {
+            return
+        }
+        if lastVerifiedTransactionID == runtime.transactionID {
+            return
+        }
+        lastVerifiedTransactionID = runtime.transactionID
+        let usedIDs = Set(runtime.lineIDs)
 
         var changed = false
         for i in profile.lines.indices where usedIDs.contains(profile.lines[i].id) {
@@ -279,13 +375,38 @@ final class AppState: ObservableObject {
 
     func connect() {
         guard canConnect else { return }
+        NetworkInfo.shared.clear()
         // 这次 save 本身就是在下发前落盘，不该把自己标成"未下发"
         save(markDirty: false)
         configDirtyFlag = false
-        engine.start(profileJSON: buildProfileJSON())
+        let profileJSON = buildProfileJSON()
+        let tailscaleLineIDs = profile.lines
+            .filter { $0.type == "tailscale" }
+            .map(\.id)
+        stopTailscaleSetupSessions(
+            lineIDs: tailscaleLineIDs,
+            profileJSON: profileJSON
+        )
+    }
+
+    private func stopTailscaleSetupSessions(
+        lineIDs: [String],
+        profileJSON: String
+    ) {
+        guard let lineID = lineIDs.first else {
+            engine.start(profileJSON: profileJSON)
+            return
+        }
+        engine.stopTailscaleSetup(lineID: lineID) { [weak self] in
+            self?.stopTailscaleSetupSessions(
+                lineIDs: Array(lineIDs.dropFirst()),
+                profileJSON: profileJSON
+            )
+        }
     }
 
     func disconnect() {
+        NetworkInfo.shared.clear()
         // 引擎不再攥着旧快照，残留提示没有意义
         configDirtyFlag = false
         // 作废进行中的重连，免得它在用户明确要求断开之后又把连接拉起来
@@ -416,6 +537,10 @@ final class AppState: ObservableObject {
     ///   用户编辑都算。只有两类内部写入传 false：连接前的落盘（马上就下发了），
     ///   以及 verified 这类纯展示标记的回写（不影响数据面行为）。
     func save(markDirty: Bool = true) {
+        if profile.lines.contains(where: { $0.type == "tailscale" }),
+           profile.tailscale.hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            profile.tailscale.hostname = Self.newTailscaleHostname()
+        }
         // 先把所有 ASCII 字段做一次全角→半角清洗（兜底）
         for i in profile.lines.indices {
             profile.lines[i].vpnServer = profile.lines[i].vpnServer.normalizedASCII()
@@ -488,15 +613,19 @@ final class AppState: ObservableObject {
         }
 
         guard let data = try? JSONEncoder().encode(sanitized) else { return }
-        UserDefaults.standard.set(data, forKey: profileKey)
+        xdialDefaults.set(data, forKey: profileKey)
 
         if markDirty && engineHoldsSnapshot {
             configDirtyFlag = true
         }
+        synchronizeLineObservations(
+            status: engine.status,
+            report: engine.connectionReport
+        )
     }
 
     private func loadSaved() {
-        guard let data = UserDefaults.standard.data(forKey: profileKey) else {
+        guard let data = xdialDefaults.data(forKey: profileKey) else {
             appLog("loadSaved: no saved data, using bootstrap")
             return  // 第一次启动，保留 bootstrap
         }
@@ -592,33 +721,21 @@ final class AppState: ObservableObject {
             }
         }
 
-        // 桌面端不再内置 Tailscale。旧配置里的线路和引用在加载时一次性迁出；
-        // 官方客户端仍可作为 XDial 启动前已经存在的 Underlay。
-        let removedLineIDs = Set(loaded.lines.filter { $0.type == "tailscale" }.map(\.id))
-        if !removedLineIDs.isEmpty {
-            loaded.lines.removeAll { removedLineIDs.contains($0.id) }
-            let fallbackLineID: String
-            if let direct = loaded.lines.first(where: { $0.enabled && $0.type == "direct" }) {
-                fallbackLineID = direct.id
-            } else if let enabled = loaded.lines.first(where: { $0.enabled }) {
-                fallbackLineID = enabled.id
-            } else {
-                loaded.lines.append(Line(id: "direct", name: "直连", type: "direct",
-                                         enabled: true, verified: true))
-                fallbackLineID = "direct"
-            }
-            for i in loaded.modes.indices {
-                loaded.modes[i].bindings.removeAll { removedLineIDs.contains($0.lineID) }
-                if removedLineIDs.contains(loaded.modes[i].defaultLineID) {
-                    loaded.modes[i].defaultLineID = fallbackLineID
-                }
-            }
+        // D33 恢复桌面内置 Tailscale。旧版本已经留下 Line 但尚未有全局设备名时，
+        // 只补一份稳定身份；不迁移、删除或重写任何 Mode 引用。
+        if loaded.lines.contains(where: { $0.type == "tailscale" }),
+           loaded.tailscale.hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            loaded.tailscale.hostname = Self.newTailscaleHostname()
             didMigrate = true
-            appLog("loadSaved: removed deprecated desktop Tailscale lines")
+            appLog("loadSaved: created persistent Tailscale identity")
         }
 
         self.profile = loaded
         if didMigrate { save() }
+    }
+
+    private static func newTailscaleHostname() -> String {
+        "xdial-" + String(UUID().uuidString.lowercased().prefix(8))
     }
 
     // MARK: - Legacy 命名 key 迁移（比喻命名 → 正式命名）

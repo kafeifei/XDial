@@ -6,6 +6,7 @@ import (
 	"context"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter/certificate"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -31,7 +32,15 @@ import (
 func boxContext(ctx context.Context) context.Context {
 	endpointRegistry := endpoint.NewRegistry()
 	registerTailscaleEndpoint(endpointRegistry)
-	return box.Context(ctx, inboundRegistry(), outboundRegistry(), endpointRegistry, dnsTransportRegistry(), boxservice.NewRegistry())
+	return box.Context(
+		ctx,
+		inboundRegistry(),
+		outboundRegistry(),
+		endpointRegistry,
+		dnsTransportRegistry(),
+		boxservice.NewRegistry(),
+		certificate.NewRegistry(),
+	)
 }
 
 func inboundRegistry() *inbound.Registry {
@@ -66,5 +75,6 @@ func dnsTransportRegistry() *dns.TransportRegistry {
 	local.RegisterTransport(registry)
 	registerTailscaleDNSTransport(registry)
 	registerMobileDNSTransport(registry)
+	registerAnyConnectDNSTransport(registry)
 	return registry
 }

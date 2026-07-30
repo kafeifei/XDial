@@ -3,6 +3,7 @@
 package libbox
 
 import (
+	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -52,16 +53,17 @@ type xdPlatformInterface struct {
 	// opener 是可替换的 TUN 打开器;nil 时用 defaultTunOpener(真实 dup+tun.New)。
 	opener TunOpener
 
-	mu                sync.Mutex
-	networkManager    adapter.NetworkManager
-	defaultInterface  *control.Interface
-	networkInterfaces []adapter.NetworkInterface
-	ownInterfaceName  string
-	monitor           *platformInterfaceMonitor
-	tunInPackets      atomic.Uint64
-	tunInBytes        atomic.Uint64
-	tunOutPackets     atomic.Uint64
-	tunOutBytes       atomic.Uint64
+	mu                 sync.Mutex
+	networkManager     adapter.NetworkManager
+	defaultInterface   *control.Interface
+	networkInterfaces  []adapter.NetworkInterface
+	ownInterfaceName   string
+	monitor            *platformInterfaceMonitor
+	bindUnderlaySocket bool
+	tunInPackets       atomic.Uint64
+	tunInBytes         atomic.Uint64
+	tunOutPackets      atomic.Uint64
+	tunOutBytes        atomic.Uint64
 }
 
 var _ adapter.PlatformInterface = (*xdPlatformInterface)(nil)
@@ -76,6 +78,10 @@ func (p *xdPlatformInterface) OpenInterface(options *tun.Options, platformOption
 		opener = p.defaultTunOpener
 	}
 	return opener(options, platformOptions)
+}
+
+func (p *xdPlatformInterface) ProcessPlatformOptions(option.TunPlatformOptions) error {
+	return nil
 }
 
 // defaultTunOpener 是真实路径:dup 传入的 NE fd 后交给 tun.New。
@@ -135,9 +141,25 @@ func (p *xdPlatformInterface) Initialize(networkManager adapter.NetworkManager) 
 	return nil
 }
 
-func (p *xdPlatformInterface) UsePlatformAutoDetectInterfaceControl() bool { return false }
+func (p *xdPlatformInterface) UsePlatformAutoDetectInterfaceControl() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.bindUnderlaySocket
+}
 
-func (p *xdPlatformInterface) AutoDetectInterfaceControl(fd int) error { return nil }
+func (p *xdPlatformInterface) AutoDetectInterfaceControl(fd int) error {
+	p.mu.Lock()
+	enabled := p.bindUnderlaySocket
+	defaultInterface := cloneInterface(p.defaultInterface)
+	p.mu.Unlock()
+	if !enabled {
+		return nil
+	}
+	if defaultInterface == nil || defaultInterface.Index <= 0 {
+		return E.New("platform: default Underlay interface is unavailable")
+	}
+	return bindSocketToInterface(fd, defaultInterface.Index)
+}
 
 func (p *xdPlatformInterface) UsePlatformDefaultInterfaceMonitor() bool { return true }
 
@@ -201,6 +223,53 @@ func (p *xdPlatformInterface) SendNotification(notification *adapter.Notificatio
 
 func (p *xdPlatformInterface) MyInterfaceAddress() []netip.Addr { return nil }
 
+func (p *xdPlatformInterface) UsePlatformNeighborResolver() bool { return false }
+
+func (p *xdPlatformInterface) StartNeighborMonitor(adapter.NeighborUpdateListener) error {
+	return E.New("platform neighbor monitor is unavailable")
+}
+
+func (p *xdPlatformInterface) CloseNeighborMonitor(adapter.NeighborUpdateListener) error {
+	return nil
+}
+
+func (p *xdPlatformInterface) UsePlatformShell() bool { return false }
+
+func (p *xdPlatformInterface) CheckPlatformShell() error {
+	return E.New("platform shell is unavailable")
+}
+
+func (p *xdPlatformInterface) OpenShellSession(
+	*adapter.PlatformUser,
+	string,
+	[]string,
+	string,
+	int32,
+	int32,
+) (adapter.ShellSession, error) {
+	return nil, E.New("platform shell is unavailable")
+}
+
+func (p *xdPlatformInterface) LookupUser(string) (*adapter.PlatformUser, error) {
+	return nil, E.New("platform user lookup is unavailable")
+}
+
+func (p *xdPlatformInterface) LookupSFTPServer() (string, error) {
+	return "", E.New("platform SFTP server is unavailable")
+}
+
+func (p *xdPlatformInterface) ReadSystemSSHHostKey() ([]byte, error) {
+	return nil, E.New("platform SSH host key is unavailable")
+}
+
+func (p *xdPlatformInterface) TailscaleHostname() string { return "" }
+
+func (p *xdPlatformInterface) UsePlatformBridge() bool { return false }
+
+func (p *xdPlatformInterface) CreateBridge(adapter.BridgeOptions) (adapter.BridgeSession, error) {
+	return nil, E.New("platform bridge is unavailable")
+}
+
 // platformInterfaceMonitor 把 Swift NWPathMonitor 报告的默认 Underlay 接口桥接给
 // sing-box。它必须在 Start 时先刷新全部接口列表，再发布初始接口，否则
 // auto_detect_interface 会看到 "no available network interface"。
@@ -262,6 +331,15 @@ func (m *platformInterfaceMonitor) RegisterMyInterface(interfaceName string) {
 	m.platform.setOwnInterface(interfaceName)
 }
 
+func (m *platformInterfaceMonitor) MyInterfaces() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.myInterface == "" {
+		return nil
+	}
+	return []string{m.myInterface}
+}
+
 func (m *platformInterfaceMonitor) MyInterface() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -284,7 +362,8 @@ func (p *xdPlatformInterface) setDefaultInterface(name string, index int) {
 		if name == p.ownInterfaceName {
 			updated = p.firstUsableInterfaceLocked()
 		} else {
-			updated = &control.Interface{Name: name, Index: index}
+			resolved := resolvePlatformInterface(name, index)
+			updated = &resolved
 		}
 	}
 	old := p.defaultInterface
@@ -305,6 +384,12 @@ func (p *xdPlatformInterface) setDefaultInterface(name string, index int) {
 	if monitor != nil {
 		monitor.notify(cloneInterface(updated))
 	}
+}
+
+func (p *xdPlatformInterface) setUnderlayInterfaceBinding(enabled bool) {
+	p.mu.Lock()
+	p.bindUnderlaySocket = enabled
+	p.mu.Unlock()
 }
 
 type platformNetworkInterfaceSnapshot struct {
@@ -329,11 +414,8 @@ func (p *xdPlatformInterface) setNetworkInterfaces(snapshots []platformNetworkIn
 			return E.New("platform: unsupported network interface type: ", snapshot.Type)
 		}
 		interfaces = append(interfaces, adapter.NetworkInterface{
-			Interface: control.Interface{
-				Name:  snapshot.Name,
-				Index: snapshot.Index,
-			},
-			Type: interfaceType,
+			Interface: resolvePlatformInterface(snapshot.Name, snapshot.Index),
+			Type:      interfaceType,
 		})
 	}
 
@@ -376,6 +458,24 @@ func (p *xdPlatformInterface) setOwnInterface(name string) {
 	if monitor != nil {
 		monitor.notify(defaultInterface)
 	}
+}
+
+// resolvePlatformInterface 补齐 sing-box 与内置 Tailscale 需要的系统接口事实。
+// NWPath 决定候选顺序和默认接口；这里不做选择，只按它给出的名称读取同一接口的
+// MTU、状态标志和地址。接口若在快照后消失，保留原快照让后续启动明确失败。
+func resolvePlatformInterface(name string, index int) control.Interface {
+	fallback := control.Interface{Name: name, Index: index}
+	systemInterface, err := net.InterfaceByName(name)
+	if err != nil {
+		return fallback
+	}
+	resolved, err := control.InterfaceFromNet(*systemInterface)
+	if err != nil {
+		return fallback
+	}
+	resolved.Name = name
+	resolved.Index = index
+	return resolved
 }
 
 // firstUsableInterfaceLocked 返回 NWPath 顺序中的第一个下层接口。

@@ -61,7 +61,7 @@ enum KeychainStore {
     /// 快照为准。全程不记录 key、value 或正文。
     static func importSandboxVaultIfNeeded() {
         let marker = "xdial.migratedFromSandboxVaultV1"
-        let defaults = UserDefaults.standard
+        let defaults = xdialDefaults
         guard !defaults.bool(forKey: marker) else { return }
 
         let source = FileManager.default.homeDirectoryForCurrentUser

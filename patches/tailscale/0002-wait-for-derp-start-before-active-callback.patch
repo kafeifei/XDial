@@ -1,0 +1,97 @@
+From da90ea664d7a601a73cd531bc5ae1db0993033c1 Mon Sep 17 00:00:00 2001
+From: Fernando Serboncini <fserb@tailscale.com>
+Date: Mon, 26 Jan 2026 10:48:21 -0300
+Subject: [PATCH] wgengine/magicsock: only run derpActiveFunc after connecting
+ to DERP (#18814)
+
+Backport of:
+https://github.com/tailscale/tailscale/commit/da90ea664d7a601a73cd531bc5ae1db0993033c1
+
+The SagerNet module archive omits Tailscale's test support. Keep the upstream
+startGate behavior in production and carry a small self-contained gate test.
+---
+ wgengine/magicsock/derp.go                  | 11 ++++++++++-
+ wgengine/magicsock/derp_active_gate_test.go | 50 +++++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+), 1 deletion(-)
+ create mode 100644 wgengine/magicsock/derp_active_gate_test.go
+
+diff --git a/wgengine/magicsock/derp.go b/wgengine/magicsock/derp.go
+--- a/wgengine/magicsock/derp.go
++++ b/wgengine/magicsock/derp.go
+@@ -421,9 +421,18 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
+ 
+ 	go c.runDerpReader(ctx, regionID, dc, wg, startGate)
+ 	go c.runDerpWriter(ctx, dc, ch, wg, startGate)
+-	go c.derpActiveFunc()
++	go runDERPActiveAfterStartGate(ctx, startGate, c.derpActiveFunc)
+ 
+ 	return ad.writeCh
+ }
++
++func runDERPActiveAfterStartGate(ctx context.Context, startGate <-chan struct{}, active func()) {
++	select {
++	case <-ctx.Done():
++		return
++	case <-startGate:
++		active()
++	}
++}
+ 
+ // setPeerLastDerpLocked notes that peer is now being written to via
+diff --git a/wgengine/magicsock/derp_active_gate_test.go b/wgengine/magicsock/derp_active_gate_test.go
+new file mode 100644
+--- /dev/null
++++ b/wgengine/magicsock/derp_active_gate_test.go
+@@ -0,0 +1,50 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"context"
++	"testing"
++	"time"
++)
++
++func TestDERPActiveWaitsForStartGate(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	startGate := make(chan struct{})
++	called := make(chan struct{}, 1)
++	done := make(chan struct{})
++
++	go func() {
++		runDERPActiveAfterStartGate(ctx, startGate, func() {
++			called <- struct{}{}
++		})
++		close(done)
++	}()
++
++	select {
++	case <-called:
++		t.Fatal("DERP active callback ran before startGate opened")
++	case <-time.After(50 * time.Millisecond):
++	}
++
++	close(startGate)
++	select {
++	case <-called:
++	case <-time.After(time.Second):
++		t.Fatal("DERP active callback did not run after startGate opened")
++	}
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("DERP active gate did not return")
++	}
++
++	cancelled, stop := context.WithCancel(context.Background())
++	stop()
++	blockedGate := make(chan struct{})
++	runDERPActiveAfterStartGate(cancelled, blockedGate, func() {
++		t.Fatal("DERP active callback ran after cancellation")
++	})
++}
+-- 
+2.50.1

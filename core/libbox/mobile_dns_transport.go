@@ -190,6 +190,17 @@ func (t *mobileDNSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*
 	return response, nil
 }
 
+func (t *mobileDNSTransport) ExchangeAsync(
+	ctx context.Context,
+	message *mDNS.Msg,
+	callback func(response *mDNS.Msg, err error),
+) {
+	go func() {
+		response, err := t.Exchange(ctx, message)
+		callback(response, err)
+	}()
+}
+
 func selectMobileDNSTransport(
 	bindings []runtimeMobileDNSBinding,
 	queryName string,

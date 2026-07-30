@@ -43,7 +43,7 @@ final class DebugServer {
                 return
             }
             Task { @MainActor in
-                let (code, body) = Self.route(raw)
+                let (code, body) = await Self.route(raw)
                 let header = "HTTP/1.1 \(code)\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\n\r\n"
                 conn.send(content: (header + body).data(using: .utf8),
                           completion: .contentProcessed { _ in conn.cancel() })
@@ -54,7 +54,7 @@ final class DebugServer {
     // MARK: - Routing
 
     @MainActor
-    private static func route(_ raw: String) -> (String, String) {
+    private static func route(_ raw: String) async -> (String, String) {
         let req = parseHTTP(raw)
         // 防 DNS rebinding：浏览器带任意 Host 打到 127.0.0.1 时拒绝。
         // 必须精确匹配主机名——用 hasPrefix 会被 localhost.evil.com / 127.0.0.1.evil.com
@@ -71,7 +71,7 @@ final class DebugServer {
             let depth = Int(req.query["depth"] ?? "") ?? 15
             return ok(buildAXTree(maxDepth: depth))
         case ("POST", "/action"):
-            return handleAction(req.body)
+            return await handleAction(req.body)
         default:
             return ("404 Not Found", json([
                 "error": "not found",
@@ -79,7 +79,7 @@ final class DebugServer {
                     "GET  /health",
                     "GET  /state",
                     "GET  /ax[?depth=N]",
-                    "POST /action  {action: connect|disconnect|reconnect|select-mode|ax-press|ax-set-value, ...}",
+                    "POST /action  {action: connect|disconnect|reconnect|connect-with-failure|begin-route-probe|routing-probe-snapshot|select-mode|ax-press|ax-set-value, ...}",
                 ],
             ]))
         }
@@ -115,7 +115,16 @@ final class DebugServer {
         let net = NetworkInfo.shared
         var perLine: [String: Any] = [:]
         for (k, v) in net.perLine {
-            perLine[k] = ["ip": v.ip, "region": v.region, "error": v.error, "summary": v.summary]
+            perLine[k] = [
+                "transactionID": v.transactionID,
+                "lineID": v.lineID,
+                "observedAt":
+                    ISO8601DateFormatter().string(from: v.observedAt),
+                "ip": v.ip,
+                "region": v.region,
+                "errorCode": v.errorCode,
+                "summary": v.summary,
+            ]
         }
 
         var dict: [String: Any] = [:]
@@ -130,7 +139,7 @@ final class DebugServer {
         dict["helperSMStatus"] = PrivilegeManager.status.rawValue
         dict["helperLegacyInstalled"] = PrivilegeManager.legacyInstalled
         dict["daemonBundledSHA256"] = PrivilegeManager.bundledDaemonSHA256() ?? ""
-        dict["dataPlane"] = "native-sing-box-tun"
+        dict["dataPlane"] = "transparent-proxy"
         dict["canConnect"] = s.canConnect
         dict["statusText"] = s.statusText
         dict["language"] = s.language.rawValue
@@ -138,6 +147,11 @@ final class DebugServer {
         dict["activeModeID"] = s.profile.activeModeID
         // 配置改了但引擎还在跑旧快照 —— 验收改动是否真正生效必须看这个
         dict["configDirty"] = s.configDirty
+        if let report = s.engine.connectionReport,
+           let data = try? JSONEncoder().encode(report),
+           let object = try? JSONSerialization.jsonObject(with: data) {
+            dict["connectionReport"] = object
+        }
 
         if let d = try? JSONEncoder().encode(s.profile),
            let p = try? JSONSerialization.jsonObject(with: d) {
@@ -145,8 +159,7 @@ final class DebugServer {
         }
 
         dict["network"] = [
-            "localIP": net.localIP,
-            "probing": net.probing,
+            "transactionID": net.transactionID ?? "",
             "perLine": perLine,
         ] as [String: Any]
 
@@ -167,6 +180,7 @@ final class DebugServer {
     // 密码/凭据字段一律打码；订阅 url 内嵌 token，同样按凭据处理
     private static let secretKeys: Set<String> = [
         "vpn_password", "trojan_password", "ss_password", "vmess_uuid",
+        "tailscale_auth_key", "auth_key",
     ]
 
     private static func redactSecrets(_ value: Any) -> Any {
@@ -283,7 +297,7 @@ final class DebugServer {
     }
 
     @MainActor
-    private static func handleAction(_ body: String) -> (String, String) {
+    private static func handleAction(_ body: String) async -> (String, String) {
         guard let data = body.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let action = obj["action"] as? String else {
@@ -297,12 +311,172 @@ final class DebugServer {
         case "connect":
             state.connect()
             return ok(["ok": true])
+        case "connect-with-failure":
+            guard state.canConnect else {
+                return ("409 Conflict", json([
+                    "error": "XDial is not ready to connect",
+                ]))
+            }
+            guard
+                let stage = obj["stage"] as? String,
+                state.engine.injectFailureOnNextStart(stage)
+            else {
+                return ("400 Bad Request", json([
+                    "error": "invalid failure stage",
+                    "availableStages": [
+                        "rule-set",
+                        "line",
+                        "commit",
+                        "post-commit-fatal",
+                    ],
+                ]))
+            }
+            state.connect()
+            return ok(["ok": true, "stage": stage])
         case "disconnect":
             state.disconnect()
             return ok(["ok": true])
         case "reconnect":
             state.reconnect()
             return ok(["ok": true, "status": state.engine.status])
+        case "prepare-system-extension":
+            // 主线程同步轮询会阻塞 OSSystemExtensionRequest 的 main-queue
+            // delegate，造成“实际已激活、接口却超时”的假阴性。挂起当前 Task 后，
+            // 主线程可以正常接收系统回调。
+            let result: DebugSystemExtensionResult =
+                await withCheckedContinuation { continuation in
+                    let gate = DebugSystemExtensionResultGate(
+                        continuation: continuation
+                    )
+                    state.engine.prepareSystemExtension { result in
+                        switch result {
+                        case .success:
+                            gate.finish(.success)
+                        case let .failure(error):
+                            gate.finish(.failure(error.localizedDescription))
+                        }
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
+                        gate.finish(.timeout)
+                    }
+                }
+            switch result {
+            case .success:
+                return ok(["ok": true])
+            case let .failure(error):
+                return ok(["ok": false, "error": error])
+            case .timeout:
+                return ok([
+                    "ok": false,
+                    "error": "system extension activation timed out",
+                ])
+            }
+        case "begin-route-probe":
+            guard
+                state.engine.status == "connected",
+                let report = state.engine.connectionReport,
+                report.state == .committed
+            else {
+                return ("409 Conflict", json([
+                    "ok": false,
+                    "code": "transparent-proxy-not-connected",
+                ]))
+            }
+            guard
+                let rawHost = obj["host"] as? String,
+                let host = validatedProbeHost(rawHost)
+            else {
+                return ("400 Bad Request", json([
+                    "ok": false,
+                    "code": "invalid-route-probe-host",
+                ]))
+            }
+            if let requestedPort = obj["port"] as? Int,
+               requestedPort != 443 {
+                return ("400 Bad Request", json([
+                    "ok": false,
+                    "code": "route-probe-port-must-be-443",
+                ]))
+            }
+            let timeoutMS = obj["timeout_ms"] as? Int ?? 10_000
+            guard (500 ... 15_000).contains(timeoutMS) else {
+                return ("400 Bad Request", json([
+                    "ok": false,
+                    "code": "invalid-route-probe-timeout",
+                ]))
+            }
+            let result: Result<ProviderBegunRouteProbe, Error> =
+                await withCheckedContinuation { continuation in
+                    state.engine.beginRouteProbe(
+                        transactionID: report.transactionID,
+                        host: host,
+                        timeoutMS: timeoutMS
+                    ) {
+                        continuation.resume(returning: $0)
+                    }
+                }
+            switch result {
+            case let .success(begun):
+                return ok([
+                    "ok": true,
+                    "transactionID": report.transactionID,
+                    "probeID": begun.probeID,
+                ])
+            case let .failure(error):
+                return ok([
+                    "ok": false,
+                    "transactionID": report.transactionID,
+                    "code": providerDiagnosticsCode(error),
+                ])
+            }
+        case "routing-probe-snapshot":
+            guard
+                state.engine.status == "connected",
+                let report = state.engine.connectionReport,
+                report.state == .committed
+            else {
+                return ("409 Conflict", json([
+                    "ok": false,
+                    "code": "transparent-proxy-not-connected",
+                ]))
+            }
+            guard
+                let rawProbeID = obj["probe_id"] as? String,
+                let probeID = validatedProbeID(rawProbeID)
+            else {
+                return ("400 Bad Request", json([
+                    "ok": false,
+                    "code": "invalid-route-probe-id",
+                ]))
+            }
+            let result:
+                Result<ProviderRoutingProbeSnapshot, Error> =
+                await withCheckedContinuation { continuation in
+                    state.engine.routingProbeSnapshot(
+                        transactionID: report.transactionID,
+                        probeID: probeID
+                    ) {
+                        continuation.resume(returning: $0)
+                    }
+                }
+            switch result {
+            case let .success(snapshot):
+                return ok([
+                    "ok": true,
+                    "transactionID": report.transactionID,
+                    "probeID": snapshot.probeID,
+                    "matchCount": snapshot.matchCount,
+                    "outboundTagCounts": snapshot.outboundTagCounts,
+                    "lineIDCounts": snapshot.lineIDCounts,
+                    "ruleSetTag": snapshot.ruleSetTag ?? "",
+                ])
+            case let .failure(error):
+                return ok([
+                    "ok": false,
+                    "transactionID": report.transactionID,
+                    "code": providerDiagnosticsCode(error),
+                ])
+            }
         case "select-mode":
             guard let id = obj["id"] as? String else {
                 return ("400 Bad Request", json(["error": "missing 'id'"]))
@@ -389,6 +563,8 @@ final class DebugServer {
         default:
             return ("400 Bad Request", json(["error": "unknown action: \(action)",
                 "available": ["connect", "disconnect", "reconnect", "select-mode", "open-settings",
+                              "connect-with-failure",
+                              "begin-route-probe", "routing-probe-snapshot",
                               "ax-press", "ax-set-value", "setup-helper", "check-helper",
                               "sm-register", "sm-unregister", "daemon-info"]]))
         }
@@ -501,6 +677,61 @@ final class DebugServer {
         return (method, path, query, body, host)
     }
 
+    /// Debug route probe 只接受 ASCII DNS 名；协议、路径、凭据和端口均不属于 host。
+    /// Provider 侧仍会再次固定端口 443 并校验当前 transaction。
+    private static func validatedProbeHost(_ raw: String) -> String? {
+        let host = raw.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).lowercased()
+        guard !host.isEmpty, host.count <= 253 else { return nil }
+        let labels = host.split(
+            separator: ".",
+            omittingEmptySubsequences: false
+        )
+        guard !labels.isEmpty else { return nil }
+        for label in labels {
+            guard
+                !label.isEmpty,
+                label.count <= 63,
+                label.first != "-",
+                label.last != "-"
+            else {
+                return nil
+            }
+            guard label.unicodeScalars.allSatisfy({
+                (0x61 ... 0x7A).contains($0.value)
+                    || (0x30 ... 0x39).contains($0.value)
+                    || $0.value == 0x2D
+            }) else {
+                return nil
+            }
+        }
+        return host
+    }
+
+    private static func validatedProbeID(_ raw: String) -> String? {
+        guard
+            raw == raw.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ),
+            !raw.isEmpty,
+            raw.utf8.count <= 128,
+            raw.unicodeScalars.allSatisfy({
+                !CharacterSet.controlCharacters.contains($0)
+            })
+        else {
+            return nil
+        }
+        return raw
+    }
+
+    private static func providerDiagnosticsCode(
+        _ error: Error
+    ) -> String {
+        (error as? ProviderDiagnosticsHostError)?.code
+            ?? "provider-diagnostics-failed"
+    }
+
     // MARK: - JSON Helpers
 
     private static func ok(_ dict: [String: Any]) -> (String, String) {
@@ -512,6 +743,33 @@ final class DebugServer {
             return "{}"
         }
         return String(data: data, encoding: .utf8) ?? "{}"
+    }
+}
+
+private enum DebugSystemExtensionResult {
+    case success
+    case failure(String)
+    case timeout
+}
+
+@MainActor
+private final class DebugSystemExtensionResultGate {
+    private var continuation:
+        CheckedContinuation<DebugSystemExtensionResult, Never>?
+
+    init(
+        continuation:
+            CheckedContinuation<DebugSystemExtensionResult, Never>
+    ) {
+        self.continuation = continuation
+    }
+
+    func finish(_ result: DebugSystemExtensionResult) {
+        guard let continuation else {
+            return
+        }
+        self.continuation = nil
+        continuation.resume(returning: result)
     }
 }
 #endif

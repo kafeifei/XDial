@@ -1,0 +1,505 @@
+From 7ce6db22ff1d2e2afdaae6c9ea7754ddcd2c2471 Mon Sep 17 00:00:00 2001
+From: XDial <xdial@local>
+Date: Thu, 30 Jul 2026 12:30:00 +0800
+Subject: [PATCH] magicsock,ipnlocal: add bounded connection diagnostics
+
+XDial needs to distinguish a newly-created control client from the NetInfo
+consumer it replaced, and a lazily-created DERP client from a DERP protocol
+session whose current reader has received ServerInfo.
+
+The exported snapshots contain only booleans, counts and bounded state
+relations. They do not expose DERP region IDs, endpoints, node keys, tailnet
+names or credentials.
+---
+ derp/derphttp/derphttp_client.go             |  7 +++
+ ipn/ipnlocal/local.go                        | 13 +++++
+ ipn/ipnlocal/xdial_diagnostics.go            | 76 ++++++++++++++++++++++++++++
+ ipn/ipnlocal/xdial_diagnostics_test.go       | 42 +++++++++++++++
+ wgengine/magicsock/derp.go                   | 103 +++++++++++++++++++++++++++
+ wgengine/magicsock/xdial_diagnostics_test.go | 130 +++++++++++++++++++++++++++++++++++
+ 6 files changed, 371 insertions(+)
+ create mode 100644 ipn/ipnlocal/xdial_diagnostics.go
+ create mode 100644 ipn/ipnlocal/xdial_diagnostics_test.go
+ create mode 100644 wgengine/magicsock/xdial_diagnostics_test.go
+
+diff --git a/derp/derphttp/derphttp_client.go b/derp/derphttp/derphttp_client.go
+--- a/derp/derphttp/derphttp_client.go
++++ b/derp/derphttp/derphttp_client.go
+@@ -115,6 +115,13 @@ type ConnectedState struct {
+ 	LocalAddr  netip.AddrPort // if Connected
+ }
+ 
++// XDialConnectionState returns only the transport lifecycle booleans needed
++// by XDial diagnostics. It intentionally omits addresses and node keys.
++func (c *Client) XDialConnectionState() (connected, closed bool) {
++	state := c.atomicState.Load()
++	return state.Connected, state.Closed
++}
++
+ func (c *Client) String() string {
+ 	return fmt.Sprintf("<derphttp_client.Client %s url=%s>", c.ServerPublicKey().ShortString(), c.url)
+ }
+diff --git a/ipn/ipnlocal/local.go b/ipn/ipnlocal/local.go
+--- a/ipn/ipnlocal/local.go
++++ b/ipn/ipnlocal/local.go
+@@ -272,9 +272,10 @@ type LocalBackend struct {
+ 	sshServer        SSHServer          // or nil, initialized lazily.
+ 	appConnector     *appc.AppConnector // or nil, initialized when configured.
+ 	// notifyCancel cancels notifications to the current SetNotifyCallback.
+-	notifyCancel context.CancelFunc
+-	cc           controlclient.Client // TODO(nickkhyl): move to nodeBackend
+-	ccAuto       *controlclient.Auto  // if cc is of type *controlclient.Auto; TODO(nickkhyl): move to nodeBackend
++	notifyCancel        context.CancelFunc
++	cc                  controlclient.Client // TODO(nickkhyl): move to nodeBackend
++	ccAuto              *controlclient.Auto  // if cc is of type *controlclient.Auto; TODO(nickkhyl): move to nodeBackend
++	xdialControlNetInfo xdialControlNetInfoTracker
+ 
+ 	// ignoreControlClientUpdates indicates whether we want to ignore SetControlClientStatus updates
+ 	// before acquiring b.mu. This is used during shutdown to avoid deadlocks.
+@@ -5759,5 +5760,6 @@ func (b *LocalBackend) setControlClientLocked(cc controlclient.Client) {
+ // b.mu must be held.
+ func (b *LocalBackend) setControlClientLocked(cc controlclient.Client) {
++	generation := b.xdialControlNetInfo.nextControlClient()
+ 	b.cc = cc
+ 	b.ccAuto, _ = cc.(*controlclient.Auto)
+ 	b.ignoreControlClientUpdates.Store(cc == nil)
+@@ -5770,6 +5772,7 @@ func (b *LocalBackend) setControlClientLocked(cc controlclient.Client) {
+ 	// NetInfo (notably PreferredDERP, our home DERP) to the new client rather
+ 	// than suppressing it as unchanged.
+ 	b.MagicConn().ResetNetInfoLast()
++	b.xdialControlNetInfo.didReset(generation)
+ }
+ 
+ // resetControlClientLocked sets b.cc to nil and returns the old value. If the
+@@ -5921,6 +5924,7 @@ func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
+ func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
+ 	b.mu.Lock()
+ 	cc := b.cc
++	controlGeneration := b.xdialControlNetInfo.generation
+ 	var refresh bool
+ 	if b.MagicConn().DERPs() > 0 || testenv.InTest() {
+ 		// When b.refreshAutoExitNode is set, we recently observed a link change
+@@ -5952,6 +5956,15 @@ func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
+ 		return
+ 	}
+ 	cc.SetNetInfo(ni)
++
++	// Client.SetNetInfo is synchronous and has no result. Reaching this point
++	// proves that the captured client received the call. Attribute it only to
++	// the generation that was current when the call began, so a late return
++	// from an old client cannot make a replacement look ready.
++	b.mu.Lock()
++	b.xdialControlNetInfo.didSet(controlGeneration, ni.PreferredDERP)
++	b.mu.Unlock()
++
+ 	if refresh {
+ 		b.RefreshExitNode()
+ 	}
+diff --git a/ipn/ipnlocal/xdial_diagnostics.go b/ipn/ipnlocal/xdial_diagnostics.go
+new file mode 100644
+--- /dev/null
++++ b/ipn/ipnlocal/xdial_diagnostics.go
+@@ -0,0 +1,76 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package ipnlocal
++
++// XDialControlNetInfoDiagnostics is a bounded snapshot of the current control
++// client's NetInfo lifecycle. It contains no NetInfo body or DERP identifier.
++type XDialControlNetInfoDiagnostics struct {
++	ClientPresent         bool
++	ResetForCurrentClient bool
++	SetForCurrentClient   bool
++	PreferredDERPRelation string
++}
++
++type xdialControlNetInfoTracker struct {
++	generation       uint64
++	resetGeneration  uint64
++	setGeneration    uint64
++	setPreferredDERP int
++}
++
++func (t *xdialControlNetInfoTracker) nextControlClient() uint64 {
++	t.generation++
++	return t.generation
++}
++
++func (t *xdialControlNetInfoTracker) didReset(generation uint64) {
++	if generation == t.generation {
++		t.resetGeneration = generation
++	}
++}
++
++func (t *xdialControlNetInfoTracker) didSet(generation uint64, preferredDERP int) {
++	if generation != t.generation {
++		return
++	}
++	t.setGeneration = generation
++	t.setPreferredDERP = preferredDERP
++}
++
++func (t *xdialControlNetInfoTracker) snapshot(
++	clientPresent bool,
++	preferredDERPRelation string,
++) XDialControlNetInfoDiagnostics {
++	current := t.generation
++	reset := clientPresent && current != 0 && t.resetGeneration == current
++	set := clientPresent && current != 0 && t.setGeneration == current
++	if !set {
++		preferredDERPRelation = "unknown"
++	}
++	return XDialControlNetInfoDiagnostics{
++		ClientPresent:         clientPresent,
++		ResetForCurrentClient: reset,
++		SetForCurrentClient:   set,
++		PreferredDERPRelation: preferredDERPRelation,
++	}
++}
++
++// XDialControlNetInfoState reports whether the current control client was
++// installed with a matching ResetNetInfoLast and subsequently received a
++// synchronous SetNetInfo call. It intentionally exposes only a relation
++// between PreferredDERP and magicsock's runtime home.
++func (b *LocalBackend) XDialControlNetInfoState() XDialControlNetInfoDiagnostics {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++
++	clientPresent := b.cc != nil
++	relation := "unknown"
++	if clientPresent &&
++		b.xdialControlNetInfo.setGeneration == b.xdialControlNetInfo.generation {
++		relation = b.MagicConn().XDialPreferredDERPRelation(
++			b.xdialControlNetInfo.setPreferredDERP,
++		)
++	}
++	return b.xdialControlNetInfo.snapshot(clientPresent, relation)
++}
+diff --git a/ipn/ipnlocal/xdial_diagnostics_test.go b/ipn/ipnlocal/xdial_diagnostics_test.go
+new file mode 100644
+--- /dev/null
++++ b/ipn/ipnlocal/xdial_diagnostics_test.go
+@@ -0,0 +1,40 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package ipnlocal
++
++import "testing"
++
++func TestXDialControlNetInfoTrackerGeneration(t *testing.T) {
++	var tracker xdialControlNetInfoTracker
++	first := tracker.nextControlClient()
++	tracker.didReset(first)
++	tracker.didSet(first, 7)
++
++	got := tracker.snapshot(true, "match")
++	if !got.ClientPresent || !got.ResetForCurrentClient ||
++		!got.SetForCurrentClient || got.PreferredDERPRelation != "match" {
++		t.Fatalf("first control generation = %+v", got)
++	}
++
++	second := tracker.nextControlClient()
++	tracker.didReset(second)
++	tracker.didSet(first, 8)
++	got = tracker.snapshot(true, "mismatch")
++	if !got.ClientPresent || !got.ResetForCurrentClient ||
++		got.SetForCurrentClient || got.PreferredDERPRelation != "unknown" {
++		t.Fatalf("stale SetNetInfo was attributed to replacement: %+v", got)
++	}
++
++	tracker.didSet(second, 9)
++	got = tracker.snapshot(true, "mismatch")
++	if !got.SetForCurrentClient || got.PreferredDERPRelation != "mismatch" {
++		t.Fatalf("current SetNetInfo missing: %+v", got)
++	}
++
++	got = tracker.snapshot(false, "match")
++	if got.ClientPresent || got.ResetForCurrentClient ||
++		got.SetForCurrentClient || got.PreferredDERPRelation != "unknown" {
++		t.Fatalf("absent control client = %+v", got)
++	}
++}
+diff --git a/wgengine/magicsock/derp.go b/wgengine/magicsock/derp.go
+--- a/wgengine/magicsock/derp.go
++++ b/wgengine/magicsock/derp.go
+@@ -94,8 +94,9 @@ type activeDerp struct {
+ 	// lastWrite is the time of the last request for its write
+ 	// channel (currently even if there was no write).
+ 	// It is always non-nil and initialized to a non-zero Time.
+-	lastWrite  *time.Time
+-	createTime time.Time
++	lastWrite     *time.Time
++	createTime    time.Time
++	protocolReady bool
+ }
+ 
+ var pickDERPFallbackForTests func() int
+@@ -499,6 +500,7 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
+ 	for {
+ 		msg, connGen, err := dc.RecvDetail()
+ 		if err != nil {
++			c.setDERPProtocolReady(regionID, dc, false)
+ 			c.health.SetDERPRegionConnectedState(regionID, false)
+ 			// Forget that all these peers have routes.
+ 			for peer := range peerPresent {
+@@ -558,6 +560,7 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
+ 
+ 		switch m := msg.(type) {
+ 		case derp.ServerInfoMessage:
++			c.setDERPProtocolReady(regionID, dc, true)
+ 			c.health.SetDERPRegionConnectedState(regionID, true)
+ 			c.health.SetDERPRegionHealth(regionID, "") // until declared otherwise
+ 			c.logf("magicsock: derp-%d connected; connGen=%v", regionID, connGen)
+@@ -949,6 +952,102 @@ func (c *Conn) scheduleCleanStaleDerpLocked() {
+ 	}
+ }
+ 
++// setDERPProtocolReady records whether the current activeDerp generation has
++// received its DERP ServerInfo frame. The client identity check prevents a
++// reader from an older activeDerp generation from mutating its replacement.
++func (c *Conn) setDERPProtocolReady(regionID int, dc *derphttp.Client, ready bool) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	active, ok := c.activeDerp[regionID]
++	if !ok || active.c != dc {
++		return
++	}
++	active.protocolReady = ready
++	c.activeDerp[regionID] = active
++}
++
++// XDialDERPConnectionDiagnostics is a bounded snapshot of DERP lifecycle
++// state. It contains no region IDs, endpoints or public keys.
++type XDialDERPConnectionDiagnostics struct {
++	ClientCount        int
++	ProtocolReadyCount int
++	HomeConfigured     bool
++	HomeState          string
++	HomeKeyRelation    string
++}
++
++func xdialDERPHomeState(
++	transportConnected bool,
++	closed bool,
++	protocolReady bool,
++) string {
++	switch {
++	case closed:
++		return "closed"
++	case protocolReady:
++		return "protocol_ready"
++	case transportConnected:
++		return "transport_connected"
++	default:
++		return "connecting"
++	}
++}
++
++// XDialPreferredDERPRelation compares a reported PreferredDERP with the
++// current magicsock home without exposing either identifier.
++func (c *Conn) XDialPreferredDERPRelation(preferredDERP int) string {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if preferredDERP == 0 || c.myDerp == 0 {
++		return "unknown"
++	}
++	if preferredDERP == c.myDerp {
++		return "match"
++	}
++	return "mismatch"
++}
++
++// XDialDERPConnectionState distinguishes activeDerp client objects from
++// sessions whose current reader has received the DERP ServerInfo frame. The
++// client identity check in setDERPProtocolReady prevents a stale reader from
++// making a replacement look ready.
++func (c *Conn) XDialDERPConnectionState() XDialDERPConnectionDiagnostics {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	result := XDialDERPConnectionDiagnostics{
++		ClientCount:     len(c.activeDerp),
++		HomeConfigured:  c.myDerp != 0,
++		HomeState:       "unconfigured",
++		HomeKeyRelation: "unknown",
++	}
++	if c.myDerp != 0 {
++		result.HomeState = "not_created"
++	}
++	for regionID, active := range c.activeDerp {
++		if active.c == nil {
++			continue
++		}
++		transportConnected, closed := active.c.XDialConnectionState()
++		if active.protocolReady {
++			result.ProtocolReadyCount++
++		}
++		if regionID != c.myDerp {
++			continue
++		}
++		result.HomeState = xdialDERPHomeState(transportConnected, closed, active.protocolReady)
++		if !c.privateKey.IsZero() {
++			if active.c.SelfPublicKey().Compare(c.privateKey.Public()) == 0 {
++				result.HomeKeyRelation = "match"
++			} else {
++				result.HomeKeyRelation = "mismatch"
++			}
++		}
++	}
++	return result
++}
++
+ // DERPs reports the number of active DERP connections.
+ func (c *Conn) DERPs() int {
+ 	c.mu.Lock()
+diff --git a/wgengine/magicsock/xdial_diagnostics_test.go b/wgengine/magicsock/xdial_diagnostics_test.go
+new file mode 100644
+--- /dev/null
++++ b/wgengine/magicsock/xdial_diagnostics_test.go
+@@ -0,0 +1,141 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"testing"
++	"time"
++
++	"github.com/sagernet/tailscale/derp/derphttp"
++	"github.com/sagernet/tailscale/net/netmon"
++	"github.com/sagernet/tailscale/tailcfg"
++	"github.com/sagernet/tailscale/types/key"
++)
++
++func newXDialTestDERPClient(t *testing.T, privateKey key.NodePrivate) *derphttp.Client {
++	t.Helper()
++	netMon := netmon.NewStatic()
++	t.Cleanup(func() { _ = netMon.Close() })
++	return derphttp.NewRegionClient(
++		privateKey,
++		t.Logf,
++		netMon,
++		func() *tailcfg.DERPRegion { return nil },
++	)
++}
++
++func TestXDialDERPProtocolReadyTracksReconnect(t *testing.T) {
++	c := newConn(t.Logf)
++	privateKey := key.NewNode()
++	client := newXDialTestDERPClient(t, privateKey)
++	c.mu.Lock()
++	c.myDerp = 7
++	c.privateKey = privateKey
++	c.activeDerp = map[int]activeDerp{
++		7: {c: client, createTime: time.Now()},
++	}
++	c.mu.Unlock()
++
++	c.setDERPProtocolReady(7, client, true)
++	if got := c.XDialDERPConnectionState(); got.ProtocolReadyCount != 1 ||
++		got.HomeState != "protocol_ready" {
++		t.Fatalf("ServerInfo did not mark protocol ready: %+v", got)
++	}
++
++	c.setDERPProtocolReady(7, client, false)
++	if got := c.XDialDERPConnectionState(); got.ProtocolReadyCount != 0 ||
++		got.HomeState == "protocol_ready" {
++		t.Fatalf("receive error did not clear protocol readiness: %+v", got)
++	}
++
++	c.setDERPProtocolReady(7, client, true)
++	if got := c.XDialDERPConnectionState(); got.ProtocolReadyCount != 1 ||
++		got.HomeState != "protocol_ready" {
++		t.Fatalf("reconnected ServerInfo did not restore readiness: %+v", got)
++	}
++}
++
++func TestXDialDERPProtocolReadyRejectsStaleClient(t *testing.T) {
++	c := newConn(t.Logf)
++	privateKey := key.NewNode()
++	stale := newXDialTestDERPClient(t, privateKey)
++	current := newXDialTestDERPClient(t, privateKey)
++	c.mu.Lock()
++	c.myDerp = 7
++	c.privateKey = privateKey
++	c.activeDerp = map[int]activeDerp{
++		7: {c: current, createTime: time.Now()},
++	}
++	c.mu.Unlock()
++
++	c.setDERPProtocolReady(7, stale, true)
++	if got := c.XDialDERPConnectionState(); got.ProtocolReadyCount != 0 {
++		t.Fatalf("stale reader marked replacement ready: %+v", got)
++	}
++
++	c.setDERPProtocolReady(7, current, true)
++	c.setDERPProtocolReady(7, stale, false)
++	if got := c.XDialDERPConnectionState(); got.ProtocolReadyCount != 1 ||
++		got.HomeState != "protocol_ready" {
++		t.Fatalf("stale reader cleared replacement readiness: %+v", got)
++	}
++}
++
++func TestXDialDERPHomeState(t *testing.T) {
++	tests := []struct {
++		transportConnected bool
++		closed             bool
++		ready              bool
++		want               string
++	}{
++		{false, false, false, "connecting"},
++		{true, false, false, "transport_connected"},
++		{true, false, true, "protocol_ready"},
++		{true, true, true, "closed"},
++	}
++	for _, test := range tests {
++		if got := xdialDERPHomeState(test.transportConnected, test.closed, test.ready); got != test.want {
++			t.Fatalf("state %+v: got %q, want %q", test, got, test.want)
++		}
++	}
++}
++
++func TestXDialDERPConnectionDiagnosticsKeyRelation(t *testing.T) {
++	c := newConn(t.Logf)
++	c.mu.Lock()
++	c.myDerp = 7
++	c.mu.Unlock()
++
++	got := c.XDialDERPConnectionState()
++	if !got.HomeConfigured || got.HomeState != "not_created" ||
++		got.HomeKeyRelation != "unknown" {
++		t.Fatalf("home without client = %+v", got)
++	}
++
++	clientKey := key.NewNode()
++	client := newXDialTestDERPClient(t, clientKey)
++	c.mu.Lock()
++	c.privateKey = clientKey
++	c.activeDerp = map[int]activeDerp{
++		7: {c: client, createTime: time.Now()},
++	}
++	c.mu.Unlock()
++	if got := c.XDialDERPConnectionState(); got.HomeKeyRelation != "match" {
++		t.Fatalf("matching key relation = %+v", got)
++	}
++
++	c.mu.Lock()
++	c.privateKey = key.NewNode()
++	c.mu.Unlock()
++	if got := c.XDialDERPConnectionState(); got.HomeKeyRelation != "mismatch" {
++		t.Fatalf("mismatching key relation = %+v", got)
++	}
++
++	c.mu.Lock()
++	c.privateKey = key.NodePrivate{}
++	c.mu.Unlock()
++	if got := c.XDialDERPConnectionState(); got.HomeKeyRelation != "unknown" {
++		t.Fatalf("unknown key relation = %+v", got)
++	}
++}
+-- 
+2.50.1

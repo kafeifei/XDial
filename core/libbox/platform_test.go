@@ -4,6 +4,8 @@ package libbox
 
 import (
 	"encoding/json"
+	"net"
+	"reflect"
 	"testing"
 
 	tun "github.com/sagernet/sing-tun"
@@ -37,6 +39,21 @@ func TestPlatformInterfaceMonitorRejectsMissingDefaultInterface(t *testing.T) {
 	monitor := &platformInterfaceMonitor{platform: platform}
 	if err := monitor.Start(); err == nil {
 		t.Fatal("monitor started without a default interface")
+	}
+}
+
+func TestUnderlayInterfaceBindingIsExplicit(t *testing.T) {
+	library := New(nil)
+	if library.platform.UsePlatformAutoDetectInterfaceControl() {
+		t.Fatal("Packet Tunnel/setup default unexpectedly binds endpoint sockets")
+	}
+	library.SetUnderlayInterfaceBinding(true)
+	if !library.platform.UsePlatformAutoDetectInterfaceControl() {
+		t.Fatal("Transparent Proxy binding was not enabled")
+	}
+	library.SetUnderlayInterfaceBinding(false)
+	if library.platform.UsePlatformAutoDetectInterfaceControl() {
+		t.Fatal("Underlay binding was not disabled")
 	}
 }
 
@@ -88,6 +105,55 @@ func TestPlatformNetworkInterfacesPublishesCompleteNWPathSnapshot(t *testing.T) 
 	monitor := &platformInterfaceMonitor{platform: platform}
 	if current := monitor.DefaultInterface(); current == nil || current.Name != "utun13" || current.Index != 21 {
 		t.Fatalf("lower VPN was not accepted as the default Underlay: %#v", current)
+	}
+}
+
+func TestPlatformNetworkInterfacesEnrichesSystemMetadata(t *testing.T) {
+	systemInterfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("list system interfaces: %v", err)
+	}
+	var expected control.Interface
+	for _, systemInterface := range systemInterfaces {
+		candidate, candidateErr := control.InterfaceFromNet(systemInterface)
+		if candidateErr == nil && candidate.Name != "" && candidate.Index > 0 {
+			expected = candidate
+			break
+		}
+	}
+	if expected.Name == "" {
+		t.Skip("no readable system interface")
+	}
+
+	platform := &xdPlatformInterface{}
+	if err := platform.setNetworkInterfaces([]platformNetworkInterfaceSnapshot{
+		{Name: expected.Name, Index: expected.Index, Type: "other"},
+	}); err != nil {
+		t.Fatalf("set platform interfaces: %v", err)
+	}
+	platform.setDefaultInterface(expected.Name, expected.Index)
+
+	interfaces, err := platform.NetworkInterfaces()
+	if err != nil {
+		t.Fatalf("read platform interfaces: %v", err)
+	}
+	if len(interfaces) != 1 {
+		t.Fatalf("unexpected platform interfaces: %#v", interfaces)
+	}
+	actual := interfaces[0].Interface
+	if actual.MTU != expected.MTU ||
+		actual.Flags != expected.Flags ||
+		!reflect.DeepEqual(actual.HardwareAddr, expected.HardwareAddr) ||
+		!reflect.DeepEqual(actual.Addresses, expected.Addresses) {
+		t.Fatalf("system interface metadata was not preserved: got %#v, want %#v", actual, expected)
+	}
+	monitor := &platformInterfaceMonitor{platform: platform}
+	defaultInterface := monitor.DefaultInterface()
+	if defaultInterface == nil ||
+		defaultInterface.MTU != expected.MTU ||
+		defaultInterface.Flags != expected.Flags ||
+		!reflect.DeepEqual(defaultInterface.Addresses, expected.Addresses) {
+		t.Fatalf("default interface metadata was not preserved: got %#v, want %#v", defaultInterface, expected)
 	}
 }
 

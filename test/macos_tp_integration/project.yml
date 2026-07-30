@@ -1,0 +1,84 @@
+name: XDialTPIntegration
+options:
+  deploymentTarget:
+    macOS: "15.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: UVZM439VGU
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+
+targets:
+  XDialTPIntegrationExtension:
+    type: system-extension
+    platform: macOS
+    sources:
+      - ../../macos/TransparentProxyExtension
+    info:
+      path: Extension/Info.plist
+      properties:
+        CFBundleDisplayName: XDial Transparent Proxy Integration
+        CFBundlePackageType: SYSX
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "18"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        NetworkExtension:
+          NEProviderClasses:
+            com.apple.networkextension.app-proxy: "$(PRODUCT_MODULE_NAME).TransparentProxyProvider"
+        NSSystemExtensionUsageDescription: 验证 XDial 正式 Transparent Proxy 数据面。
+    entitlements:
+      path: Extension/XDialTPIntegrationExtension.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - app-proxy-provider
+        com.apple.security.application-groups:
+          - UVZM439VGU.com.kafeifei.xdial.network
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
+        PRODUCT_NAME: com.kafeifei.xdial.ne-probe.extension
+        ENABLE_APP_SANDBOX: YES
+        CODE_SIGN_ENTITLEMENTS: Extension/XDialTPIntegrationExtension.entitlements
+    dependencies:
+      - framework: ../../build/frameworks/macos/Libbox.xcframework
+        embed: false
+      - sdk: libresolv.tbd
+      - sdk: NetworkExtension.framework
+      - sdk: Security.framework
+
+  XDialTPIntegration:
+    type: application
+    platform: macOS
+    sources:
+      - Host
+    info:
+      path: Host/Info.plist
+      properties:
+        CFBundleDisplayName: XDial TP Integration
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "18"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        LSUIElement: true
+        NSSystemExtensionUsageDescription: 验证 XDial 正式 Transparent Proxy 数据面。
+    entitlements:
+      path: Host/XDialTPIntegration.entitlements
+      properties:
+        com.apple.developer.system-extension.install: true
+        com.apple.developer.networking.networkextension:
+          - app-proxy-provider
+        com.apple.security.application-groups:
+          - UVZM439VGU.com.kafeifei.xdial.network
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe
+        PRODUCT_NAME: XDialTPIntegration
+        CODE_SIGN_ENTITLEMENTS: Host/XDialTPIntegration.entitlements
+    dependencies:
+      - target: XDialTPIntegrationExtension
+        embed: true
+        codeSign: true
+      - sdk: NetworkExtension.framework
+      - sdk: SystemExtensions.framework

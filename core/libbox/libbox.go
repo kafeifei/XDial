@@ -62,6 +62,14 @@ type vpnClient interface {
 	Disconnect()
 }
 
+// DetectUnderlayInterface 返回宿主操作系统当前默认路由已经选定的接口。
+// 调用方只能把这个结果与同一时刻的完整接口快照一起转交给 sing-box，不能按名称、
+// 类型或产品重写。放在 libbox 门面是为了让 macOS App 与旧桌面引擎复用同一份
+// route(8) 解析和存活校验，而不是在 Swift 再复制一套。
+func DetectUnderlayInterface() (string, error) {
+	return engine.DetectUnderlayInterface(context.Background())
+}
+
 // 错误分类码:通过 Callback.OnError 传给 Swift 侧,让上层能按大类做区分处理
 // (比如"配置错" vs "网络错"给不同的用户提示),而不必解析 Go error 字符串。
 // 刻意只分几大类,不做细粒度设计。
@@ -77,21 +85,30 @@ const (
 )
 
 type Libbox struct {
-	mu           sync.Mutex
-	cb           Callback
-	vpn          vpnClient
-	bridge       *engine.VPNBridge
-	box          *box.Box
-	running      bool
-	platform     *xdPlatformInterface
-	lastError    string
-	dnsJSON      string
-	session      *session.ConnSession
-	generation   uint64
-	cleaning     bool
-	runtimeCtx   context.Context
-	routingProbe *routingProbeTracker
-	stateLocks   []*os.File
+	mu                       sync.Mutex
+	cb                       Callback
+	vpn                      vpnClient
+	bridge                   *engine.VPNBridge
+	box                      *box.Box
+	running                  bool
+	platform                 *xdPlatformInterface
+	lastError                string
+	dnsJSON                  string
+	session                  *session.ConnSession
+	generation               uint64
+	cleaning                 bool
+	runtimeCtx               context.Context
+	runtimeCancel            context.CancelFunc
+	runtimeUsers             sync.WaitGroup
+	debugRoutingProbeEnabled bool
+	routingProbe             *routingProbeTracker
+	stateLocks               []*os.File
+	probeOutboundAddressFunc func(
+		context.Context,
+		adapter.Outbound,
+		outboundAddressProbeEndpoint,
+		int,
+	) (string, error)
 }
 
 func New(cb Callback) *Libbox {
@@ -121,6 +138,27 @@ func (l *Libbox) SetTunFD(fd int) {
 // RegisterMyInterface 明确登记的 XDial 自身接口。
 func (l *Libbox) SetDefaultInterface(name string, index int) {
 	l.platform.setDefaultInterface(name, index)
+}
+
+// SetUnderlayInterfaceBinding controls whether sockets opened internally by
+// protocol endpoints must be bound to the default Underlay interface.
+//
+// Packet Tunnel providers leave this disabled because NECP already excludes
+// provider-owned sockets from their own tunnel. Transparent Proxy providers do
+// not have that guarantee while startProxy is still in progress: an unbound
+// Tailscale DERP/UDP socket can be captured by the proxy that is creating it.
+func (l *Libbox) SetUnderlayInterfaceBinding(enabled bool) {
+	l.platform.setUnderlayInterfaceBinding(enabled)
+}
+
+// SetDebugRoutingProbeEnabled controls whether the next Start installs the
+// routing tracker in sing-box's flow hot path. It is deliberately disabled by
+// default: only a Debug host may opt in before Start, and changing it while a
+// generation is running never mutates that generation.
+func (l *Libbox) SetDebugRoutingProbeEnabled(enabled bool) {
+	l.mu.Lock()
+	l.debugRoutingProbeEnabled = enabled
+	l.mu.Unlock()
 }
 
 // SetNetworkInterfaces 接收 NWPath.availableInterfaces 的完整快照。
@@ -287,20 +325,20 @@ var outboundAddressProbeEndpoints = []outboundAddressProbeEndpoint{
 		destination: M.ParseSocksaddrHostPortStr("checkip.amazonaws.com", "443"),
 	},
 	{
-		url:         "http://1.1.1.1/cdn-cgi/trace",
-		destination: M.ParseSocksaddrHostPortStr("1.1.1.1", "80"),
+		url:         "https://1.1.1.1/cdn-cgi/trace",
+		destination: M.ParseSocksaddrHostPortStr("1.1.1.1", "443"),
 	},
 }
 
 // ProbeOutboundIP fetches a public address through one exact running outbound.
 // Both endpoints are fixed so provider messages cannot turn this into an
-// arbitrary network fetch primitive. The HTTPS endpoint is the primary
-// reachability/address assertion; the numeric HTTP endpoint keeps the probe
+// arbitrary network fetch primitive. The named HTTPS endpoint is the primary
+// reachability/address assertion; the numeric HTTPS endpoint keeps the probe
 // usable when an enterprise tunnel DNS server cannot resolve public names.
 func (l *Libbox) ProbeOutboundIP(outboundTag string, timeoutMS int) (string, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if !l.running || l.box == nil || l.runtimeCtx == nil {
+		l.mu.Unlock()
 		return "", fmt.Errorf("connection is not running")
 	}
 	if timeoutMS < 500 {
@@ -311,20 +349,54 @@ func (l *Libbox) ProbeOutboundIP(outboundTag string, timeoutMS int) (string, err
 	}
 	outbound, loaded := l.box.Outbound().Outbound(outboundTag)
 	if !loaded {
+		l.mu.Unlock()
 		return "", fmt.Errorf("probe outbound is unavailable")
 	}
-
 	ctx, cancel := context.WithTimeout(l.runtimeCtx, time.Duration(timeoutMS)*time.Millisecond)
+	generation := l.generation
+	probe := l.probeOutboundAddressFunc
+	if probe == nil {
+		probe = probeOutboundAddress
+	}
+	// adapter.Outbound is a bare Dialer and does not grant an external caller
+	// a lifetime lease. Box.Close closes its outbound manager and endpoint
+	// implementations, so cleanup must wait until this borrowed outbound is
+	// no longer in use. Add happens under l.mu while the generation is still
+	// running; detach flips running/cleaning under the same lock before Wait.
+	l.runtimeUsers.Add(1)
+	l.mu.Unlock()
+	defer l.runtimeUsers.Done()
 	defer cancel()
+
 	var probeErrors []string
 	for index, endpoint := range outboundAddressProbeEndpoints {
-		address, err := probeOutboundAddress(ctx, outbound, endpoint, len(outboundAddressProbeEndpoints)-index)
+		address, err := probe(
+			ctx,
+			outbound,
+			endpoint,
+			len(outboundAddressProbeEndpoints)-index,
+		)
 		if err == nil {
+			if !l.probeGenerationIsCurrent(generation) {
+				return "", fmt.Errorf("connection changed during outbound address probe")
+			}
 			return address, nil
 		}
 		probeErrors = append(probeErrors, err.Error())
 	}
+	if !l.probeGenerationIsCurrent(generation) {
+		return "", fmt.Errorf("connection changed during outbound address probe")
+	}
 	return "", fmt.Errorf("outbound address probe failed: %s", strings.Join(probeErrors, "; "))
+}
+
+func (l *Libbox) probeGenerationIsCurrent(generation uint64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.running &&
+		!l.cleaning &&
+		l.generation == generation &&
+		l.runtimeCtx != nil
 }
 
 func probeOutboundAddress(
@@ -375,7 +447,10 @@ func probeOutboundAddress(
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("address probe returned an unexpected status")
+		return "", fmt.Errorf(
+			"address probe returned HTTP %d",
+			response.StatusCode,
+		)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 	if err != nil {
@@ -532,8 +607,7 @@ func (l *Libbox) StartStandalone(configJSON string) error {
 	if err != nil {
 		return fail(ErrCodeEngine, fmt.Errorf("construct sing-box: %w", err))
 	}
-	routingProbe := newRoutingProbeTracker()
-	instance.Router().AppendTracker(routingProbe)
+	routingProbe := l.installRoutingProbe(instance)
 	if err := instance.Start(); err != nil {
 		instance.Close()
 		return fail(ErrCodeEngine, fmt.Errorf("start sing-box: %w", err))
@@ -543,7 +617,7 @@ func (l *Libbox) StartStandalone(configJSON string) error {
 	l.box = instance
 	l.running = true
 	l.session = nil
-	l.runtimeCtx = ctx
+	l.runtimeCtx, l.runtimeCancel = context.WithCancel(ctx)
 	l.routingProbe = routingProbe
 	l.stateLocks = stateLocks
 	keepStateLocks = true
@@ -663,8 +737,7 @@ func (l *Libbox) start(server, dialAddress, username, password string, allowInse
 		return fail(ErrCodeEngine, fmt.Errorf("construct sing-box: %w", err))
 	}
 
-	routingProbe := newRoutingProbeTracker()
-	instance.Router().AppendTracker(routingProbe)
+	routingProbe := l.installRoutingProbe(instance)
 	if err := instance.Start(); err != nil {
 		instance.Close()
 		bridge.Close()
@@ -676,7 +749,7 @@ func (l *Libbox) start(server, dialAddress, username, password string, allowInse
 	l.box = instance
 	l.running = true
 	l.session = cSess
-	l.runtimeCtx = ctx
+	l.runtimeCtx, l.runtimeCancel = context.WithCancel(ctx)
 	l.routingProbe = routingProbe
 	l.stateLocks = stateLocks
 	keepStateLocks = true
@@ -699,6 +772,15 @@ func startVPNConfig(server, dialAddress, username, password string, allowInsecur
 		Password:      password,
 		AllowInsecure: allowInsecure,
 	}
+}
+
+func (l *Libbox) installRoutingProbe(instance *box.Box) *routingProbeTracker {
+	if !l.debugRoutingProbeEnabled {
+		return nil
+	}
+	tracker := newRoutingProbeTracker()
+	instance.Router().AppendTracker(tracker)
+	return tracker
 }
 
 func (l *Libbox) Stop() error {
@@ -759,7 +841,11 @@ func (l *Libbox) detachRunningLocked() (*box.Box, *engine.VPNBridge, []*os.File)
 	l.bridge = nil
 	l.stateLocks = nil
 	l.session = nil
+	if l.runtimeCancel != nil {
+		l.runtimeCancel()
+	}
 	l.runtimeCtx = nil
+	l.runtimeCancel = nil
 	l.routingProbe = nil
 	l.running = false
 	l.dnsJSON = ""
@@ -773,6 +859,11 @@ func (l *Libbox) closeDetached(
 	bridge *engine.VPNBridge,
 	stateLocks []*os.File,
 ) {
+	// detachRunningLocked cancels runtimeCtx before reaching this wait. A
+	// well-behaved probe therefore exits promptly, while this barrier prevents
+	// Box.Close (and VPNBridge.Close for the vpn outbound) from racing the
+	// borrowed adapter.Outbound.
+	l.runtimeUsers.Wait()
 	if instance != nil {
 		instance.Close()
 	}

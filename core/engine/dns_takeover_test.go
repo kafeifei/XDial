@@ -1749,7 +1749,9 @@ func TestEngineDoesNotTakeoverDNSWhenDisallowed(t *testing.T) {
 	takeover := newTestTakeover(t, runner)
 
 	eng := &Engine{status: StatusConnected, dns: takeover}
-	eng.takeoverDNSLocked()
+	if err := eng.takeoverDNSLocked(); err != nil {
+		t.Fatalf("disabled takeover must be a no-op: %v", err)
+	}
 
 	if runner.callCount() != 0 {
 		t.Fatalf("disallowed takeover must run nothing, got %v", runner.calls)
@@ -1768,13 +1770,40 @@ func TestEngineTakesOverDNSWhenAllowed(t *testing.T) {
 
 	eng := &Engine{status: StatusConnected, dns: takeover}
 	eng.AllowSystemDNSTakeover(true)
-	eng.takeoverDNSLocked()
+	if err := eng.takeoverDNSLocked(); err != nil {
+		t.Fatalf("enabled takeover: %v", err)
+	}
 
 	assertSetCalls(t, runner, "Wi-Fi "+dnsTakeoverAddress)
 	if !takeover.active {
 		t.Fatal("allowed takeover must be active")
 	}
 	assertHasState(t, takeover)
+}
+
+// daemon 承诺的是完整密封的数据面。路由优先级被下层全局 VPN 抢走时，DNS 查询无法
+// 进入 sing-box；此时继续显示 Connected 会让所有域名规则看似存在、实际不生效。
+func TestEngineRejectsConnectionReadinessWhenDNSTakeoverFails(t *testing.T) {
+	runner := newFakeDNSRunner("Wi-Fi")
+	runner.current["Wi-Fi"] = "1.1.1.1"
+	runner.routeIface = "utun13"
+	runner.routeDestination = "default"
+	runner.routeGateway = ""
+	takeover := newTestTakeover(t, runner)
+	takeover.probeWindow = 30 * time.Millisecond
+	takeover.probeInterval = 5 * time.Millisecond
+
+	eng := &Engine{status: StatusConnecting, dns: takeover}
+	eng.AllowSystemDNSTakeover(true)
+	err := eng.takeoverDNSLocked()
+	if err == nil || !strings.Contains(err.Error(), "已取消连接以避免错误分流") {
+		t.Fatalf("DNS outside the tun must reject readiness, got %v", err)
+	}
+	if takeover.active {
+		t.Fatal("failed readiness must not leave DNS takeover active")
+	}
+	assertSetCalls(t, runner)
+	assertNoState(t, takeover)
 }
 
 // 顺序断言：cleanupLocked 必须在停 sing-box 之前恢复系统 DNS，否则会留下一个

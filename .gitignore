@@ -11,3 +11,4 @@ macos/.build/
 /xdial
 appletv/XDialTV.xcodeproj/
 ios/XDialIOS.xcodeproj/
+macos/XDial.xcodeproj/

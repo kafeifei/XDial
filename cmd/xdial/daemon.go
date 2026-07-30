@@ -10,11 +10,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	"github.com/kafeifei/xdial/core/config"
 	"github.com/kafeifei/xdial/core/engine"
 	"github.com/kafeifei/xdial/core/subscription"
+	"github.com/kafeifei/xdial/core/tailscalesetup"
 )
 
 // daemonExeHash 是本进程二进制在启动时刻的内容 hash。必须启动时算一次缓存住：
@@ -97,6 +99,22 @@ func runDaemon(socketPath string) {
 	clients := NewClientSet()
 	cb := &daemonCallback{clients: clients}
 	eng := engine.New(basePath, statePath, cb)
+	networkStatePath := networkExtensionStatePath(statePath)
+	if err := tailscalesetup.PreparePersistentState(
+		statePath,
+		networkStatePath,
+	); err != nil {
+		slog.Error(
+			"prepare shared Tailscale state failed",
+			"path",
+			networkStatePath,
+			"err",
+			err,
+		)
+		os.Exit(1)
+	}
+	tailscaleSetup := tailscalesetup.New(networkStatePath)
+	var networkRuntimeMu sync.Mutex
 	// daemon 是唯一有资格接管系统 DNS 的宿主：它由 launchd KeepAlive 托管，被
 	// SIGKILL 后会被拉起并立刻跑下面的 RestoreLeftoverDNS 自愈。
 	eng.AllowSystemDNSTakeover(true)
@@ -144,7 +162,7 @@ func runDaemon(socketPath string) {
 				conn.Close()
 				continue
 			}
-			go handleClient(conn, eng, clients)
+			go handleClient(conn, eng, tailscaleSetup, &networkRuntimeMu, clients)
 		}
 	}()
 
@@ -159,7 +177,10 @@ func runDaemon(socketPath string) {
 	// 停在"一半服务已恢复、另一半刚被改动"的中间态）。恢复只成功一部分的场景交给启动
 	// 自愈：状态文件还在（restoreLocked 会把已恢复的条目剔掉、只留没救回来的），
 	// launchd KeepAlive 把 daemon 拉起来后第一件事就是 RestoreLeftoverDNS。
+	networkRuntimeMu.Lock()
+	_ = tailscaleSetup.Stop()
 	eng.Stop()
+	networkRuntimeMu.Unlock()
 	// 后台恢复重试到这里没有意义了：要么已经恢复成功，要么状态文件还在、下次启动
 	// 的 RestoreLeftoverDNS 会接着救。
 	eng.Close()
@@ -176,7 +197,13 @@ func isAlreadyRunning(socketPath string) bool {
 	return true
 }
 
-func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
+func handleClient(
+	conn net.Conn,
+	eng *engine.Engine,
+	tailscaleSetup *tailscalesetup.Manager,
+	networkRuntimeMu *sync.Mutex,
+	clients *ClientSet,
+) {
 	client := NewClient(conn)
 	clients.Add(client)
 	defer func() {
@@ -195,14 +222,31 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 			profile, err := config.ParseProfile([]byte(req.Profile))
 			if err != nil {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
-			} else if err := eng.Start(profile); err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+				continue
+			}
+			networkRuntimeMu.Lock()
+			setupErr := tailscaleSetup.Stop()
+			var startErr error
+			if setupErr == nil {
+				startErr = preflightTailscale(profile, req.Profile, tailscaleSetup)
+			}
+			if setupErr == nil && startErr == nil {
+				startErr = eng.Start(profile)
+			}
+			networkRuntimeMu.Unlock()
+			if setupErr != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: setupErr.Error()})
+			} else if startErr != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: startErr.Error()})
 			} else {
 				client.SendResponse(Response{ID: req.ID, OK: true})
 			}
 
 		case "stop":
-			if err := eng.Stop(); err != nil {
+			networkRuntimeMu.Lock()
+			err := eng.Stop()
+			networkRuntimeMu.Unlock()
+			if err != nil {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
 			} else {
 				client.SendResponse(Response{ID: req.ID, OK: true})
@@ -223,6 +267,22 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 			}{Version: version, ExeSHA256: daemonExeHash, PID: os.Getpid()})
 			client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
 
+		case "connection-report":
+			data, err := readProviderConnectionReport()
+			if err != nil {
+				client.SendResponse(Response{
+					ID:      req.ID,
+					OK:      false,
+					Message: err.Error(),
+				})
+			} else {
+				client.SendResponse(Response{
+					ID:   req.ID,
+					OK:   true,
+					Data: string(data),
+				})
+			}
+
 		case "respawn":
 			// 仅在引擎空闲时允许：re-exec 后 killOrphanSingBox 会扫掉数据面，
 			// 连接中 respawn 等于静默断流。app 侧本就只在断开时发，这里兜底。
@@ -233,8 +293,15 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 				client.SendResponse(Response{ID: req.ID, OK: false, Message: "engine busy: " + st.Status})
 				continue
 			}
+			networkRuntimeMu.Lock()
+			if err := tailscaleSetup.Stop(); err != nil {
+				networkRuntimeMu.Unlock()
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+				continue
+			}
 			client.SendResponse(Response{ID: req.ID, OK: true})
 			slog.Info("respawn requested")
+			networkRuntimeMu.Unlock()
 			respawnDaemon()
 
 		case "parse-sub":
@@ -247,8 +314,137 @@ func handleClient(conn net.Conn, eng *engine.Engine, clients *ClientSet) {
 				client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
 			}
 
+		case "runtime-lines":
+			profile, err := config.ParseProfile([]byte(req.Profile))
+			if err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
+			} else {
+				data, _ := json.Marshal(config.BuildLineRuntimeCatalog(profile))
+				client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
+			}
+
+		case "tailscale-prepare":
+			networkRuntimeMu.Lock()
+			if status := engineStatus(eng); status != "disconnected" {
+				networkRuntimeMu.Unlock()
+				req.AuthKey = ""
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: "disconnect XDial before configuring Tailscale"})
+				continue
+			}
+			data, err := tailscaleSetup.Prepare(req.Profile, req.LineID, req.AuthKey)
+			req.AuthKey = ""
+			networkRuntimeMu.Unlock()
+			if err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+			} else {
+				client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
+			}
+
+		case "tailscale-status":
+			networkRuntimeMu.Lock()
+			data, err := tailscaleSetup.Status(req.LineID)
+			networkRuntimeMu.Unlock()
+			if err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+			} else {
+				client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
+			}
+
+		case "tailscale-login":
+			networkRuntimeMu.Lock()
+			data, err := tailscaleSetup.BeginLogin(req.LineID)
+			networkRuntimeMu.Unlock()
+			if err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+			} else {
+				client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
+			}
+
+		case "tailscale-logout":
+			networkRuntimeMu.Lock()
+			data, err := tailscaleSetup.Logout(req.LineID)
+			networkRuntimeMu.Unlock()
+			if err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+			} else {
+				client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
+			}
+
+		case "tailscale-stop-setup":
+			networkRuntimeMu.Lock()
+			err := tailscaleSetup.StopLine(req.LineID)
+			networkRuntimeMu.Unlock()
+			if err != nil {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+			} else {
+				client.SendResponse(Response{ID: req.ID, OK: true})
+			}
+
 		default:
 			client.SendResponse(Response{ID: req.ID, OK: false, Message: "unknown command: " + req.Cmd})
 		}
 	}
+}
+
+func engineStatus(eng *engine.Engine) string {
+	var status struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(eng.Status()), &status); err != nil {
+		return "unknown"
+	}
+	return status.Status
+}
+
+func preflightTailscale(
+	profile *config.Profile,
+	profileJSON string,
+	setup *tailscalesetup.Manager,
+) error {
+	line, err := config.ActiveTailscaleLine(profile)
+	if err != nil || line == nil {
+		return err
+	}
+	rawStatus, err := setup.Prepare(profileJSON, line.ID, "")
+	if err != nil {
+		return err
+	}
+	statusErr := validateTailscalePreflightStatus(line, rawStatus)
+	stopErr := setup.Stop()
+	if statusErr != nil {
+		return statusErr
+	}
+	if stopErr != nil {
+		return fmt.Errorf("Tailscale setup could not stop: %w", stopErr)
+	}
+	return nil
+}
+
+func validateTailscalePreflightStatus(line *config.Line, rawStatus string) error {
+	var status struct {
+		BackendState string `json:"backend_state"`
+		ExitNodes    []struct {
+			IP     string `json:"ip"`
+			Online bool   `json:"online"`
+		} `json:"exit_nodes"`
+	}
+	if err := json.Unmarshal([]byte(rawStatus), &status); err != nil {
+		return fmt.Errorf("Tailscale status is invalid")
+	}
+	if status.BackendState != "Running" {
+		return fmt.Errorf("Tailscale sign-in is required")
+	}
+	if line.TailscaleExitNode == "" {
+		return nil
+	}
+	for _, node := range status.ExitNodes {
+		if node.IP != line.TailscaleExitNode {
+			continue
+		}
+		if !node.Online {
+			return fmt.Errorf("selected Tailscale exit node is offline")
+		}
+		return nil
+	}
+	return fmt.Errorf("selected Tailscale exit node is unavailable")
 }
