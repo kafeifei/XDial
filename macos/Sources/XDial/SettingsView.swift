@@ -36,6 +36,9 @@ struct SettingsView: View {
             if state.configDirty {
                 dirtyBanner
             }
+            if !state.installation.isReady {
+                installationBanner
+            }
 
             Divider()
 
@@ -64,6 +67,31 @@ struct SettingsView: View {
             Button(state.tr("立即重连", "Reconnect now")) { state.reconnect() }
                 .controlSize(.small)
                 .disabled(state.isBusy || !state.canConnect)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.12))
+    }
+
+    private var installationBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "shield.lefthalf.filled")
+                .font(.caption)
+                .foregroundStyle(.orange)
+            Text(
+                state.installation.report.error?.message
+                    ?? state.tr(
+                        "XDial 正在完成首次安装",
+                        "XDial is completing first-run setup"
+                    )
+            )
+            .font(.caption)
+            .foregroundStyle(.orange)
+            Spacer()
+            Button(state.tr("查看进度", "View Progress")) {
+                state.installation.present()
+            }
+            .controlSize(.small)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
@@ -380,16 +408,27 @@ struct LineRow: View {
     @SwiftUI.Binding var line: Line
     var onDelete: () -> Void
     @State private var expanded = false
-    @State private var tailscaleStatus: TailscaleRuntimeStatus?
-    @State private var tailscaleError: String?
-    @State private var tailscaleBusy = false
     @State private var showAuthKey = false
     @State private var authKey = ""
-    @State private var pollGeneration = 0
     @EnvironmentObject var state: AppState
     @ObservedObject private var net = NetworkInfo.shared
 
     private var isLocked: Bool { line.type == "direct" }
+    private var tailscaleStatus: TailscaleRuntimeStatus? {
+        state.tailscaleConfigurationStatus(for: line.id)
+    }
+    private var tailscaleError: String? {
+        state.tailscaleConfigurationError(for: line.id)
+    }
+    private var tailscaleBusy: Bool {
+        state.isTailscaleConfigurationBusy(for: line.id)
+    }
+    private var tailscaleRuntimeConnected: Bool {
+        ConnectionReportRuntimeFacts.committedLines(
+            status: state.engine.status,
+            report: state.engine.connectionReport
+        )?.lineIDs.contains(line.id) == true
+    }
 
     var body: some View {
         CollapsibleCard(
@@ -465,6 +504,18 @@ struct LineRow: View {
         // 没有本次事务的有效观察时，只显示静态配置。
         switch line.type {
         case "tailscale":
+            if tailscaleRuntimeConnected {
+                if let status = tailscaleStatus,
+                   let node = status.exitNodes.first(where: {
+                       $0.ip == line.tailscaleExitNode
+                   }) {
+                    return state.tr(
+                        "已连接 · \(node.name)",
+                        "Connected · \(node.name)"
+                    )
+                }
+                return state.tr("已连接", "Connected")
+            }
             if let status = tailscaleStatus {
                 if status.isRunning {
                     if line.tailscaleExitNode.isEmpty {
@@ -509,6 +560,9 @@ struct LineRow: View {
     }
 
     private var tailscaleStatusColor: Color {
+        if tailscaleRuntimeConnected {
+            return .green
+        }
         if tailscaleStatus?.isRunning == true {
             if !line.tailscaleExitNode.isEmpty,
                tailscaleStatus?.exitNodes.first(where: { $0.ip == line.tailscaleExitNode })?.online != true {
@@ -523,6 +577,9 @@ struct LineRow: View {
     }
 
     private var tailscaleStatusLabel: String {
+        if tailscaleRuntimeConnected {
+            return state.tr("已连接", "Connected")
+        }
         if tailscaleStatus?.isRunning == true {
             return state.tr("已登录", "Signed in")
         }
@@ -584,6 +641,7 @@ struct LineRow: View {
                     }
                     .buttonStyle(.plain)
                     .help(state.tr("刷新状态", "Refresh status"))
+                    .disabled(state.engine.status != "disconnected")
                 }
             }
 
@@ -594,24 +652,25 @@ struct LineRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if let status = tailscaleStatus, status.isRunning {
+            if tailscaleRuntimeConnected {
+                tailscaleConnectedFields
+            } else if let status = tailscaleStatus, status.isRunning {
                 tailscaleSignedInFields(status)
             } else {
                 tailscaleSignInFields
             }
         }
         .padding(.top, 2)
-        .onChange(of: state.engine.status) { _, newStatus in
-            if newStatus == "disconnected" {
-                // 数据面连接会关闭隔离的 setup session。这里只清掉旧显示；
-                // 重新创建会话必须来自用户点击刷新、登录或 Auth Key。
-                tailscaleStatus = nil
-                tailscaleError = nil
-                tailscaleBusy = false
-            } else {
-                pollGeneration += 1
-            }
-        }
+    }
+
+    private var tailscaleConnectedFields: some View {
+        Text(state.tr(
+            "本次连接事务已确认 Tailscale 线路就绪。断开 XDial 后可以刷新登录与出口节点配置。",
+            "The current connection transaction confirmed this Tailscale line is ready. Disconnect XDial to refresh sign-in or exit-node configuration."
+        ))
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var tailscaleSignInFields: some View {
@@ -743,21 +802,22 @@ struct LineRow: View {
 
     private func prepareTailscale(authKey: String = "") {
         guard line.type == "tailscale", !tailscaleBusy else { return }
+        guard requireInstallation() else { return }
         guard state.engine.status == "disconnected" else {
-            tailscaleError = state.tr(
+            state.setTailscaleConfigurationError(state.tr(
                 "请先断开 XDial，再配置 Tailscale 登录状态。",
                 "Disconnect XDial before configuring Tailscale sign-in."
-            )
+            ), for: line.id)
             return
         }
-        tailscaleBusy = true
-        tailscaleError = nil
+        state.setTailscaleConfigurationBusy(true, for: line.id)
+        state.setTailscaleConfigurationError(nil, for: line.id)
         state.engine.prepareTailscale(
             profileJSON: state.buildProfileJSON(),
             lineID: line.id,
             authKey: authKey
         ) { result in
-            tailscaleBusy = false
+            state.setTailscaleConfigurationBusy(false, for: line.id)
             applyTailscaleResult(result)
         }
     }
@@ -770,8 +830,9 @@ struct LineRow: View {
 
     private func beginTailscaleLogin() {
         guard !tailscaleBusy else { return }
-        tailscaleBusy = true
-        tailscaleError = nil
+        guard requireInstallation() else { return }
+        state.setTailscaleConfigurationBusy(true, for: line.id)
+        state.setTailscaleConfigurationError(nil, for: line.id)
         // 设置窗口或 helper 重启后，旧卡片可能还在但 setup session 已经结束。
         // 登录按钮先重建会话，不能假设 onAppear 曾成功执行。
         state.engine.prepareTailscale(
@@ -780,16 +841,28 @@ struct LineRow: View {
         ) { result in
             switch result {
             case let .failure(error):
-                tailscaleBusy = false
-                tailscaleError = error.localizedDescription
+                state.setTailscaleConfigurationBusy(false, for: line.id)
+                state.setTailscaleConfigurationError(
+                    error.localizedDescription,
+                    for: line.id
+                )
             case let .success(status):
-                tailscaleStatus = status
+                state.setTailscaleConfigurationStatus(
+                    status,
+                    for: line.id
+                )
                 if status.isRunning {
-                    tailscaleBusy = false
+                    state.setTailscaleConfigurationBusy(
+                        false,
+                        for: line.id
+                    )
                     return
                 }
                 if let url = validatedAuthURL(status.authURL) {
-                    tailscaleBusy = false
+                    state.setTailscaleConfigurationBusy(
+                        false,
+                        for: line.id
+                    )
                     NSWorkspace.shared.open(url)
                     startTailscalePolling()
                     return
@@ -801,20 +874,26 @@ struct LineRow: View {
 
     private func requestTailscaleLoginURL() {
         state.engine.beginTailscaleLogin(lineID: line.id) { result in
-            tailscaleBusy = false
+            state.setTailscaleConfigurationBusy(false, for: line.id)
             switch result {
             case let .failure(error):
-                tailscaleError = error.localizedDescription
+                state.setTailscaleConfigurationError(
+                    error.localizedDescription,
+                    for: line.id
+                )
             case let .success(status):
-                tailscaleStatus = status
+                state.setTailscaleConfigurationStatus(
+                    status,
+                    for: line.id
+                )
                 if let url = validatedAuthURL(status.authURL) {
                     NSWorkspace.shared.open(url)
                     startTailscalePolling()
                 } else if !status.isRunning {
-                    tailscaleError = state.tr(
+                    state.setTailscaleConfigurationError(state.tr(
                         "没有取得有效的登录入口，请重试。",
                         "No valid sign-in URL was returned. Please try again."
-                    )
+                    ), for: line.id)
                 }
             }
         }
@@ -829,10 +908,11 @@ struct LineRow: View {
 
     private func logoutTailscale() {
         guard !tailscaleBusy else { return }
-        tailscaleBusy = true
-        tailscaleError = nil
+        guard requireInstallation() else { return }
+        state.setTailscaleConfigurationBusy(true, for: line.id)
+        state.setTailscaleConfigurationError(nil, for: line.id)
         state.engine.logoutTailscale(lineID: line.id) { result in
-            tailscaleBusy = false
+            state.setTailscaleConfigurationBusy(false, for: line.id)
             applyTailscaleResult(result)
         }
     }
@@ -840,11 +920,27 @@ struct LineRow: View {
     private func applyTailscaleResult(_ result: Result<TailscaleRuntimeStatus, Error>) {
         switch result {
         case .success(let status):
-            tailscaleStatus = status
-            tailscaleError = nil
+            state.setTailscaleConfigurationStatus(
+                status,
+                for: line.id
+            )
         case .failure(let error):
-            tailscaleError = error.localizedDescription
+            state.setTailscaleConfigurationError(
+                error.localizedDescription,
+                for: line.id
+            )
         }
+    }
+
+    private func requireInstallation() -> Bool {
+        guard state.requireInstallationReady() else {
+            state.setTailscaleConfigurationError(state.tr(
+                "XDial 的首次安装尚未完成；安装窗口会自动继续。",
+                "XDial first-run setup is not complete. The installation window will continue automatically."
+            ), for: line.id)
+            return false
+        }
+        return true
     }
 
     private func validatedAuthURL(_ raw: String) -> URL? {
@@ -857,31 +953,7 @@ struct LineRow: View {
     }
 
     private func startTailscalePolling() {
-        pollGeneration += 1
-        scheduleTailscalePoll(generation: pollGeneration, remaining: 90)
-    }
-
-    private func scheduleTailscalePoll(generation: Int, remaining: Int) {
-        guard remaining > 0 else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            guard expanded, generation == pollGeneration else { return }
-            state.engine.tailscaleStatus(lineID: line.id) { result in
-                guard expanded, generation == pollGeneration else { return }
-                switch result {
-                case .success(let status):
-                    tailscaleStatus = status
-                    tailscaleError = nil
-                    if !status.isRunning {
-                        scheduleTailscalePoll(
-                            generation: generation,
-                            remaining: remaining - 1
-                        )
-                    }
-                case .failure(let error):
-                    tailscaleError = error.localizedDescription
-                }
-            }
-        }
+        state.startTailscaleConfigurationPolling(lineID: line.id)
     }
 
     private var insecureToggle: some View {
@@ -954,6 +1026,7 @@ struct LineRow: View {
 
 struct RulesTab: View {
     @EnvironmentObject var state: AppState
+    private let presetCatalog = RuleSetPresetCatalog.load()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -969,10 +1042,25 @@ struct RulesTab: View {
             HStack {
                 Spacer()
                 Menu {
-                    Button("URL 规则") { add(type: "url") }
-                    Button("手动域名/IP") { add(type: "manual") }
+                    Menu(state.tr("URL 规则", "URL Rule")) {
+                        ForEach(presetCatalog.presets) { preset in
+                            Button(
+                                state.language == .zh
+                                    ? preset.nameZH
+                                    : preset.nameEN
+                            ) {
+                                add(preset: preset)
+                            }
+                        }
+                    }
+                    Button(state.tr("手动域名/IP", "Manual Domain/IP")) {
+                        addManual()
+                    }
                 } label: {
-                    Label("添加规则", systemImage: "plus")
+                    Label(
+                        state.tr("添加规则", "Add Rule"),
+                        systemImage: "plus"
+                    )
                 }
                 .menuStyle(.borderlessButton)
                 .padding(8)
@@ -980,10 +1068,28 @@ struct RulesTab: View {
         }
     }
 
-    private func add(type: String) {
+    private func add(preset: RuleSetPreset) {
         let id = "rule-" + String(UUID().uuidString.prefix(6))
-        let name = type == "url" ? "新 URL 规则" : "新手动规则"
-        state.profile.ruleSets.append(RuleSet(id: id, name: name, type: type))
+        state.profile.ruleSets.append(RuleSet(
+            id: id,
+            name: state.language == .zh
+                ? preset.nameZH
+                : preset.nameEN,
+            type: "url",
+            url: preset.url,
+            format: preset.format,
+            invert: preset.invert
+        ))
+        state.save()
+    }
+
+    private func addManual() {
+        let id = "rule-" + String(UUID().uuidString.prefix(6))
+        state.profile.ruleSets.append(RuleSet(
+            id: id,
+            name: state.tr("新手动规则", "New Manual Rule"),
+            type: "manual"
+        ))
         state.save()
     }
 
@@ -1063,6 +1169,15 @@ struct RuleSetRow: View {
                 .labelsHidden()
                 .onChange(of: rule.format) { _, _ in state.save() }
             }
+            Toggle(
+                state.tr(
+                    "反向匹配（匹配列表之外）",
+                    "Invert (match outside the list)"
+                ),
+                isOn: $rule.invert
+            )
+            .font(.caption)
+            .onChange(of: rule.invert) { _, _ in state.save() }
         }
         .padding(.leading, 18)
     }

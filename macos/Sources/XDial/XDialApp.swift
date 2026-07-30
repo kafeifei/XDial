@@ -16,15 +16,21 @@ private struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        let icon = Image(nsImage: AppIcon.menuBar())
+        Image(nsImage: AppIcon.menuBar())
             .accessibilityLabel("XDial")
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: .xdialOpenInstallation
+                )
+            ) { _ in
+                openWindow(id: "installation")
+                NSApp.activate(ignoringOtherApps: true)
+            }
         #if DEBUG
-        icon.onReceive(NotificationCenter.default.publisher(for: .xdialDebugOpenSettings)) { _ in
-            openWindow(id: "settings")
-            NSApp.activate(ignoringOtherApps: true)
-        }
-        #else
-        icon
+            .onReceive(NotificationCenter.default.publisher(for: .xdialDebugOpenSettings)) { _ in
+                openWindow(id: "settings")
+                NSApp.activate(ignoringOtherApps: true)
+            }
         #endif
     }
 }
@@ -48,6 +54,14 @@ struct XDialApp: App {
         }
         .defaultSize(width: 540, height: 540)
         .windowResizability(.contentSize)
+
+        Window("XDial 安装", id: "installation") {
+            InstallationView(
+                coordinator: InstallationCoordinator.shared
+            )
+        }
+        .defaultSize(width: 480, height: 420)
+        .windowResizability(.contentSize)
     }
 }
 
@@ -56,17 +70,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 设置窗口：不随失焦隐藏 + 出现在 Cmd+Tab
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { n in
             guard let w = n.object as? NSWindow,
-                  w.title.contains("设置") || w.title.contains("Settings") else { return }
+                  w.title.contains("设置")
+                    || w.title.contains("Settings")
+                    || w.title.contains("安装")
+                    || w.title.contains("Installation") else { return }
             w.hidesOnDeactivate = false
             NSApp.applicationIconImage = AppIcon.dock(size: 256)
             NSApp.setActivationPolicy(.regular)
         }
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { n in
             guard let w = n.object as? NSWindow,
-                  w.title.contains("设置") || w.title.contains("Settings") else { return }
+                  w.title.contains("设置")
+                    || w.title.contains("Settings")
+                    || w.title.contains("安装")
+                    || w.title.contains("Installation") else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 let hasSettings = NSApp.windows.contains {
-                    $0.isVisible && ($0.title.contains("设置") || $0.title.contains("Settings"))
+                    $0.isVisible && (
+                        $0.title.contains("设置")
+                            || $0.title.contains("Settings")
+                            || $0.title.contains("安装")
+                            || $0.title.contains("Installation")
+                    )
                 }
                 if !hasSettings { NSApp.setActivationPolicy(.accessory) }
             }

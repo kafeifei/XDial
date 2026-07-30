@@ -45,6 +45,7 @@ enum PrivilegeManager {
             if canConnectSocket() { return }
             Thread.sleep(forTimeInterval: 0.2)
         }
+        throw HelperError.socketUnavailable
     }
 
     /// bundle 内 daemon 二进制的 SHA256。与运行中 daemon 的 daemon-info 比对，
@@ -234,5 +235,16 @@ enum PrivilegeManager {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
         return "\"" + escaped + "\""
+    }
+
+    private enum HelperError: LocalizedError {
+        case socketUnavailable
+
+        var errorDescription: String? {
+            switch self {
+            case .socketUnavailable:
+                "后台服务已注册，但 6 秒内没有建立本地控制通道"
+            }
+        }
     }
 }

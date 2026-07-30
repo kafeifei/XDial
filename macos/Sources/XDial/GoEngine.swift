@@ -150,7 +150,11 @@ final class GoEngine: ObservableObject {
                 completion(.failure(NSError(
                     domain: "XDial",
                     code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "Cannot connect to helper"]
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            InstallationCoordinator.shared
+                            .blockingMessage,
+                    ]
                 )))
                 return
             }
@@ -303,8 +307,11 @@ final class GoEngine: ObservableObject {
         Task { [weak self] in
             let ok = await self?.ensureHelperAsync() ?? false
             guard let self, ok, self.ensureSocket() else {
-                completion(.failure(self?.requestError("无法连接到 helper 进程")
-                    ?? NSError(domain: "XDial", code: -1)))
+                completion(.failure(
+                    self?.requestError(
+                        InstallationCoordinator.shared.blockingMessage
+                    ) ?? NSError(domain: "XDial", code: -1)
+                ))
                 return
             }
             var fields = ["line_id": lineID]
@@ -404,7 +411,10 @@ final class GoEngine: ObservableObject {
     private nonisolated func ensureHelperAsync() async -> Bool {
         guard PrivilegeManager.isInstalled else {
             await MainActor.run { [weak self] in
-                self?.lastError = "请先点击「一键配置」启用后台服务"
+                InstallationCoordinator.shared.start()
+                InstallationCoordinator.shared.present()
+                self?.lastError =
+                    InstallationCoordinator.shared.blockingMessage
                 self?.status = "disconnected"
             }
             return false
