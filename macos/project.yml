@@ -36,29 +36,25 @@ targets:
           NEProviderClasses:
             com.apple.networkextension.app-proxy: "$(PRODUCT_MODULE_NAME).TransparentProxyProvider"
         NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和模式交给 sing-box 统一执行。
-    entitlements:
-      path: TransparentProxyExtension/XDialTransparentProxy.entitlements
-      properties:
-        com.apple.developer.networking.networkextension:
-          - app-proxy-provider
-        com.apple.security.application-groups:
-          - UVZM439VGU.com.kafeifei.xdial.network
-        com.apple.security.app-sandbox: true
-        com.apple.security.network.client: true
-        com.apple.security.network.server: true
     settings:
       base:
+        PRODUCT_NAME: XDialTransparentProxy
         MARKETING_VERSION: "0.7.0"
         CURRENT_PROJECT_VERSION: "73"
         ENABLE_APP_SANDBOX: YES
-        CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxy.entitlements
       configs:
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
-          PRODUCT_NAME: com.kafeifei.xdial.ne-probe.extension
+          CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxy.entitlements
         Release:
           PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.transparent-proxy
-          PRODUCT_NAME: com.kafeifei.xdial.transparent-proxy
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          PROVISIONING_PROFILE_SPECIFIER: XDial Developer ID Transparent Proxy
+          CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxyRelease.entitlements
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
+          ENABLE_HARDENED_RUNTIME: YES
     dependencies:
       - framework: ../build/frameworks/macos/Libbox.xcframework
         embed: false
@@ -87,26 +83,25 @@ targets:
           NSAllowsArbitraryLoads: true
         NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和模式交给 sing-box 统一执行。
         XDialTransparentProxyBundleIdentifier: "$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)"
-    entitlements:
-      path: XDial.entitlements
-      properties:
-        com.apple.developer.networking.networkextension:
-          - app-proxy-provider
-        com.apple.security.application-groups:
-          - UVZM439VGU.com.kafeifei.xdial.network
-        com.apple.developer.system-extension.install: true
     settings:
       base:
         PRODUCT_NAME: XDial
         MARKETING_VERSION: "0.7.0"
         CURRENT_PROJECT_VERSION: "73"
-        CODE_SIGN_ENTITLEMENTS: XDial.entitlements
         ENABLE_USER_SCRIPT_SANDBOXING: NO
       configs:
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe
+          CODE_SIGN_ENTITLEMENTS: XDial.entitlements
         Release:
           PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          PROVISIONING_PROFILE_SPECIFIER: XDial Developer ID Host 2026
+          CODE_SIGN_ENTITLEMENTS: XDialRelease.entitlements
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
+          ENABLE_HARDENED_RUNTIME: YES
     dependencies:
       - target: XDialTransparentProxy
         embed: true
@@ -128,9 +123,16 @@ targets:
           mkdir -p "${helper_dir}" "${launchd_dir}"
           cp "${helper_source}" "${helper_dir}/xdial-daemon"
           cp "${SRCROOT}/com.kafeifei.xdial.helper.plist" "${launchd_dir}/"
-          /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
-            --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
-            "${helper_dir}/xdial-daemon"
+          if [ "${CONFIGURATION}" = "Release" ]; then
+            /usr/bin/codesign --force --options runtime --timestamp \
+              --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
+              "${helper_dir}/xdial-daemon"
+          else
+            /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
+              "${helper_dir}/xdial-daemon"
+          fi
         inputFiles:
           - "$(SRCROOT)/../build/xdial"
           - "$(SRCROOT)/com.kafeifei.xdial.helper.plist"
