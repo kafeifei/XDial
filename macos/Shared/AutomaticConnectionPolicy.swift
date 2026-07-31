@@ -70,3 +70,17 @@ struct ConnectionAttemptGate {
         candidate == generation
     }
 }
+
+/// 显式断开在当前 App 生命周期内压过尚未送达的自动连接回调；只有用户再次
+/// 点连接/重连，或下一次冷启动，才恢复自动请求的进入资格。
+struct ConnectionIntentLatch {
+    private(set) var allowsAutomaticConnection = true
+
+    mutating func userRequestedConnection() {
+        allowsAutomaticConnection = true
+    }
+
+    mutating func userRequestedDisconnection() {
+        allowsAutomaticConnection = false
+    }
+}
