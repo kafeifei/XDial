@@ -86,4 +86,21 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
 
         XCTAssertFalse(gate.isCurrent(attempt))
     }
+
+    func testExplicitDisconnectBlocksLateAutomaticConnection() {
+        var intent = ConnectionIntentLatch()
+
+        intent.userRequestedDisconnection()
+
+        XCTAssertFalse(intent.allowsAutomaticConnection)
+    }
+
+    func testExplicitConnectReenablesConnectionIntent() {
+        var intent = ConnectionIntentLatch()
+        intent.userRequestedDisconnection()
+
+        intent.userRequestedConnection()
+
+        XCTAssertTrue(intent.allowsAutomaticConnection)
+    }
 }

@@ -64,6 +64,7 @@ final class AppState: ObservableObject {
     private var initialStatusSynchronized = false
     private var launchAutoConnectPending = false
     private var connectionAttempts = ConnectionAttemptGate()
+    private var connectionIntent = ConnectionIntentLatch()
 
     private let profileKey = "xdial.profile"
     private let keychainPrefix = "xdial-line-"
@@ -558,7 +559,7 @@ final class AppState: ObservableObject {
 
         launchAutoConnectPending = false
         appLog("launch auto-connect started")
-        connect()
+        connectAutomatically()
     }
 
     private func registerSleepWakeObservers() {
@@ -659,7 +660,7 @@ final class AppState: ObservableObject {
                 return
             }
             appLog("wake reconnect started")
-            self.connect()
+            self.connectAutomatically()
         }
     }
 
@@ -737,6 +738,19 @@ final class AppState: ObservableObject {
     // MARK: - Connect
 
     func connect() {
+        connectionIntent.userRequestedConnection()
+        beginConnection()
+    }
+
+    private func connectAutomatically() {
+        guard connectionIntent.allowsAutomaticConnection else {
+            appLog("automatic connection ignored after explicit disconnect")
+            return
+        }
+        beginConnection()
+    }
+
+    private func beginConnection() {
         guard installation.isReady else {
             installation.start()
             installation.present()
@@ -790,6 +804,7 @@ final class AppState: ObservableObject {
 
     func disconnect() {
         // 用户明确断开必须压过尚未消费的冷启动自动连接意图。
+        connectionIntent.userRequestedDisconnection()
         launchAutoConnectPending = false
         connectionAttempts.cancel()
         cancelWakeReconnectTask()
