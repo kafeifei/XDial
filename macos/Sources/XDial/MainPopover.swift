@@ -18,7 +18,7 @@ struct MainPopover: View {
             }
             Divider()
             statusRow
-            if let report = state.engine.presentedConnectionReport {
+            if let report = state.presentedConnectionReport {
                 transactionSummary(report)
             }
             actionRow
@@ -217,30 +217,36 @@ struct MainPopover: View {
 
     private var actionRow: some View {
         HStack(spacing: 8) {
-            switch state.engine.status {
-            case "connecting":
-                Button("连接中…") {}
+            if state.wakeReconnectPhase != nil {
+                Button(state.tr("恢复中…", "Recovering…")) {}
                     .controlSize(.small)
                     .disabled(true)
-            case "connected":
-                Button("断开") { state.disconnect() }
-                    .tint(.red)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-            case "reconnecting":
-                Button("重连中…") { state.disconnect() }
-                    .tint(.orange)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-            case "disconnecting":
-                Button("断开中…") {}
-                    .controlSize(.small)
-                    .disabled(true)
-            default:
-                Button("连接") { state.connect() }
-                    .keyboardShortcut(.defaultAction)
-                    .controlSize(.small)
-                    .disabled(!state.canConnect)
+            } else {
+                switch state.engine.status {
+                case "connecting":
+                    Button("连接中…") {}
+                        .controlSize(.small)
+                        .disabled(true)
+                case "connected":
+                    Button("断开") { state.disconnect() }
+                        .tint(.red)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                case "reconnecting":
+                    Button("重连中…") { state.disconnect() }
+                        .tint(.orange)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                case "disconnecting":
+                    Button("断开中…") {}
+                        .controlSize(.small)
+                        .disabled(true)
+                default:
+                    Button("连接") { state.connect() }
+                        .keyboardShortcut(.defaultAction)
+                        .controlSize(.small)
+                        .disabled(!state.canConnect)
+                }
             }
 
             Spacer()

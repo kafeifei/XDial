@@ -103,4 +103,19 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
 
         XCTAssertTrue(intent.allowsAutomaticConnection)
     }
+
+    func testWakeRecoveryPhasesHidePreviousCancelledReport() {
+        for phase in WakeReconnectPhase.allCases {
+            XCTAssertFalse(phase.presentsConnectionReport)
+        }
+    }
+
+    func testWaitingForNetworkHasRecoveryStatusInsteadOfCancelled() {
+        let phase = WakeReconnectPhase.waitingForNetwork
+
+        XCTAssertEqual(phase.zhStatusText, "等待网络恢复…")
+        XCTAssertEqual(phase.enStatusText, "Waiting for network…")
+        XCTAssertNotEqual(phase.zhStatusText, "已取消")
+        XCTAssertNotEqual(phase.enStatusText, "Cancelled")
+    }
 }
