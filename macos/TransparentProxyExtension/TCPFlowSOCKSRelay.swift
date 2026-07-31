@@ -11,55 +11,74 @@ enum TCPFlowSOCKSRelay {
         case flowClosed
     }
 
-    static func start(
+    static func makeHandle(
         flow: NEAppProxyTCPFlow,
         socksPort: UInt16,
         credentials: SOCKSCredentials? = nil,
         trialID: String,
         logger: Logger
-    ) {
-        Task {
-            var stage = "destination"
-            let connection = NWConnection(
-                host: .ipv4(IPv4Address.loopback),
-                port: Network.NWEndpoint.Port(rawValue: socksPort)!,
-                using: .tcp
-            )
-            do {
-                let destination = try destination(for: flow)
-                stage = "control-connect"
-                try await start(connection)
-                stage = "socks-negotiate"
-                try await negotiateSOCKS(
-                    connection,
-                    credentials: credentials,
-                    host: destination.host,
-                    port: destination.port
-                )
-                stage = "flow-open"
-                try await open(flow)
-                logger.debug(
-                    "relay-started trial=\(trialID, privacy: .public)"
-                )
-                stage = "relay"
-                try await relay(flow: flow, connection: connection)
-                logger.debug(
-                    "relay-finished trial=\(trialID, privacy: .public)"
-                )
-                close(flow: flow, connection: connection, error: nil)
-            } catch {
-                if isExpectedFlowClosure(error) {
-                    logger.debug(
-                        "relay-closed trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
-                    )
-                } else {
-                    logger.error(
-                        "relay-error trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
-                    )
-                }
-                close(flow: flow, connection: connection, error: error)
-            }
+    ) -> ProviderRelayHandle {
+        let connection = NWConnection(
+            host: .ipv4(IPv4Address.loopback),
+            port: Network.NWEndpoint.Port(rawValue: socksPort)!,
+            using: .tcp
+        )
+        let resources = TCPRelayResources(
+            flow: flow,
+            connection: connection
+        )
+        let shutdown = RelayTaskShutdown { error in
+            resources.close(with: error)
         }
+        return ProviderRelayHandle(
+            shutdown: shutdown,
+            operation: {
+                var stage = "destination"
+                await withTaskCancellationHandler {
+                    do {
+                        let destination = try destination(for: flow)
+                        stage = "control-connect"
+                        try await start(connection)
+                        stage = "socks-negotiate"
+                        try await negotiateSOCKS(
+                            connection,
+                            credentials: credentials,
+                            host: destination.host,
+                            port: destination.port
+                        )
+                        stage = "flow-open"
+                        try await open(flow)
+                        logger.debug(
+                            "relay-started trial=\(trialID, privacy: .public)"
+                        )
+                        stage = "relay"
+                        try await relay(
+                            flow: flow,
+                            connection: connection,
+                            resources: resources,
+                            shutdown: shutdown
+                        )
+                        logger.debug(
+                            "relay-finished trial=\(trialID, privacy: .public)"
+                        )
+                        shutdown.finish(with: nil)
+                    } catch {
+                        if isExpectedFlowClosure(error) {
+                            logger.debug(
+                                "relay-closed trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                            )
+                        } else {
+                            logger.error(
+                                "relay-error trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                            )
+                        }
+                        shutdown.finish(with: error)
+                    }
+                } onCancel: {
+                    shutdown.finish(with: CancellationError())
+                }
+            }
+        )
     }
 
     private static func isExpectedFlowClosure(_ error: Error) -> Bool {
@@ -114,21 +133,21 @@ enum TCPFlowSOCKSRelay {
     }
 
     private static func start(_ connection: NWConnection) async throws {
-        try await withCheckedThrowingContinuation { continuation in
+        try await awaitRelayCallback { completion in
             let gate = OneShotGate()
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
                     if gate.take() {
-                        continuation.resume()
+                        completion(.success(()))
                     }
                 case let .failed(error):
                     if gate.take() {
-                        continuation.resume(throwing: error)
+                        completion(.failure(error))
                     }
                 case .cancelled:
                     if gate.take() {
-                        continuation.resume(throwing: RelayError.socksUnavailable)
+                        completion(.failure(RelayError.socksUnavailable))
                     }
                 default:
                     break
@@ -221,17 +240,16 @@ enum TCPFlowSOCKSRelay {
     }
 
     private static func open(_ flow: NEAppProxyFlow) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+        let _: Void = try await awaitRelayCallback { completion in
             let gate = OneShotGate()
             flow.open(withLocalFlowEndpoint: nil) { error in
                 guard gate.take() else {
                     return
                 }
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else {
-                    continuation.resume()
+                    completion(.success(()))
                 }
             }
         }
@@ -239,44 +257,77 @@ enum TCPFlowSOCKSRelay {
 
     private static func relay(
         flow: NEAppProxyTCPFlow,
-        connection: NWConnection
+        connection: NWConnection,
+        resources: TCPRelayResources,
+        shutdown: RelayTaskShutdown
     ) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
+        try await RelayTaskPair.run(
+            first: {
                 while !Task.isCancelled {
                     let data = try await read(from: flow)
                     if data.isEmpty {
+                        resources.closeFlowRead()
+                        try await finishSending(to: connection)
                         return
                     }
                     try await send(data, to: connection)
                 }
-            }
-            group.addTask {
+            },
+            second: {
                 while !Task.isCancelled {
-                    let data = try await receive(from: connection)
-                    if data.isEmpty {
+                    let result = try await receive(from: connection)
+                    if !result.data.isEmpty {
+                        try await write(result.data, to: flow)
+                    }
+                    if let error = result.error {
+                        throw error
+                    }
+                    if result.isComplete {
+                        resources.closeFlowWrite()
                         return
                     }
-                    try await write(data, to: flow)
+                    guard !result.data.isEmpty else {
+                        throw RelayError.socksUnavailable
+                    }
                 }
-            }
-            _ = try await group.next()
-            group.cancelAll()
+            },
+            shutdown: shutdown
+        )
+    }
+
+    /// Marks the SOCKS TCP stream complete in the sending direction. Network
+    /// framework documents this as the TCP FIN equivalent; the receive side
+    /// remains available until its own EOF or an error.
+    private static func finishSending(
+        to connection: NWConnection
+    ) async throws {
+        let _: Void = try await awaitRelayCallback { completion in
+            connection.send(
+                content: nil,
+                contentContext: .finalMessage,
+                isComplete: true,
+                completion: .contentProcessed { error in
+                    if let error {
+                        completion(.failure(error))
+                    } else {
+                        completion(.success(()))
+                    }
+                }
+            )
         }
     }
 
     private static func read(from flow: NEAppProxyTCPFlow) async throws -> Data {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Data, Error>) in
+        try await awaitRelayCallback { completion in
             let gate = OneShotGate()
             flow.readData { data, error in
                 guard gate.take() else {
                     return
                 }
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else {
-                    continuation.resume(returning: data ?? Data())
+                    completion(.success(data ?? Data()))
                 }
             }
         }
@@ -286,17 +337,16 @@ enum TCPFlowSOCKSRelay {
         _ data: Data,
         to flow: NEAppProxyTCPFlow
     ) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+        let _: Void = try await awaitRelayCallback { completion in
             let gate = OneShotGate()
             flow.write(data) { error in
                 guard gate.take() else {
                     return
                 }
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else {
-                    continuation.resume()
+                    completion(.success(()))
                 }
             }
         }
@@ -306,35 +356,43 @@ enum TCPFlowSOCKSRelay {
         _ data: Data,
         to connection: NWConnection
     ) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+        let _: Void = try await awaitRelayCallback { completion in
             connection.send(content: data, completion: .contentProcessed { error in
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else {
-                    continuation.resume()
+                    completion(.success(()))
                 }
             })
         }
     }
 
+    private struct ReceiveResult {
+        let data: Data
+        let isComplete: Bool
+        let error: Error?
+    }
+
     private static func receive(
         from connection: NWConnection
-    ) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
+    ) async throws -> ReceiveResult {
+        try await awaitRelayCallback { completion in
             connection.receive(
                 minimumIncompleteLength: 1,
                 maximumLength: 64 * 1024
             ) { data, _, isComplete, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else if let data, !data.isEmpty {
-                    continuation.resume(returning: data)
-                } else if isComplete {
-                    continuation.resume(returning: Data())
-                } else {
-                    continuation.resume(throwing: RelayError.socksUnavailable)
-                }
+                // Network.framework may deliver the final bytes together with
+                // either FIN or an error. Preserve those bytes before applying
+                // the terminal state; dropping them corrupts the stream tail.
+                completion(
+                    .success(
+                        ReceiveResult(
+                            data: data ?? Data(),
+                            isComplete: isComplete,
+                            error: error
+                        )
+                    )
+                )
             }
         }
     }
@@ -346,17 +404,17 @@ enum TCPFlowSOCKSRelay {
         var result = Data()
         while result.count < length {
             let remaining = length - result.count
-            let chunk: Data = try await withCheckedThrowingContinuation { continuation in
+            let chunk: Data = try await awaitRelayCallback { completion in
                 connection.receive(
                     minimumIncompleteLength: 1,
                     maximumLength: remaining
                 ) { data, _, _, error in
                     if let error {
-                        continuation.resume(throwing: error)
+                        completion(.failure(error))
                     } else if let data, !data.isEmpty {
-                        continuation.resume(returning: data)
+                        completion(.success(data))
                     } else {
-                        continuation.resume(throwing: RelayError.socksUnavailable)
+                        completion(.failure(RelayError.socksUnavailable))
                     }
                 }
             }
@@ -365,14 +423,67 @@ enum TCPFlowSOCKSRelay {
         return result
     }
 
-    private static func close(
+}
+
+private final class TCPRelayResources: @unchecked Sendable {
+    private let lock = NSLock()
+    private let flow: NEAppProxyTCPFlow
+    private let connection: NWConnection
+    private var flowReadClosed = false
+    private var flowWriteClosed = false
+    private var closed = false
+
+    init(
         flow: NEAppProxyTCPFlow,
-        connection: NWConnection,
-        error: Error?
+        connection: NWConnection
     ) {
+        self.flow = flow
+        self.connection = connection
+    }
+
+    func closeFlowRead() {
+        lock.lock()
+        guard !closed, !flowReadClosed else {
+            lock.unlock()
+            return
+        }
+        flowReadClosed = true
+        lock.unlock()
+        flow.closeReadWithError(nil)
+    }
+
+    func closeFlowWrite() {
+        lock.lock()
+        guard !closed, !flowWriteClosed else {
+            lock.unlock()
+            return
+        }
+        flowWriteClosed = true
+        lock.unlock()
+        flow.closeWriteWithError(nil)
+    }
+
+    func close(with error: Error?) {
+        lock.lock()
+        guard !closed else {
+            lock.unlock()
+            return
+        }
+        closed = true
+        let shouldCloseRead = !flowReadClosed
+        let shouldCloseWrite = !flowWriteClosed
+        flowReadClosed = true
+        flowWriteClosed = true
+        lock.unlock()
+
         connection.cancel()
-        flow.closeReadWithError(error)
-        flow.closeWriteWithError(error)
+        let sourceError = AppProxyFlowCloseError.normalize(error)
+        if shouldCloseRead {
+            flow.closeReadWithError(sourceError)
+        }
+        if shouldCloseWrite {
+            flow.closeWriteWithError(sourceError)
+        }
     }
 }
 

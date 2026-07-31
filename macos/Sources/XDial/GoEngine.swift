@@ -40,6 +40,20 @@ final class GoEngine: ObservableObject {
     @Published var lastError: String?
     @Published private(set) var connectedAt: Date?
     @Published private(set) var connectionReport: ConnectionReport?
+    private var coldLaunchSettledTransactionID: String?
+    private var explicitlyStoppedTransactionID: String?
+    private var pendingStatusSyncCompletions: [() -> Void] = []
+
+    var presentedConnectionReport: ConnectionReport? {
+        ConnectionReportLiveProjection.presentedReport(
+            connectionReport,
+            status: status,
+            coldLaunchSettledTransactionID:
+                coldLaunchSettledTransactionID,
+            explicitlyStoppedTransactionID:
+                explicitlyStoppedTransactionID
+        )
+    }
 
     struct ParseResult: Decodable {
         let lines: [Line]
@@ -59,6 +73,14 @@ final class GoEngine: ObservableObject {
     }
 
     private init() {
+        connectionReport = ConnectionReportJournal.read()
+        if let connectionReport,
+           ConnectionReportLiveProjection.isSafelySettledTerminal(
+               connectionReport
+           ) {
+            coldLaunchSettledTransactionID =
+                connectionReport.transactionID
+        }
         transparentProxy.statusHandler = { [weak self] status, error in
             Task { @MainActor in
                 self?.applyTransparentProxyStatus(status, error: error)
@@ -69,13 +91,17 @@ final class GoEngine: ObservableObject {
                 self?.applyConnectionReport(report)
             }
         }
-        connectionReport = ConnectionReportJournal.read()
     }
 
     // MARK: - Public API
 
     func start(profileJSON: String) {
         lastError = nil
+        // The journal remains available for recovery and diagnostics, but the
+        // previous terminal report must not flash while a new transaction is
+        // being planned.
+        connectionReport = nil
+        explicitlyStoppedTransactionID = nil
         transparentProxySystemStatus = "connecting"
         reconcileTransparentProxyStatus()
         transparentProxy.start(profileJSON: profileJSON)
@@ -91,6 +117,14 @@ final class GoEngine: ObservableObject {
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         transparentProxy.prepareSystemExtension(completion: completion)
+    }
+
+    func uninstallSystemExtension(
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        transparentProxy.uninstallSystemExtension(
+            completion: completion
+        )
     }
 
     func probeLineOutboundAddress(
@@ -137,8 +171,12 @@ final class GoEngine: ObservableObject {
     }
     #endif
 
-    func stop() {
+    func stop(userInitiated: Bool = false) {
         appLog("stop() called for Transparent Proxy, status=\(status)")
+        if userInitiated {
+            explicitlyStoppedTransactionID =
+                connectionReport?.transactionID
+        }
         transparentProxy.stop()
     }
 
@@ -175,7 +213,10 @@ final class GoEngine: ObservableObject {
         }
     }
 
-    func syncStatus() {
+    func syncStatus(completion: (() -> Void)? = nil) {
+        if let completion {
+            pendingStatusSyncCompletions.append(completion)
+        }
         transparentProxy.syncStatus()
     }
 
@@ -564,6 +605,11 @@ final class GoEngine: ObservableObject {
         if let error, !error.isEmpty {
             appLog("Transparent Proxy error: \(error)")
             lastError = error
+        }
+        let completions = pendingStatusSyncCompletions
+        pendingStatusSyncCompletions.removeAll()
+        for completion in completions {
+            completion()
         }
     }
 

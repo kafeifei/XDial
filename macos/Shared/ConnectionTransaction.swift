@@ -194,15 +194,353 @@ enum ConnectionTaskState: String, Codable {
     case skipped
 }
 
+/// The callback is armed by libbox's structured connected event, not by a
+/// later platform preparation milestone. This closes the window where an
+/// AnyConnect session could die after `Start` returned but before the provider
+/// finished preparing other active Lines.
+struct EngineCallbackRuntimeGate: Equatable {
+    enum Phase: Equatable {
+        case starting
+        case running
+        case stopped
+    }
+
+    private(set) var phase: Phase = .starting
+
+    mutating func beginStart() {
+        phase = .starting
+    }
+
+    mutating func consumeStatus(_ statusJSON: String?) {
+        guard
+            let statusJSON,
+            let data = statusJSON.data(using: .utf8),
+            let envelope = try? JSONDecoder().decode(
+                EngineCallbackStatusEnvelope.self,
+                from: data
+            )
+        else {
+            return
+        }
+        switch envelope.status {
+        case "connected":
+            if phase != .stopped {
+                phase = .running
+            }
+        case "disconnected":
+            phase = .stopped
+        default:
+            break
+        }
+    }
+
+    mutating func stop() {
+        phase = .stopped
+    }
+
+    mutating func consumeFatalError() -> Bool {
+        guard phase == .running else {
+            return false
+        }
+        phase = .stopped
+        return true
+    }
+}
+
+private struct EngineCallbackStatusEnvelope: Decodable {
+    let status: String
+}
+
+struct AnyConnectLineRuntimeStatus: Decodable, Equatable {
+    enum State: String, Decodable {
+        case reconnecting = "line_reconnecting"
+        case connected = "line_connected"
+    }
+
+    let state: State
+    let lineType: String
+    let attempt: Int
+    let maxAttempts: Int
+
+    enum CodingKeys: String, CodingKey {
+        case state = "status"
+        case lineType = "line_type"
+        case attempt
+        case maxAttempts = "max_attempts"
+    }
+
+    var isAnyConnect: Bool {
+        lineType == "vpn"
+    }
+}
+
+struct ConnectionFailureEvidence: Codable, Equatable {
+    let anyConnect: AnyConnectFailureEvidence?
+
+    enum CodingKeys: String, CodingKey {
+        case anyConnect = "anyconnect"
+    }
+
+    init(anyConnect: AnyConnectFailureEvidence? = nil) {
+        self.anyConnect = anyConnect
+    }
+}
+
+struct AnyConnectFailureEvidence: Codable, Equatable {
+    let schemaVersion: Int
+    let forceDPDSeconds: Int
+    let sessionAgeMS: Int64?
+    let negotiated: AnyConnectNegotiatedEvidence
+    let tls: AnyConnectTLSChannelEvidence
+    let dtls: AnyConnectDTLSChannelEvidence
+    let close: AnyConnectCloseEvidence?
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case forceDPDSeconds = "force_dpd_seconds"
+        case sessionAgeMS = "session_age_ms"
+        case negotiated
+        case tls
+        case dtls
+        case close
+    }
+
+    var reportCode: String? {
+        close?.reportCode
+    }
+
+    var publicFailureMessage: String {
+        switch close?.code {
+        case "tls-dpd-timeout":
+            return "AnyConnect TLS 控制通道保活检测超时"
+        case "tls-read-timeout":
+            return "AnyConnect TLS 控制通道读取超时"
+        case "tls-read-eof":
+            return "AnyConnect TLS 控制通道被对端关闭"
+        case "tls-read-reset", "tls-write-reset":
+            return "AnyConnect TLS 控制通道被重置"
+        case "tls-read-closed":
+            return "AnyConnect TLS 控制通道已关闭"
+        case "tls-write-timeout":
+            return "AnyConnect TLS 控制通道写入超时"
+        case "tls-write-eof", "tls-write-closed":
+            return "AnyConnect TLS 控制通道写入时被关闭"
+        case "peer-disconnect":
+            return peerDisconnectPublicFailureMessage
+        case "peer-terminate":
+            return "AnyConnect 服务端终止了当前会话"
+        default:
+            return "AnyConnect 会话意外结束"
+        }
+    }
+
+    private var peerDisconnectPublicFailureMessage: String {
+        switch close?.peerReasonCategory {
+        case "idle-timeout":
+            return "AnyConnect 服务端因空闲超时结束了当前会话"
+        case "session-timeout":
+            return "AnyConnect 服务端因会话超时结束了当前会话"
+        case "duplicate-session":
+            return "AnyConnect 服务端因重复会话结束了当前会话"
+        case "authentication":
+            return "AnyConnect 服务端因认证失败结束了当前会话"
+        case "policy":
+            return "AnyConnect 服务端因策略限制结束了当前会话"
+        case "rekey":
+            return "AnyConnect 服务端在重新协商密钥时结束了当前会话"
+        case "server-error":
+            return "AnyConnect 服务端因内部错误结束了当前会话"
+        default:
+            return "AnyConnect 服务端结束了当前会话"
+        }
+    }
+}
+
+struct AnyConnectNegotiatedEvidence: Codable, Equatable {
+    let tlsDPDSeconds: Int
+    let tlsKeepaliveSeconds: Int
+    let dtlsDPDSeconds: Int
+    let dtlsKeepaliveSeconds: Int
+    let cstpRekeySeconds: Int?
+    let cstpRekeyMethod: String?
+    let cstpLeaseDurationSeconds: Int?
+    let cstpSessionTimeoutSeconds: Int?
+    let cstpSessionTimeoutRemainingSeconds: Int?
+    let cstpIdleTimeoutSeconds: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case tlsDPDSeconds = "tls_dpd_seconds"
+        case tlsKeepaliveSeconds = "tls_keepalive_seconds"
+        case dtlsDPDSeconds = "dtls_dpd_seconds"
+        case dtlsKeepaliveSeconds = "dtls_keepalive_seconds"
+        case cstpRekeySeconds = "cstp_rekey_seconds"
+        case cstpRekeyMethod = "cstp_rekey_method"
+        case cstpLeaseDurationSeconds =
+            "cstp_lease_duration_seconds"
+        case cstpSessionTimeoutSeconds =
+            "cstp_session_timeout_seconds"
+        case cstpSessionTimeoutRemainingSeconds =
+            "cstp_session_timeout_remaining_seconds"
+        case cstpIdleTimeoutSeconds =
+            "cstp_idle_timeout_seconds"
+    }
+}
+
+struct AnyConnectTLSChannelEvidence: Codable, Equatable {
+    let effectiveDPDSeconds: Int
+    let dpdRequestsQueued: UInt64
+    let dpdRequestsDropped: UInt64
+    let dpdRequestsWritten: UInt64
+    let dpdResponsesReceived: UInt64
+    let peerDPDRequestsReceived: UInt64
+    let keepalivesReceived: UInt64
+    let dataFramesReceived: UInt64?
+    let dataFramesWritten: UInt64?
+    let lastFrameAgeMS: Int64?
+    let lastDPDWrittenAgeMS: Int64?
+    let lastDPDResponseAgeMS: Int64?
+    let lastDataReceivedAgeMS: Int64?
+    let lastDataWrittenAgeMS: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case effectiveDPDSeconds = "effective_dpd_seconds"
+        case dpdRequestsQueued = "dpd_requests_queued"
+        case dpdRequestsDropped = "dpd_requests_dropped"
+        case dpdRequestsWritten = "dpd_requests_written"
+        case dpdResponsesReceived = "dpd_responses_received"
+        case peerDPDRequestsReceived = "peer_dpd_requests_received"
+        case keepalivesReceived = "keepalives_received"
+        case dataFramesReceived = "data_frames_received"
+        case dataFramesWritten = "data_frames_written"
+        case lastFrameAgeMS = "last_frame_age_ms"
+        case lastDPDWrittenAgeMS = "last_dpd_written_age_ms"
+        case lastDPDResponseAgeMS = "last_dpd_response_age_ms"
+        case lastDataReceivedAgeMS =
+            "last_data_received_age_ms"
+        case lastDataWrittenAgeMS =
+            "last_data_written_age_ms"
+    }
+}
+
+struct AnyConnectDTLSChannelEvidence: Codable, Equatable {
+    let effectiveDPDSeconds: Int
+    let dpdRequestsQueued: UInt64
+    let dpdRequestsDropped: UInt64
+    let dpdRequestsWritten: UInt64
+    let dpdResponsesReceived: UInt64
+    let peerDPDRequestsReceived: UInt64
+    let keepalivesReceived: UInt64
+    let dataFramesReceived: UInt64?
+    let dataFramesWritten: UInt64?
+    let lastFrameAgeMS: Int64?
+    let lastDPDWrittenAgeMS: Int64?
+    let lastDPDResponseAgeMS: Int64?
+    let lastDataReceivedAgeMS: Int64?
+    let lastDataWrittenAgeMS: Int64?
+    let everConnected: Bool
+    let currentlyConnected: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case effectiveDPDSeconds = "effective_dpd_seconds"
+        case dpdRequestsQueued = "dpd_requests_queued"
+        case dpdRequestsDropped = "dpd_requests_dropped"
+        case dpdRequestsWritten = "dpd_requests_written"
+        case dpdResponsesReceived = "dpd_responses_received"
+        case peerDPDRequestsReceived = "peer_dpd_requests_received"
+        case keepalivesReceived = "keepalives_received"
+        case dataFramesReceived = "data_frames_received"
+        case dataFramesWritten = "data_frames_written"
+        case lastFrameAgeMS = "last_frame_age_ms"
+        case lastDPDWrittenAgeMS = "last_dpd_written_age_ms"
+        case lastDPDResponseAgeMS = "last_dpd_response_age_ms"
+        case lastDataReceivedAgeMS =
+            "last_data_received_age_ms"
+        case lastDataWrittenAgeMS =
+            "last_data_written_age_ms"
+        case everConnected = "ever_connected"
+        case currentlyConnected = "currently_connected"
+    }
+}
+
+struct AnyConnectCloseEvidence: Codable, Equatable {
+    let code: String
+    let channel: String
+    let operation: String
+    let errorClass: String
+    let occurredAtUnixMilli: Int64
+    let peerPayloadLength: Int?
+    let peerReasonCode: String?
+    let peerHasReasonText: Bool?
+    let peerReasonCategory: String?
+
+    enum CodingKeys: String, CodingKey {
+        case code
+        case channel
+        case operation
+        case errorClass = "error_class"
+        case occurredAtUnixMilli = "occurred_at_unix_milli"
+        case peerPayloadLength = "peer_payload_length"
+        case peerReasonCode = "peer_reason_code"
+        case peerHasReasonText = "peer_has_reason_text"
+        case peerReasonCategory = "peer_reason_category"
+    }
+
+    var reportCode: String? {
+        guard
+            !code.isEmpty,
+            code.count <= 64,
+            code.unicodeScalars.allSatisfy({
+                ($0.value >= 97 && $0.value <= 122) ||
+                    ($0.value >= 48 && $0.value <= 57) ||
+                    $0.value == 45
+            })
+        else {
+            return nil
+        }
+        return "anyconnect-\(code)"
+    }
+}
+
+struct ConnectionRuntimeFailure: LocalizedError {
+    static let dataPlaneTaskID = "data-plane:sing-box"
+
+    let code: String
+    let message: String
+    let taskID: String
+    let evidence: ConnectionFailureEvidence?
+
+    var attributedTaskID: String {
+        taskID.isEmpty ? Self.dataPlaneTaskID : taskID
+    }
+
+    var errorDescription: String? {
+        message
+    }
+}
+
 struct ConnectionReportError: Codable, Equatable {
     let code: String
     let message: String
     let taskID: String
+    let evidence: ConnectionFailureEvidence?
 
     enum CodingKeys: String, CodingKey {
         case code
         case message
         case taskID = "task_id"
+        case evidence
+    }
+
+    init(
+        code: String,
+        message: String,
+        taskID: String,
+        evidence: ConnectionFailureEvidence? = nil
+    ) {
+        self.code = code
+        self.message = message
+        self.taskID = taskID
+        self.evidence = evidence
     }
 }
 
@@ -430,8 +768,8 @@ struct ConnectionReport: Codable, Equatable {
         switch newState {
         case .ready, .committed, .rolledBack, .failed, .skipped:
             tasks[index].finishedAt = now
-        default:
-            break
+        case .pending, .running, .committing, .rollingBack:
+            tasks[index].finishedAt = nil
         }
         updatedAt = now
         appendEvent(
@@ -456,12 +794,14 @@ struct ConnectionReport: Codable, Equatable {
     mutating func fail(
         code: String,
         message: String,
-        taskID: String = ""
+        taskID: String = "",
+        evidence: ConnectionFailureEvidence? = nil
     ) {
         let failure = ConnectionReportError(
             code: code,
             message: message,
-            taskID: taskID
+            taskID: taskID,
+            evidence: evidence
         )
         error = failure
         if !taskID.isEmpty {

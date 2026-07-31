@@ -51,10 +51,15 @@ type transparentProxySession struct {
 	// LineOutbounds is a capability map for this exact active ConnectionPlan.
 	// It contains no endpoint or credential material and intentionally excludes
 	// enabled Lines that the active Mode did not reference.
-	LineOutbounds map[string]string           `json:"line_outbounds"`
-	RuleSetTags   []string                    `json:"rule_set_tags"`
-	AnyConnect    *transparentProxyAnyConnect `json:"anyconnect,omitempty"`
-	Tailscale     *transparentProxyTailscale  `json:"tailscale,omitempty"`
+	LineOutbounds map[string]string `json:"line_outbounds"`
+	// SubscriptionOutbounds carries the exact route-visible outbound tags
+	// returned by the same generator catalog that built this session's data
+	// plane. It is restricted to subscription tasks in this exact
+	// ConnectionPlan.
+	SubscriptionOutbounds map[string][]string         `json:"subscription_outbounds"`
+	RuleSetTags           []string                    `json:"rule_set_tags"`
+	AnyConnect            *transparentProxyAnyConnect `json:"anyconnect,omitempty"`
+	Tailscale             *transparentProxyTailscale  `json:"tailscale,omitempty"`
 }
 
 type transparentProxyAnyConnect struct {
@@ -65,8 +70,9 @@ type transparentProxyAnyConnect struct {
 }
 
 type transparentProxyTailscale struct {
-	EndpointTag string `json:"endpoint_tag"`
-	ExitNode    string `json:"exit_node"`
+	EndpointTag     string `json:"endpoint_tag"`
+	ExitNode        string `json:"exit_node"`
+	MagicDNSEnabled bool   `json:"magic_dns_enabled"`
 }
 
 // GenerateConnectionPlan compiles the active Mode into a side-effect-free,
@@ -230,6 +236,10 @@ func generateTransparentProxySession(
 	if err != nil {
 		return "", err
 	}
+	session.SubscriptionOutbounds, err = activeSubscriptionOutbounds(profile, plan)
+	if err != nil {
+		return "", err
+	}
 	session.RuleSetTags, err = activeRouteRuleSetTags(data)
 	if err != nil {
 		return "", err
@@ -268,8 +278,9 @@ func generateTransparentProxySession(
 			return "", fmt.Errorf("Tailscale runtime endpoint is missing")
 		}
 		session.Tailscale = &transparentProxyTailscale{
-			EndpointTag: endpointTag,
-			ExitNode:    exitNode,
+			EndpointTag:     endpointTag,
+			ExitNode:        exitNode,
+			MagicDNSEnabled: tailscaleLine.TailscaleMagicDNS,
 		}
 	}
 	encoded, err := json.Marshal(session)
@@ -310,6 +321,70 @@ func activeLineOutbounds(
 			return nil, fmt.Errorf("active Line %q has conflicting runtime outbounds", lineID)
 		}
 		active[lineID] = tag
+	}
+	return active, nil
+}
+
+func activeSubscriptionOutbounds(
+	profile *config.Profile,
+	plan *config.ConnectionPlan,
+) (map[string][]string, error) {
+	if profile == nil {
+		return nil, fmt.Errorf("active Subscription capability profile is missing")
+	}
+	if plan == nil {
+		return nil, fmt.Errorf("active Subscription capability plan is missing")
+	}
+
+	runtimeTags := make(map[string][]string)
+	conflictingRuntimeTags := make(map[string]bool)
+	for _, subscription := range config.BuildSubscriptionRuntimeCatalog(
+		profile,
+		config.PlatformTransparentProxy,
+	).Subscriptions {
+		subscriptionID := strings.TrimSpace(subscription.ID)
+		if subscriptionID == "" {
+			continue
+		}
+		tags := append([]string(nil), subscription.ReadinessTags...)
+		if existing, loaded := runtimeTags[subscriptionID]; loaded &&
+			!reflect.DeepEqual(existing, tags) {
+			conflictingRuntimeTags[subscriptionID] = true
+			continue
+		}
+		runtimeTags[subscriptionID] = tags
+	}
+
+	active := make(map[string][]string)
+	for _, task := range plan.Tasks {
+		if task.Kind != config.ConnectionTaskSubscription {
+			continue
+		}
+		subscriptionID := strings.TrimSpace(task.ResourceID)
+		if subscriptionID == "" {
+			return nil, fmt.Errorf("active Subscription capability is missing an ID")
+		}
+		if conflictingRuntimeTags[subscriptionID] {
+			return nil, fmt.Errorf(
+				"active Subscription %q has conflicting runtime outbounds",
+				subscriptionID,
+			)
+		}
+		tags := runtimeTags[subscriptionID]
+		if len(tags) == 0 {
+			return nil, fmt.Errorf(
+				"active Subscription %q has no runtime outbound",
+				subscriptionID,
+			)
+		}
+		if existing, loaded := active[subscriptionID]; loaded &&
+			!reflect.DeepEqual(existing, tags) {
+			return nil, fmt.Errorf(
+				"active Subscription %q has conflicting runtime outbounds",
+				subscriptionID,
+			)
+		}
+		active[subscriptionID] = append([]string(nil), tags...)
 	}
 	return active, nil
 }

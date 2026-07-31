@@ -135,7 +135,7 @@ func vmessLine() Line {
 	return Line{
 		ID: "vmess-1", Name: "America VMess", Type: LineTypeVMess, Enabled: true,
 		VMessServer: "us.example.com", VMessPort: 443,
-		VMessUUID: "test-uuid", VMessAltID: 0,
+		VMessUUID: "11111111-1111-4111-8111-111111111111", VMessAltID: 0,
 	}
 }
 
@@ -181,8 +181,10 @@ func TestGenerate_DesktopTailscale(t *testing.T) {
 	if _, err := exec.LookPath("sing-box"); err != nil {
 		t.Skip("sing-box not installed")
 	}
+	tailnet := tailscaleLine()
+	tailnet.TailscaleMagicDNS = true
 	p := &Profile{
-		Lines: []Line{directLine(), tailscaleLine()},
+		Lines: []Line{directLine(), tailnet},
 		Modes: []Mode{{
 			ID: "tailnet", Name: "Tailnet", DefaultLineID: "tailscale-1",
 		}},
@@ -197,8 +199,10 @@ func TestGenerate_DesktopTailscale(t *testing.T) {
 }
 
 func TestGenerate_NETailscale(t *testing.T) {
+	tailnet := tailscaleLine()
+	tailnet.TailscaleMagicDNS = true
 	p := &Profile{
-		Lines: []Line{directLine(), tailscaleLine()},
+		Lines: []Line{directLine(), tailnet},
 		Modes: []Mode{{
 			ID: "tailnet", Name: "Tailnet", DefaultLineID: "tailscale-1",
 		}},
@@ -365,8 +369,8 @@ func TestGenerate_DisabledSubscription(t *testing.T) {
 	singboxCheck(t, p, "disabled-sub")
 }
 
-// 7. 订阅节点为空
-func TestGenerate_EmptySubscription(t *testing.T) {
+// 7. active、enabled 的空订阅不能静默回落 direct
+func TestGenerate_EmptySubscriptionFailsClosed(t *testing.T) {
 	sub := Subscription{
 		ID: "sub-empty", Name: "Empty", URL: "https://example.com",
 		Enabled: true, Strategy: "urltest",
@@ -385,7 +389,12 @@ func TestGenerate_EmptySubscription(t *testing.T) {
 		}},
 		ActiveModeID: "c1",
 	}
-	singboxCheck(t, p, "empty-sub")
+	if data, err := GenerateSingBox(p, 10800, ""); err == nil {
+		t.Fatalf(
+			"[empty-sub] unavailable active subscription generated a config:\n%s",
+			data,
+		)
+	}
 }
 
 // 8. 多订阅（都有 GEOIP,CN，不能 tag 冲突）

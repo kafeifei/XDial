@@ -109,6 +109,88 @@ func TestBuildConnectionPlanRejectsBrokenReferencesBeforeSideEffects(t *testing.
 	}
 }
 
+func TestBuildConnectionPlanUnavailableSubscriptionOnlyFailsWhenEffective(t *testing.T) {
+	unavailable := Subscription{
+		ID:       "empty-sub",
+		Name:     "Empty",
+		Enabled:  true,
+		Strategy: "selector",
+	}
+
+	t.Run("active binding", func(t *testing.T) {
+		profile := invBaseProfile()
+		profile.Subscriptions = append(profile.Subscriptions, unavailable)
+		profile.Modes[0].Bindings[0] = RuleBinding{
+			RuleSetID:      "intranet",
+			SubscriptionID: unavailable.ID,
+		}
+		if plan, err := BuildConnectionPlan(profile); err == nil {
+			t.Fatalf("unavailable active subscription generated a plan: %+v", plan)
+		}
+	})
+
+	t.Run("active default", func(t *testing.T) {
+		profile := invBaseProfile()
+		profile.Subscriptions = append(profile.Subscriptions, unavailable)
+		profile.Modes[0].DefaultLineID = ""
+		profile.Modes[0].DefaultSubscriptionID = unavailable.ID
+		if plan, err := BuildConnectionPlan(profile); err == nil {
+			t.Fatalf("unavailable default subscription generated a plan: %+v", plan)
+		}
+	})
+
+	t.Run("disabled rule reference", func(t *testing.T) {
+		profile := invBaseProfile()
+		profile.Subscriptions = append(profile.Subscriptions, unavailable)
+		profile.RuleSets[0].Enabled = false
+		profile.Modes[0].Bindings[0] = RuleBinding{
+			RuleSetID:      "intranet",
+			SubscriptionID: unavailable.ID,
+		}
+		plan, err := BuildConnectionPlan(profile)
+		if err != nil {
+			t.Fatalf("disabled rule must keep the subscription ineffective: %v", err)
+		}
+		if containsString(connectionPlanTaskIDs(plan), "subscription:"+unavailable.ID) {
+			t.Fatalf("ineffective subscription leaked into plan: %+v", plan.Tasks)
+		}
+	})
+
+	t.Run("explicitly disabled", func(t *testing.T) {
+		profile := invBaseProfile()
+		disabled := unavailable
+		disabled.Enabled = false
+		profile.Subscriptions = append(profile.Subscriptions, disabled)
+		profile.Modes[0].Bindings[0] = RuleBinding{
+			RuleSetID:      "intranet",
+			SubscriptionID: disabled.ID,
+		}
+		plan, err := BuildConnectionPlan(profile)
+		if err != nil {
+			t.Fatalf("explicitly disabled subscription must keep warning semantics: %v", err)
+		}
+		if containsString(connectionPlanTaskIDs(plan), "subscription:"+disabled.ID) {
+			t.Fatalf("disabled subscription leaked into plan: %+v", plan.Tasks)
+		}
+		if len(plan.Warnings) == 0 ||
+			plan.Warnings[0].Kind != WarningDisabledSubscription {
+			t.Fatalf("disabled subscription warning is missing: %+v", plan.Warnings)
+		}
+	})
+
+	t.Run("unreferenced", func(t *testing.T) {
+		profile := invBaseProfile()
+		profile.Subscriptions = append(profile.Subscriptions, unavailable)
+		plan, err := BuildConnectionPlan(profile)
+		if err != nil {
+			t.Fatalf("unreferenced subscription must have no effect: %v", err)
+		}
+		if containsString(connectionPlanTaskIDs(plan), "subscription:"+unavailable.ID) {
+			t.Fatalf("unreferenced subscription leaked into plan: %+v", plan.Tasks)
+		}
+	})
+}
+
 func connectionPlanTaskIDs(plan *ConnectionPlan) []string {
 	ids := make([]string, 0, len(plan.Tasks))
 	for _, task := range plan.Tasks {

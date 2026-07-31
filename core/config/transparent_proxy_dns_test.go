@@ -2,6 +2,8 @@ package config
 
 import (
 	"encoding/json"
+	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -39,6 +41,164 @@ func TestTransparentProxyDNSRejectsMissingOrInvalidSystemSnapshot(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestTransparentProxyDomainEndpointUsesIsolatedBootstrapResolver(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{
+				ID:             "taiwan",
+				Type:           LineTypeAnyTLS,
+				Enabled:        true,
+				AnyTLSServer:   "node.example.com",
+				AnyTLSPort:     3489,
+				AnyTLSPassword: "secret",
+				AnyTLSSNI:      "cover.example.com",
+			},
+		},
+		Modes:        []Mode{{ID: "mode", DefaultLineID: "taiwan"}},
+		ActiveModeID: "mode",
+	}
+
+	cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
+	outbound := transparentProxyOutboundByTag(t, cfg, "proxy-taiwan")
+	if outbound["domain_resolver"] != desktopPublicDNSTag {
+		t.Fatalf("domain proxy endpoint did not use the bootstrap resolver: %v", outbound)
+	}
+
+	bootstrap := transparentProxyDNSServerByTag(t, cfg, desktopPublicDNSTag)
+	if bootstrap["type"] != "https" || bootstrap["server"] != "223.5.5.5" {
+		t.Fatalf("unexpected proxy endpoint bootstrap resolver: %v", bootstrap)
+	}
+	if _, err := netip.ParseAddr(bootstrap["server"].(string)); err != nil {
+		t.Fatalf("bootstrap resolver must not require another DNS lookup: %v", bootstrap)
+	}
+	if _, exists := bootstrap["detour"]; exists {
+		t.Fatalf("bootstrap resolver must not detour through the proxy it starts: %v", bootstrap)
+	}
+
+	lineResolver := desktopProxyDNSTag("proxy-taiwan")
+	if cfg.Route["default_domain_resolver"] != transparentSystemDNSTag {
+		t.Fatalf("proxy endpoint bootstrap changed the Underlay resolver: %v", cfg.Route)
+	}
+	if cfg.DNS["final"] != lineResolver {
+		t.Fatalf("Mode default Line lost user-traffic DNS ownership: %v", cfg.DNS)
+	}
+	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
+		`{"action":"resolve","server":"` + lineResolver + `"}`,
+	})
+}
+
+func TestTransparentProxyEndpointBootstrapOnlyCoversActiveDomainServers(t *testing.T) {
+	t.Run("numeric active endpoint", func(t *testing.T) {
+		profile := &Profile{
+			Lines: []Line{
+				{ID: "direct", Type: LineTypeDirect, Enabled: true},
+				{
+					ID:             "taiwan",
+					Type:           LineTypeAnyTLS,
+					Enabled:        true,
+					AnyTLSServer:   "192.0.2.10",
+					AnyTLSPort:     3489,
+					AnyTLSPassword: "secret",
+					AnyTLSSNI:      "cover.example.com",
+				},
+			},
+			Modes:        []Mode{{ID: "mode", DefaultLineID: "taiwan"}},
+			ActiveModeID: "mode",
+		}
+
+		cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
+		outbound := transparentProxyOutboundByTag(t, cfg, "proxy-taiwan")
+		if _, exists := outbound["domain_resolver"]; exists {
+			t.Fatalf("numeric endpoint unexpectedly acquired a resolver: %v", outbound)
+		}
+		assertTransparentProxyNoDNSServerTag(t, cfg, desktopPublicDNSTag)
+	})
+
+	t.Run("unreferenced domain endpoint", func(t *testing.T) {
+		profile := &Profile{
+			Lines: []Line{
+				{ID: "direct", Type: LineTypeDirect, Enabled: true},
+				{
+					ID:             "unused",
+					Type:           LineTypeAnyTLS,
+					Enabled:        true,
+					AnyTLSServer:   "unused.example.com",
+					AnyTLSPort:     3489,
+					AnyTLSPassword: "secret",
+				},
+			},
+			Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
+			ActiveModeID: "mode",
+		}
+
+		cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
+		for _, outbound := range cfg.Outbounds {
+			if outbound["tag"] == "proxy-unused" {
+				t.Fatalf("unreferenced Line leaked into active outbounds: %v", outbound)
+			}
+		}
+		assertTransparentProxyNoDNSServerTag(t, cfg, desktopPublicDNSTag)
+	})
+}
+
+func TestTransparentProxySubscriptionNodeDomainEndpointsUseBootstrapResolver(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		RuleSets: []RuleSet{{
+			ID:      "stream",
+			Type:    RuleSetTypeManual,
+			Enabled: true,
+			Domains: []string{"video.example"},
+		}},
+		Subscriptions: []Subscription{{
+			ID:       "sub",
+			Enabled:  true,
+			Strategy: "selector",
+			Lines: []Line{
+				{
+					ID:             "domain-node",
+					Name:           "Domain node",
+					Type:           LineTypeAnyTLS,
+					Enabled:        true,
+					AnyTLSServer:   "node.example.com",
+					AnyTLSPort:     3489,
+					AnyTLSPassword: "secret",
+				},
+				{
+					ID:             "ip-node",
+					Name:           "IP node",
+					Type:           LineTypeAnyTLS,
+					Enabled:        true,
+					AnyTLSServer:   "192.0.2.20",
+					AnyTLSPort:     3489,
+					AnyTLSPassword: "secret",
+				},
+			},
+		}},
+		Modes: []Mode{{
+			ID: "mode",
+			Bindings: []RuleBinding{{
+				RuleSetID:      "stream",
+				SubscriptionID: "sub",
+			}},
+			DefaultLineID: "direct",
+		}},
+		ActiveModeID: "mode",
+	}
+
+	cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
+	domainNode := transparentProxyOutboundByTag(t, cfg, "proxy-sub-domain-node")
+	if domainNode["domain_resolver"] != desktopPublicDNSTag {
+		t.Fatalf("subscription domain endpoint did not use bootstrap resolver: %v", domainNode)
+	}
+	ipNode := transparentProxyOutboundByTag(t, cfg, "proxy-sub-ip-node")
+	if _, exists := ipNode["domain_resolver"]; exists {
+		t.Fatalf("subscription numeric endpoint unexpectedly acquired a resolver: %v", ipNode)
+	}
+	transparentProxyDNSServerByTag(t, cfg, desktopPublicDNSTag)
 }
 
 func TestTransparentProxyDNSCompilesManualDomainThenCIDRInCausalOrder(t *testing.T) {
@@ -227,6 +387,86 @@ func TestTransparentProxyDefaultLineOwnsFinalResolution(t *testing.T) {
 	assertTransparentProxyHasNoMobileDNSFallback(t, raw)
 }
 
+func TestTransparentProxyMagicDNSToggleCompilesDynamicDNSAndPeerRoutes(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{
+				ID: "tailnet", Type: LineTypeTailscale, Enabled: true,
+				TailscaleExitNode: "100.118.7.9", TailscaleMagicDNS: true,
+			},
+		},
+		RuleSets: []RuleSet{
+			{
+				ID: "ip-first", Name: "IP First", Type: RuleSetTypeManual,
+				Enabled: true, CIDRs: []string{"203.0.113.0/24"},
+			},
+			{
+				ID: "cdn", Name: "CDN", Type: RuleSetTypeManual,
+				Enabled: true, Domains: []string{"cdn.example.com"},
+			},
+		},
+		Modes: []Mode{{
+			ID: "mode",
+			Bindings: []RuleBinding{
+				{RuleSetID: "ip-first", LineID: "direct"},
+				{RuleSetID: "cdn", LineID: "direct"},
+			},
+			DefaultLineID: "tailnet",
+		}},
+		ActiveModeID: "mode",
+	}
+
+	cfg, raw := generateTransparentProxyDNSTestConfig(t, profile)
+	resolverTag := mobileTailscaleDNSTag("tailscale-tailnet")
+	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
+		`{"action":"resolve","server":"xdial-system-dns"}`,
+		`{"ip_cidr":["203.0.113.0/24"],"outbound":"direct"}`,
+		`{"action":"resolve","domain_suffix":["cdn.example.com"],"server":"xdial-system-dns"}`,
+		`{"domain_suffix":["cdn.example.com"],"outbound":"direct"}`,
+		`{"action":"resolve","domain_regex":["^[^.]+$"],"server":"` + resolverTag + `"}`,
+		`{"action":"resolve","preferred_by":"tailscale-tailnet","server":"` + resolverTag + `"}`,
+		`{"outbound":"tailscale-tailnet","preferred_by":"tailscale-tailnet"}`,
+		`{"action":"resolve","server":"proxy-dns-tailscale-tailnet"}`,
+	})
+
+	servers := cfg.DNS["servers"].([]interface{})
+	if len(servers) != 3 {
+		t.Fatalf("expected system, Tailscale, and default-Line DNS servers, got %v", servers)
+	}
+	tailnetDNS := servers[1].(map[string]interface{})
+	if tailnetDNS["type"] != "tailscale" ||
+		tailnetDNS["tag"] != resolverTag ||
+		tailnetDNS["endpoint"] != "tailscale-tailnet" ||
+		tailnetDNS["accept_default_resolvers"] != false ||
+		tailnetDNS["accept_search_domain"] != true {
+		t.Fatalf("unexpected Tailnet DNS server: %v", tailnetDNS)
+	}
+	dnsRules := cfg.DNS["rules"].([]interface{})
+	if len(dnsRules) != 3 {
+		t.Fatalf("expected explicit CDN followed by dynamic MagicDNS rules, got %v", dnsRules)
+	}
+	first := dnsRules[0].(map[string]interface{})
+	second := dnsRules[1].(map[string]interface{})
+	third := dnsRules[2].(map[string]interface{})
+	if first["server"] != transparentSystemDNSTag ||
+		!reflect.DeepEqual(first["domain_suffix"], []interface{}{"cdn.example.com"}) {
+		t.Fatalf("explicit CDN DNS ownership must precede MagicDNS: %v", dnsRules)
+	}
+	if second["preferred_by"] != resolverTag || second["server"] != resolverTag {
+		t.Fatalf("MagicDNS ownership is not dynamic: %v", second)
+	}
+	if third["server"] != resolverTag ||
+		!reflect.DeepEqual(third["domain_regex"], []interface{}{tailnetSingleLabelDomainRegex}) {
+		t.Fatalf("short Tailnet names are not routed to MagicDNS: %v", third)
+	}
+	for _, forbidden := range []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("MagicDNS must not hard-code Tailnet ranges (%s):\n%s", forbidden, raw)
+		}
+	}
+}
+
 func TestTransparentProxyInvertedURLIPRuleKeepsSystemResolutionAndInvertsRoute(t *testing.T) {
 	profile := &Profile{
 		Lines: []Line{
@@ -288,6 +528,47 @@ func generateTransparentProxyDNSTestConfig(t *testing.T, profile *Profile) (Sing
 		t.Fatal(err)
 	}
 	return cfg, raw
+}
+
+func transparentProxyOutboundByTag(t *testing.T, cfg SingBoxConfig, tag string) map[string]interface{} {
+	t.Helper()
+	for _, outbound := range cfg.Outbounds {
+		if outbound["tag"] == tag {
+			return outbound
+		}
+	}
+	t.Fatalf("outbound %q is missing: %v", tag, cfg.Outbounds)
+	return nil
+}
+
+func transparentProxyDNSServerByTag(t *testing.T, cfg SingBoxConfig, tag string) map[string]interface{} {
+	t.Helper()
+	servers, ok := cfg.DNS["servers"].([]interface{})
+	if !ok {
+		t.Fatalf("invalid DNS servers: %v", cfg.DNS["servers"])
+	}
+	for _, rawServer := range servers {
+		server := rawServer.(map[string]interface{})
+		if server["tag"] == tag {
+			return server
+		}
+	}
+	t.Fatalf("DNS server %q is missing: %v", tag, servers)
+	return nil
+}
+
+func assertTransparentProxyNoDNSServerTag(t *testing.T, cfg SingBoxConfig, tag string) {
+	t.Helper()
+	servers, ok := cfg.DNS["servers"].([]interface{})
+	if !ok {
+		t.Fatalf("invalid DNS servers: %v", cfg.DNS["servers"])
+	}
+	for _, rawServer := range servers {
+		server := rawServer.(map[string]interface{})
+		if server["tag"] == tag {
+			t.Fatalf("unexpected DNS server %q: %v", tag, server)
+		}
+	}
 }
 
 func transparentProxyUserRules(t *testing.T, cfg SingBoxConfig) []interface{} {

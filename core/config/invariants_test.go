@@ -312,9 +312,7 @@ func invSubscriptionMainTag(profile *Profile, subscriptionID string) string {
 		if subscription.ID != subscriptionID {
 			continue
 		}
-		if len(subscription.Groups) > 0 {
-			return subscription.Groups[0].Tag
-		}
+		return subscription.MainTag
 	}
 	return ""
 }
@@ -374,9 +372,11 @@ func TestINV1_UnreferencedObjectsDoNotAffectGeneratedConfig(t *testing.T) {
 			},
 		},
 		{
-			name: "加入未被引用的旧 Tailscale 线路",
+			name: "加入未被引用且勾选 MagicDNS 的 Tailscale 线路",
 			mutate: func(p *Profile) {
-				p.Lines = append(p.Lines, invTailscaleLine())
+				line := invTailscaleLine()
+				line.TailscaleMagicDNS = true
+				p.Lines = append(p.Lines, line)
 			},
 		},
 		{
@@ -417,8 +417,8 @@ func TestINV1_UnreferencedObjectsDoNotAffectGeneratedConfig(t *testing.T) {
 
 // INV1c —— 桌面 Tailscale 是盒内普通 Line，不享有隐式生效的例外。
 //
-// 未被 Mode 引用时必须和不存在逐字节等价；被引用时只生成一个无系统接口、无隐藏
-// 路由、无持久 Auth Key 的 sing-box endpoint。
+// 未被 Mode 引用时必须和不存在逐字节等价；被引用但未勾选 MagicDNS
+// 时只生成一个无系统接口、无 peer 路由、无持久 Auth Key 的 endpoint。
 func TestINV1c_DesktopTailscaleHasNoException(t *testing.T) {
 	baseline := invGenerateDesktop(t, invBaseProfile())
 	invNormalize(baseline)
@@ -459,9 +459,25 @@ func TestINV1c_DesktopTailscaleHasNoException(t *testing.T) {
 	route := cfg["route"].(map[string]interface{})
 	for _, rawRule := range route["rules"].([]interface{}) {
 		rule := rawRule.(map[string]interface{})
-		if rule["outbound"] == "tailscale-ts" && reflect.DeepEqual(rule["ip_cidr"], []interface{}{"100.64.0.0/10"}) {
-			t.Fatalf("Tailscale Line 不得注入隐藏 tailnet 路由: %v", rule)
+		if rule["preferred_by"] == "tailscale-ts" {
+			t.Fatalf("未勾选 MagicDNS 时不得注入 peer 路由: %v", rule)
 		}
+	}
+
+	active.Lines[len(active.Lines)-1].TailscaleMagicDNS = true
+	cfg = invGenerateDesktop(t, active)
+	foundDynamicRoute := false
+	for _, rawRule := range cfg["route"].(map[string]interface{})["rules"].([]interface{}) {
+		rule := rawRule.(map[string]interface{})
+		if rule["preferred_by"] == "tailscale-ts" && rule["outbound"] == "tailscale-ts" {
+			foundDynamicRoute = true
+			if _, hardcoded := rule["ip_cidr"]; hardcoded {
+				t.Fatalf("MagicDNS 路由必须来自 NetMap，不得硬编码 CIDR: %v", rule)
+			}
+		}
+	}
+	if !foundDynamicRoute {
+		t.Fatal("已勾选的 active Tailscale Line 缺少动态 peer 路由")
 	}
 }
 
@@ -789,6 +805,9 @@ func invClassifyRouteRule(profile *Profile, rule map[string]interface{}, ctx inv
 	if invMatchesModeBinding(profile, rule) {
 		return "mode"
 	}
+	if invMatchesActiveMagicDNS(profile, rule) {
+		return "magic-dns"
+	}
 	if invMatchesSubscriptionRule(profile, rule) {
 		return "subscription"
 	}
@@ -798,6 +817,20 @@ func invClassifyRouteRule(profile *Profile, rule map[string]interface{}, ctx inv
 		}
 	}
 	return ""
+}
+
+func invMatchesActiveMagicDNS(profile *Profile, rule map[string]interface{}) bool {
+	mode := profile.ActiveMode()
+	if mode == nil {
+		return false
+	}
+	for _, endpointTag := range effectiveActiveMagicDNSEndpointTags(profile, mode) {
+		if rule["preferred_by"] == endpointTag && rule["outbound"] == endpointTag {
+			_, hasCIDR := rule["ip_cidr"]
+			return !hasCIDR
+		}
+	}
+	return false
 }
 
 func TestINV4_NoHiddenRouteRules(t *testing.T) {
@@ -831,6 +864,17 @@ func TestINV4_NoHiddenRouteRules(t *testing.T) {
 					RuleBinding{RuleSetID: connectivityDirectRuleSetID, LineID: "direct"},
 					RuleBinding{RuleSetID: connectivityOutboundRuleSetID, LineID: "corp"},
 				)
+				return p
+			},
+		},
+		{
+			name: "active Tailscale Line 显式勾选 MagicDNS",
+			profile: func() *Profile {
+				p := invBaseProfile()
+				line := invTailscaleLine()
+				line.TailscaleMagicDNS = true
+				p.Lines = append(p.Lines, line)
+				p.Modes[0].DefaultLineID = line.ID
 				return p
 			},
 		},

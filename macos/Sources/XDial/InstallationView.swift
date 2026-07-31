@@ -41,7 +41,13 @@ struct InstallationView: View {
                                 )
                         }
                         Spacer()
-                        if task.state == .running {
+                        if canRetry(task) {
+                            Button(retryTitle(task)) {
+                                coordinator.retry()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        } else if task.state == .running {
                             ProgressView().controlSize(.small)
                         } else {
                             Text(stateText(task.state))
@@ -64,7 +70,8 @@ struct InstallationView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Spacer()
-                if coordinator.report.state == .failed {
+                if coordinator.report.state == .failed,
+                   !isExtensionFailure {
                     Button("重试") {
                         coordinator.retry()
                     }
@@ -177,5 +184,23 @@ struct InstallationView: View {
         case .failed:
             "失败"
         }
+    }
+
+    private func canRetry(_ task: InstallationTaskReport) -> Bool {
+        task.state == .failed
+            && task.id == "system-extension"
+    }
+
+    private func retryTitle(
+        _ task: InstallationTaskReport
+    ) -> String {
+        "重试安装"
+    }
+
+    private var isExtensionFailure: Bool {
+        guard let taskID = coordinator.report.error?.taskID else {
+            return false
+        }
+        return taskID == "system-extension"
     }
 }

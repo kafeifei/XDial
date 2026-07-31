@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"path"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -33,7 +35,31 @@ const (
 	mobileDispatcherDNSTag        = "xdial-mobile-dns"
 	transparentSystemDNSTag       = "xdial-system-dns"
 	transparentEnterpriseDNSTag   = "xdial-anyconnect-dns"
+	tailnetSingleLabelDomainRegex = `^[^.]+$`
+	minAnyTLSDurationSeconds      = 6
+	maxAnyTLSDurationSeconds      = 3600
+	maxAnyTLSMinIdleSession       = 64
+	maxAnyTLSALPNProtocols        = 8
+	maxAnyTLSALPNProtocolBytes    = 255
 )
+
+var anyTLSClientFingerprints = map[string]struct{}{
+	"chrome_psk":                 {},
+	"chrome_psk_shuffle":         {},
+	"chrome_padding_psk_shuffle": {},
+	"chrome_pq":                  {},
+	"chrome_pq_psk":              {},
+	"chrome":                     {},
+	"firefox":                    {},
+	"edge":                       {},
+	"safari":                     {},
+	"360":                        {},
+	"qq":                         {},
+	"ios":                        {},
+	"android":                    {},
+	"random":                     {},
+	"randomized":                 {},
+}
 
 // Platform 决定 sing-box 配置生成的目标运行环境。
 //
@@ -172,6 +198,7 @@ func generateSingBox(
 	activeLineIDs, activeSubscriptionIDs := effectiveActiveTargetIDs(profile, mode)
 	activeVPNIDs := effectiveActiveVPNLineIDs(profile, mode)
 	activeTailscaleIDs := effectiveActiveTailscaleLineIDs(profile, mode)
+	activeMagicDNSTags := effectiveActiveMagicDNSEndpointTags(profile, mode)
 	// D30：sslcon 是包级单例，一个进程只能维持一条 AnyConnect 隧道，而所有 VPN
 	// 线路共享 "vpn" 这一个 outbound tag。两条不同的 active VPN 线路会让第二条的
 	// 流量静默钻进第一条的隧道（违反 Line 隔离）。所有平台一律硬校验报错，
@@ -235,9 +262,17 @@ func generateSingBox(
 			continue
 		}
 		ob := buildProxyOutbound(&line)
-		if ob != nil {
-			outbounds = append(outbounds, ob)
+		if ob == nil {
+			// inspectModeReferences 使用同一能力判据，正常情况下会更早返回错误。
+			// 这里仍保留生成器自身的最后防线，避免未来两处判据漂移后又把 active
+			// Line 静默丢掉，让绑定或默认出口落到 direct。
+			return nil, fmt.Errorf(
+				"active enabled line %q (type %q) cannot generate an outbound",
+				line.ID,
+				line.Type,
+			)
 		}
+		outbounds = append(outbounds, ob)
 	}
 
 	// 订阅 outbound：节点 + 策略组（或默认 urltest/selector）
@@ -253,6 +288,17 @@ func generateSingBox(
 			subTagMap[sub.ID] = mainTag
 			subGroupTagMap[sub.ID] = groupTags
 		}
+	}
+
+	// 代理服务器域名属于 Line 的启动端点，不是用户流量的目标域名。Transparent
+	// Proxy 的全局 resolver 必须继续保持启动前 Underlay 的系统 DNS 视角；但把代理
+	// 端点也交给它，会让一个对公网域名返回 SERVFAIL 的下层 resolver 阻断整条 Line。
+	// 这里只覆盖 active Mode 实际生成的域名型代理 outbound，并使用盒内、IP 直连的
+	// public-dns 做唯一的启动解析主路径。它不参与 Mode DNS 分域，也绝不能 detour
+	// 回正在启动的代理（否则形成 resolver → outbound → resolver 自循环）。
+	needsProxyEndpointBootstrap := false
+	if platform.isTransparentProxy() {
+		needsProxyEndpointBootstrap = configureTransparentProxyEndpointBootstrap(outbounds)
 	}
 
 	if platform == PlatformMacOS {
@@ -335,6 +381,16 @@ func generateSingBox(
 	// 兜底规则抢走，这正是"隐式抢注"。改为：用户显式绑定优先，订阅规则退为兜底。
 	routeRules = append(routeRules, ordinaryModeRules...)
 
+	// 用户在 active Tailscale Line 上勾选 MagicDNS 后，才加入
+	// endpoint 根据当前 NetMap 动态申报的域名与 peer 地址归属。
+	// 它排在 Mode 的显式规则之后，避免 Tailnet 分域 DNS 与用户的
+	// CDN/企业域名绑定重叠时抢走用户裁决；又排在订阅供给规则
+	// 之前，保证常见的大范围订阅规则不会吞掉 Tailnet 节点。
+	routeRules = append(routeRules, buildMagicDNSRouteRules(
+		activeMagicDNSTags,
+		platform.isTransparentProxy(),
+	)...)
+
 	// 订阅自带规则：以一等公民身份进入裁决，但排在用户显式绑定之后。
 	for _, sub := range profile.Subscriptions {
 		if !activeSubscriptionIDs[sub.ID] || !sub.Enabled {
@@ -364,13 +420,9 @@ func generateSingBox(
 		}
 	}
 
-	if platform == PlatformNE {
-		routeRules = append(routeRules, buildTailscaleInternalRouteRules(activeTailscaleTags)...)
-	}
-
-	// 默认出口。悬空引用已在 inspectModeReferences 里报错拒绝，这里能走到回落
-	// direct 的只剩"对象存在但被禁用/参数不全"一种情况，且已经产生了对应的
-	// ProfileWarning（INV6b），不是静默降级。
+	// 默认出口。悬空引用和 enabled 但生成不出 outbound 的线路已在
+	// inspectModeReferences 里报错拒绝；这里能走到 direct 的只剩用户显式禁用
+	// 对象的 INV6b 语义，并且已经产生对应 ProfileWarning。
 	defaultTag := "direct"
 	if mode.DefaultSubscriptionID != "" {
 		if tag, ok := subTagMap[mode.DefaultSubscriptionID]; ok && validTags[tag] {
@@ -428,7 +480,7 @@ func generateSingBox(
 	if len(ruleSetResources) > 0 {
 		route["rule_set"] = ruleSetResources
 	}
-	dnsConfig := buildNEDNS(activeTailscaleTags)
+	dnsConfig := buildNEDNS(activeMagicDNSTags)
 	if platform.isTransparentProxy() {
 		var dnsErr error
 		dnsConfig, dnsErr = buildTransparentProxyDNS(
@@ -437,8 +489,10 @@ func generateSingBox(
 			subTagMap,
 			subGroupTagMap,
 			validTags,
+			activeMagicDNSTags,
 			systemDNS,
 			defaultTag,
+			needsProxyEndpointBootstrap,
 		)
 		if dnsErr != nil {
 			return nil, dnsErr
@@ -448,6 +502,7 @@ func generateSingBox(
 			enterpriseDNS,
 			collectVPNBoundDomains(profile, mode),
 			collectProxyBoundDNSTargets(profile, mode, subTagMap, validTags),
+			activeMagicDNSTags,
 		)
 	}
 
@@ -537,6 +592,22 @@ func effectiveActiveTailscaleLineIDs(profile *Profile, mode *Mode) map[string]bo
 		}
 	}
 	return ids
+}
+
+// effectiveActiveMagicDNSEndpointTags 只返回 active Mode 实际引用，
+// 且用户在 Line 上显式勾选 MagicDNS 的 Tailscale endpoint。单纯声明、
+// 启用或勾选一条未被 active Mode 引用的 Line 仍然是零副作用。
+func effectiveActiveMagicDNSEndpointTags(profile *Profile, mode *Mode) []string {
+	var tags []string
+	activeLineIDs := effectiveActiveTailscaleLineIDs(profile, mode)
+	for index := range profile.Lines {
+		line := &profile.Lines[index]
+		if !activeLineIDs[line.ID] || !line.TailscaleMagicDNS {
+			continue
+		}
+		tags = append(tags, tailscaleEndpointTag(line))
+	}
+	return tags
 }
 
 // ActiveTailscaleLine returns the one enabled Tailscale Line referenced by the active
@@ -737,6 +808,7 @@ func buildDNS(
 	enterpriseDNS []string,
 	enterpriseDomains []string,
 	proxyTargets []proxyDNSTarget,
+	magicDNSEndpointTags []string,
 ) map[string]interface{} {
 	servers := []map[string]interface{}{
 		// system 仍保留：个别场景（无网络策略偏好）可作诊断对照，但不再当默认。
@@ -795,6 +867,15 @@ func buildDNS(
 		rules = append(rules, rule)
 	}
 
+	// 只有 active Mode 实际引用的 Tailscale Line 显式勾选 MagicDNS 时才启用。
+	// preferred_by 从 endpoint 的当前 NetMap 动态读取分域归属；短节点名由
+	// accept_search_domain 依次追加 Tailscale 搜索域。两者都不接受公共回落。
+	for _, endpointTag := range magicDNSEndpointTags {
+		serverTag := mobileTailscaleDNSTag(endpointTag)
+		servers = append(servers, buildTailnetDNSServer(endpointTag))
+		rules = append(rules, buildTailnetDNSRules(serverTag)...)
+	}
+
 	config := map[string]interface{}{
 		"servers": servers,
 		"final":   desktopPublicDNSTag,
@@ -819,12 +900,7 @@ func buildNEDNS(tailscaleTags []string) map[string]interface{} {
 	bindings := make([]map[string]interface{}, 0, len(tailscaleTags))
 	for _, endpointTag := range tailscaleTags {
 		serverTag := mobileTailscaleDNSTag(endpointTag)
-		servers = append(servers, map[string]interface{}{
-			"type":                     "tailscale",
-			"tag":                      serverTag,
-			"endpoint":                 endpointTag,
-			"accept_default_resolvers": false,
-		})
+		servers = append(servers, buildTailnetDNSServer(endpointTag))
 		bindings = append(bindings, map[string]interface{}{
 			"endpoint": endpointTag,
 			"server":   serverTag,
@@ -836,10 +912,18 @@ func buildNEDNS(tailscaleTags []string) map[string]interface{} {
 		"public_fallback": mobilePublicDNSTag,
 		"tailscale":       bindings,
 	})
-	return map[string]interface{}{
+	config := map[string]interface{}{
 		"servers": servers,
 		"final":   mobileDispatcherDNSTag,
 	}
+	var rules []map[string]interface{}
+	for _, endpointTag := range tailscaleTags {
+		rules = append(rules, buildTailnetDNSRules(mobileTailscaleDNSTag(endpointTag))...)
+	}
+	if len(rules) > 0 {
+		config["rules"] = rules
+	}
+	return config
 }
 
 func buildTransparentProxyDNS(
@@ -848,8 +932,10 @@ func buildTransparentProxyDNS(
 	subTagMap map[string]string,
 	subGroupTagMap map[string]map[string]string,
 	validTags map[string]bool,
+	magicDNSEndpointTags []string,
 	systemDNS []string,
 	defaultOutboundTag string,
+	needsProxyEndpointBootstrap bool,
 ) (map[string]interface{}, error) {
 	primarySystemDNS, err := validateTransparentProxySystemDNS(systemDNS)
 	if err != nil {
@@ -861,14 +947,28 @@ func buildTransparentProxyDNS(
 		"server":      primarySystemDNS,
 		"server_port": 53,
 	}}
+	if needsProxyEndpointBootstrap {
+		servers = append(servers, map[string]interface{}{
+			"type":   "https",
+			"tag":    desktopPublicDNSTag,
+			"server": "223.5.5.5",
+		})
+	}
 	var rules []map[string]interface{}
-	seenResolver := map[string]bool{transparentSystemDNSTag: true}
+	seenResolver := map[string]bool{
+		transparentSystemDNSTag: true,
+		desktopPublicDNSTag:     needsProxyEndpointBootstrap,
+	}
 
-	ensureResolver := func(resolverTag, outTag string) {
+	ensureResolver := func(resolverTag, outTag string, tailnet bool) {
 		if seenResolver[resolverTag] {
 			return
 		}
 		seenResolver[resolverTag] = true
+		if tailnet {
+			servers = append(servers, buildTailnetDNSServer(outTag))
+			return
+		}
 		switch resolverTag {
 		case transparentEnterpriseDNSTag:
 			servers = append(servers, map[string]interface{}{
@@ -904,11 +1004,19 @@ func buildTransparentProxyDNS(
 		switch ruleSet.Type {
 		case RuleSetTypeManual:
 			if len(ruleSet.Domains) > 0 {
-				ensureResolver(resolverTag, outTag)
+				ensureResolver(resolverTag, outTag, false)
 				if dnsRulesOpen {
 					rules = append(rules, map[string]interface{}{
 						"domain_suffix": ruleSet.Domains,
 						"server":        resolverTag,
+					})
+				} else if len(magicDNSEndpointTags) > 0 {
+					// 这条域名 binding 位于 IP/混合规则之后，按既定
+					// 保守语义仍用启动前系统 DNS。显式列出它可防止
+					// 后续 MagicDNS 对重叠后缀取得优先权。
+					rules = append(rules, map[string]interface{}{
+						"domain_suffix": ruleSet.Domains,
+						"server":        transparentSystemDNSTag,
 					})
 				}
 			}
@@ -923,11 +1031,18 @@ func buildTransparentProxyDNS(
 				dnsRulesOpen = false
 				continue
 			}
-			ensureResolver(resolverTag, outTag)
+			ensureResolver(resolverTag, outTag, false)
 			if dnsRulesOpen {
 				rule := map[string]interface{}{
 					"rule_set": sbRuleSetTag(ruleSet),
 					"server":   resolverTag,
+				}
+				applyURLRuleSetInvert(rule, ruleSet)
+				rules = append(rules, rule)
+			} else if len(magicDNSEndpointTags) > 0 {
+				rule := map[string]interface{}{
+					"rule_set": sbRuleSetTag(ruleSet),
+					"server":   transparentSystemDNSTag,
 				}
 				applyURLRuleSetInvert(rule, ruleSet)
 				rules = append(rules, rule)
@@ -947,7 +1062,7 @@ func buildTransparentProxyDNS(
 				continue
 			}
 			if rule.outTag == rejectTag {
-				if dnsRulesOpen {
+				if dnsRulesOpen || len(magicDNSEndpointTags) > 0 {
 					rules = append(rules, map[string]interface{}{
 						rule.matchKey: rule.values,
 						"action":      "reject",
@@ -956,18 +1071,32 @@ func buildTransparentProxyDNS(
 				continue
 			}
 			resolverTag := transparentProxyResolverForOutbound(rule.outTag)
-			ensureResolver(resolverTag, rule.outTag)
+			ensureResolver(resolverTag, rule.outTag, false)
 			if dnsRulesOpen {
 				rules = append(rules, map[string]interface{}{
 					rule.matchKey: rule.values,
 					"server":      resolverTag,
 				})
+			} else if len(magicDNSEndpointTags) > 0 {
+				rules = append(rules, map[string]interface{}{
+					rule.matchKey: rule.values,
+					"server":      transparentSystemDNSTag,
+				})
 			}
 		}
 	}
 
+	// MagicDNS 是 Line 上的显式能力开关，不是 RuleSet。它位于当前
+	// Mode 与订阅的显式 DNS 规则之后：重叠域名由用户绑定优先，
+	// 其余 MagicDNS 名称和单标签节点名才由 Tailscale 原生解析器回答。
+	for _, endpointTag := range magicDNSEndpointTags {
+		serverTag := mobileTailscaleDNSTag(endpointTag)
+		ensureResolver(serverTag, endpointTag, true)
+		rules = append(rules, buildTailnetDNSRules(serverTag)...)
+	}
+
 	defaultResolverTag := transparentProxyResolverForOutbound(defaultOutboundTag)
-	ensureResolver(defaultResolverTag, defaultOutboundTag)
+	ensureResolver(defaultResolverTag, defaultOutboundTag, false)
 	dnsConfig := map[string]interface{}{
 		"servers":           servers,
 		"final":             defaultResolverTag,
@@ -1007,6 +1136,57 @@ func mobileTailscaleDNSTag(endpointTag string) string {
 	return "xdial-dns-" + endpointTag
 }
 
+func buildTailnetDNSServer(endpointTag string) map[string]interface{} {
+	return map[string]interface{}{
+		"type":                     "tailscale",
+		"tag":                      mobileTailscaleDNSTag(endpointTag),
+		"endpoint":                 endpointTag,
+		"accept_default_resolvers": false,
+		"accept_search_domain":     true,
+	}
+}
+
+func buildTailnetDNSRules(serverTag string) []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"preferred_by": serverTag,
+			"server":       serverTag,
+		},
+		{
+			"domain_regex": []string{tailnetSingleLabelDomainRegex},
+			"server":       serverTag,
+		},
+	}
+}
+
+func buildMagicDNSRouteRules(
+	endpointTags []string,
+	resolveBeforeRoute bool,
+) (rules []map[string]interface{}) {
+	for _, endpointTag := range endpointTags {
+		if resolveBeforeRoute {
+			resolverTag := mobileTailscaleDNSTag(endpointTag)
+			rules = append(rules,
+				map[string]interface{}{
+					"domain_regex": []string{tailnetSingleLabelDomainRegex},
+					"action":       "resolve",
+					"server":       resolverTag,
+				},
+				map[string]interface{}{
+					"preferred_by": endpointTag,
+					"action":       "resolve",
+					"server":       resolverTag,
+				},
+			)
+		}
+		rules = append(rules, map[string]interface{}{
+			"preferred_by": endpointTag,
+			"outbound":     endpointTag,
+		})
+	}
+	return rules
+}
+
 func buildSystemRouteRules(includeDesktopDiagnostics bool) []map[string]interface{} {
 	rules := []map[string]interface{}{
 		{"action": "sniff"},
@@ -1029,22 +1209,6 @@ func buildNESystemRouteRules() []map[string]interface{} {
 		{"action": "sniff"},
 		{"protocol": "dns", "action": "hijack-dns"},
 	}
-}
-
-// buildTailscaleInternalRouteRules 只接管 tailnet 内部网段：按 MagicDNS 名字
-// 访问 tailnet 设备时进 Tailscale 数据面。两段都要：MagicDNS 的 A 记录落在
-// CGNAT 100.64/10，AAAA 记录落在 tailnet 固定的 IPv6 ULA fd7a:115c:a1e0::/48，
-// 只写 IPv4 的话，双栈客户端优先取 AAAA 就会走 direct 黑洞。
-func buildTailscaleInternalRouteRules(tailscaleTags []string) []map[string]interface{} {
-	tag := firstString(tailscaleTags)
-	if tag == "" {
-		return nil
-	}
-	return []map[string]interface{}{{
-		"ip_cidr":  []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"},
-		"action":   "route",
-		"outbound": tag,
-	}}
 }
 
 // buildTransparentProxyModeRouteRules 把每个 Mode binding 编译成一段连续的
@@ -1634,11 +1798,19 @@ type RuntimeSubscriptionCatalog struct {
 }
 
 type RuntimeSubscription struct {
-	ID       string          `json:"id"`
-	Name     string          `json:"name"`
-	Strategy string          `json:"strategy"`
-	Nodes    []RuntimeMember `json:"nodes"`
-	Groups   []RuntimeGroup  `json:"groups"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Strategy string `json:"strategy"`
+	// MainTag is the exact primary outbound selected by
+	// buildSubscriptionOutbounds, not a tag reconstructed by a consumer.
+	MainTag string `json:"main_tag"`
+	// ReadinessTags contains only generated proxy groups that can affect the
+	// active subscription: its primary group and groups referenced by its own
+	// compiled rules. Direct/reject targets and unused declared groups are
+	// intentionally excluded.
+	ReadinessTags []string        `json:"readiness_tags"`
+	Nodes         []RuntimeMember `json:"nodes"`
+	Groups        []RuntimeGroup  `json:"groups"`
 }
 
 type RuntimeGroup struct {
@@ -1687,7 +1859,7 @@ func BuildSubscriptionRuntimeCatalog(profile *Profile, platform Platform) Runtim
 		if !subscription.Enabled {
 			continue
 		}
-		generated, _, groupTags := buildSubscriptionOutbounds(subscription, platform)
+		generated, mainTag, groupTags := buildSubscriptionOutbounds(subscription, platform)
 		if len(generated) == 0 {
 			continue
 		}
@@ -1700,7 +1872,15 @@ func BuildSubscriptionRuntimeCatalog(profile *Profile, platform Platform) Runtim
 
 		entry := RuntimeSubscription{
 			ID: subscription.ID, Name: subscription.Name, Strategy: subscription.Strategy,
-			Nodes: []RuntimeMember{}, Groups: []RuntimeGroup{},
+			MainTag: mainTag,
+			ReadinessTags: subscriptionReadinessTags(
+				subscription,
+				mainTag,
+				groupTags,
+				generatedTags,
+			),
+			Nodes:  []RuntimeMember{},
+			Groups: []RuntimeGroup{},
 		}
 		memberTags := make(map[string]string)
 		for _, line := range subscription.Lines {
@@ -1763,6 +1943,35 @@ func BuildSubscriptionRuntimeCatalog(profile *Profile, platform Platform) Runtim
 		catalog.Subscriptions = append(catalog.Subscriptions, entry)
 	}
 	return catalog
+}
+
+func subscriptionReadinessTags(
+	subscription *Subscription,
+	mainTag string,
+	groupTags map[string]string,
+	generatedTags map[string]bool,
+) []string {
+	tags := make([]string, 0, len(groupTags))
+	seen := make(map[string]bool, len(groupTags))
+	appendTag := func(tag string) {
+		tag = strings.TrimSpace(tag)
+		if tag == "" ||
+			tag == "direct" ||
+			tag == rejectTag ||
+			!generatedTags[tag] ||
+			seen[tag] {
+			return
+		}
+		seen[tag] = true
+		tags = append(tags, tag)
+	}
+
+	appendTag(mainTag)
+	compiled, _ := collectSubscriptionRules(subscription, groupTags)
+	for _, rule := range compiled {
+		appendTag(rule.outTag)
+	}
+	return tags
 }
 
 type subscriptionCompiledRule struct {
@@ -1928,6 +2137,68 @@ func applyTransport(ob map[string]interface{}, line *Line) {
 	}
 }
 
+func validAnyTLSOptions(line *Line) bool {
+	if (line.AnyTLSIdleSessionCheckInterval != 0 &&
+		(line.AnyTLSIdleSessionCheckInterval < minAnyTLSDurationSeconds ||
+			line.AnyTLSIdleSessionCheckInterval > maxAnyTLSDurationSeconds)) ||
+		(line.AnyTLSIdleSessionTimeout != 0 &&
+			(line.AnyTLSIdleSessionTimeout < minAnyTLSDurationSeconds ||
+				line.AnyTLSIdleSessionTimeout > maxAnyTLSDurationSeconds)) ||
+		line.AnyTLSMinIdleSession < 0 ||
+		line.AnyTLSMinIdleSession > maxAnyTLSMinIdleSession {
+		return false
+	}
+	if line.AnyTLSClientFingerprint != "" {
+		if _, exists := anyTLSClientFingerprints[line.AnyTLSClientFingerprint]; !exists {
+			return false
+		}
+	}
+	if len(line.AnyTLSALPN) > maxAnyTLSALPNProtocols {
+		return false
+	}
+	seenALPN := make(map[string]struct{}, len(line.AnyTLSALPN))
+	for _, protocol := range line.AnyTLSALPN {
+		if protocol == "" ||
+			len(protocol) > maxAnyTLSALPNProtocolBytes ||
+			!utf8.ValidString(protocol) ||
+			strings.IndexFunc(protocol, unicode.IsControl) >= 0 {
+			return false
+		}
+		if _, duplicate := seenALPN[protocol]; duplicate {
+			return false
+		}
+		seenALPN[protocol] = struct{}{}
+	}
+	return true
+}
+
+// configureTransparentProxyEndpointBootstrap isolates proxy endpoint lookup from
+// user-traffic DNS ownership. Only concrete proxy outbounds generated from the
+// active Mode are present here; selectors and infrastructure outbounds have no
+// server field and must never acquire this resolver implicitly.
+func configureTransparentProxyEndpointBootstrap(outbounds []map[string]interface{}) bool {
+	needed := false
+	for _, outbound := range outbounds {
+		outboundType, _ := outbound["type"].(string)
+		switch outboundType {
+		case "trojan", "shadowsocks", "vmess", "anytls":
+		default:
+			continue
+		}
+		server, _ := outbound["server"].(string)
+		server = strings.TrimSpace(server)
+		if server == "" {
+			continue
+		}
+		if _, err := netip.ParseAddr(server); err == nil {
+			continue
+		}
+		outbound["domain_resolver"] = desktopPublicDNSTag
+		needed = true
+	}
+	return needed
+}
+
 func buildProxyOutbound(line *Line) map[string]interface{} {
 	switch line.Type {
 	case LineTypeTrojan:
@@ -1983,6 +2254,60 @@ func buildProxyOutbound(line *Line) map[string]interface{} {
 			"alter_id":    line.VMessAltID,
 		}
 		applyTransport(ob, line)
+		return ob
+	case LineTypeAnyTLS:
+		// AnyTLS 会在握手期间读取已经建立连接的远端地址，而 TCP Fast Open
+		// 返回的是延迟建立连接。sing-box 明确拒绝这个组合；在配置编译阶段就把
+		// 线路判为不可用，避免数据面启动时崩溃或才暴露错误。
+		if line.TFO ||
+			line.AnyTLSServer == "" ||
+			line.AnyTLSPort <= 0 ||
+			line.AnyTLSPort > 65535 ||
+			line.AnyTLSPassword == "" ||
+			!validAnyTLSOptions(line) {
+			return nil
+		}
+		serverName := line.AnyTLSSNI
+		if serverName == "" {
+			serverName = line.AnyTLSServer
+		}
+		tls := map[string]interface{}{
+			"enabled":     true,
+			"server_name": serverName,
+		}
+		if line.AllowInsecure {
+			tls["insecure"] = true
+		}
+		if len(line.AnyTLSALPN) > 0 {
+			tls["alpn"] = line.AnyTLSALPN
+		}
+		if line.AnyTLSClientFingerprint != "" {
+			tls["utls"] = map[string]interface{}{
+				"enabled":     true,
+				"fingerprint": line.AnyTLSClientFingerprint,
+			}
+		}
+		ob := map[string]interface{}{
+			"type":        "anytls",
+			"tag":         "proxy-" + line.ID,
+			"server":      line.AnyTLSServer,
+			"server_port": line.AnyTLSPort,
+			"password":    line.AnyTLSPassword,
+			"tls":         tls,
+		}
+		if line.AnyTLSIdleSessionCheckInterval > 0 {
+			ob["idle_session_check_interval"] = fmt.Sprintf(
+				"%ds",
+				line.AnyTLSIdleSessionCheckInterval,
+			)
+		}
+		if line.AnyTLSIdleSessionTimeout > 0 {
+			ob["idle_session_timeout"] = fmt.Sprintf("%ds", line.AnyTLSIdleSessionTimeout)
+		}
+		if line.AnyTLSMinIdleSession > 0 {
+			ob["min_idle_session"] = line.AnyTLSMinIdleSession
+		}
+		// AnyTLS 原生用 UoT 承载 UDP；不能套用通用 udp_over_tcp 字段。
 		return ob
 	}
 	return nil

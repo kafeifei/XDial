@@ -127,6 +127,23 @@ struct GeneralTab: View {
                     Text(state.tr("开机自动启动", "Launch at login"))
                 }
                 .toggleStyle(.switch)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Toggle(isOn: $state.autoConnect) {
+                        Text(state.tr(
+                            "启动时自动连接",
+                            "Connect automatically on launch"
+                        ))
+                    }
+                    .toggleStyle(.switch)
+                    Text(state.tr(
+                        "此选项控制 XDial 启动后连接当前模式。合盖前已有连接时，唤醒后仍会等待网络恢复并重新连接。",
+                        "This controls connecting the active Mode when XDial launches. A connection active before sleep is still restored after the network wakes."
+                    ))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 2)
+                }
             }
             .padding(.horizontal, 16)
 
@@ -136,8 +153,8 @@ struct GeneralTab: View {
                 Text(state.tr("卸载", "Uninstall"))
                     .font(.headline)
                 Text(state.tr(
-                    "断开 XDial，并移除系统 VPN 配置。",
-                    "Disconnect XDial and remove its system VPN configuration."
+                    "断开 XDial，移除网络配置、网络扩展和后台服务，然后把应用移到废纸篓。",
+                    "Disconnect XDial, remove its network configuration, extension, and background service, then move the app to Trash."
                 ))
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -164,7 +181,7 @@ struct GeneralTab: View {
             isPresented: $confirmingUninstall,
             titleVisibility: .visible
         ) {
-            Button(state.tr("仅移除系统 VPN 配置", "Remove system VPN configuration only")) {
+            Button(state.tr("卸载 XDial（保留设置）", "Uninstall XDial (keep settings)")) {
                 deleteDataOnUninstall = false
                 runUninstall()
             }
@@ -185,10 +202,8 @@ struct GeneralTab: View {
         state.uninstall(deleteData: deleteDataOnUninstall) { ok, err in
             if ok {
                 uninstallError = nil
-                if deleteDataOnUninstall {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        NSApp.terminate(nil)
-                    }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    NSApp.terminate(nil)
                 }
             } else {
                 uninstallError = err
@@ -224,6 +239,7 @@ struct LinesTab: View {
                     Button("Trojan") { add(type: "trojan") }
                     Button("Shadowsocks") { add(type: "shadowsocks") }
                     Button("VMess") { add(type: "vmess") }
+                    Button("AnyTLS") { add(type: "anytls") }
                     Button("Tailscale") { add(type: "tailscale") }
                     Divider()
                     Button(state.tr("从订阅导入…", "Import from subscription…")) {
@@ -249,6 +265,7 @@ struct LinesTab: View {
         case "trojan": name = "Trojan 节点"
         case "shadowsocks": name = "SS 节点"
         case "vmess": name = "VMess 节点"
+        case "anytls": name = "AnyTLS 节点"
         case "tailscale": name = "Tailscale"
         default: name = "节点"
         }
@@ -277,7 +294,7 @@ private struct RuntimeResourceBadge: View {
     @EnvironmentObject private var state: AppState
 
     private var report: ConnectionReport? {
-        state.engine.connectionReport
+        state.engine.presentedConnectionReport
     }
 
     private var runtimeState: ConnectionResourceRuntimeState {
@@ -410,8 +427,22 @@ struct LineRow: View {
     @State private var expanded = false
     @State private var showAuthKey = false
     @State private var authKey = ""
+    @State private var anyTLSALPNInput: String
     @EnvironmentObject var state: AppState
     @ObservedObject private var net = NetworkInfo.shared
+
+    init(
+        line: SwiftUI.Binding<Line>,
+        onDelete: @escaping () -> Void
+    ) {
+        self._line = line
+        self.onDelete = onDelete
+        self._anyTLSALPNInput = State(
+            initialValue: line.wrappedValue.anytlsALPN.joined(
+                separator: "\n"
+            )
+        )
+    }
 
     private var isLocked: Bool { line.type == "direct" }
     private var tailscaleStatus: TailscaleRuntimeStatus? {
@@ -476,7 +507,7 @@ struct LineRow: View {
 
     @ViewBuilder
     private var runtimeFailure: some View {
-        if let task = state.engine.connectionReport?.task(
+        if let task = state.engine.presentedConnectionReport?.task(
             kind: "line",
             resourceID: line.id
         ),
@@ -542,6 +573,9 @@ struct LineRow: View {
         case "vmess":
             guard !line.vmessServer.isEmpty else { return "" }
             return "\(line.vmessServer):\(line.vmessPort)"
+        case "anytls":
+            guard !line.anytlsServer.isEmpty else { return "" }
+            return "\(line.anytlsServer):\(line.anytlsPort)"
         default:
             return ""
         }
@@ -554,6 +588,7 @@ struct LineRow: View {
         case "trojan": return "Trojan"
         case "shadowsocks": return "SS"
         case "vmess": return "VMess"
+        case "anytls": return "AnyTLS"
         case "tailscale": return "Tailscale"
         default: return line.type
         }
@@ -613,6 +648,49 @@ struct LineRow: View {
             intField("端口", $line.vmessPort)
             secureField("UUID", $line.vmessUUID)
             intField("Alter ID", $line.vmessAltID)
+        case "anytls":
+            field("服务器", $line.anytlsServer)
+            boundedIntField("端口", $line.anytlsPort, range: 1...65535)
+            field("SNI", $line.anytlsSNI)
+            secureField("密码", $line.anytlsPassword)
+            anyTLSFingerprintField
+            anyTLSALPNField
+            boundedIntField(
+                "检查间隔",
+                $line.anytlsIdleSessionCheckInterval,
+                range: 0...3600,
+                help: state.tr(
+                    "6–3600 秒；0 表示使用协议默认值",
+                    "6–3600 seconds; 0 uses the protocol default"
+                )
+            )
+            boundedIntField(
+                "空闲超时",
+                $line.anytlsIdleSessionTimeout,
+                range: 0...3600,
+                help: state.tr(
+                    "6–3600 秒；0 表示使用协议默认值",
+                    "6–3600 seconds; 0 uses the protocol default"
+                )
+            )
+            boundedIntField(
+                "最少空闲",
+                $line.anytlsMinIdleSession,
+                range: Line.anyTLSMinIdleSessionRange,
+                help: state.tr(
+                    "至少保留的空闲会话数（0–64）",
+                    "Minimum idle sessions to retain (0–64)"
+                )
+            )
+            anyTLSUDPField
+            anyTLSTFOField
+            insecureToggle
+            if let issue = anyTLSVisibleValidationIssue {
+                Label(issue, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         case "tailscale":
             tailscaleDetail
         default:
@@ -651,6 +729,29 @@ struct LineRow: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            Toggle(
+                state.tr("启用 MagicDNS", "Enable MagicDNS"),
+                isOn: Binding(
+                    get: { line.tailscaleMagicDNS },
+                    set: {
+                        line.tailscaleMagicDNS = $0
+                        state.save()
+                    }
+                )
+            )
+            .toggleStyle(.switch)
+            .font(.caption)
+            .disabled(state.engine.status != "disconnected")
+            .accessibilityIdentifier("tailscale-magic-dns-toggle")
+
+            Text(state.tr(
+                "解析并访问 Tailnet 节点；仅在当前 Mode 使用这条线路时生效，Mode 中已有的显式域名规则优先。",
+                "Resolve and reach Tailnet peers only when the current Mode uses this line. Explicit domain rules in the Mode take priority."
+            ))
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
 
             if tailscaleRuntimeConnected {
                 tailscaleConnectedFields
@@ -961,12 +1062,203 @@ struct LineRow: View {
             Text("跳过证书验证").font(.caption).foregroundStyle(.secondary)
                 .frame(width: 60, alignment: .leading)
             VStack(alignment: .leading, spacing: 2) {
-                Toggle("", isOn: $line.allowInsecure).labelsHidden()
+                Toggle("", isOn: $line.allowInsecure)
+                    .labelsHidden()
+                    .onChange(of: line.allowInsecure) { _, _ in
+                        markLineChanged()
+                    }
                 Text("仅自签证书的服务器才需要开启；开启后无法防中间人窃取凭据")
                     .font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
         }
+    }
+
+    private var anyTLSFingerprintField: some View {
+        HStack {
+            Text(state.tr("TLS 指纹", "TLS Fingerprint"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 60, alignment: .leading)
+            Picker("", selection: SwiftUI.Binding(
+                get: { line.anytlsClientFingerprint },
+                set: { value in
+                    guard line.anytlsClientFingerprint != value else {
+                        return
+                    }
+                    line.anytlsClientFingerprint = value
+                    markLineChanged()
+                }
+            )) {
+                ForEach(
+                    Line.anyTLSSupportedClientFingerprints,
+                    id: \.self
+                ) { fingerprint in
+                    Text(anyTLSFingerprintLabel(fingerprint))
+                        .tag(fingerprint)
+                }
+                if !Line.anyTLSSupportedClientFingerprints.contains(
+                    line.anytlsClientFingerprint
+                ) {
+                    Text(state.tr(
+                        "不支持：\(line.anytlsClientFingerprint)",
+                        "Unsupported: \(line.anytlsClientFingerprint)"
+                    ))
+                    .tag(line.anytlsClientFingerprint)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            Spacer()
+        }
+    }
+
+    private var anyTLSALPNField: some View {
+        HStack(alignment: .top) {
+            Text("ALPN")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 60, alignment: .leading)
+            VStack(alignment: .leading, spacing: 3) {
+                TextEditor(text: $anyTLSALPNInput)
+                    .font(.caption.monospaced())
+                    .frame(minHeight: 42, maxHeight: 58)
+                    .padding(3)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(Color.secondary.opacity(0.35))
+                    )
+                    .onChange(of: anyTLSALPNInput) { _, input in
+                        let protocols = input.isEmpty
+                            ? []
+                            : input.components(separatedBy: .newlines)
+                        guard line.anytlsALPN != protocols else {
+                            return
+                        }
+                        line.anytlsALPN = protocols
+                        markLineChanged()
+                    }
+                    .onChange(of: line.anytlsALPN) { _, protocols in
+                        let input = protocols.joined(separator: "\n")
+                        if anyTLSALPNInput != input {
+                            anyTLSALPNInput = input
+                        }
+                    }
+                Text(state.tr(
+                    "每行一个协议，留空表示不指定，最多 8 项",
+                    "One protocol per line; blank leaves ALPN unspecified; max 8"
+                ))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+    }
+
+    private var anyTLSTFOField: some View {
+        HStack(alignment: .top) {
+            Text("TFO")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 60, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Toggle("", isOn: SwiftUI.Binding(
+                    get: { line.tfo },
+                    set: { value in
+                        // AnyTLS 握手会读取已经建立连接的远端地址，与
+                        // TCP Fast Open 不兼容。导入的 true 仍要保留并
+                        // 可见地阻止连接，但 UI 只允许用户把它关掉。
+                        guard !value, line.tfo else { return }
+                        line.tfo = false
+                        markLineChanged()
+                    }
+                ))
+                .labelsHidden()
+                .disabled(!line.tfo)
+                Text(state.tr(
+                    line.tfo
+                        ? "订阅导入了 TFO；AnyTLS 不支持，请关闭后再连接"
+                        : "AnyTLS 不支持 TCP Fast Open",
+                    line.tfo
+                        ? "The subscription enabled TFO. Turn it off before connecting."
+                        : "AnyTLS does not support TCP Fast Open"
+                ))
+                .font(.caption2)
+                .foregroundStyle(
+                    line.tfo ? Color.red : Color.secondary
+                )
+            }
+            Spacer()
+        }
+    }
+
+    private var anyTLSUDPField: some View {
+        HStack(alignment: .top) {
+            Text("UDP")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 60, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Label(
+                    state.tr("原生 UoT", "Native UoT"),
+                    systemImage: "checkmark.circle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.green)
+                Text(state.tr(
+                    line.udp
+                        ? "AnyTLS 数据面原生承载 UDP"
+                        : "订阅声明了 udp=false；该值仅保留为导入事实，AnyTLS 数据面仍原生支持 UDP",
+                    line.udp
+                        ? "The AnyTLS data plane carries UDP natively"
+                        : "The subscription declared udp=false. It is preserved as imported metadata; the AnyTLS data plane still supports UDP natively."
+                ))
+                .font(.caption2)
+                .foregroundStyle(
+                    line.udp ? Color.secondary : Color.orange
+                )
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+    }
+
+    private var anyTLSVisibleValidationIssue: String? {
+        return line.anyTLSOptionsValidationIssue
+    }
+
+    private func anyTLSFingerprintLabel(_ value: String) -> String {
+        switch value {
+        case "":
+            return state.tr("系统 TLS（不伪装）", "System TLS (no mimic)")
+        case "chrome":
+            return "Chrome"
+        case "firefox":
+            return "Firefox"
+        case "edge":
+            return "Edge"
+        case "safari":
+            return "Safari"
+        case "ios":
+            return "iOS"
+        case "android":
+            return "Android"
+        case "random":
+            return state.tr("随机浏览器", "Random browser")
+        case "randomized":
+            return state.tr("随机生成", "Randomized")
+        case "chrome_psk", "chrome_psk_shuffle",
+             "chrome_padding_psk_shuffle", "chrome_pq",
+             "chrome_pq_psk":
+            return "\(value) \(state.tr("（兼容）", "(legacy)"))"
+        default:
+            return value.uppercased()
+        }
+    }
+
+    private func markLineChanged() {
+        line.verified = false
+        state.save()
     }
 
     private func field(_ label: String, _ binding: SwiftUI.Binding<String>, placeholder: String = "") -> some View {
@@ -976,8 +1268,7 @@ struct LineRow: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .onChange(of: binding.wrappedValue) { _, _ in
-                    line.verified = false
-                    state.save()
+                    markLineChanged()
                 }
         }
     }
@@ -989,8 +1280,7 @@ struct LineRow: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .onChange(of: binding.wrappedValue) { _, _ in
-                    line.verified = false
-                    state.save()
+                    markLineChanged()
                 }
         }
     }
@@ -1002,9 +1292,41 @@ struct LineRow: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .onChange(of: binding.wrappedValue) { _, _ in
-                    line.verified = false
-                    state.save()
+                    markLineChanged()
                 }
+        }
+    }
+
+    private func boundedIntField(
+        _ label: String,
+        _ binding: SwiftUI.Binding<Int>,
+        range: ClosedRange<Int>,
+        help: String = ""
+    ) -> some View {
+        HStack(alignment: .top) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 60, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                TextField("", value: binding, format: .number)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .onChange(of: binding.wrappedValue) { _, _ in
+                        // 保留用户输入的事实，让模型校验与连接计划 fail-closed。
+                        // 边输边静默夹到边界会把 30 之类的正常输入改成 60，
+                        // 也会掩盖订阅里真正的非法值。
+                        markLineChanged()
+                    }
+                let effectiveHelp = help.isEmpty
+                    ? "\(range.lowerBound)–\(range.upperBound)"
+                    : help
+                if !effectiveHelp.isEmpty {
+                    Text(effectiveHelp)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
     }
 
@@ -1014,8 +1336,7 @@ struct LineRow: View {
             Toggle("", isOn: binding)
                 .labelsHidden()
                 .onChange(of: binding.wrappedValue) { _, _ in
-                    line.verified = false
-                    state.save()
+                    markLineChanged()
                 }
             Spacer()
         }
@@ -1130,7 +1451,7 @@ struct RuleSetRow: View {
             header: {
                 Text(rule.name).font(.system(size: 13, weight: .medium))
                 Spacer()
-                Text(rule.type == "url" ? "URL" : state.tr("手动", "Manual"))
+                Text(ruleTypeLabel)
                     .font(.caption).foregroundStyle(.secondary)
             },
             detail: {
@@ -1141,11 +1462,23 @@ struct RuleSetRow: View {
                             .textFieldStyle(.roundedBorder).font(.caption)
                             .onChange(of: rule.name) { _, _ in state.save() }
                     }
-                    if rule.type == "url" { urlFields }
-                    else { manualFields }
+                    if rule.type == "url" {
+                        urlFields
+                    } else {
+                        manualFields
+                    }
                 }
             }
         )
+    }
+
+    private var ruleTypeLabel: String {
+        switch rule.type {
+        case "url":
+            return "URL"
+        default:
+            return state.tr("手动", "Manual")
+        }
     }
 
     private var urlFields: some View {

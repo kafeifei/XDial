@@ -27,8 +27,9 @@ struct Line: Codable, Identifiable, Hashable {
     var vmessAltID: Int = 0
 
     // Tailscale 身份（设备名、登录态）是 Profile 全局唯一的一份，见 TailscaleIdentity。
-    // 线路上只留「这条线路走哪个出口」。
+    // 线路上只留「这条线路怎么使用 tailnet」。
     var tailscaleExitNode: String = ""
+    var tailscaleMagicDNS: Bool = false
     var tailscaleAuthenticated: Bool = false
 
     var allowInsecure: Bool = false
@@ -52,6 +53,7 @@ struct Line: Codable, Identifiable, Hashable {
         case vmessUUID = "vmess_uuid"
         case vmessAltID = "vmess_alt_id"
         case tailscaleExitNode = "tailscale_exit_node"
+        case tailscaleMagicDNS = "tailscale_magic_dns"
         case tailscaleAuthenticated = "tailscale_authenticated"
     }
 
@@ -60,7 +62,8 @@ struct Line: Codable, Identifiable, Hashable {
          trojanServer: String = "", trojanPort: Int = 443, trojanPassword: String = "", trojanSNI: String = "",
          ssServer: String = "", ssPort: Int = 8388, ssMethod: String = "aes-256-gcm", ssPassword: String = "",
          vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0,
-         tailscaleExitNode: String = "", tailscaleAuthenticated: Bool = false,
+         tailscaleExitNode: String = "", tailscaleMagicDNS: Bool = false,
+         tailscaleAuthenticated: Bool = false,
          allowInsecure: Bool = false) {
         self.id = id; self.name = name; self.type = type; self.enabled = enabled; self.verified = verified
         self.vpnServer = vpnServer; self.vpnUsername = vpnUsername; self.vpnPassword = vpnPassword
@@ -68,6 +71,7 @@ struct Line: Codable, Identifiable, Hashable {
         self.ssServer = ssServer; self.ssPort = ssPort; self.ssMethod = ssMethod; self.ssPassword = ssPassword
         self.vmessServer = vmessServer; self.vmessPort = vmessPort; self.vmessUUID = vmessUUID; self.vmessAltID = vmessAltID
         self.tailscaleExitNode = tailscaleExitNode
+        self.tailscaleMagicDNS = tailscaleMagicDNS
         self.tailscaleAuthenticated = tailscaleAuthenticated
         self.allowInsecure = allowInsecure
     }
@@ -95,6 +99,10 @@ struct Line: Codable, Identifiable, Hashable {
         vmessUUID = try c.decodeIfPresent(String.self, forKey: .vmessUUID) ?? ""
         vmessAltID = try c.decodeIfPresent(Int.self, forKey: .vmessAltID) ?? 0
         tailscaleExitNode = try c.decodeIfPresent(String.self, forKey: .tailscaleExitNode) ?? ""
+        tailscaleMagicDNS = try c.decodeIfPresent(
+            Bool.self,
+            forKey: .tailscaleMagicDNS
+        ) ?? false
         tailscaleAuthenticated = try c.decodeIfPresent(
             Bool.self,
             forKey: .tailscaleAuthenticated

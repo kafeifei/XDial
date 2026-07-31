@@ -5,8 +5,8 @@ GOBIN := $(shell go env GOPATH)/bin
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PLIST_VERSION := $(patsubst v%,%,$(VERSION))
 GO_LDFLAGS := -X main.version=$(VERSION)
-DESKTOP_GO_TAGS := with_gvisor
-MOBILE_LIBBOX_TAGS := with_gvisor
+DESKTOP_GO_TAGS := with_gvisor,with_utls
+MOBILE_LIBBOX_TAGS := with_gvisor,with_utls
 MACOS_LIBBOX_FRAMEWORK := $(BUILD_DIR)/frameworks/macos/Libbox.xcframework
 MACOS_LIBBOX_BINARY := $(MACOS_LIBBOX_FRAMEWORK)/macos-arm64_x86_64/Libbox.framework/Libbox
 LIBBOX_GO_SOURCES := $(shell find core -type f -name '*.go' ! -name '*_test.go')
@@ -24,7 +24,7 @@ SING_BOX_TEST_BINARY := $(abspath $(BUILD_DIR)/tools/sing-box)
 # （partial match，本机唯一），无证书环境可 SIGN_IDENTITY=- 回落 ad-hoc。
 SIGN_IDENTITY ?= Apple Development
 
-.PHONY: all cli app release restart inspector clean prepare-patched-go go-vet go-build test test-patched-tailscale test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
+.PHONY: all cli app release restart inspector clean prepare-patched-go go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
 
 # 组装 .app bundle。$(1)=swift 产物目录(debug/release) $(2)=bundle 路径
 define assemble_app
@@ -73,13 +73,29 @@ test-patched-tailscale: $(PATCHED_WORKFILE)
 		-run '^(TestResetNetInfoLast|TestDERPActiveWaitsForStartGate|TestXDial.*)$$' \
 		-count=1
 
-test: $(PATCHED_WORKFILE) test-patched-tailscale
-	$(PATCHED_GO_ENV) go test -tags with_gvisor ./core/... -v -count=1
+test-patched-sing-box: $(PATCHED_WORKFILE)
+	$(PATCHED_GO_ENV) go test -tags '$(DESKTOP_GO_TAGS)' \
+		github.com/sagernet/sing-box/protocol/tailscale \
+		-run '^TestXDialPreferredRouteSetExcludesExitDefaults$$' \
+		-count=1
+
+test-patched-sslcon: $(PATCHED_WORKFILE)
+	cd $(PATCHED_GO_DIR)/sslcon && \
+		GOWORK='$(PATCHED_WORKFILE)' GOFLAGS= go test -race \
+			./session ./vpn -count=1
+
+test: $(PATCHED_WORKFILE) test-patched-tailscale test-patched-sing-box test-patched-sslcon
+	$(PATCHED_GO_ENV) go test -tags '$(MOBILE_LIBBOX_TAGS)' ./core/... -v -count=1
 
 test-macos-transaction:
 	@! rg -n 'probeNetwork|127\.0\.0\.1:9090|test-out' macos/Sources/XDial
 	@! rg -n 'URLSession|ip-api\.com' macos/Sources/XDial/NetworkInfo.swift
 	@! rg -U -n '\.on(Appear|Disappear)[[:space:]]*\{[^}]{0,500}(probeNetwork|prepareTailscale|closeTailscaleSetup|URLSession|127\.0\.0\.1:9090)' macos/Sources/XDial/SettingsView.swift
+	@test "$$(rg -U -o 'AXUIElementCopyAttributeValue\([^)]*kAXValueAttribute' macos/Sources/XDial/DebugServer.swift | wc -l | tr -d ' ')" -eq 1
+	@rg -U -q 'private static func safeAXValue\([^}]+guard subrole != secureTextFieldSubrole else \{ return nil \}[^}]+AXUIElementCopyAttributeValue\([^)]*kAXValueAttribute' macos/Sources/XDial/DebugServer.swift
+	@rg -q 'safeAXValue\(el, subrole: subrole\)' macos/Sources/XDial/DebugServer.swift
+	@rg -q 'safeAXStringValue\(' macos/Sources/XDial/DebugServer.swift
+	@! rg -n 'str\([^)]*kAXValueAttribute' macos/Sources/XDial/DebugServer.swift
 	@test "$$(rg -n 'statusHandler\?\(' macos/Sources/XDial/TransparentProxyManager.swift | wc -l | tr -d ' ')" -eq 1
 	@rg -U -q 'private func publishRuntimeStatus\([^}]+TransparentProxyRuntimeGate\.resolve' macos/Sources/XDial/TransparentProxyManager.swift
 	cd macos && xcodegen generate
@@ -128,14 +144,14 @@ release: libbox-macos-xcframework
 	ditto "$(BUILD_DIR)/macos-xcode-release/Build/Products/Release/XDial.app" "$(RELEASE_BUNDLE)"
 	@echo "release bundle: $(RELEASE_BUNDLE) (version $(PLIST_VERSION))"
 
-# 一键重启:杀旧实例→重编→启动→等 debug server 上线(所有等待有超时)
+# 一键重启:杀旧实例→重编→由应用安装事务替换 /Applications 中的旧版
+# →等 debug server 上线。不要在 build/ 留旧 App 容器，否则 macOS 会继续
+# 把它关联的 System Extension 显示为已安装。
 restart: app
 	@pkill -x XDial 2>/dev/null || true
 	@for i in $$(seq 1 20); do pgrep -x XDial >/dev/null || break; sleep 0.2; done
 	@rm -rf "$(BUILD_DIR)/XDial.previous.app"
-	@if [ -d /Applications/XDial.app ]; then mv /Applications/XDial.app "$(BUILD_DIR)/XDial.previous.app"; fi
-	@ditto "$(APP_BUNDLE)" /Applications/XDial.app
-	@open /Applications/XDial.app
+	@open "$(APP_BUNDLE)"
 	@for i in $$(seq 1 30); do \
 		if curl -s -m 1 http://127.0.0.1:19876/health >/dev/null 2>&1; then \
 			echo "✓ XDial restarted, debug server ready"; exit 0; fi; \
@@ -157,6 +173,9 @@ check-mobile-libbox-deps: $(PATCHED_WORKFILE)
 	fi; \
 	if ! printf '%s\n' "$$deps" | grep -Eq '^github\.com/sagernet/tailscale(/|$$)'; then \
 		echo 'error: mobile Libbox is missing the Tailscale data plane'; exit 1; \
+	fi; \
+	if ! printf '%s\n' "$$deps" | grep -Eq '^github\.com/metacubex/utls$$'; then \
+		echo 'error: mobile Libbox is missing uTLS client fingerprint support'; exit 1; \
 	fi
 
 libbox-xcframework: check-mobile-libbox-deps
@@ -165,6 +184,9 @@ libbox-xcframework: check-mobile-libbox-deps
 	PATH="$(PATH):$(GOBIN)" $(PATCHED_GO_ENV) gomobile bind -tags '$(MOBILE_LIBBOX_TAGS)' -target=tvos -o $(BUILD_DIR)/Libbox.xcframework ./core/libbox
 	@if find $(BUILD_DIR)/Libbox.xcframework -type f -name Libbox -exec strings {} \; | grep -Fq 'gVisor is not included in this build'; then \
 		echo 'error: Libbox was built without the gVisor data stack'; exit 1; \
+	fi
+	@if find $(BUILD_DIR)/Libbox.xcframework -type f -name Libbox -exec strings {} \; | grep -Fq 'uTLS is not included in this build'; then \
+		echo 'error: Libbox was built without uTLS client fingerprint support'; exit 1; \
 	fi
 
 # iOS 使用独立 XCFramework，避免 iOS/tvOS slice 互相覆盖。
@@ -175,23 +197,31 @@ libbox-ios-xcframework: check-mobile-libbox-deps
 	@if find $(BUILD_DIR)/frameworks/ios/Libbox.xcframework -type f -name Libbox -exec strings {} \; | grep -Fq 'gVisor is not included in this build'; then \
 		echo 'error: Libbox was built without the gVisor data stack'; exit 1; \
 	fi
+	@if find $(BUILD_DIR)/frameworks/ios/Libbox.xcframework -type f -name Libbox -exec strings {} \; | grep -Fq 'uTLS is not included in this build'; then \
+		echo 'error: Libbox was built without uTLS client fingerprint support'; exit 1; \
+	fi
 
 # macOS Transparent Proxy 与移动端复用同一个进程内 Libbox 数据面。用文件依赖保证
 # core 变化后桌面构建不会继续链接旧 XCFramework。
 libbox-macos-xcframework: $(MACOS_LIBBOX_BINARY)
 
-$(MACOS_LIBBOX_BINARY): $(LIBBOX_GO_SOURCES) go.mod go.sum $(PATCHED_WORKFILE)
+$(MACOS_LIBBOX_BINARY): $(LIBBOX_GO_SOURCES) go.mod go.sum Makefile $(PATCHED_WORKFILE)
 	$(MAKE) check-mobile-libbox-deps
 	@mkdir -p $(BUILD_DIR)/frameworks/macos
-	rm -rf $(MACOS_LIBBOX_FRAMEWORK)
+	rm -rf $(MACOS_LIBBOX_FRAMEWORK) \
+		$(BUILD_DIR)/macos-amd64 \
+		$(BUILD_DIR)/macos-arm64
 	PATH="$(PATH):$(GOBIN)" $(PATCHED_GO_ENV) gomobile bind -tags '$(MOBILE_LIBBOX_TAGS)' -target=macos -o $(MACOS_LIBBOX_FRAMEWORK) ./core/libbox
 	@if find $(MACOS_LIBBOX_FRAMEWORK) -type f -name Libbox -exec strings {} \; | grep -Fq 'gVisor is not included in this build'; then \
 		echo 'error: Libbox was built without the gVisor data stack'; exit 1; \
 	fi
+	@if find $(MACOS_LIBBOX_FRAMEWORK) -type f -name Libbox -exec strings {} \; | grep -Fq 'uTLS is not included in this build'; then \
+		echo 'error: Libbox was built without uTLS client fingerprint support'; exit 1; \
+	fi
 
-$(SING_BOX_TEST_BINARY): $(PATCHED_WORKFILE)
+$(SING_BOX_TEST_BINARY): Makefile $(PATCHED_WORKFILE)
 	@mkdir -p $(dir $(SING_BOX_TEST_BINARY))
-	$(PATCHED_GO_ENV) go build -tags 'with_gvisor,with_clash_api,with_tailscale' \
+	$(PATCHED_GO_ENV) go build -tags 'with_gvisor,with_utls,with_clash_api,with_tailscale' \
 		-o $(SING_BOX_TEST_BINARY) github.com/sagernet/sing-box/cmd/sing-box
 
 sing-box-test-validator: $(SING_BOX_TEST_BINARY)

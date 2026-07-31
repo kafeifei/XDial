@@ -297,12 +297,21 @@ struct ConfigurationView: View {
     }
 
     private func addRuleButton(type: String) -> some View {
-        Button(type == "url" ? app.tr("URL 规则", "URL rule") : app.tr("手工规则", "Manual rule")) {
+        let label: String = switch type {
+        case "url":
+            app.tr("URL 规则", "URL rule")
+        default:
+            app.tr("手工规则", "Manual rule")
+        }
+        Button(label) {
             guard !app.hasActiveTunnel, !app.isBusy else { return }
             let id = "rule-" + String(UUID().uuidString.prefix(8)).lowercased()
-            let name = type == "url"
-                ? app.tr("新 URL 规则", "New URL Rule")
-                : app.tr("新手工规则", "New Manual Rule")
+            let name: String = switch type {
+            case "url":
+                app.tr("新 URL 规则", "New URL Rule")
+            default:
+                app.tr("新手工规则", "New Manual Rule")
+            }
             app.profile.ruleSets.append(RuleSet(id: id, name: name, type: type))
             app.save()
         }
@@ -586,12 +595,17 @@ private struct LineEditorView: View {
                         .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
+                Toggle(
+                    app.tr("启用 MagicDNS", "Enable MagicDNS"),
+                    isOn: lineBinding(index, \.tailscaleMagicDNS)
+                )
+                .accessibilityIdentifier("tailscale-magic-dns-toggle")
             } header: {
                 Text("Tailscale")
             } footer: {
                 Text(app.tr(
-                    "登录在 XDial 内独立完成，不会启动系统线路。正式连接后，MagicDNS/.ts.net 会按域名交给对应 Tailscale 线路。",
-                    "Sign-in is completed inside XDial without starting a system line. During a normal connection, MagicDNS/.ts.net queries use the matching Tailscale line."
+                    "勾选后可解析并访问 Tailnet 节点；只有当前 Mode 使用这条线路时才生效，Mode 中已有的显式域名规则优先。",
+                    "When enabled, Tailnet peers can be resolved and reached only while the current Mode uses this line. Explicit domain rules in the Mode take priority."
                 ))
             }
             .disabled(app.hasActiveTunnel)
@@ -1112,7 +1126,7 @@ private struct RuleEditorView: View {
                     TextField(app.tr("名称", "Name"), text: ruleBinding(index, \.name))
                     LabeledContent(
                         app.tr("类型", "Type"),
-                        value: app.profile.ruleSets[index].type == "url" ? "URL" : app.tr("手工", "Manual")
+                        value: ruleTypeLabel(app.profile.ruleSets[index].type)
                     )
                     Toggle(app.tr("启用", "Enabled"), isOn: ruleBinding(index, \.enabled))
                 }
@@ -1189,6 +1203,15 @@ private struct RuleEditorView: View {
 
     private var ruleIndex: Int? {
         app.profile.ruleSets.firstIndex { $0.id == ruleSetID }
+    }
+
+    private func ruleTypeLabel(_ type: String) -> String {
+        switch type {
+        case "url":
+            return "URL"
+        default:
+            return app.tr("手工", "Manual")
+        }
     }
 
     private var isConnectivityTestRule: Bool {

@@ -6,6 +6,30 @@ import Foundation
 /// cannot publish XDial as connected until the same transaction has committed
 /// its Transparent Proxy ingress and still owns the system takeover.
 enum TransparentProxyRuntimeGate {
+    /// During automatic recovery the transaction which described the lost
+    /// session is no longer eligible to prove connectivity. A retry becomes
+    /// eligible only after that exact transaction has been handed to a new
+    /// Network Extension session.
+    static func connectionProofTransactionID(
+        currentTransactionID: String?,
+        automaticReconnectInProgress: Bool,
+        reconnectTransactionID: String?,
+        networkExtensionSessionTransactionID: String?
+    ) -> String? {
+        guard automaticReconnectInProgress else {
+            return currentTransactionID
+        }
+        guard
+            let reconnectTransactionID,
+            reconnectTransactionID == currentTransactionID,
+            reconnectTransactionID ==
+                networkExtensionSessionTransactionID
+        else {
+            return nil
+        }
+        return reconnectTransactionID
+    }
+
     static func resolve(
         systemStatus: String,
         report: ConnectionReport?,

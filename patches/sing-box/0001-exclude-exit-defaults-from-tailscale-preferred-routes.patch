@@ -1,0 +1,81 @@
+diff --git a/protocol/tailscale/endpoint.go b/protocol/tailscale/endpoint.go
+--- a/protocol/tailscale/endpoint.go
++++ b/protocol/tailscale/endpoint.go
+@@ -936,20 +936,32 @@ func (t *Endpoint) onReconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCf
+ 	}
+ 	t.routeDomains.Store(routeDomains)
+ 
++	t.routePrefixes.Store(tailscalePreferredRouteSet(cfg.Peers))
++
++	if t.onReconfigHook != nil {
++		t.onReconfigHook(cfg, routerCfg, dnsCfg)
++	}
++	if t.sshReconfigHook != nil {
++		t.sshReconfigHook(cfg, routerCfg, dnsCfg)
++	}
++}
++
++func tailscalePreferredRouteSet(peers []wgcfg.Peer) *netipx.IPSet {
+ 	var builder netipx.IPSetBuilder
+-	for _, peer := range cfg.Peers {
++	for _, peer := range peers {
+ 		for _, allowedIP := range peer.AllowedIPs {
++			// preferred_by is used for Tailscale peer and subnet ownership, not
++			// for selecting the endpoint as the profile's default internet route.
++			// A selected Exit Node contributes 0.0.0.0/0 and ::/0 here; keeping
++			// those prefixes would make preferred_by match every destination and
++			// silently override the caller's route final.
++			if allowedIP.Bits() == 0 {
++				continue
++			}
+ 			builder.AddPrefix(allowedIP)
+ 		}
+ 	}
+-	t.routePrefixes.Store(common.Must1(builder.IPSet()))
+-
+-	if t.onReconfigHook != nil {
+-		t.onReconfigHook(cfg, routerCfg, dnsCfg)
+-	}
+-	if t.sshReconfigHook != nil {
+-		t.sshReconfigHook(cfg, routerCfg, dnsCfg)
+-	}
++	return common.Must1(builder.IPSet())
+ }
+ 
+ func addressFromAddr(destination netip.Addr) tcpip.Address {
+diff --git a/protocol/tailscale/endpoint_xdial_test.go b/protocol/tailscale/endpoint_xdial_test.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/tailscale/endpoint_xdial_test.go
+@@ -0,0 +1,31 @@
++package tailscale
++
++import (
++	"net/netip"
++	"testing"
++
++	"github.com/sagernet/tailscale/wgengine/wgcfg"
++)
++
++func TestXDialPreferredRouteSetExcludesExitDefaults(t *testing.T) {
++	peerAddress := netip.MustParsePrefix("100.100.0.8/32")
++	subnetRoute := netip.MustParsePrefix("10.20.0.0/16")
++	routes := tailscalePreferredRouteSet([]wgcfg.Peer{{
++		AllowedIPs: []netip.Prefix{
++			netip.MustParsePrefix("0.0.0.0/0"),
++			netip.MustParsePrefix("::/0"),
++			peerAddress,
++			subnetRoute,
++		},
++	}})
++
++	if !routes.Contains(peerAddress.Addr()) {
++		t.Fatal("peer address was removed from preferred routes")
++	}
++	if !routes.Contains(netip.MustParseAddr("10.20.1.2")) {
++		t.Fatal("subnet route was removed from preferred routes")
++	}
++	if routes.Contains(netip.MustParseAddr("203.0.113.7")) {
++		t.Fatal("Exit Node default route leaked into preferred routes")
++	}
++}

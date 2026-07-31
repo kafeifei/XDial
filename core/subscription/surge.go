@@ -163,10 +163,18 @@ func surgeLineToLine(line string) (config.Line, bool) {
 
 	kvs := make(map[string]string)
 	if len(parts) > 3 {
+		lastKey := ""
 		for _, kv := range strings.Split(parts[3], ",") {
-			kv = strings.TrimSpace(kv)
+			// 普通分隔空格可以去掉；制表符等控制字符必须保留下来，交给
+			// AnyTLS 的同源 ALPN 校验拒绝，不能清洗成另一个合法协议名。
+			kv = strings.Trim(kv, " ")
 			if i := strings.Index(kv, "="); i > 0 {
-				kvs[strings.TrimSpace(kv[:i])] = strings.TrimSpace(kv[i+1:])
+				lastKey = strings.ToLower(strings.TrimSpace(kv[:i]))
+				kvs[lastKey] = strings.Trim(kv[i+1:], " ")
+			} else if lastKey == "alpn" {
+				// Surge 风格是逗号分隔参数；兼容 alpn=h2,http/1.1 时，
+				// 没有 "=" 的紧邻项只能是上一项 ALPN 列表的延续。
+				kvs[lastKey] += "," + kv
 			}
 		}
 	}
@@ -212,7 +220,80 @@ func surgeLineToLine(line string) (config.Line, bool) {
 		base.UDP = kvs["udp-relay"] == "true"
 		return base, true
 
+	case "anytls":
+		base.Type = config.LineTypeAnyTLS
+		base.AnyTLSServer = server
+		base.AnyTLSPort = portNum
+		base.AnyTLSPassword = kvs["password"]
+		sni := kvs["sni"]
+		if sni == "" {
+			sni = kvs["server-name"]
+		}
+		if sni == "" {
+			sni = kvs["servername"]
+		}
+		if sni == "" {
+			sni = server
+		}
+		base.AnyTLSSNI = sni
+
+		base.AnyTLSClientFingerprint = normalizeAnyTLSFingerprint(kvs["client-fingerprint"])
+		rawALPN, valid := splitAnyTLSALPN(kvs["alpn"])
+		if !valid {
+			return config.Line{}, false
+		}
+		base.AnyTLSALPN = normalizeAnyTLSALPN(rawALPN)
+
+		if value, exists := kvs["idle-session-check-interval"]; exists {
+			seconds, valid := parseAnyTLSSessionSeconds(value)
+			if !valid {
+				return config.Line{}, false
+			}
+			base.AnyTLSIdleSessionCheckInterval = seconds
+		}
+		if value, exists := kvs["idle-session-timeout"]; exists {
+			seconds, valid := parseAnyTLSSessionSeconds(value)
+			if !valid {
+				return config.Line{}, false
+			}
+			base.AnyTLSIdleSessionTimeout = seconds
+		}
+		if value, exists := kvs["min-idle-session"]; exists {
+			count, valid := parseAnyTLSMinIdleSession(value)
+			if !valid {
+				return config.Line{}, false
+			}
+			base.AnyTLSMinIdleSession = count
+		}
+
+		var ok bool
+		base.AllowInsecure, ok = surgeOptionalBool(kvs, "skip-cert-verify")
+		if !ok {
+			return config.Line{}, false
+		}
+		base.UDP, ok = surgeOptionalBool(kvs, "udp", "udp-relay")
+		if !ok {
+			return config.Line{}, false
+		}
+		if !config.LineHasUsableOutbound(&base) {
+			return config.Line{}, false
+		}
+		base.TFO, ok = surgeOptionalBool(kvs, "tfo")
+		if !ok {
+			return config.Line{}, false
+		}
+		return base, true
+
 	default:
 		return config.Line{}, false
 	}
+}
+
+func surgeOptionalBool(values map[string]string, keys ...string) (bool, bool) {
+	for _, key := range keys {
+		if value, exists := values[key]; exists {
+			return parseOptionalBool(value)
+		}
+	}
+	return false, true
 }

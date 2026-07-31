@@ -11,74 +11,80 @@ enum UDPFlowSOCKSRelay {
         case fragmentedDatagram
     }
 
-    static func start(
+    static func makeHandle(
         flow: NEAppProxyUDPFlow,
         socksPort: UInt16,
         credentials: SOCKSCredentials? = nil,
         trialID: String,
         logger: Logger
-    ) {
-        Task {
-            var stage = "flow-open"
-            let control = NWConnection(
-                host: .ipv4(IPv4Address.loopback),
-                port: Network.NWEndpoint.Port(rawValue: socksPort)!,
-                using: .tcp
-            )
-            var udpConnection: NWConnection?
-            do {
-                // UDP callers may send and close before a SOCKS association can
-                // finish. Open immediately so NetworkExtension retains and
-                // buffers the flow while the fail-closed relay is prepared.
-                try await open(flow)
-                stage = "control-connect"
-                try await start(control)
-                stage = "udp-associate"
-                let relayEndpoint = try await associateUDP(
-                    control,
-                    credentials: credentials
-                )
-                stage = "relay-connect"
-                let udpRelay = NWConnection(to: relayEndpoint, using: .udp)
-                udpConnection = udpRelay
-                try await start(udpRelay)
-                logger.debug(
-                    "udp-relay-started trial=\(trialID, privacy: .public) endpoint=\(String(describing: relayEndpoint), privacy: .public)"
-                )
-                stage = "relay"
-                try await relay(
-                    flow: flow,
-                    connection: udpRelay,
-                    trialID: trialID,
-                    logger: logger
-                )
-                logger.debug(
-                    "udp-relay-finished trial=\(trialID, privacy: .public)"
-                )
-                close(
-                    flow: flow,
-                    control: control,
-                    relay: udpRelay,
-                    error: nil
-                )
-            } catch {
-                if isExpectedFlowClosure(error) {
-                    logger.debug(
-                        "udp-relay-closed trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
-                    )
-                } else {
-                    logger.error(
-                        "udp-relay-error trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
-                    )
-                }
-                close(
-                    flow: flow,
-                    control: control,
-                    relay: udpConnection,
-                    error: error
-                )
-            }
+    ) -> ProviderRelayHandle {
+        let control = NWConnection(
+            host: .ipv4(IPv4Address.loopback),
+            port: Network.NWEndpoint.Port(rawValue: socksPort)!,
+            using: .tcp
+        )
+        let resources = UDPRelayResources(flow: flow, control: control)
+        let shutdown = RelayTaskShutdown { error in
+            resources.close(with: error)
         }
+        return ProviderRelayHandle(
+            shutdown: shutdown,
+            operation: {
+                var stage = "flow-open"
+                await withTaskCancellationHandler {
+                    do {
+                        // UDP callers may send and close before a SOCKS
+                        // association can finish. Open immediately so
+                        // NetworkExtension retains and buffers the flow while
+                        // the fail-closed relay is prepared.
+                        try await open(flow)
+                        stage = "control-connect"
+                        try await start(control)
+                        stage = "udp-associate"
+                        let relayEndpoint = try await associateUDP(
+                            control,
+                            credentials: credentials
+                        )
+                        stage = "relay-connect"
+                        let udpRelay = NWConnection(
+                            to: relayEndpoint,
+                            using: .udp
+                        )
+                        resources.install(relay: udpRelay)
+                        try await start(udpRelay)
+                        logger.debug(
+                            "udp-relay-started trial=\(trialID, privacy: .public) endpoint=\(String(describing: relayEndpoint), privacy: .public)"
+                        )
+                        stage = "relay"
+                        try await relay(
+                            flow: flow,
+                            connection: udpRelay,
+                            control: control,
+                            trialID: trialID,
+                            logger: logger,
+                            shutdown: shutdown
+                        )
+                        logger.debug(
+                            "udp-relay-finished trial=\(trialID, privacy: .public)"
+                        )
+                        shutdown.finish(with: nil)
+                    } catch {
+                        if isExpectedFlowClosure(error) {
+                            logger.debug(
+                                "udp-relay-closed trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                            )
+                        } else {
+                            logger.error(
+                                "udp-relay-error trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                            )
+                        }
+                        shutdown.finish(with: error)
+                    }
+                } onCancel: {
+                    shutdown.finish(with: CancellationError())
+                }
+            }
+        )
     }
 
     private static func isExpectedFlowClosure(_ error: Error) -> Bool {
@@ -210,48 +216,112 @@ enum UDPFlowSOCKSRelay {
     private static func relay(
         flow: NEAppProxyUDPFlow,
         connection: NWConnection,
+        control: NWConnection,
         trialID: String,
-        logger: Logger
+        logger: Logger,
+        shutdown: RelayTaskShutdown
     ) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                while !Task.isCancelled {
-                    let (datagrams, error) = await flow.readDatagrams()
-                    if let error {
-                        throw error
+        try await RelayTaskGroup.run(
+            operations: [
+                {
+                    while !Task.isCancelled {
+                        let datagrams =
+                            try await readDatagrams(from: flow)
+                        guard let datagrams, !datagrams.isEmpty else {
+                            return
+                        }
+                        for (payload, endpoint) in datagrams {
+                            let packet = try encode(
+                                payload: payload,
+                                destination: endpoint
+                            )
+                            logger.debug(
+                                "udp-send trial=\(trialID, privacy: .public) bytes=\(payload.count)"
+                            )
+                            try await send(packet, to: connection)
+                        }
                     }
-                    guard let datagrams, !datagrams.isEmpty else {
-                        return
-                    }
-                    for (payload, endpoint) in datagrams {
-                        let packet = try encode(
-                            payload: payload,
-                            destination: endpoint
-                        )
+                },
+                {
+                    while !Task.isCancelled {
+                        let packet =
+                            try await receiveMessage(from: connection)
+                        if packet.isEmpty {
+                            return
+                        }
+                        let decoded = try decode(packet: packet)
                         logger.debug(
-                            "udp-send trial=\(trialID, privacy: .public) bytes=\(payload.count)"
+                            "udp-receive trial=\(trialID, privacy: .public) bytes=\(decoded.payload.count)"
                         )
-                        try await send(packet, to: connection)
+                        try await writeDatagrams(
+                            [(decoded.payload, decoded.endpoint)],
+                            to: flow
+                        )
                     }
+                },
+                {
+                    try await monitorControl(control)
+                },
+            ],
+            shutdown: shutdown
+        )
+    }
+
+    private static func readDatagrams(
+        from flow: NEAppProxyUDPFlow
+    ) async throws -> [(Data, Network.NWEndpoint)]? {
+        try await awaitRelayCallback { completion in
+            flow.readDatagrams { datagrams, error in
+                if let error {
+                    completion(.failure(error))
+                } else {
+                    completion(.success(datagrams))
                 }
             }
-            group.addTask {
-                while !Task.isCancelled {
-                    let packet = try await receiveMessage(from: connection)
-                    if packet.isEmpty {
-                        return
-                    }
-                    let decoded = try decode(packet: packet)
-                    logger.debug(
-                        "udp-receive trial=\(trialID, privacy: .public) bytes=\(decoded.payload.count)"
+        }
+    }
+
+    private static func writeDatagrams(
+        _ datagrams: [(Data, Network.NWEndpoint)],
+        to flow: NEAppProxyUDPFlow
+    ) async throws {
+        let _: Void = try await awaitRelayCallback { completion in
+            flow.writeDatagrams(datagrams) { error in
+                if let error {
+                    completion(.failure(error))
+                } else {
+                    completion(.success(()))
+                }
+            }
+        }
+    }
+
+    /// A SOCKS UDP association exists only while its TCP control connection is
+    /// alive. Any EOF, error, or unexpected payload invalidates the UDP relay.
+    private static func monitorControl(
+        _ connection: NWConnection
+    ) async throws {
+        let _: Void = try await awaitRelayCallback { completion in
+            connection.receive(
+                minimumIncompleteLength: 1,
+                maximumLength: 1
+            ) { data, _, isComplete, error in
+                if let error {
+                    completion(.failure(error))
+                } else if let data, !data.isEmpty {
+                    completion(
+                        .failure(
+                            RelayError.socksProtocol(
+                                "unexpected UDP control payload"
+                            )
+                        )
                     )
-                    try await flow.writeDatagrams([
-                        (decoded.payload, decoded.endpoint),
-                    ])
+                } else if isComplete {
+                    completion(.failure(CancellationError()))
+                } else {
+                    completion(.failure(RelayError.socksUnavailable))
                 }
             }
-            _ = try await group.next()
-            group.cancelAll()
         }
     }
 
@@ -356,39 +426,37 @@ enum UDPFlowSOCKSRelay {
     }
 
     private static func open(_ flow: NEAppProxyFlow) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+        let _: Void = try await awaitRelayCallback { completion in
             let gate = UDPRelayGate()
             flow.open(withLocalFlowEndpoint: nil) { error in
                 guard gate.take() else {
                     return
                 }
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else {
-                    continuation.resume()
+                    completion(.success(()))
                 }
             }
         }
     }
 
     private static func start(_ connection: NWConnection) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+        let _: Void = try await awaitRelayCallback { completion in
             let gate = UDPRelayGate()
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
                     if gate.take() {
-                        continuation.resume()
+                        completion(.success(()))
                     }
                 case let .failed(error):
                     if gate.take() {
-                        continuation.resume(throwing: error)
+                        completion(.failure(error))
                     }
                 case .cancelled:
                     if gate.take() {
-                        continuation.resume(throwing: RelayError.socksUnavailable)
+                        completion(.failure(RelayError.socksUnavailable))
                     }
                 default:
                     break
@@ -402,13 +470,12 @@ enum UDPFlowSOCKSRelay {
         _ data: Data,
         to connection: NWConnection
     ) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+        let _: Void = try await awaitRelayCallback { completion in
             connection.send(content: data, completion: .contentProcessed { error in
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else {
-                    continuation.resume()
+                    completion(.success(()))
                 }
             })
         }
@@ -421,17 +488,17 @@ enum UDPFlowSOCKSRelay {
         var result = Data()
         while result.count < length {
             let remaining = length - result.count
-            let chunk: Data = try await withCheckedThrowingContinuation { continuation in
+            let chunk: Data = try await awaitRelayCallback { completion in
                 connection.receive(
                     minimumIncompleteLength: 1,
                     maximumLength: remaining
                 ) { data, _, _, error in
                     if let error {
-                        continuation.resume(throwing: error)
+                        completion(.failure(error))
                     } else if let data, !data.isEmpty {
-                        continuation.resume(returning: data)
+                        completion(.success(data))
                     } else {
-                        continuation.resume(throwing: RelayError.socksUnavailable)
+                        completion(.failure(RelayError.socksUnavailable))
                     }
                 }
             }
@@ -443,32 +510,21 @@ enum UDPFlowSOCKSRelay {
     private static func receiveMessage(
         from connection: NWConnection
     ) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
+        try await awaitRelayCallback { completion in
             connection.receiveMessage { data, _, isComplete, error in
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else if let data {
-                    continuation.resume(returning: data)
+                    completion(.success(data))
                 } else if isComplete {
-                    continuation.resume(returning: Data())
+                    completion(.success(Data()))
                 } else {
-                    continuation.resume(throwing: RelayError.socksUnavailable)
+                    completion(.failure(RelayError.socksUnavailable))
                 }
             }
         }
     }
 
-    private static func close(
-        flow: NEAppProxyUDPFlow,
-        control: NWConnection,
-        relay: NWConnection?,
-        error: Error?
-    ) {
-        control.cancel()
-        relay?.cancel()
-        flow.closeReadWithError(error)
-        flow.closeWriteWithError(error)
-    }
 }
 
 private final class UDPRelayGate: @unchecked Sendable {
@@ -485,5 +541,47 @@ private final class UDPRelayGate: @unchecked Sendable {
         }
         available = false
         return true
+    }
+}
+
+private final class UDPRelayResources: @unchecked Sendable {
+    private let lock = NSLock()
+    private let flow: NEAppProxyUDPFlow
+    private let control: NWConnection
+    private var relay: NWConnection?
+    private var closed = false
+
+    init(flow: NEAppProxyUDPFlow, control: NWConnection) {
+        self.flow = flow
+        self.control = control
+    }
+
+    func install(relay: NWConnection) {
+        lock.lock()
+        if closed {
+            lock.unlock()
+            relay.cancel()
+            return
+        }
+        self.relay = relay
+        lock.unlock()
+    }
+
+    func close(with error: Error?) {
+        lock.lock()
+        guard !closed else {
+            lock.unlock()
+            return
+        }
+        closed = true
+        let currentRelay = relay
+        relay = nil
+        lock.unlock()
+
+        control.cancel()
+        currentRelay?.cancel()
+        let sourceError = AppProxyFlowCloseError.normalize(error)
+        flow.closeReadWithError(sourceError)
+        flow.closeWriteWithError(sourceError)
     }
 }

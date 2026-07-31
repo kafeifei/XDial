@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/kafeifei/xdial/core/engine"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
@@ -40,14 +39,13 @@ func newAnyConnectDNSTransport(
 	tag string,
 	_ anyConnectDNSServerOptions,
 ) (adapter.DNSTransport, error) {
-	bridge := service.FromContext[*engine.VPNBridge](ctx)
-	servers := snapshotTunnelDNS()
-	if bridge == nil || len(servers) == 0 {
+	line := service.FromContext[*anyConnectLineRuntime](ctx)
+	if line == nil {
 		return nil, fmt.Errorf("AnyConnect DNS transport is unavailable")
 	}
 	return &anyConnectDNSTransport{
 		TransportAdapter: dns.NewTransportAdapter(typeAnyConnectDNS, tag, nil),
-		exchanger:        newBridgeDNSExchanger(bridge, servers),
+		exchanger:        line,
 	}, nil
 }
 

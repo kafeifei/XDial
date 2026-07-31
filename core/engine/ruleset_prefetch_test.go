@@ -243,6 +243,11 @@ func TestPrepareRuleSetsSkipsProxyBoundSets(t *testing.T) {
 			line:    config.Line{ID: "ss", Type: config.LineTypeShadowsocks, Enabled: true},
 			binding: config.RuleBinding{LineID: "ss"},
 		},
+		{
+			name:    "anytls line",
+			line:    config.Line{ID: "anytls", Type: config.LineTypeAnyTLS, Enabled: true},
+			binding: config.RuleBinding{LineID: "anytls"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

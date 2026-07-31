@@ -1052,7 +1052,8 @@ func TestSmoke_SubscribeDisabled(t *testing.T) {
 }
 
 func TestSmoke_SubscribeEmptyNodes(t *testing.T) {
-	// 订阅无有效节点时回退到 direct
+	// active enabled 订阅无有效节点时必须 fail-closed，不能把声明的
+	// 订阅出口静默改成 direct。
 	profile := &Profile{
 		Lines: []Line{
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
@@ -1075,10 +1076,14 @@ func TestSmoke_SubscribeEmptyNodes(t *testing.T) {
 		ActiveModeID: "main",
 	}
 
-	r := newSmokeRunner(t, profile)
-	defer r.stop()
-
-	r.requestAndAssert("google.com", "direct")
+	_, err := GenerateSingBox(profile, 0, "")
+	if err == nil ||
+		!strings.Contains(err.Error(), "cannot generate an outbound") {
+		t.Fatalf(
+			"active empty Subscription must fail closed, got %v",
+			err,
+		)
+	}
 }
 
 func TestSmoke_SubscribeMultiSubscription(t *testing.T) {

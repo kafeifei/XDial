@@ -3,7 +3,7 @@ import Foundation
 struct Line: Codable, Identifiable, Hashable {
     var id: String
     var name: String
-    var type: String  // direct / vpn / trojan / shadowsocks / vmess / tailscale
+    var type: String  // direct / vpn / trojan / shadowsocks / vmess / anytls / tailscale
     var enabled: Bool = true
     var verified: Bool = false
 
@@ -26,14 +26,32 @@ struct Line: Codable, Identifiable, Hashable {
     var vmessUUID: String = ""
     var vmessAltID: Int = 0
 
-    // Tailscale 身份由 Profile 全局共享；Line 只选择本线路使用的 exit node。
+    var anytlsServer: String = ""
+    var anytlsPort: Int = 443
+    var anytlsPassword: String = ""
+    var anytlsSNI: String = ""
+    var anytlsClientFingerprint: String = "chrome"
+    var anytlsALPN: [String] = ["h2"]
+    var anytlsIdleSessionCheckInterval: Int = 30
+    var anytlsIdleSessionTimeout: Int = 30
+    var anytlsMinIdleSession: Int = 0
+
+    // 通用拨号能力。订阅导入必须无损保留；具体协议是否允许由生成阶段
+    // fail-closed 校验，不能在 Swift decode 时静默丢掉。
+    var udp: Bool = false
+    var tfo: Bool = false
+
+    // Tailscale 身份由 Profile 全局共享；Line 选择本线路使用的
+    // exit node，并显式决定是否启用 MagicDNS 与节点路由。
     var tailscaleExitNode: String = ""
+    var tailscaleMagicDNS: Bool = false
 
     // 跳过 TLS 证书验证（自签场景显式开启）。默认 false=验证证书。
     var allowInsecure: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case id, name, type, enabled, verified
+        case udp, tfo
         case allowInsecure = "allow_insecure"
         case vpnServer = "vpn_server"
         case vpnUsername = "vpn_username"
@@ -50,7 +68,18 @@ struct Line: Codable, Identifiable, Hashable {
         case vmessPort = "vmess_port"
         case vmessUUID = "vmess_uuid"
         case vmessAltID = "vmess_alt_id"
+        case anytlsServer = "anytls_server"
+        case anytlsPort = "anytls_port"
+        case anytlsPassword = "anytls_password"
+        case anytlsSNI = "anytls_sni"
+        case anytlsClientFingerprint = "anytls_client_fingerprint"
+        case anytlsALPN = "anytls_alpn"
+        case anytlsIdleSessionCheckInterval =
+            "anytls_idle_session_check_interval"
+        case anytlsIdleSessionTimeout = "anytls_idle_session_timeout"
+        case anytlsMinIdleSession = "anytls_min_idle_session"
         case tailscaleExitNode = "tailscale_exit_node"
+        case tailscaleMagicDNS = "tailscale_magic_dns"
     }
 
     init(id: String, name: String, type: String, enabled: Bool = true, verified: Bool = false,
@@ -58,14 +87,31 @@ struct Line: Codable, Identifiable, Hashable {
          trojanServer: String = "", trojanPort: Int = 443, trojanPassword: String = "", trojanSNI: String = "",
          ssServer: String = "", ssPort: Int = 8388, ssMethod: String = "aes-256-gcm", ssPassword: String = "",
          vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0,
-         tailscaleExitNode: String = "",
+         anytlsServer: String = "", anytlsPort: Int = 443, anytlsPassword: String = "", anytlsSNI: String = "",
+         anytlsClientFingerprint: String = "chrome", anytlsALPN: [String] = ["h2"],
+         anytlsIdleSessionCheckInterval: Int = 30, anytlsIdleSessionTimeout: Int = 30,
+         anytlsMinIdleSession: Int = 0,
+         udp: Bool? = nil, tfo: Bool = false,
+         tailscaleExitNode: String = "", tailscaleMagicDNS: Bool = false,
          allowInsecure: Bool = false) {
         self.id = id; self.name = name; self.type = type; self.enabled = enabled; self.verified = verified
         self.vpnServer = vpnServer; self.vpnUsername = vpnUsername; self.vpnPassword = vpnPassword
         self.trojanServer = trojanServer; self.trojanPort = trojanPort; self.trojanPassword = trojanPassword; self.trojanSNI = trojanSNI
         self.ssServer = ssServer; self.ssPort = ssPort; self.ssMethod = ssMethod; self.ssPassword = ssPassword
         self.vmessServer = vmessServer; self.vmessPort = vmessPort; self.vmessUUID = vmessUUID; self.vmessAltID = vmessAltID
+        self.anytlsServer = anytlsServer; self.anytlsPort = anytlsPort; self.anytlsPassword = anytlsPassword; self.anytlsSNI = anytlsSNI
+        self.anytlsClientFingerprint = anytlsClientFingerprint
+        self.anytlsALPN = anytlsALPN
+        self.anytlsIdleSessionCheckInterval = anytlsIdleSessionCheckInterval
+        self.anytlsIdleSessionTimeout = anytlsIdleSessionTimeout
+        self.anytlsMinIdleSession = anytlsMinIdleSession
+        // AnyTLS always exposes native UoT in the embedded sing-box runtime.
+        // Keep an explicitly imported false as source metadata, but make new
+        // manually created AnyTLS Lines describe their real capability.
+        self.udp = udp ?? (type == "anytls")
+        self.tfo = tfo
         self.tailscaleExitNode = tailscaleExitNode
+        self.tailscaleMagicDNS = tailscaleMagicDNS
         self.allowInsecure = allowInsecure
     }
 
@@ -91,8 +137,122 @@ struct Line: Codable, Identifiable, Hashable {
         vmessPort = try c.decodeIfPresent(Int.self, forKey: .vmessPort) ?? 443
         vmessUUID = try c.decodeIfPresent(String.self, forKey: .vmessUUID) ?? ""
         vmessAltID = try c.decodeIfPresent(Int.self, forKey: .vmessAltID) ?? 0
+        anytlsServer = try c.decodeIfPresent(String.self, forKey: .anytlsServer) ?? ""
+        anytlsPort = try c.decodeIfPresent(Int.self, forKey: .anytlsPort) ?? 443
+        anytlsPassword = try c.decodeIfPresent(String.self, forKey: .anytlsPassword) ?? ""
+        anytlsSNI = try c.decodeIfPresent(String.self, forKey: .anytlsSNI) ?? ""
+        // 缺少这些 key 表示旧版 Profile。不能把新建线路的推荐值强行
+        // 注入存量线路，否则一次升级就会静默改变 TLS ClientHello / ALPN。
+        anytlsClientFingerprint = try c.decodeIfPresent(
+            String.self,
+            forKey: .anytlsClientFingerprint
+        ) ?? ""
+        anytlsALPN = try c.decodeIfPresent(
+            [String].self,
+            forKey: .anytlsALPN
+        ) ?? []
+        anytlsIdleSessionCheckInterval = try c.decodeIfPresent(
+            Int.self,
+            forKey: .anytlsIdleSessionCheckInterval
+        ) ?? 0
+        anytlsIdleSessionTimeout = try c.decodeIfPresent(
+            Int.self,
+            forKey: .anytlsIdleSessionTimeout
+        ) ?? 0
+        anytlsMinIdleSession = try c.decodeIfPresent(
+            Int.self,
+            forKey: .anytlsMinIdleSession
+        ) ?? 0
+        udp = try c.decodeIfPresent(Bool.self, forKey: .udp) ?? false
+        tfo = try c.decodeIfPresent(Bool.self, forKey: .tfo) ?? false
         tailscaleExitNode = try c.decodeIfPresent(String.self, forKey: .tailscaleExitNode) ?? ""
+        tailscaleMagicDNS = try c.decodeIfPresent(Bool.self, forKey: .tailscaleMagicDNS) ?? false
         allowInsecure = try c.decodeIfPresent(Bool.self, forKey: .allowInsecure) ?? false
+    }
+
+    /// sing-box 当前 `uTLSClientHelloID` 实际接受的值。`chrome_*`
+    /// 已被上游废弃，但仍会明确兼容映射到 Chrome；保留它们可避免旧订阅
+    /// 因 UI 保存而被无声改写。
+    static let anyTLSSupportedClientFingerprints = [
+        "",
+        "chrome",
+        "firefox",
+        "edge",
+        "safari",
+        "360",
+        "qq",
+        "ios",
+        "android",
+        "random",
+        "randomized",
+        "chrome_psk",
+        "chrome_psk_shuffle",
+        "chrome_padding_psk_shuffle",
+        "chrome_pq",
+        "chrome_pq_psk",
+    ]
+
+    static let anyTLSIdleSessionIntervalRange = 6...3600
+    static let anyTLSMinIdleSessionRange = 0...64
+    static let anyTLSMaximumALPNCount = 8
+
+    /// 空数组表示不显式指定 ALPN。非空值按 RFC 7301 的协议名长度约束
+    /// 校验；协议名是 opaque byte string，因此不能擅自限制为 ASCII。
+    static func validateAnyTLSALPN(_ protocols: [String]) -> String? {
+        guard protocols.count <= anyTLSMaximumALPNCount else {
+            return "ALPN 最多只能填写 \(anyTLSMaximumALPNCount) 项"
+        }
+        var seen = Set<String>()
+        for value in protocols {
+            guard !value.isEmpty else {
+                return "ALPN 协议名不能为空"
+            }
+            guard value.utf8.count <= 255 else {
+                return "单个 ALPN 协议名不能超过 255 字节"
+            }
+            guard value.unicodeScalars.allSatisfy({
+                !CharacterSet.controlCharacters.contains($0)
+            }) else {
+                return "ALPN 协议名不能包含控制字符"
+            }
+            guard seen.insert(value).inserted else {
+                return "ALPN 协议名不能重复"
+            }
+        }
+        return nil
+    }
+
+    /// 返回当前 AnyTLS 传输选项的首个可见问题。0 秒只作为旧 Profile
+    /// 的“未显式指定”哨兵；新建线路仍明确写入推荐的 30 秒。
+    var anyTLSOptionsValidationIssue: String? {
+        guard type == "anytls" else { return nil }
+        if tfo {
+            return "AnyTLS 不支持 TCP Fast Open，请关闭 TFO"
+        }
+        if !Self.anyTLSSupportedClientFingerprints.contains(
+            anytlsClientFingerprint
+        ) {
+            return "不支持的 TLS 客户端指纹"
+        }
+        if let issue = Self.validateAnyTLSALPN(anytlsALPN) {
+            return issue
+        }
+        if anytlsIdleSessionCheckInterval != 0,
+           !Self.anyTLSIdleSessionIntervalRange.contains(
+               anytlsIdleSessionCheckInterval
+           ) {
+            return "空闲检查间隔必须是 6–3600 秒，或 0 表示使用协议默认值"
+        }
+        if anytlsIdleSessionTimeout != 0,
+           !Self.anyTLSIdleSessionIntervalRange.contains(
+               anytlsIdleSessionTimeout
+           ) {
+            return "空闲超时必须是 6–3600 秒，或 0 表示使用协议默认值"
+        }
+        if !Self.anyTLSMinIdleSessionRange.contains(anytlsMinIdleSession) {
+            return "最少空闲会话数必须是 0–64"
+        }
+        return nil
     }
 }
 
@@ -398,7 +558,7 @@ struct Mode: Codable, Identifiable, Hashable {
     }
 }
 
-struct Profile: Codable {
+struct Profile: Codable, Hashable {
     var lines: [Line] = []
     var ruleSets: [RuleSet] = []
     var modes: [Mode] = []

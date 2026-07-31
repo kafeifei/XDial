@@ -5,7 +5,7 @@ import Security
 enum ApplicationLaunchPreparation {
     case continueLaunch
     case relaunching
-    case failed(String)
+    case failed(message: String, canRetry: Bool)
 }
 
 /// XDial 的平台安装入口。它只复制并验证 app bundle，不注册网络配置，也不启动数据面。
@@ -23,6 +23,17 @@ enum ApplicationRelocator {
         _ = try validateDistributionBundle(at: Bundle.main.bundleURL)
     }
 
+    static func moveInstalledApplicationToTrash() throws {
+        guard isRunningFromApplications else {
+            throw InstallationError.applicationNotInstalled
+        }
+        var resultingURL: NSURL?
+        try FileManager.default.trashItem(
+            at: destinationURL,
+            resultingItemURL: &resultingURL
+        )
+    }
+
     static func prepareForLaunch() -> ApplicationLaunchPreparation {
         let sourceURL = Bundle.main.bundleURL
         do {
@@ -31,44 +42,68 @@ enum ApplicationRelocator {
                 atPath: destinationURL.path
             )
             let destinationMatchesIdentity: Bool
+            let destinationIsRecognizedProduct: Bool
+            let destinationIdentity: SigningIdentity?
             if destinationExists {
-                destinationMatchesIdentity =
-                    try existingApplicationIdentity(
-                        at: destinationURL
-                    ) == sourceIdentity
+                let identity = try existingApplicationIdentity(
+                    at: destinationURL
+                )
+                destinationIdentity = identity
+                destinationMatchesIdentity = identity == sourceIdentity
+                destinationIsRecognizedProduct =
+                    XDialApplicationIdentifierPolicy
+                        .permitsReplacement(
+                            existingIdentifier: identity.identifier,
+                            incomingIdentifier: sourceIdentity.identifier,
+                            teamIdentifiersMatch:
+                                identity.teamIdentifier
+                                    == sourceIdentity.teamIdentifier
+                        )
             } else {
+                destinationIdentity = nil
                 destinationMatchesIdentity = false
+                destinationIsRecognizedProduct = false
             }
 
             switch ApplicationRelocationDecision.decide(
                 currentIsCanonical: isRunningFromApplications,
                 destinationExists: destinationExists,
-                destinationMatchesIdentity: destinationMatchesIdentity
+                destinationMatchesIdentity: destinationMatchesIdentity,
+                destinationIsRecognizedProduct:
+                    destinationIsRecognizedProduct
             ) {
             case .continueLaunch:
                 return .continueLaunch
             case .rejectExisting:
                 return .failed(
-                    "“应用程序”中已有另一份签名或标识不同的 XDial。"
-                    + "为避免覆盖未知程序，XDial 已停止自动安装。"
+                    message:
+                        "“应用程序”中已有另一份签名或标识不同的 XDial。"
+                        + "为避免覆盖未知程序，XDial 已停止自动安装。",
+                    canRetry: false
                 )
             case .install, .replace:
                 try install(
                     sourceURL: sourceURL,
                     sourceIdentity: sourceIdentity,
+                    replacedIdentity: destinationIdentity,
                     replaceExisting: destinationExists
                 )
                 try relaunchInstalledApplication()
                 return .relaunching
             }
         } catch {
-            return .failed(error.localizedDescription)
+            return .failed(
+                message: error.localizedDescription,
+                canRetry:
+                    (error as? InstallationError)?.canRetry ?? false
+            )
         }
     }
 
     private static func install(
         sourceURL: URL,
         sourceIdentity: SigningIdentity,
+        replacedIdentity: SigningIdentity?,
         replaceExisting: Bool
     ) throws {
         let fileManager = FileManager.default
@@ -92,7 +127,12 @@ enum ApplicationRelocator {
 
         if replaceExisting {
             try terminateOtherCopies(
-                bundleIdentifier: sourceIdentity.identifier
+                bundleIdentifiers: Set(
+                    [
+                        sourceIdentity.identifier,
+                        replacedIdentity?.identifier,
+                    ].compactMap { $0 }
+                )
             )
             let backupName =
                 ".XDial.backup-\(UUID().uuidString).app"
@@ -149,24 +189,73 @@ enum ApplicationRelocator {
     }
 
     private static func terminateOtherCopies(
-        bundleIdentifier: String
+        bundleIdentifiers: Set<String>
     ) throws {
-        let current = NSRunningApplication.current
-        let others = NSRunningApplication.runningApplications(
-            withBundleIdentifier: bundleIdentifier
-        ).filter { $0 != current }
-        guard !others.isEmpty else { return }
-        for application in others {
-            _ = application.terminate()
-        }
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline,
-              others.contains(where: { !$0.isTerminated }) {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        guard others.allSatisfy(\.isTerminated) else {
+        let currentProcessIdentifier =
+            NSRunningApplication.current.processIdentifier
+        let terminated =
+            ApplicationReplacementExitWaiter.wait(
+                requestGracefulTermination: {
+                    processIdentifier in
+                    guard
+                        let application = otherRunningCopies(
+                            bundleIdentifiers:
+                                bundleIdentifiers,
+                            currentProcessIdentifier:
+                                currentProcessIdentifier
+                        ).first(where: {
+                            $0.processIdentifier
+                                == processIdentifier
+                        })
+                    else {
+                        return
+                    }
+                    _ = application.terminate()
+                },
+                remainingProcessIdentifiers: {
+                    Set(
+                        otherRunningCopies(
+                            bundleIdentifiers:
+                                bundleIdentifiers,
+                            currentProcessIdentifier:
+                                currentProcessIdentifier
+                        ).map(\.processIdentifier)
+                    )
+                }
+            )
+        guard terminated else {
             throw InstallationError.existingApplicationDidNotTerminate
         }
+    }
+
+    private static func otherRunningCopies(
+        bundleIdentifiers: Set<String>,
+        currentProcessIdentifier: Int32
+    ) -> [NSRunningApplication] {
+        let candidates = bundleIdentifiers.flatMap {
+            NSRunningApplication.runningApplications(
+                withBundleIdentifier: $0
+            )
+        }
+        let processIdentifiers =
+            ApplicationReplacementExitWaiter
+                .otherProcessIdentifiers(
+                    currentProcessIdentifier:
+                        currentProcessIdentifier,
+                    candidateProcessIdentifiers:
+                        candidates.map(\.processIdentifier)
+                )
+        var applicationsByProcessIdentifier:
+            [Int32: NSRunningApplication] = [:]
+        for application in candidates
+        where processIdentifiers.contains(
+            application.processIdentifier
+        ) {
+            applicationsByProcessIdentifier[
+                application.processIdentifier
+            ] = application
+        }
+        return Array(applicationsByProcessIdentifier.values)
     }
 
     private static func validateDistributionBundle(
@@ -331,6 +420,16 @@ enum ApplicationRelocator {
         case signatureMetadataMissing(String)
         case relaunchFailed
         case existingApplicationDidNotTerminate
+        case applicationNotInstalled
+
+        var canRetry: Bool {
+            switch self {
+            case .existingApplicationDidNotTerminate:
+                true
+            default:
+                false
+            }
+        }
 
         var errorDescription: String? {
             switch self {
@@ -365,7 +464,11 @@ enum ApplicationRelocator {
             case .relaunchFailed:
                 "XDial 已安装，但无法从“应用程序”重新启动"
             case .existingApplicationDidNotTerminate:
-                "正在运行的旧版 XDial 未能安全退出，已停止自动替换"
+                "旧版 XDial 仍在运行，无法安全替换。"
+                    + "XDial 不会强制结束它；请稍等后重试，"
+                    + "或从菜单栏退出旧版后再重试。"
+            case .applicationNotInstalled:
+                "XDial 不在“应用程序”目录，无法完成卸载"
             }
         }
     }

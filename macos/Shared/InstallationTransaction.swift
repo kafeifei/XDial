@@ -66,7 +66,7 @@ struct InstallationReportEvent: Codable, Equatable {
 }
 
 struct InstallationReport: Codable, Equatable {
-    static let schemaVersion = 1
+    static let schemaVersion = 4
 
     let schemaVersion: Int
     let transactionID: String
@@ -116,7 +116,7 @@ struct InstallationReport: Codable, Equatable {
                 InstallationTaskReport(
                     id: "system-extension",
                     name: "启用网络扩展",
-                    detail: "安装 XDial Transparent Proxy",
+                    detail: "激活后复核当前版本与启用状态",
                     state: .pending,
                     error: nil
                 ),
@@ -230,7 +230,8 @@ enum ApplicationRelocationDecision: Equatable {
     static func decide(
         currentIsCanonical: Bool,
         destinationExists: Bool,
-        destinationMatchesIdentity: Bool
+        destinationMatchesIdentity: Bool,
+        destinationIsRecognizedProduct: Bool = false
     ) -> ApplicationRelocationDecision {
         if currentIsCanonical {
             return .continueLaunch
@@ -238,7 +239,10 @@ enum ApplicationRelocationDecision: Equatable {
         guard destinationExists else {
             return .install
         }
-        return destinationMatchesIdentity ? .replace : .rejectExisting
+        return destinationMatchesIdentity
+            || destinationIsRecognizedProduct
+            ? .replace
+            : .rejectExisting
     }
 }
 
@@ -247,6 +251,56 @@ enum SystemExtensionInstallationEvent: Equatable {
     case waitingForApproval
     case completed
     case failed(String)
+}
+
+enum InstallationBuildMarker {
+    static func make(
+        bundleIdentifier: String,
+        bundleVersion: String
+    ) -> String {
+        "\(bundleIdentifier):\(bundleVersion)"
+            + ":installation-v\(InstallationReport.schemaVersion)"
+    }
+}
+
+struct SystemExtensionPropertySnapshot: Equatable {
+    let bundleIdentifier: String
+    let bundleVersion: String
+    let isEnabled: Bool
+    let isAwaitingUserApproval: Bool
+    let isUninstalling: Bool
+}
+
+enum SystemExtensionActivationVerifier {
+    static func containsReadyCurrentVersion(
+        _ properties: [SystemExtensionPropertySnapshot],
+        expectedIdentifier: String,
+        expectedVersion: String
+    ) -> Bool {
+        properties.contains {
+            $0.bundleIdentifier == expectedIdentifier
+                && $0.bundleVersion == expectedVersion
+                && $0.isEnabled
+                && !$0.isAwaitingUserApproval
+                && !$0.isUninstalling
+        }
+    }
+}
+
+enum XDialApplicationIdentifierPolicy {
+    static let debug = "com.kafeifei.xdial.ne-probe"
+    static let release = "com.kafeifei.xdial"
+
+    static func permitsReplacement(
+        existingIdentifier: String,
+        incomingIdentifier: String,
+        teamIdentifiersMatch: Bool
+    ) -> Bool {
+        guard teamIdentifiersMatch else { return false }
+        let knownIdentifiers = Set([debug, release])
+        return knownIdentifiers.contains(existingIdentifier)
+            && knownIdentifiers.contains(incomingIdentifier)
+    }
 }
 
 enum ApplicationBundleReplacer {

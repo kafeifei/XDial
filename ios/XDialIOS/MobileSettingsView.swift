@@ -129,8 +129,8 @@ struct MobileSettingsView: View {
                         "AnyConnect and rule routing: verified in layers on every connection"
                     ), systemImage: "checkmark.shield")
                     Label(app.tr(
-                        "Tailscale 可独立启动，支持登录、出口节点与 MagicDNS/.ts.net 分域解析",
-                        "Tailscale can start independently with sign-in, exit-node, and split MagicDNS/.ts.net resolution"
+                        "Tailscale 可独立启动；在线路上勾选 MagicDNS 后可访问 Tailnet 节点",
+                        "Tailscale can start independently; enable MagicDNS on the line to reach Tailnet peers"
                     ), systemImage: "checkmark.shield")
                 }
 

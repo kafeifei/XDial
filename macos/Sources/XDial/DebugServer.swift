@@ -144,6 +144,7 @@ final class DebugServer {
         dict["statusText"] = s.statusText
         dict["language"] = s.language.rawValue
         dict["launchAtLogin"] = s.launchAtLogin
+        dict["autoConnect"] = s.autoConnect
         dict["activeModeID"] = s.profile.activeModeID
         // 配置改了但引擎还在跑旧快照 —— 验收改动是否真正生效必须看这个
         dict["configDirty"] = s.configDirty
@@ -198,6 +199,7 @@ final class DebugServer {
     // 密码/凭据字段一律打码；订阅 url 内嵌 token，同样按凭据处理
     private static let secretKeys: Set<String> = [
         "vpn_password", "trojan_password", "ss_password", "vmess_uuid",
+        "anytls_password",
         "tailscale_auth_key", "auth_key",
     ]
 
@@ -223,6 +225,34 @@ final class DebugServer {
     }
 
     // MARK: - AX Tree
+
+    private static let secureTextFieldSubrole = "AXSecureTextField"
+
+    /// AX is also a diagnostic surface. AppKit currently protects secure text
+    /// fields, but that behavior is not a credential boundary we should depend
+    /// on. Refuse the read before asking Accessibility for AXValue so neither
+    /// the tree dump nor element lookup can observe a password.
+    private static func safeAXValue(
+        _ element: AXUIElement,
+        subrole: String?
+    ) -> CFTypeRef? {
+        guard subrole != secureTextFieldSubrole else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success else {
+            return nil
+        }
+        return value
+    }
+
+    private static func safeAXStringValue(
+        _ element: AXUIElement,
+        subrole: String?
+    ) -> String? {
+        guard let value = safeAXValue(element, subrole: subrole) else {
+            return nil
+        }
+        return value as? String
+    }
 
     @MainActor
     private static func buildAXTree(maxDepth: Int) -> [String: Any] {
@@ -263,16 +293,15 @@ final class DebugServer {
         }
 
         if let v = str(kAXRoleAttribute) { d["role"] = v }
-        if let v = str(kAXSubroleAttribute) { d["subrole"] = v }
+        let subrole = str(kAXSubroleAttribute)
+        if let subrole { d["subrole"] = subrole }
         if let v = str(kAXTitleAttribute), !v.isEmpty { d["title"] = v }
         if let v = str(kAXDescriptionAttribute), !v.isEmpty { d["description"] = v }
         if let v = str("AXIdentifier"), !v.isEmpty { d["id"] = v }
         if let v = str(kAXRoleDescriptionAttribute), !v.isEmpty { d["roleDesc"] = v }
         if let v = str(kAXHelpAttribute), !v.isEmpty { d["help"] = v }
 
-        var valRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &valRef) == .success,
-           let v = valRef {
+        if let v = safeAXValue(el, subrole: subrole) {
             if let s = v as? String { d["value"] = s }
             else if let n = v as? NSNumber { d["value"] = n }
             else { d["value"] = "\(v)" }
@@ -632,15 +661,21 @@ final class DebugServer {
         func search(_ el: AXUIElement, depth: Int) -> AXUIElement? {
             if depth > maxDepth { return nil }
             let elRole = str(el, kAXRoleAttribute)
-            let texts = [
+            let subrole = str(el, kAXSubroleAttribute)
+            var texts = [
                 str(el, kAXTitleAttribute),
                 str(el, kAXDescriptionAttribute),
                 str(el, kAXRoleDescriptionAttribute),
-                str(el, kAXSubroleAttribute),
+                subrole,
                 str(el, "AXIdentifier"),
                 str(el, kAXHelpAttribute),
-                str(el, kAXValueAttribute),
             ].compactMap { $0 }
+            if let value = safeAXStringValue(
+                el,
+                subrole: subrole
+            ) {
+                texts.append(value)
+            }
 
             let titleMatch = texts.contains { $0.contains(title) }
             let roleMatch = role == nil || elRole == role

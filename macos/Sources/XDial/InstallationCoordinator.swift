@@ -53,8 +53,16 @@ final class InstallationCoordinator: ObservableObject {
     }
 
     func retry() {
-        start(force: true)
-        present()
+        let previousRun = runTask
+        Task { [weak self] in
+            previousRun?.cancel()
+            if let previousRun {
+                await previousRun.value
+            }
+            guard let self else { return }
+            self.start(force: true)
+            self.present()
+        }
     }
 
     func present() {
@@ -250,7 +258,10 @@ final class InstallationCoordinator: ObservableObject {
         let version = bundle.object(
             forInfoDictionaryKey: "CFBundleVersion"
         ) as? String ?? "unknown"
-        return "\(identifier):\(version)"
+        return InstallationBuildMarker.make(
+            bundleIdentifier: identifier,
+            bundleVersion: version
+        )
     }
 
     private struct InstallationFailure: Error {

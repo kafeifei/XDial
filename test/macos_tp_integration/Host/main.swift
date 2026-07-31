@@ -219,6 +219,7 @@ private final class IntegrationHost:
                 ("trojan", "trojan_password"),
                 ("ss", "ss_password"),
                 ("vmess", "vmess_uuid"),
+                ("anytls", "anytls_password"),
             ] {
                 if let value = vault["\(key)-\(suffix)"] {
                     lines[index][field] = value

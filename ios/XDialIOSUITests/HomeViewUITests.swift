@@ -290,7 +290,7 @@ final class HomeViewUITests: XCTestCase {
         XCTAssertTrue(diagnosticsButton.waitForExistence(timeout: 2))
         let tailscaleCapability = app.staticTexts.containing(NSPredicate(
             format: "label CONTAINS %@",
-            "MagicDNS/.ts.net 分域解析"
+            "勾选 MagicDNS"
         )).firstMatch
         if !tailscaleCapability.exists {
             app.swipeUp()
