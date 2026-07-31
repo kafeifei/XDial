@@ -31,8 +31,9 @@ func TestEncodeTailscaleStatusAllowlist(t *testing.T) {
 			Relay: "must-not-leak-self-relay-region",
 		},
 		CurrentTailnet: &ipnstate.TailnetStatus{
-			Name:           "must-not-leak-tailnet",
-			MagicDNSSuffix: "private-tailnet.ts.net",
+			Name:            "must-not-leak-tailnet",
+			MagicDNSSuffix:  "private-tailnet.ts.net",
+			MagicDNSEnabled: true,
 		},
 		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
 			onlineNodeKey: {
@@ -139,8 +140,9 @@ func TestEncodeTailscaleStatusAllowlist(t *testing.T) {
 	if err := stdjson.Unmarshal([]byte(encoded), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if len(payload) != 6 || payload["backend_state"] != "NeedsLogin" || payload["auth_url"] != status.AuthURL ||
-		payload["health_count"] != float64(1) || payload["control_self_home_present"] != true {
+	if len(payload) != 7 || payload["backend_state"] != "NeedsLogin" || payload["auth_url"] != status.AuthURL ||
+		payload["health_count"] != float64(1) || payload["control_self_home_present"] != true ||
+		payload["magic_dns_ready"] != true {
 		t.Fatalf("unexpected status payload: %v", payload)
 	}
 	for _, misleading := range []string{

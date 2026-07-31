@@ -3,13 +3,19 @@
 package libbox
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"go.uber.org/atomic"
+	"sslcon/base"
 	"sslcon/proto"
 	"sslcon/session"
 
@@ -36,6 +42,58 @@ type startTestVPNClient struct {
 	info           *engine.VPNInfo
 	connectErr     error
 	disconnectOnce sync.Once
+}
+
+type reconnectTestVPNClient struct {
+	mu             sync.Mutex
+	info           *engine.VPNInfo
+	currentSession *session.ConnSession
+	nextSession    *session.ConnSession
+	connectErr     error
+	connectStarted chan struct{}
+	allowConnect   chan struct{}
+	startOnce      sync.Once
+}
+
+func (c *reconnectTestVPNClient) Connect(
+	engine.VPNConfig,
+) (*engine.VPNInfo, error) {
+	c.startOnce.Do(func() {
+		if c.connectStarted != nil {
+			close(c.connectStarted)
+		}
+	})
+	if c.allowConnect != nil {
+		<-c.allowConnect
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.connectErr != nil {
+		return nil, c.connectErr
+	}
+	c.currentSession = c.nextSession
+	return c.info, nil
+}
+
+func (c *reconnectTestVPNClient) Session() *session.ConnSession {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.currentSession
+}
+
+func (c *reconnectTestVPNClient) Disconnect() {
+	c.mu.Lock()
+	current := c.currentSession
+	c.currentSession = nil
+	c.mu.Unlock()
+	if current == nil {
+		return
+	}
+	select {
+	case <-current.CloseChan:
+	default:
+		close(current.CloseChan)
+	}
 }
 
 func (c *startTestVPNClient) Connect(engine.VPNConfig) (*engine.VPNInfo, error) {
@@ -167,9 +225,32 @@ func (c *sessionMonitorCallback) snapshot() []sessionMonitorEvent {
 func installMonitoredSession(l *Libbox, cSess *session.ConnSession) uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	bridge, err := engine.NewVPNBridge("10.0.0.2", 1400)
+	if err != nil {
+		panic(err)
+	}
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
 	l.running = true
 	l.dnsJSON = `["10.0.0.53"]`
 	l.session = cSess
+	l.bridge = bridge
+	l.anyConnectLine = newAnyConnectLineRuntime(
+		bridge,
+		anyConnectDNSServers([]string{"10.0.0.53"}),
+	)
+	l.runtimeCtx = runtimeCtx
+	l.runtimeCancel = runtimeCancel
+	l.anyConnectConfig = engine.VPNConfig{
+		Server:   "https://vpn.example.com",
+		Username: "user",
+		Password: "password",
+	}
+	l.anyConnectRetryDelays = []time.Duration{0, 0, 0}
+	if l.vpn == nil {
+		l.vpn = &startTestVPNClient{
+			connectErr: errors.New("reconnect failed"),
+		}
+	}
 	l.generation++
 	return l.generation
 }
@@ -209,14 +290,234 @@ func TestSessionMonitorUnexpectedCloseCleansStateAndReportsInOrder(t *testing.T)
 	}
 
 	events := cb.snapshot()
-	if len(events) != 2 {
-		t.Fatalf("events = %#v, want error then disconnected", events)
+	if len(events) != maxAnyConnectReconnectAttempts+2 {
+		t.Fatalf("events = %#v, want retries then error and disconnected", events)
 	}
-	if events[0] != (sessionMonitorEvent{kind: "error", code: ErrCodeNetwork, message: unexpectedSessionCloseError}) {
-		t.Fatalf("first event = %#v", events[0])
+	for attempt := 1; attempt <= maxAnyConnectReconnectAttempts; attempt++ {
+		if events[attempt-1].kind != "status" ||
+			!strings.Contains(
+				events[attempt-1].message,
+				`"status":"line_reconnecting"`,
+			) {
+			t.Fatalf("retry event %d = %#v", attempt, events[attempt-1])
+		}
 	}
-	if events[1] != (sessionMonitorEvent{kind: "status", message: `{"status":"disconnected"}`}) {
-		t.Fatalf("second event = %#v", events[1])
+	if events[len(events)-2] != (sessionMonitorEvent{kind: "error", code: ErrCodeNetwork, message: unexpectedSessionCloseError}) {
+		t.Fatalf("fatal event = %#v", events[len(events)-2])
+	}
+	if events[len(events)-1] != (sessionMonitorEvent{kind: "status", message: `{"status":"disconnected"}`}) {
+		t.Fatalf("final event = %#v", events[len(events)-1])
+	}
+}
+
+func TestSessionMonitorReconnectsOnlyAnyConnectLine(t *testing.T) {
+	oldSession := &session.ConnSession{CloseChan: make(chan struct{})}
+	newSession := newStartTestSession()
+	vpn := &reconnectTestVPNClient{
+		info: &engine.VPNInfo{
+			VPNAddress: "10.0.0.3",
+			DNS:        []string{"10.0.0.54"},
+			MTU:        1400,
+		},
+		nextSession:    newSession,
+		connectStarted: make(chan struct{}),
+		allowConnect:   make(chan struct{}),
+	}
+	cb := &sessionMonitorCallback{}
+	l := &Libbox{
+		cb:       cb,
+		vpn:      vpn,
+		platform: &xdPlatformInterface{},
+	}
+	generation := installMonitoredSession(l, oldSession)
+	lockFile, err := os.CreateTemp(t.TempDir(), "tailscale-state-lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.mu.Lock()
+	l.stateLocks = []*os.File{lockFile}
+	line := l.anyConnectLine
+	l.mu.Unlock()
+
+	done := runSessionMonitor(l, generation, oldSession)
+	close(oldSession.CloseChan)
+	select {
+	case <-vpn.connectStarted:
+	case <-time.After(time.Second):
+		t.Fatal("line reconnect did not start")
+	}
+
+	if line.available() {
+		t.Fatal("failed AnyConnect line remained available while reconnecting")
+	}
+	if _, err := line.DialTCP(
+		context.Background(),
+		"192.0.2.1:443",
+	); !errors.Is(err, errAnyConnectLineUnavailable) {
+		t.Fatalf("unavailable line dial error = %v", err)
+	}
+	udpConn, err := line.DialUDP(
+		nil,
+		&net.UDPAddr{IP: net.IPv4(192, 0, 2, 53), Port: 53},
+	)
+	if udpConn != nil ||
+		!errors.Is(err, errAnyConnectLineUnavailable) {
+		t.Fatalf(
+			"unavailable line UDP dial = (%v, %v), want nil and reconnecting error",
+			udpConn,
+			err,
+		)
+	}
+	dnsTransport := &anyConnectDNSTransport{exchanger: line}
+	dnsResponse, err := dnsTransport.Exchange(
+		context.Background(),
+		mobileDNSTestRequest("corp.example."),
+	)
+	if dnsResponse != nil || !errors.Is(err, errMobileDNSFailed) {
+		t.Fatalf(
+			"unavailable line DNS exchange = (%v, %v), want nil and explicit failure",
+			dnsResponse,
+			err,
+		)
+	}
+	l.mu.Lock()
+	runningDuringReconnect := l.running
+	retainedLocks := len(l.stateLocks) == 1 &&
+		l.stateLocks[0] == lockFile
+	l.mu.Unlock()
+	if !runningDuringReconnect {
+		t.Fatal("sing-box generation stopped during line reconnect")
+	}
+	if !retainedLocks {
+		t.Fatal("unrelated Tailscale state ownership was released")
+	}
+
+	close(vpn.allowConnect)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("line reconnect did not finish")
+	}
+
+	l.mu.Lock()
+	running := l.running
+	currentSession := l.session
+	currentGeneration := l.generation
+	retainedLocks = len(l.stateLocks) == 1 &&
+		l.stateLocks[0] == lockFile
+	l.mu.Unlock()
+	if !running || currentSession != newSession ||
+		currentGeneration != generation {
+		t.Fatalf(
+			"line reconnect replaced the data-plane generation: running=%v session=%p generation=%d",
+			running,
+			currentSession,
+			currentGeneration,
+		)
+	}
+	if !line.available() {
+		t.Fatal("AnyConnect line was not restored")
+	}
+	if !retainedLocks {
+		t.Fatal("Tailscale state ownership changed after line reconnect")
+	}
+
+	events := cb.snapshot()
+	if len(events) != 2 ||
+		events[0].kind != "status" ||
+		events[1].kind != "status" {
+		t.Fatalf("events = %#v", events)
+	}
+	var reconnectingStatus, connectedStatus struct {
+		Status  string `json:"status"`
+		Attempt int    `json:"attempt"`
+	}
+	if err := json.Unmarshal(
+		[]byte(events[0].message),
+		&reconnectingStatus,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(
+		[]byte(events[1].message),
+		&connectedStatus,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if reconnectingStatus.Status != "line_reconnecting" ||
+		reconnectingStatus.Attempt != 1 ||
+		connectedStatus.Status != "line_connected" ||
+		connectedStatus.Attempt != 1 {
+		t.Fatalf("unexpected line recovery events: %#v", events)
+	}
+
+	if err := l.Stop(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionMonitorPublishesStructuredAnyConnectFailure(t *testing.T) {
+	configurator, ok := any(base.Cfg).(interface {
+		SetXDialForceDPD(int)
+	})
+	if !ok {
+		t.Skip("pristine sslcon source does not include the staged XDial patch")
+	}
+	configurator.SetXDialForceDPD(5)
+	cSess := (&session.Session{}).NewConnSession(&http.Header{})
+	closer, ok := any(cSess).(interface {
+		XDialCloseWithReason(string, string, string, string)
+	})
+	if !ok {
+		t.Fatal("patched session lacks structured close support")
+	}
+
+	cb := &sessionMonitorCallback{}
+	l := &Libbox{cb: cb, platform: &xdPlatformInterface{}}
+	generation := installMonitoredSession(l, cSess)
+	done := runSessionMonitor(l, generation, cSess)
+	closer.XDialCloseWithReason(
+		"tls-read-timeout",
+		"tls",
+		"read",
+		"timeout",
+	)
+	<-done
+
+	var diagnosticState diagnostics
+	if err := json.Unmarshal(
+		[]byte(l.Diagnostics()),
+		&diagnosticState,
+	); err != nil {
+		t.Fatalf("decode diagnostics: %v", err)
+	}
+	if diagnosticState.LastError !=
+		"AnyConnect TLS control channel read timed out" {
+		t.Fatalf("last error = %q", diagnosticState.LastError)
+	}
+	var snapshot struct {
+		ForceDPDSeconds int `json:"force_dpd_seconds"`
+		Close           *struct {
+			Code string `json:"code"`
+		} `json:"close"`
+	}
+	if err := json.Unmarshal(
+		diagnosticState.AnyConnect,
+		&snapshot,
+	); err != nil {
+		t.Fatalf("decode AnyConnect diagnostics: %v", err)
+	}
+	if snapshot.ForceDPDSeconds != 5 ||
+		snapshot.Close == nil ||
+		snapshot.Close.Code != "tls-read-timeout" {
+		t.Fatalf("unexpected AnyConnect diagnostics: %#v", snapshot)
+	}
+
+	events := cb.snapshot()
+	if len(events) != maxAnyConnectReconnectAttempts+2 ||
+		events[len(events)-2].message !=
+			"AnyConnect TLS control channel read timed out" {
+		t.Fatalf("events = %#v", events)
 	}
 }
 
@@ -304,7 +605,9 @@ func TestSessionMonitorConcurrentStopAndCloseLeavesConsistentState(t *testing.T)
 			case "error":
 				errors++
 			case "status":
-				disconnected++
+				if event.message == `{"status":"disconnected"}` {
+					disconnected++
+				}
 			}
 		}
 		if disconnected != 1 || errors > 1 {

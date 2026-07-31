@@ -76,6 +76,80 @@ final class TransparentProxyRuntimeGateTests: XCTestCase {
         )
     }
 
+    func testAutomaticRecoveryRejectsLostCommittedSession() {
+        let oldReport = committedReport(transactionID: "old")
+        let proofTransactionID =
+            TransparentProxyRuntimeGate
+                .connectionProofTransactionID(
+                    currentTransactionID: "old",
+                    automaticReconnectInProgress: true,
+                    reconnectTransactionID: nil,
+                    networkExtensionSessionTransactionID: nil
+                )
+
+        XCTAssertNil(proofTransactionID)
+        XCTAssertEqual(
+            TransparentProxyRuntimeGate.resolve(
+                systemStatus: "connected",
+                report: oldReport,
+                activeTransactionID: proofTransactionID,
+                previousStatus: "reconnecting"
+            ),
+            "reconnecting"
+        )
+    }
+
+    func testRecoveryRequiresRetryReportAndCurrentNESession() {
+        let retryReport = committedReport(transactionID: "retry")
+        let staleSessionProof =
+            TransparentProxyRuntimeGate
+                .connectionProofTransactionID(
+                    currentTransactionID: "retry",
+                    automaticReconnectInProgress: true,
+                    reconnectTransactionID: "retry",
+                    networkExtensionSessionTransactionID: "old"
+                )
+
+        XCTAssertNil(staleSessionProof)
+        XCTAssertEqual(
+            TransparentProxyRuntimeGate.resolve(
+                systemStatus: "connected",
+                report: retryReport,
+                activeTransactionID: staleSessionProof,
+                previousStatus: "reconnecting"
+            ),
+            "reconnecting"
+        )
+
+        let currentSessionProof =
+            TransparentProxyRuntimeGate
+                .connectionProofTransactionID(
+                    currentTransactionID: "retry",
+                    automaticReconnectInProgress: true,
+                    reconnectTransactionID: "retry",
+                    networkExtensionSessionTransactionID: "retry"
+                )
+        XCTAssertEqual(currentSessionProof, "retry")
+        XCTAssertEqual(
+            TransparentProxyRuntimeGate.resolve(
+                systemStatus: "connected",
+                report: committedReport(transactionID: "old"),
+                activeTransactionID: currentSessionProof,
+                previousStatus: "reconnecting"
+            ),
+            "reconnecting"
+        )
+        XCTAssertEqual(
+            TransparentProxyRuntimeGate.resolve(
+                systemStatus: "connected",
+                report: retryReport,
+                activeTransactionID: currentSessionProof,
+                previousStatus: "reconnecting"
+            ),
+            "connected"
+        )
+    }
+
     private func committedReport(
         transactionID: String
     ) -> ConnectionReport {

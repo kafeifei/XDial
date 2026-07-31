@@ -84,6 +84,14 @@ const (
 	ErrCodeEngine = 4
 )
 
+const maxAnyConnectReconnectAttempts = 3
+
+var anyConnectReconnectDelays = [...]time.Duration{
+	0,
+	2 * time.Second,
+	5 * time.Second,
+}
+
 type Libbox struct {
 	mu                       sync.Mutex
 	cb                       Callback
@@ -103,6 +111,10 @@ type Libbox struct {
 	debugRoutingProbeEnabled bool
 	routingProbe             *routingProbeTracker
 	stateLocks               []*os.File
+	anyConnectDiagnostics    stdjson.RawMessage
+	anyConnectLine           *anyConnectLineRuntime
+	anyConnectConfig         engine.VPNConfig
+	anyConnectRetryDelays    []time.Duration
 	probeOutboundAddressFunc func(
 		context.Context,
 		adapter.Outbound,
@@ -499,6 +511,7 @@ type diagnostics struct {
 	TunOutBytes           uint64                `json:"tun_out_bytes"`
 	Bridge                engine.VPNBridgeStats `json:"bridge"`
 	LastError             string                `json:"last_error,omitempty"`
+	AnyConnect            stdjson.RawMessage    `json:"anyconnect,omitempty"`
 }
 
 // Diagnostics 返回不含凭据和服务器地址的运行快照，供 NetworkExtension 在发布版
@@ -522,6 +535,14 @@ func (l *Libbox) Diagnostics() string {
 		TunOutPackets:         platform.TunOutPackets,
 		TunOutBytes:           platform.TunOutBytes,
 		LastError:             l.lastError,
+		AnyConnect:            l.anyConnectDiagnostics,
+	}
+	if l.session != nil {
+		if current := validAnyConnectDiagnostics(
+			engine.AnyConnectSessionDiagnostics(l.session),
+		); current != nil {
+			result.AnyConnect = current
+		}
 	}
 	if l.bridge != nil {
 		result.Bridge = l.bridge.Stats()
@@ -586,6 +607,9 @@ func (l *Libbox) StartStandalone(configJSON string) error {
 	}
 	l.lastError = ""
 	l.dnsJSON = ""
+	l.anyConnectDiagnostics = nil
+	l.anyConnectLine = nil
+	l.anyConnectConfig = engine.VPNConfig{}
 
 	ctx := boxContext(context.Background())
 	ctx = service.ContextWith[adapter.PlatformInterface](ctx, adapter.PlatformInterface(l.platform))
@@ -670,6 +694,9 @@ func (l *Libbox) start(server, dialAddress, username, password string, allowInse
 	}
 	l.lastError = ""
 	l.dnsJSON = ""
+	l.anyConnectDiagnostics = nil
+	l.anyConnectLine = nil
+	l.anyConnectConfig = engine.VPNConfig{}
 
 	stateLocks, err := acquireTailscaleStateLocks(configJSON)
 	if err != nil {
@@ -686,13 +713,7 @@ func (l *Libbox) start(server, dialAddress, username, password string, allowInse
 	if err != nil {
 		return fail(ErrCodeNetwork, fmt.Errorf("anyconnect dial: %w", err))
 	}
-	var dnsServers []string
-	for _, raw := range vpnInfo.DNS {
-		addr, parseErr := netip.ParseAddr(strings.TrimSpace(raw))
-		if parseErr == nil && addr.Is4() {
-			dnsServers = append(dnsServers, addr.String())
-		}
-	}
+	dnsServers := anyConnectDNSServers(vpnInfo.DNS)
 	if len(dnsServers) == 0 {
 		l.vpn.Disconnect()
 		return fail(ErrCodeNetwork, fmt.Errorf("anyconnect did not provide a usable DNS server"))
@@ -716,9 +737,10 @@ func (l *Libbox) start(server, dialAddress, username, password string, allowInse
 		return fail(ErrCodeNetwork, fmt.Errorf("AnyConnect session ended immediately after connect"))
 	}
 	bridge.Start(cSess)
+	line := newAnyConnectLineRuntime(bridge, dnsServers)
 
 	ctx := boxContext(context.Background())
-	ctx = service.ContextWith[*engine.VPNBridge](ctx, bridge)
+	ctx = service.ContextWith[*anyConnectLineRuntime](ctx, line)
 	// 注入 PlatformInterface:sing-box 的 TUN inbound 靠它拿到 NE packetFlow 的 fd。
 	// 与上面注入 VPNBridge 同一套 service.ContextWith 机制。
 	ctx = service.ContextWith[adapter.PlatformInterface](ctx, adapter.PlatformInterface(l.platform))
@@ -752,6 +774,14 @@ func (l *Libbox) start(server, dialAddress, username, password string, allowInse
 	l.runtimeCtx, l.runtimeCancel = context.WithCancel(ctx)
 	l.routingProbe = routingProbe
 	l.stateLocks = stateLocks
+	l.anyConnectLine = line
+	l.anyConnectConfig = startVPNConfig(
+		server,
+		dialAddress,
+		username,
+		password,
+		allowInsecure,
+	)
 	keepStateLocks = true
 	l.generation++
 	monitoredSession = cSess
@@ -815,19 +845,244 @@ func (l *Libbox) monitorSession(generation uint64, cSess *session.ConnSession) {
 		l.mu.Unlock()
 		return
 	}
+	anyConnectDiagnostics := validAnyConnectDiagnostics(
+		engine.AnyConnectSessionDiagnostics(cSess),
+	)
+	bridge := l.bridge
+	line := l.anyConnectLine
+	config := l.anyConnectConfig
+	runtimeCtx := l.runtimeCtx
+	if line == nil || bridge == nil || runtimeCtx == nil ||
+		!line.deactivate(bridge) {
+		l.mu.Unlock()
+		return
+	}
+	l.bridge = nil
+	l.session = nil
+	l.dnsJSON = "[]"
+	l.anyConnectDiagnostics = anyConnectDiagnostics
+	failureMessage := anyConnectFailureMessage(anyConnectDiagnostics)
+	l.lastError = failureMessage
+	l.runtimeUsers.Add(1)
+	l.mu.Unlock()
+
+	// Close only the failed Line's bridge. The sing-box instance, Tailscale
+	// endpoint, Transparent Proxy ingress and state locks remain owned by the
+	// same data-plane generation.
+	bridge.Close()
+	if l.vpn != nil {
+		l.vpn.Disconnect()
+	}
+
+	reconnected := l.reconnectAnyConnect(
+		runtimeCtx,
+		generation,
+		line,
+		config,
+	)
+	l.runtimeUsers.Done()
+	if reconnected || runtimeCtx.Err() != nil {
+		return
+	}
+
+	// Local recovery is bounded. Only after its budget is exhausted does the
+	// existing fatal path tear down the complete transaction.
+	l.failAfterAnyConnectReconnect(
+		generation,
+		line,
+		failureMessage,
+	)
+}
+
+func (l *Libbox) reconnectAnyConnect(
+	runtimeCtx context.Context,
+	generation uint64,
+	line *anyConnectLineRuntime,
+	config engine.VPNConfig,
+) bool {
+	for attempt := 1; attempt <= maxAnyConnectReconnectAttempts; attempt++ {
+		delay := l.anyConnectReconnectDelay(attempt)
+		if !waitForAnyConnectReconnect(runtimeCtx, delay) {
+			return false
+		}
+		l.notifyStatus(anyConnectLineStatusJSON(
+			"line_reconnecting",
+			attempt,
+			maxAnyConnectReconnectAttempts,
+		))
+
+		vpnInfo, err := l.vpn.Connect(config)
+		if err != nil {
+			l.vpn.Disconnect()
+			continue
+		}
+		dnsServers := anyConnectDNSServers(vpnInfo.DNS)
+		if len(dnsServers) == 0 {
+			l.vpn.Disconnect()
+			continue
+		}
+		bridge, err := engine.NewVPNBridge(vpnInfo.VPNAddress, vpnInfo.MTU)
+		if err != nil {
+			l.vpn.Disconnect()
+			continue
+		}
+		cSess := l.vpn.Session()
+		if cSess == nil {
+			bridge.Close()
+			l.vpn.Disconnect()
+			continue
+		}
+		bridge.Start(cSess)
+
+		l.mu.Lock()
+		if !l.running || l.cleaning ||
+			l.generation != generation ||
+			l.anyConnectLine != line ||
+			l.session != nil ||
+			runtimeCtx.Err() != nil {
+			l.mu.Unlock()
+			bridge.Close()
+			l.vpn.Disconnect()
+			return false
+		}
+		line.activate(bridge, dnsServers)
+		l.bridge = bridge
+		l.session = cSess
+		dnsData, _ := stdjson.Marshal(dnsServers)
+		l.dnsJSON = string(dnsData)
+		l.lastError = ""
+		l.anyConnectDiagnostics = nil
+		l.mu.Unlock()
+
+		l.notifyStatus(anyConnectLineStatusJSON(
+			"line_connected",
+			attempt,
+			maxAnyConnectReconnectAttempts,
+		))
+		go l.monitorSession(generation, cSess)
+		return true
+	}
+	return false
+}
+
+func (l *Libbox) anyConnectReconnectDelay(attempt int) time.Duration {
+	if attempt > 0 && attempt <= len(l.anyConnectRetryDelays) {
+		return l.anyConnectRetryDelays[attempt-1]
+	}
+	return anyConnectReconnectDelays[attempt-1]
+}
+
+func waitForAnyConnectReconnect(
+	ctx context.Context,
+	delay time.Duration,
+) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func anyConnectLineStatusJSON(
+	status string,
+	attempt,
+	maxAttempts int,
+) string {
+	data, err := stdjson.Marshal(struct {
+		Status      string `json:"status"`
+		LineType    string `json:"line_type"`
+		Attempt     int    `json:"attempt"`
+		MaxAttempts int    `json:"max_attempts"`
+	}{
+		Status:      status,
+		LineType:    "vpn",
+		Attempt:     attempt,
+		MaxAttempts: maxAttempts,
+	})
+	if err != nil {
+		return `{"status":"line_reconnecting","line_type":"vpn"}`
+	}
+	return string(data)
+}
+
+func (l *Libbox) notifyStatus(statusJSON string) {
+	l.mu.Lock()
+	cb := l.cb
+	l.mu.Unlock()
+	if cb != nil {
+		cb.OnStatusChanged(statusJSON)
+	}
+}
+
+func (l *Libbox) failAfterAnyConnectReconnect(
+	generation uint64,
+	line *anyConnectLineRuntime,
+	failureMessage string,
+) {
+	l.mu.Lock()
+	if !l.running || l.cleaning ||
+		l.generation != generation ||
+		l.anyConnectLine != line ||
+		l.session != nil {
+		l.mu.Unlock()
+		return
+	}
 	instance, bridge, stateLocks := l.detachRunningLocked()
-	l.lastError = unexpectedSessionCloseError
 	cb := l.cb
 	l.mu.Unlock()
 	defer l.finishCleaning()
 
 	l.closeDetached(instance, bridge, stateLocks)
-
-	// 外部回调不持有内部锁，允许上层同步读取 Diagnostics 或调用 Stop。
-	// cleaning 在回调完成前保持为 true，避免旧连接的回调落到已启动的新连接上。
 	if cb != nil {
-		cb.OnError(ErrCodeNetwork, unexpectedSessionCloseError)
+		cb.OnError(ErrCodeNetwork, failureMessage)
 		cb.OnStatusChanged(`{"status":"disconnected"}`)
+	}
+}
+
+func validAnyConnectDiagnostics(raw string) stdjson.RawMessage {
+	if raw == "" || !stdjson.Valid([]byte(raw)) {
+		return nil
+	}
+	var object map[string]any
+	if err := stdjson.Unmarshal([]byte(raw), &object); err != nil ||
+		len(object) == 0 {
+		return nil
+	}
+	return append(stdjson.RawMessage(nil), raw...)
+}
+
+func anyConnectFailureMessage(snapshot stdjson.RawMessage) string {
+	var state struct {
+		Close *struct {
+			Code string `json:"code"`
+		} `json:"close"`
+	}
+	if len(snapshot) == 0 ||
+		stdjson.Unmarshal(snapshot, &state) != nil ||
+		state.Close == nil {
+		return unexpectedSessionCloseError
+	}
+	switch state.Close.Code {
+	case "tls-dpd-timeout":
+		return "AnyConnect TLS control channel did not answer DPD"
+	case "tls-read-timeout":
+		return "AnyConnect TLS control channel read timed out"
+	case "tls-read-eof":
+		return "AnyConnect TLS control channel reached EOF"
+	case "tls-read-reset", "tls-write-reset":
+		return "AnyConnect TLS control channel was reset"
+	case "peer-disconnect":
+		return "AnyConnect server requested disconnect"
+	case "peer-terminate":
+		return "AnyConnect server terminated the session"
+	default:
+		return unexpectedSessionCloseError
 	}
 }
 
@@ -839,6 +1094,8 @@ func (l *Libbox) detachRunningLocked() (*box.Box, *engine.VPNBridge, []*os.File)
 	stateLocks := l.stateLocks
 	l.box = nil
 	l.bridge = nil
+	l.anyConnectLine = nil
+	l.anyConnectConfig = engine.VPNConfig{}
 	l.stateLocks = nil
 	l.session = nil
 	if l.runtimeCancel != nil {

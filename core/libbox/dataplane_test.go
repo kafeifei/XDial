@@ -331,7 +331,10 @@ func startBoxOffline(t *testing.T, configJSON []byte, bridge *engine.VPNBridge) 
 	platform.setDefaultInterface(interfaces[0].Name, interfaces[0].Index)
 
 	ctx := boxContext(context.Background())
-	ctx = service.ContextWith[*engine.VPNBridge](ctx, bridge)
+	ctx = service.ContextWith[*anyConnectLineRuntime](
+		ctx,
+		newAnyConnectLineRuntime(bridge, nil),
+	)
 	ctx = service.ContextWith[adapter.PlatformInterface](ctx, adapter.PlatformInterface(platform))
 
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, configJSON)

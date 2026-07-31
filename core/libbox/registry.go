@@ -15,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/dns/transport"
 	"github.com/sagernet/sing-box/dns/transport/hosts"
 	"github.com/sagernet/sing-box/dns/transport/local"
+	"github.com/sagernet/sing-box/protocol/anytls"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
@@ -61,6 +62,7 @@ func outboundRegistry() *outbound.Registry {
 	trojan.RegisterOutbound(registry)
 	shadowsocks.RegisterOutbound(registry)
 	vmess.RegisterOutbound(registry)
+	anytls.RegisterOutbound(registry)
 	registerVPNOutbound(registry)
 
 	return registry

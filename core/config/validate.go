@@ -37,9 +37,11 @@ const (
 	WarningDisabledDefaultLine ProfileWarningKind = "disabled_default_line"
 	// WarningDisabledDefaultSubscription 模式默认出口订阅被禁用，默认出口回落 direct。
 	WarningDisabledDefaultSubscription ProfileWarningKind = "disabled_default_subscription"
-	// WarningUnavailableLine 线路 enabled，但参数不完整，生成不出 outbound。
+	// WarningUnavailableLine 仅为旧 JSON/API 兼容保留。active Mode 直接引用的 enabled
+	// Line 无法生成 outbound 时现在必须返回 error，不再产生此 warning。
 	WarningUnavailableLine ProfileWarningKind = "unavailable_line"
-	// WarningUnavailableSubscription 订阅 enabled，但没有任何可用节点。
+	// WarningUnavailableSubscription 仅为旧 JSON/API 兼容保留。active Mode 直接引用的
+	// enabled Subscription 无法生成主 outbound 时现在必须返回 error。
 	WarningUnavailableSubscription ProfileWarningKind = "unavailable_subscription"
 )
 
@@ -61,8 +63,12 @@ func (w ProfileWarning) String() string {
 // CollectProfileWarnings 校验活动模式的引用完整性。
 //
 // 返回 error = 配置里有悬空引用（INV6a），GenerateSingBox* 也一定会用同一份逻辑拒绝生成。
-// 返回 warnings = 有对象存在但被显式禁用或不可用（INV6b），生成会继续，但调用方
+// 返回 warnings = 有对象存在但被显式禁用（INV6b），生成会继续，但调用方
 // （daemon / UI）必须把这些提示展示给用户。
+//
+// active Mode 直接引用的 enabled Line / Subscription 若生成不出 outbound 则返回
+// error。它不是用户主动禁用，而是无法兑现 Mode 已声明的出口；继续生成会让绑定消失
+// 或让默认出口落到 direct，违反 fail-closed。
 //
 // 这是一个独立的只读入口，刻意不改 GenerateSingBox / GenerateSingBoxFor /
 // GenerateSingBoxDesktop 的签名，现有调用方（core/engine、core/libbox）零改动。
@@ -122,6 +128,17 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 				mode.ID, binding.RuleSetID)
 		}
 
+		switch ruleSet.Type {
+		case RuleSetTypeURL, RuleSetTypeManual:
+		default:
+			return nil, fmt.Errorf(
+				"mode %q references rule set %q with unsupported type %q",
+				mode.ID,
+				ruleSet.ID,
+				ruleSet.Type,
+			)
+		}
+
 		// 规则被禁用时整条绑定不生效，出口那侧就不再重复提示。
 		if !ruleSet.Enabled {
 			warn(ProfileWarning{
@@ -147,13 +164,12 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 				continue
 			}
 			if !subscriptionHasUsableOutbound(subscription) {
-				warn(ProfileWarning{
-					Kind:           WarningUnavailableSubscription,
-					RuleSetID:      ruleSet.ID,
-					SubscriptionID: subscription.ID,
-					Message: fmt.Sprintf("订阅 %q 没有可用节点，规则 %q 绑定的流量回落到模式默认出口",
-						subscriptionLabel(subscription), ruleSetLabel(ruleSet)),
-				})
+				return nil, fmt.Errorf(
+					"mode %q binds enabled rule set %q to enabled subscription %q, but the subscription cannot generate an outbound",
+					mode.ID,
+					ruleSet.ID,
+					subscription.ID,
+				)
 			}
 			continue
 		}
@@ -173,13 +189,13 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 			continue
 		}
 		if !lineHasUsableOutbound(line) {
-			warn(ProfileWarning{
-				Kind:      WarningUnavailableLine,
-				RuleSetID: ruleSet.ID,
-				LineID:    line.ID,
-				Message: fmt.Sprintf("线路 %q 参数不完整，规则 %q 绑定的流量回落到模式默认出口",
-					lineLabel(line), ruleSetLabel(ruleSet)),
-			})
+			return nil, fmt.Errorf(
+				"mode %q binds enabled rule set %q to enabled line %q (type %q), but the line cannot generate an outbound",
+				mode.ID,
+				ruleSet.ID,
+				line.ID,
+				line.Type,
+			)
 		}
 	}
 
@@ -200,12 +216,11 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 					modeLabel(mode), subscriptionLabel(subscription)),
 			})
 		} else if !subscriptionHasUsableOutbound(subscription) {
-			warn(ProfileWarning{
-				Kind:           WarningUnavailableSubscription,
-				SubscriptionID: subscription.ID,
-				Message: fmt.Sprintf("模式 %q 的默认出口订阅 %q 没有可用节点，默认出口回落直连",
-					modeLabel(mode), subscriptionLabel(subscription)),
-			})
+			return nil, fmt.Errorf(
+				"mode %q uses enabled subscription %q as its default, but the subscription cannot generate an outbound",
+				mode.ID,
+				subscription.ID,
+			)
 		}
 	case mode.DefaultLineID == builtinDirectLineID:
 		// 内建直连默认出口，恒可用。
@@ -223,12 +238,12 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 					modeLabel(mode), lineLabel(line)),
 			})
 		} else if !lineHasUsableOutbound(line) {
-			warn(ProfileWarning{
-				Kind:   WarningUnavailableLine,
-				LineID: line.ID,
-				Message: fmt.Sprintf("模式 %q 的默认出口线路 %q 参数不完整，默认出口回落直连",
-					modeLabel(mode), lineLabel(line)),
-			})
+			return nil, fmt.Errorf(
+				"mode %q uses enabled line %q (type %q) as its default, but the line cannot generate an outbound",
+				mode.ID,
+				line.ID,
+				line.Type,
+			)
 		}
 	}
 
@@ -237,7 +252,8 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 
 // lineHasUsableOutbound 判断一条 enabled 线路能不能真的生成出 outbound。
 // direct / vpn / tailscale 由生成器直接构造，恒可用；代理类线路参数不全时
-// buildProxyOutbound 返回 nil，规则会落空。
+// buildProxyOutbound 返回 nil。active Mode 直接引用这种线路时必须拒绝规划和生成，
+// 不能把缺失 outbound 降为 warning。
 func lineHasUsableOutbound(line *Line) bool {
 	switch line.Type {
 	case LineTypeDirect, LineTypeVPN, LineTypeTailscale:
@@ -245,6 +261,14 @@ func lineHasUsableOutbound(line *Line) bool {
 	default:
 		return buildProxyOutbound(line) != nil
 	}
+}
+
+// LineHasUsableOutbound exposes the generator's exact Line capability check to
+// control-plane consumers. Callers must not reimplement protocol validation:
+// accepting a node here that buildProxyOutbound later drops would make a
+// subscription look ready while its actual outbound is absent.
+func LineHasUsableOutbound(line *Line) bool {
+	return lineHasUsableOutbound(line)
 }
 
 // subscriptionHasUsableOutbound 判断订阅能否生成出可被规则引用的主 tag。

@@ -206,7 +206,10 @@ private struct ModeDetailView: View {
         ruleSetID: String = ""
     ) -> some View {
         let availableLines = app.profile.lines.filter {
-            includeDefault ? app.isUsableRouteLine($0) : app.isUsableDefaultRouteLine($0)
+            let usable = includeDefault
+                ? app.isUsableRouteLine($0)
+                : app.isUsableDefaultRouteLine($0)
+            return usable
         }
         let availableSubscriptions = app.profile.subscriptions.filter(app.isUsableSubscription)
         let availableIDs = Set(

@@ -135,7 +135,8 @@ final class ConnectionTransactionReporter {
     func fail(
         _ error: Error,
         code: String,
-        taskID: String? = nil
+        taskID: String? = nil,
+        evidence: ConnectionFailureEvidence? = nil
     ) {
         update { report in
             guard report.error == nil else {
@@ -147,9 +148,19 @@ final class ConnectionTransactionReporter {
             report.fail(
                 code: code,
                 message: error.localizedDescription,
-                taskID: resolvedTaskID
+                taskID: resolvedTaskID,
+                evidence: evidence
             )
         }
+    }
+
+    func fail(_ failure: ConnectionRuntimeFailure) {
+        fail(
+            failure,
+            code: failure.code,
+            taskID: failure.attributedTaskID,
+            evidence: failure.evidence
+        )
     }
 
     func failRollback(
@@ -235,9 +246,14 @@ final class ConnectionTransactionReporter {
         return report
     }
 
-    func firstTaskID(kind: String) -> String? {
+    func firstTaskID(
+        kind: String,
+        resourceType: String? = nil
+    ) -> String? {
         currentReport()?.tasks.first {
-            $0.kind == kind
+            $0.kind == kind &&
+                (resourceType == nil ||
+                    $0.resourceType == resourceType)
         }?.id
     }
 

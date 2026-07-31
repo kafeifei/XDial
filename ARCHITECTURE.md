@@ -98,7 +98,7 @@ Codex / Cursor）和人类贡献者在改动本仓库前必须先读完本文，
 | 维度 | 负责什么 | 绝不负责什么 | 典型违规写法 |
 |---|---|---|---|
 | **Ingress**（入口）<br>tun / 系统代理 | 流量如何进盒；把包归因到源（进程、接口、地址族）；声明盒子占用的地址段 | **绝不参与路由裁决**。不决定任何流量走哪个出口，不携带任何域名/规则知识 | 在 `buildTUNInbound` 里按线路类型改 `route_exclude_address`（VPN 服务端地址例外是密封性要求——不排除就会自环——不是裁决）；在 inbound 上挂 `outbound` 字段；按"当前模式"改 tun 地址段 |
-| **Line**（出口） | 声明"怎么到达一个出口"：协议参数、凭据、传输选项、**能力**（能解析哪些后缀、是否自带 resolver、是否自带路由供给） | **绝不自行生效**。未被 active Mode 引用时，不得对本机流量决策产生任何影响；不得注册全局路由；不得抢占默认出口；不得改写系统状态 | `preferred_by`；线路 enabled 就往 `route.rules` 插规则；线路自己往 `dns.rules` 插 `final`；线路 enabled 就发起出网连接 / 持有活跃会话 |
+| **Line**（出口） | 声明"怎么到达一个出口"：协议参数、凭据、传输选项、**能力**（能解析哪些后缀、是否自带 resolver、是否自带路由供给） | **绝不自行生效**。未被 active Mode 引用时，不得对本机流量决策产生任何影响；不得注册全局路由；不得抢占默认出口；不得改写系统状态 | Line 未被 active Mode 引用或用户未打开可见能力开关，就往 `route.rules` / `dns.rules` 插入 `preferred_by`；线路自己改写 `final`；线路 enabled 就发起出网连接 / 持有活跃会话 |
 | **RuleSet**（匹配） | 只管**匹配流量**：域名、后缀、CIDR、远程规则集资源 | **不知道任何 Line 存在**。`RuleSet` 结构体里绝不能出现 `line_id`、`outbound`、`server` 之类字段 | 在 `RuleSet` 上加 `DefaultLineID`；在 `buildRouteRule` 里根据规则集内容猜出口；订阅规则表直接携带出口名并绕过 Mode |
 | **Mode**（裁决） | 唯一裁决者：绑定 RuleSet→Line、指定默认出口、裁决 DNS 分域归属。route 规则和 DNS 规则**必须从同一份 Mode binding 编译** | 不定义匹配内容（那是 RuleSet），不定义出口参数（那是 Line），不定义流量如何进盒（那是 Ingress） | Mode 里内联域名列表；Mode 里内联服务器地址；route 规则从 Mode 编译而 DNS 规则从别处编译（两者必然漂移） |
 
@@ -125,7 +125,12 @@ Mode 的字段，就是越界的最短路径。**
   但任何调整都必须是显式产品决策并同步更新本文档。
 - **可不用**：完全不引用供给源时，配置里必须一个字节都看不出这个供给源存在过。
 
-供给源与消费者之间的关系是**申报制**，不是注入制：Line / 订阅向 Mode **申报**"我这里有这些规则"，Mode 决定采用哪些、放在什么位置。申报动作本身不改变任何生成产物。桌面端目前**没有任何 Line 级自动路由豁免**。
+供给源与消费者之间的关系是**申报制**，不是注入制：Line / 订阅向 Mode **申报**"我这里有这些规则"，Mode 决定采用哪些、放在什么位置。申报动作本身不改变任何生成产物。
+
+D33 只有一个窄例外：被 active Mode 引用的 Tailscale Line 可以由用户在该 Line 上显式
+勾选 MagicDNS。此时 DNS 与 route 必须成对使用 sing-box endpoint 从当前 NetMap 动态
+申报的 `preferred_by`，且排在 Mode 的显式绑定之后；未引用或未勾选时产物必须为零。
+这不是一般 Line 供给规则的豁免，不允许扩展成硬编码域名、CIDR 或默认路由。
 
 ---
 
@@ -148,7 +153,11 @@ Mode 决定是否使用。同一条线路上，内网域名与公网域名也可
 
 **这条约束的作用域只能是「基于域名的绑定」，这一点是因果链的直接推论，不是妥协。** 路由裁决可以基于 IP（`ip_cidr` / GEOIP / `ip_is_private`），而 DNS 裁决发生在拿到 IP **之前**。要求"任意域名的 DNS 判定与路由判定一致"等于要求 DNS 阶段就已经知道解析结果——逻辑上自相矛盾。所以正确表述是：**基于域名的绑定必须双向一致（有路由分支就有 DNS 分支，反之亦然）；基于 IP 的绑定天然不参与 DNS 分域。** 不变量 INV7 就是按这个收窄版写的。
 
-唯一显式豁免是 `direct` 线路：它不声明独立解析器（本就使用 Underlay 视角），因此不产生额外 DNS 分支。这里的 Underlay 视角是 macOS 在 XDial 启动前已经组合并最终选定的
+两个显式边界是：`direct` 线路不声明独立解析器（本就使用 Underlay 视角），因此不产生额外
+DNS 分支；以及 D33 的 Tailscale MagicDNS 开关，它只在该 Line 被 active Mode 引用且
+用户勾选时，将同一个 endpoint 的动态 DNS 归属与 peer 路由成对编译。MagicDNS 规则排在
+Mode 的显式域名绑定之后，所以与 CDN / 企业域名重叠时仍由 Mode binding 获胜；不得把
+Tailscale 默认 resolver、硬编码 Tailnet 地址段或默认路由带入这个例外。这里的 Underlay 视角是 macOS 在 XDial 启动前已经组合并最终选定的
 DNS；官方 VPN 存在时可以就是该 VPN 的 DNS，绝不等于绕过所有叠加层去寻找物理网卡
 或路由器的 resolver。
 
@@ -280,9 +289,12 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
 
 - **数据面决策**：内置 Tailscale 是 sing-box 的普通 `endpoint`，与 Trojan 等 Line
   一样只在被 active Mode 引用时进入完整配置。它不得启用 `system_interface`，不得
-  创建第二个系统 TUN、接管系统 DNS、接受 peer 路由、发布路由或自行注入 MagicDNS /
-  `100.64.0.0/10` 规则。流量是否走 Tailscale、是否使用 exit node，只由用户可见的
-  Line 参数和 Mode binding 决定。
+  创建第二个系统 TUN、接管系统 DNS、接受系统级 peer 路由或发布路由。Tailscale Line
+  提供一个默认关闭的可见 `MagicDNS` 勾选项；只有该 Line 被 active Mode 引用且勾选时，
+  生成器才成对启用 endpoint 原生 DNS server 与动态 `preferred_by` peer 路由。归属范围
+  只能来自当前 NetMap，不得硬编码 `100.64.0.0/10`、IPv6 前缀、搜索域或默认路由。
+  Mode 的显式规则优先于这个能力规则；流量是否走 Tailscale、是否使用 exit node，仍由
+  用户可见的 Line 参数和 Mode 决定。
 - **与 Underlay 的边界**：官方 Tailscale、XDVPN、企业 VPN、Wi-Fi 和网线仍共同组成
   不透明 Underlay。内置 Tailscale Line 是 XDial 自己选择的出口，不能识别、关闭或
   重排任何已存在产品，也不能改变 D32 的系统默认接口快照规则。
@@ -298,7 +310,8 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   清空。Key 过期只影响新的注册，不影响已经持久化的 node key。
 - **失败语义**：未登录、需要重新认证、所选 exit node 不存在或不可用时，启动必须
   fail-closed 并给出结构化错误；不得自动选择其他节点、改走 direct 或继续使用旧的
-  隐式路由。状态和 exit-node 列表必须来自 Tailscale LocalAPI，禁止解析日志。
+  隐式路由。勾选 MagicDNS 但当前 Tailnet 尚未发布可用 MagicDNS 配置时，同样必须在
+  Commit 前失败。状态和 exit-node 列表必须来自 Tailscale LocalAPI，禁止解析日志。
 
 ### D34 — 全流量 Network Extension Underlay 不能靠普通路由表强行叠加
 
@@ -351,12 +364,19 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   `underlay-egress-unavailable`，且 Rollback 已完成、系统接管已移除时，宿主才可按
   2 / 5 / 10 / 20 / 30 秒做至多五次有界重试。Line 登录、节点、握手或规则失败不得被
   **Underlay 切换**这条重试掩盖。
-- **已提交会话的意外断线恢复**：一次已经进入 `committed` 并真实发布为 `connected`
-  的会话，如果 Provider 或线路在用户没有执行断开的情况下掉线，宿主保留同一份用户
-  连接意图，在系统接管已移除后启动有界自动重连。这个恢复序列也使用五次总预算；
-  恢复事务中的 Line / 握手失败必须原样写入报告和断线历史，但可以继续消耗剩余预算，
-  不能静默无限拉起。短暂“连上又掉”不重置预算；只有同一事务连续稳定运行满五分钟才
-  清零。用户主动断开立即取消恢复，且不触发新的重连。
+- **已提交会话的 Line 局部恢复**：一次已经进入 `committed` 并真实发布为 `connected`
+  的会话，如果某条 Line 在用户没有执行断开的情况下掉线，且该 Line 的协议适配器支持
+  在同一 sing-box 代际内替换会话，则只允许把这条 Line 置为 `reconnecting` 并有界
+  重建它自己的会话。其他 Line、endpoint、sing-box、Transparent Proxy Ingress 和
+  transaction ID 必须保持不变；不可用窗口严格执行铁律 3 的 REJECT / SERVFAIL，
+  不得回落到其他出口。每次尝试和最终恢复必须写入当前 `ConnectionReport`。局部预算
+  耗尽后才把该 Line 失败提升为本次数据面失败，进入完整 Rollback 和宿主恢复。
+- **已提交会话的完整恢复**：如果 Provider 自身掉线、数据面共享组件失败，或 Line
+  局部恢复预算耗尽，宿主保留同一份用户连接意图，在系统接管已移除后启动有界自动
+  重连。这个恢复序列使用五次总预算；恢复事务中的 Line / 握手失败必须原样写入报告和
+  断线历史，但可以继续消耗剩余预算，不能静默无限拉起。短暂“连上又掉”不重置预算；
+  只有同一事务连续稳定运行满五分钟才清零。用户主动断开立即取消恢复，且不触发新的
+  重连。
 - **断线事实源**：每次意外断线都要在用户私有目录留下有界结构化记录，至少包含断线
   时间、原事务与 Mode、结构化原因、系统最后断线错误、每次重连的时间/事务 ID，以及
   最终恢复、失败或耗尽预算的结果。Debug Server 只读暴露这份记录；日志不能反过来
@@ -531,6 +551,9 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
 
 - **决策**：每个域名的解析器归属，由 active Mode 的 binding 或默认线路唯一决定。
   DNS 规则、route 规则与最终 resolver 从同一份 Mode 编译。**不存在无主的 DNS 规则。**
+  D33 的 MagicDNS 是唯一窄例外：active Mode 先决定该 Tailscale Line 是否进入数据面，
+  Line 上可见且可关闭的勾选项再决定是否采用 endpoint 当前 NetMap 同时申报的 DNS 与
+  peer 路由；两者必须成对出现，并排在 Mode 显式规则之后。
 - **理由**：见第 4.1 节的因果链。DNS 与 route 分家编译必然漂移，且漂移后的症状（流量走 A、解析走 B）极难归因。
 - **被否决的替代方案**：(a) DNS 用一套独立的用户配置——两套配置必然不一致，用户要维护两遍；(b) 按 Line 类型自动推断解析器——Line 不该做裁决，且同一条 Line 上手动规则集（内网名）与 URL 规则集（公网名）的正确解析器不同。
 
@@ -595,12 +618,12 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
 以下每一条都对应至少一次真实事故。不允许以"这次情况特殊"为由绕过。
 
 1. **不许让任何 Line 在未被 active Mode 引用时影响本机流量决策。** 包括但不限于：注册路由、抢占默认出口、注入 DNS 规则、修改系统状态。
-2. **不许在生成器里注入用户不可见的路由规则。** 生成的 `route.rules` 每一条都必须能追溯到某个 Mode binding 或一份**显式列举**的系统白名单（`sniff` / `hijack-dns` / 桌面诊断 selector）。白名单本身不得在未更新本文档的情况下扩充。
+2. **不许在生成器里注入用户不可见的路由规则。** 生成的 `route.rules` 每一条都必须能追溯到某个 Mode binding、一份**显式列举**的系统白名单（`sniff` / `hijack-dns` / 桌面诊断 selector），或 D33 中“active Mode 引用 + Line 可见勾选项”共同启用的动态 MagicDNS 能力。白名单本身不得在未更新本文档的情况下扩充；MagicDNS 不得硬编码匹配范围。
 3. **不许让任何 Line 在未被引用时自动持有活会话或发起出网请求**（含探测、健康检查、订阅刷新、控制面登录）。"enabled 就去连一下试试"是副作用面泄漏——它产生用户不知道的网络指纹，也会在断网时产生莫名其妙的错误。唯一例外是 D33 定义的用户显式、限时、无系统网络副作用的配置会话；它不得混入完整数据面生命周期。
 4. **不许让 Swift 复刻 Go 的 tag / slug / schema 规则。** `macos/Sources/XDial/NetworkInfo.swift` 的 `slugify` 是一份存量违规复刻——它的注释里自认"必须与 Go 端 `core/config/generator.go` 的 `slugify` 完全一致"，这句话本身就是 bug 的定义（两份实现，一份契约，无人守护）。正确做法是 Go 侧导出运行时目录、Swift 侧只消费，参考 `RuntimeSubscriptionCatalog`。新代码一律走导出，存量复刻应逐步迁移。
 5. **不许静默回落 direct**，也不许静默回落到公共 DNS，不许静默跳过一条无法生成的规则而不告知用户。**引用悬空必须报错**（见 INV6a），不得 `continue` 了事。
 6. **不许用日志抓取做控制流。** 解析 sing-box / sslcon 的日志文本来判断状态，然后据此决策——日志格式不是契约，上游改一个字就静默失效，且失效方式是"永远走 else 分支"，没有任何报错。状态判断必须走结构化接口（Clash API、进程退出码、显式回调）。
-7. **不许把 DNS 规则和 route 规则从不同来源编译。** 两者的唯一输入源是 `mode.Bindings`。
+7. **不许把 DNS 规则和 route 规则从不同来源编译。** 普通分域的唯一输入源是 `mode.Bindings`；D33 MagicDNS 的 DNS 与 route 必须共同来自同一条 active Tailscale Line 的同一个可见开关，并保持成对启停与相同优先级。
 8. **不许在 XDial 里选择或重排 Underlay。** 不得按产品名、接口名称前缀或物理/虚拟
    分类删除候选，不得生成 outbound `bind_interface`，也不得为了"兼容某个 VPN"增加
    产品级 DNS/路由分支。旧原生 TUN 的 `route.default_interface` 唯一合法来源是
@@ -629,7 +652,9 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
 - 悬空引用报错，用户主动禁用产生可见 warning；
 - 桌面只允许一条 active AnyConnect；
 - 一个 active Mode 只允许一条 active Tailscale，且未引用的 Tailscale 不生成 endpoint；
-- 桌面 Tailscale endpoint 不创建系统接口、不接受或注入隐藏路由、不携带 Auth Key；
+- 桌面 Tailscale endpoint 不创建系统接口、不接受或注入系统隐藏路由、不携带 Auth Key；
+  MagicDNS 未勾选或 Line 未被 active Mode 引用时无任何 DNS / peer 路由产物，勾选后只
+  使用当前 NetMap 动态归属且不得覆盖 Mode 显式规则；
 - 桌面逐字转交系统默认路由与完整接口快照，不启用自动探测，也不为单条 outbound
   绑定接口。
 

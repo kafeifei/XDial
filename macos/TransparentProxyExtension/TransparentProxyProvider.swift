@@ -4,6 +4,11 @@ import Network
 @preconcurrency import NetworkExtension
 import OSLog
 
+private struct ProviderRelayEndpoint: Sendable {
+    let port: UInt16
+    let credentials: SOCKSCredentials
+}
+
 final class TransparentProxyProvider: NETransparentProxyProvider {
     private static let profileOption = "profile"
     private static let underlayInterfacesOption = "underlay_interfaces"
@@ -30,6 +35,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     private let cancellationLock = NSLock()
     private let outboundProbeGate =
         ProviderDiagnosticsOperationGate()
+    private let relayRegistry =
+        ProviderRelayRegistry<ProviderRelayEndpoint>()
 
     private var runtime: EmbeddedSingBoxRuntime?
     private var session: EmbeddedSingBoxRuntime.Session?
@@ -215,6 +222,23 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     ),
                 ]
                 let commitID = UUID()
+                let replacedRelays = self.relayRegistry.activate(
+                    generation: generation,
+                    endpoint: ProviderRelayEndpoint(
+                        port: session.port,
+                        credentials: session.credentials
+                    )
+                )
+                if replacedRelays.count > 0 {
+                    self.logger.error(
+                        "replaced-stale-relays generation=\(generation, privacy: .public) count=\(replacedRelays.count)"
+                    )
+                    guard replacedRelays.wait(timeout: 1) else {
+                        throw ProviderError.relayDrainTimedOut(
+                            replacedRelays.count
+                        )
+                    }
+                }
                 self.settingsCommitID = commitID
                 self.settingsCommitInFlight = true
                 self.scheduleCommitTimeout(
@@ -247,7 +271,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                                     .failed,
                                 // Commit 已经发给系统；即使回调报错，也要显式撤销，
                                 // 不能假设系统一定没有应用其中任何一部分。
-                                networkSettings: .removeExplicitly
+                                networkSettings: .removeExplicitly,
+                                relayDrain: pendingAbort?.relayDrain
                             ) {
                                 self.finishStart(
                                     Self.providerNSError(
@@ -269,7 +294,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                                 error: pendingAbort.error,
                                 code: pendingAbort.code,
                                 finalState: pendingAbort.finalState,
-                                networkSettings: .removeExplicitly
+                                networkSettings: .removeExplicitly,
+                                relayDrain: pendingAbort.relayDrain
                             ) {
                                 self.finishStart(
                                     Self.providerNSError(
@@ -342,7 +368,13 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     }
                 }
             } catch {
-                reporter.fail(error, code: "prepare-failed")
+                let runtimeFailure =
+                    error as? ConnectionRuntimeFailure
+                if let runtimeFailure {
+                    reporter.fail(runtimeFailure)
+                } else {
+                    reporter.fail(error, code: "prepare-failed")
+                }
                 self.logger.error(
                     "start-failed generation=\(generation, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
                 )
@@ -353,7 +385,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     runtime: runtime,
                     reporter: reporter,
                     error: error,
-                    code: "prepare-failed",
+                    code:
+                        runtimeFailure?.code ?? "prepare-failed",
                     finalState: finalState,
                     networkSettings: .alreadyAbsent
                 ) {
@@ -368,6 +401,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         completionHandler: @escaping () -> Void
     ) {
         outboundProbeGate.invalidate()
+        let relayDrain = relayRegistry.deactivateCurrent()
         cancellationLock.lock()
         activeCancellation?.cancel()
         cancellationLock.unlock()
@@ -376,6 +410,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             let reporter = self.reporter
             self.session = nil
             guard let runtime, let reporter else {
+                _ = relayDrain.wait(timeout: 1)
                 try? runtime?.stop()
                 self.runtime = nil
                 self.reporter = nil
@@ -389,7 +424,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 self.deferCommitAbort(
                     error: nil,
                     code: "provider-stopped",
-                    finalState: finalState
+                    finalState: finalState,
+                    relayDrain: relayDrain
                 ) {
                     self.logger.notice(
                         "stopped reason=\(reason.rawValue)"
@@ -406,7 +442,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 finalState: finalState,
                 networkSettings: .providerStop(
                     settingsCommitted: self.settingsCommitted
-                )
+                ),
+                relayDrain: relayDrain
             ) {
                 self.logger.notice("stopped reason=\(reason.rawValue)")
                 completionHandler()
@@ -616,30 +653,60 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
         // Transparent Proxy 返回 false 会让系统按原网络路径放行。只允许在启动前或显式
         // 停止后的无会话窗口这样做；active 会话内的 TCP/UDP 转发失败必须由 relay 关流。
-        guard let session else {
+        let reservation: ProviderRelayRegistry<
+            ProviderRelayEndpoint
+        >.Reservation
+        switch relayRegistry.claim() {
+        case let .relay(currentReservation):
+            reservation = currentReservation
+        case .reject:
+            Self.reject(flow)
+            return true
+        case .passThrough:
             return false
         }
+        let handle: ProviderRelayHandle
         if let tcpFlow = flow as? NEAppProxyTCPFlow {
-            TCPFlowSOCKSRelay.start(
+            handle = TCPFlowSOCKSRelay.makeHandle(
                 flow: tcpFlow,
-                socksPort: session.port,
-                credentials: session.credentials,
-                trialID: generation,
+                socksPort: reservation.endpoint.port,
+                credentials: reservation.endpoint.credentials,
+                trialID: reservation.generation,
                 logger: logger
             )
-            return true
-        }
-        if let udpFlow = flow as? NEAppProxyUDPFlow {
-            UDPFlowSOCKSRelay.start(
+        } else if let udpFlow = flow as? NEAppProxyUDPFlow {
+            handle = UDPFlowSOCKSRelay.makeHandle(
                 flow: udpFlow,
-                socksPort: session.port,
-                credentials: session.credentials,
-                trialID: generation,
+                socksPort: reservation.endpoint.port,
+                credentials: reservation.endpoint.credentials,
+                trialID: reservation.generation,
                 logger: logger
             )
+        } else {
+            relayRegistry.finish(reservation)
+            Self.reject(flow)
             return true
         }
-        return false
+        guard relayRegistry.attach(handle, to: reservation) else {
+            // The transaction stopped after this flow was reserved. It has
+            // already been claimed by XDial, so fail it closed rather than
+            // returning false and leaking it to the Underlay.
+            handle.cancel(with: AppProxyFlowCloseError.aborted)
+            return true
+        }
+        if !handle.start(onFinish: { [weak self] in
+            self?.relayRegistry.finish(reservation)
+        }) {
+            relayRegistry.finish(reservation)
+            handle.cancel(with: AppProxyFlowCloseError.aborted)
+        }
+        return true
+    }
+
+    private static func reject(_ flow: NEAppProxyFlow) {
+        let error = AppProxyFlowCloseError.aborted
+        flow.closeReadWithError(error)
+        flow.closeWriteWithError(error)
     }
 
     private func beginLineOutboundAddressProbe(
@@ -808,6 +875,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
 
     private func handleFatalError(_ error: Error) {
         outboundProbeGate.invalidate()
+        let relayDrain = relayRegistry.deactivateCurrent()
         engineQueue.async { [weak self] in
             guard
                 let self,
@@ -816,33 +884,39 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             else {
                 return
             }
+            let failure =
+                error as? ConnectionRuntimeFailure ??
+                ConnectionRuntimeFailure(
+                    code: "data-plane-failed",
+                    message: error.localizedDescription,
+                    taskID: "data-plane:sing-box",
+                    evidence: nil
+                )
             self.session = nil
-            reporter.fail(
-                error,
-                code: "data-plane-failed",
-                taskID: "data-plane:sing-box"
-            )
+            reporter.fail(failure)
             if self.settingsCommitInFlight {
                 self.deferCommitAbort(
-                    error: error,
-                    code: "data-plane-failed",
-                    finalState: .failed
+                    error: failure,
+                    code: failure.code,
+                    finalState: .failed,
+                    relayDrain: relayDrain
                 ) {
-                    self.cancelProxyWithError(error)
+                    self.cancelProxyWithError(failure)
                 }
                 return
             }
             self.rollback(
                 runtime: runtime,
                 reporter: reporter,
-                error: error,
-                code: "data-plane-failed",
+                error: failure,
+                code: failure.code,
                 finalState: .failed,
                 networkSettings: self.settingsCommitted
                     ? .removeExplicitly
-                    : .alreadyAbsent
+                    : .alreadyAbsent,
+                relayDrain: relayDrain
             ) {
-                self.cancelProxyWithError(error)
+                self.cancelProxyWithError(failure)
             }
         }
     }
@@ -875,7 +949,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 code: pendingAbort?.code ?? "commit-timeout",
                 finalState: pendingAbort?.finalState ?? .failed,
                 // 超时意味着提交结果未知；等满边界后必须显式撤销。
-                networkSettings: .removeExplicitly
+                networkSettings: .removeExplicitly,
+                relayDrain: pendingAbort?.relayDrain
             ) {
                 self.finishStart(
                     Self.providerNSError(
@@ -891,6 +966,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         error: Error?,
         code: String,
         finalState: ConnectionTransactionState,
+        relayDrain: ProviderRelayDrain = .empty,
         completion: @escaping () -> Void
     ) {
         if var pending = pendingCommitAbort {
@@ -903,6 +979,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 pending.error = error
                 pending.code = code
             }
+            if relayDrain.generation != nil {
+                pending.relayDrains.append(relayDrain)
+            }
             pending.completions.append(completion)
             pendingCommitAbort = pending
             return
@@ -911,6 +990,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             error: error,
             code: code,
             finalState: finalState,
+            relayDrains: relayDrain.generation != nil
+                ? [relayDrain]
+                : [],
             completions: [completion]
         )
     }
@@ -953,9 +1035,12 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         finalState: ConnectionTransactionState,
         networkSettings:
             TransparentProxyNetworkSettingsRollbackAction,
+        relayDrain initialRelayDrain: ProviderRelayDrain? = nil,
         completion: @escaping () -> Void
     ) {
         outboundProbeGate.invalidate()
+        let relayDrain =
+            initialRelayDrain ?? relayRegistry.deactivateCurrent()
         guard !rollbackInProgress else {
             rollbackCompletions.append(completion)
             return
@@ -969,6 +1054,12 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 completion()
                 return
             }
+            if takeoverRemoved,
+               let relayGeneration = relayDrain.generation {
+                self.relayRegistry.markInactive(
+                    generation: relayGeneration
+                )
+            }
             var cleanupResolved = false
             let resolveCleanup: (Error?) -> Void = {
                 [weak self] cleanupError in
@@ -980,17 +1071,25 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     cleanupResolved = true
                     if let cleanupError {
                         let failureCode: String
+                        let failureTaskID: String
                         if let providerError =
                             cleanupError as? ProviderError,
                            case .rollbackTimedOut = providerError {
                             failureCode = "rollback-runtime-timeout"
+                            failureTaskID = "data-plane:sing-box"
+                        } else if let providerError =
+                            cleanupError as? ProviderError,
+                            case .relayDrainTimedOut = providerError {
+                            failureCode = "rollback-relay-timeout"
+                            failureTaskID = "ingress:transparent-proxy"
                         } else {
                             failureCode = "rollback-runtime-failed"
+                            failureTaskID = "data-plane:sing-box"
                         }
                         reporter.failRollback(
                             cleanupError,
                             code: failureCode,
-                            taskID: "data-plane:sing-box"
+                            taskID: failureTaskID
                         )
                     }
                     self.runtime = nil
@@ -1015,9 +1114,16 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 }
             }
             DispatchQueue.global(qos: .userInitiated).async {
+                let relaysDrained = relayDrain.wait(timeout: 1)
+                let relayDrainError: Error? =
+                    relaysDrained
+                    ? nil
+                    : ProviderError.relayDrainTimedOut(
+                        relayDrain.count
+                    )
                 do {
                     try runtime.stop()
-                    resolveCleanup(nil)
+                    resolveCleanup(relayDrainError)
                 } catch {
                     resolveCleanup(error)
                 }
@@ -1126,6 +1232,7 @@ private enum ProviderError: Error {
     case invalidUnderlaySnapshot
     case deallocated
     case rollbackTimedOut
+    case relayDrainTimedOut(Int)
     case commitTimedOut
     case cancelledBeforeCommit
     case cancelledDuringCommit
@@ -1147,6 +1254,8 @@ extension ProviderError: LocalizedError {
             "XDial 网络扩展已经退出"
         case .rollbackTimedOut:
             "XDial 回滚未能在 5 秒内完成"
+        case let .relayDrainTimedOut(count):
+            "XDial 有 \(count) 条旧网络流未能在 1 秒内结束"
         case .commitTimedOut:
             "XDial 系统网络接管提交未能在 5 秒内完成"
         case .cancelledBeforeCommit:
@@ -1165,5 +1274,10 @@ private struct PendingCommitAbort {
     var error: Error?
     var code: String
     var finalState: ConnectionTransactionState
+    var relayDrains: [ProviderRelayDrain]
     var completions: [() -> Void]
+
+    var relayDrain: ProviderRelayDrain {
+        .merged(relayDrains)
+    }
 }

@@ -2,6 +2,8 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -53,15 +55,8 @@ func testProfile() *Profile {
 	}
 }
 
-// isTailnetRouteRule 判断一条 route 规则是不是「tailnet 内部网段 → 该 endpoint」。
-// IPv4 CGNAT 与 IPv6 ULA 缺一不可：双栈客户端优先取 AAAA，只写 IPv4 会走 direct 黑洞。
-func isTailnetRouteRule(rule map[string]interface{}, endpointTag string) bool {
-	cidrs, ok := rule["ip_cidr"].([]interface{})
-	if !ok || len(cidrs) != 2 {
-		return false
-	}
-	return cidrs[0] == "100.64.0.0/10" && cidrs[1] == "fd7a:115c:a1e0::/48" &&
-		rule["outbound"] == endpointTag
+func isMagicDNSRouteRule(rule map[string]interface{}, endpointTag string) bool {
+	return rule["preferred_by"] == endpointTag && rule["outbound"] == endpointTag
 }
 
 func sliceContainsString(values []interface{}, expected string) bool {
@@ -86,6 +81,276 @@ func TestProfileFinders(t *testing.T) {
 	}
 	if v := p.VPNLine(); v == nil || v.VPNServer == "" {
 		t.Fatal("VPNLine failed")
+	}
+}
+
+func TestBuildAnyTLSOutbound(t *testing.T) {
+	line := &Line{
+		ID:                             "anytls",
+		Type:                           LineTypeAnyTLS,
+		Enabled:                        true,
+		AnyTLSServer:                   "anytls.example.com",
+		AnyTLSPort:                     443,
+		AnyTLSPassword:                 "secret",
+		AnyTLSSNI:                      "edge.example.com",
+		AllowInsecure:                  true,
+		UDP:                            true,
+		AnyTLSClientFingerprint:        "chrome",
+		AnyTLSALPN:                     []string{"h2"},
+		AnyTLSIdleSessionCheckInterval: 30,
+		AnyTLSIdleSessionTimeout:       30,
+	}
+
+	outbound := buildProxyOutbound(line)
+	if outbound == nil {
+		t.Fatal("expected AnyTLS outbound")
+	}
+	if outbound["type"] != "anytls" ||
+		outbound["tag"] != "proxy-anytls" ||
+		outbound["server"] != "anytls.example.com" ||
+		outbound["server_port"] != 443 ||
+		outbound["password"] != "secret" {
+		t.Fatalf("unexpected AnyTLS outbound: %+v", outbound)
+	}
+	tls, ok := outbound["tls"].(map[string]interface{})
+	if !ok || tls["enabled"] != true ||
+		tls["server_name"] != "edge.example.com" ||
+		tls["insecure"] != true {
+		t.Fatalf("unexpected AnyTLS TLS options: %+v", outbound["tls"])
+	}
+	alpn, ok := tls["alpn"].([]string)
+	if !ok || len(alpn) != 1 || alpn[0] != "h2" {
+		t.Fatalf("unexpected AnyTLS ALPN: %+v", tls["alpn"])
+	}
+	utls, ok := tls["utls"].(map[string]interface{})
+	if !ok || utls["enabled"] != true || utls["fingerprint"] != "chrome" {
+		t.Fatalf("unexpected AnyTLS uTLS options: %+v", tls["utls"])
+	}
+	if outbound["idle_session_check_interval"] != "30s" ||
+		outbound["idle_session_timeout"] != "30s" {
+		t.Fatalf("unexpected AnyTLS idle session options: %+v", outbound)
+	}
+	if _, exists := outbound["min_idle_session"]; exists {
+		t.Fatal("AnyTLS min_idle_session=0 must keep the upstream default")
+	}
+	if _, exists := outbound["tcp_fast_open"]; exists {
+		t.Fatal("AnyTLS outbound must not enable TCP Fast Open")
+	}
+	if _, exists := outbound["udp_over_tcp"]; exists {
+		t.Fatal("AnyTLS uses native UoT and must not emit generic udp_over_tcp")
+	}
+}
+
+func TestBuildAnyTLSOutboundDefaultsSNIAndRejectsTFO(t *testing.T) {
+	line := &Line{
+		ID:             "anytls",
+		Type:           LineTypeAnyTLS,
+		Enabled:        true,
+		AnyTLSServer:   "anytls.example.com",
+		AnyTLSPort:     443,
+		AnyTLSPassword: "secret",
+	}
+	outbound := buildProxyOutbound(line)
+	tls, ok := outbound["tls"].(map[string]interface{})
+	if !ok || tls["server_name"] != "anytls.example.com" {
+		t.Fatalf("AnyTLS SNI should default to server: %+v", outbound)
+	}
+	if _, exists := tls["utls"]; exists {
+		t.Fatal("legacy AnyTLS line must not enable uTLS implicitly")
+	}
+	if _, exists := tls["alpn"]; exists {
+		t.Fatal("legacy AnyTLS line must not gain an implicit ALPN")
+	}
+	if _, exists := outbound["idle_session_check_interval"]; exists {
+		t.Fatal("legacy AnyTLS line must keep the upstream idle check default")
+	}
+	if _, exists := outbound["idle_session_timeout"]; exists {
+		t.Fatal("legacy AnyTLS line must keep the upstream idle timeout default")
+	}
+
+	line.TFO = true
+	if outbound := buildProxyOutbound(line); outbound != nil {
+		t.Fatalf("AnyTLS with TFO must be unavailable: %+v", outbound)
+	}
+}
+
+func TestBuildAnyTLSOutboundValidatesBoundaries(t *testing.T) {
+	base := Line{
+		ID:             "anytls",
+		Type:           LineTypeAnyTLS,
+		Enabled:        true,
+		AnyTLSServer:   "anytls.example.com",
+		AnyTLSPort:     443,
+		AnyTLSPassword: "secret",
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Line)
+	}{
+		{
+			name: "unknown fingerprint",
+			mutate: func(line *Line) {
+				line.AnyTLSClientFingerprint = "chrome-unknown"
+			},
+		},
+		{
+			name: "empty ALPN",
+			mutate: func(line *Line) {
+				line.AnyTLSALPN = []string{""}
+			},
+		},
+		{
+			name: "control character in ALPN",
+			mutate: func(line *Line) {
+				line.AnyTLSALPN = []string{"h2\n"}
+			},
+		},
+		{
+			name: "invalid UTF-8 in ALPN",
+			mutate: func(line *Line) {
+				line.AnyTLSALPN = []string{string([]byte{0xff})}
+			},
+		},
+		{
+			name: "overlong ALPN",
+			mutate: func(line *Line) {
+				line.AnyTLSALPN = []string{strings.Repeat("a", maxAnyTLSALPNProtocolBytes+1)}
+			},
+		},
+		{
+			name: "too many ALPN protocols",
+			mutate: func(line *Line) {
+				line.AnyTLSALPN = []string{
+					"h2", "http/1.1", "h3", "mqtt", "acme-tls/1",
+					"dot", "custom-1", "custom-2", "custom-3",
+				}
+			},
+		},
+		{
+			name: "duplicate ALPN",
+			mutate: func(line *Line) {
+				line.AnyTLSALPN = []string{"h2", "h2"}
+			},
+		},
+		{
+			name: "idle check interval below runtime minimum",
+			mutate: func(line *Line) {
+				line.AnyTLSIdleSessionCheckInterval = minAnyTLSDurationSeconds - 1
+			},
+		},
+		{
+			name: "idle check interval overflow",
+			mutate: func(line *Line) {
+				line.AnyTLSIdleSessionCheckInterval = int(maxAnyTLSDurationSeconds + 1)
+			},
+		},
+		{
+			name: "idle timeout below runtime minimum",
+			mutate: func(line *Line) {
+				line.AnyTLSIdleSessionTimeout = minAnyTLSDurationSeconds - 1
+			},
+		},
+		{
+			name: "idle timeout overflow",
+			mutate: func(line *Line) {
+				line.AnyTLSIdleSessionTimeout = int(maxAnyTLSDurationSeconds + 1)
+			},
+		},
+		{
+			name: "negative minimum idle sessions",
+			mutate: func(line *Line) {
+				line.AnyTLSMinIdleSession = -1
+			},
+		},
+		{
+			name: "too many minimum idle sessions",
+			mutate: func(line *Line) {
+				line.AnyTLSMinIdleSession = maxAnyTLSMinIdleSession + 1
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			line := base
+			test.mutate(&line)
+			if outbound := buildProxyOutbound(&line); outbound != nil {
+				t.Fatalf("invalid AnyTLS options must be unavailable: %+v", outbound)
+			}
+		})
+	}
+}
+
+func TestBuildAnyTLSOutboundAllowsSupportedFingerprintALPNAndIdlePool(t *testing.T) {
+	line := &Line{
+		ID:                             "anytls",
+		Type:                           LineTypeAnyTLS,
+		Enabled:                        true,
+		AnyTLSServer:                   "anytls.example.com",
+		AnyTLSPort:                     443,
+		AnyTLSPassword:                 "secret",
+		AnyTLSClientFingerprint:        "safari",
+		AnyTLSALPN:                     []string{"http/1.1", "h2", "custom-protocol"},
+		AnyTLSIdleSessionCheckInterval: minAnyTLSDurationSeconds,
+		AnyTLSIdleSessionTimeout:       maxAnyTLSDurationSeconds,
+		AnyTLSMinIdleSession:           2,
+	}
+	outbound := buildProxyOutbound(line)
+	if outbound == nil {
+		t.Fatal("supported AnyTLS boundary values must compile")
+	}
+	if outbound["idle_session_check_interval"] !=
+		fmt.Sprintf("%ds", minAnyTLSDurationSeconds) ||
+		outbound["idle_session_timeout"] !=
+			fmt.Sprintf("%ds", maxAnyTLSDurationSeconds) ||
+		outbound["min_idle_session"] != 2 {
+		t.Fatalf("unexpected AnyTLS boundary output: %+v", outbound)
+	}
+}
+
+func TestGenerateAnyTLSOnlyWhenReferencedByActiveMode(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Name: "Direct", Type: LineTypeDirect, Enabled: true},
+			{
+				ID:             "active-anytls",
+				Name:           "Active AnyTLS",
+				Type:           LineTypeAnyTLS,
+				Enabled:        true,
+				AnyTLSServer:   "active.example.com",
+				AnyTLSPort:     443,
+				AnyTLSPassword: "active-secret",
+			},
+			{
+				ID:             "idle-anytls",
+				Name:           "Idle AnyTLS",
+				Type:           LineTypeAnyTLS,
+				Enabled:        true,
+				AnyTLSServer:   "idle.example.com",
+				AnyTLSPort:     443,
+				AnyTLSPassword: "idle-secret",
+			},
+		},
+		Modes: []Mode{{
+			ID:            "mode",
+			Name:          "Mode",
+			DefaultLineID: "active-anytls",
+		}},
+		ActiveModeID: "mode",
+	}
+
+	data, err := GenerateSingBox(profile, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"tag": "proxy-active-anytls"`) ||
+		!strings.Contains(text, `"password": "active-secret"`) {
+		t.Fatalf("active AnyTLS outbound is missing: %s", text)
+	}
+	if strings.Contains(text, "proxy-idle-anytls") ||
+		strings.Contains(text, "idle.example.com") ||
+		strings.Contains(text, "idle-secret") {
+		t.Fatalf("unreferenced AnyTLS line leaked into generated config: %s", text)
 	}
 }
 
@@ -545,6 +810,13 @@ func TestDefaultSubscriptionSelectorUsesPersistedSelection(t *testing.T) {
 		t.Fatalf("unexpected runtime catalog: %+v", catalog)
 	}
 	group := catalog.Subscriptions[0].Groups[0]
+	if catalog.Subscriptions[0].MainTag != group.Tag {
+		t.Fatalf(
+			"runtime catalog main tag = %q, want generated default group %q",
+			catalog.Subscriptions[0].MainTag,
+			group.Tag,
+		)
+	}
 	if group.Name != "__default__" || group.Selected != "Two" || len(group.Members) != 2 {
 		t.Fatalf("default runtime selector metadata is incomplete: %+v", group)
 	}
@@ -561,6 +833,11 @@ func TestSubscriptionRuntimeCatalogMatchesGeneratedTags(t *testing.T) {
 			{Name: "香港节点", Type: "select", Proxies: []string{"Node One"}, Selected: "Node One"},
 			{Name: "台湾节点", Type: "select", Proxies: []string{"Node Two"}, Selected: "Node Two"},
 		},
+		Rules: []SubscriptionRule{
+			{Type: "DOMAIN-SUFFIX", Value: "primary.example", Group: "香港节点"},
+			{Type: "DOMAIN-SUFFIX", Value: "secondary.example", Group: "台湾节点"},
+			{Type: "DOMAIN-SUFFIX", Value: "direct.example", Group: "DIRECT"},
+		},
 	}}}
 	catalog := BuildSubscriptionRuntimeCatalog(profile, PlatformNE)
 	if len(catalog.Subscriptions) != 1 {
@@ -569,6 +846,18 @@ func TestSubscriptionRuntimeCatalogMatchesGeneratedTags(t *testing.T) {
 	entry := catalog.Subscriptions[0]
 	if len(entry.Nodes) != 2 || len(entry.Groups) != 2 {
 		t.Fatalf("runtime catalog omitted members: %+v", entry)
+	}
+	if entry.MainTag != entry.Groups[0].Tag {
+		t.Fatalf("runtime catalog main tag = %q, want %q", entry.MainTag, entry.Groups[0].Tag)
+	}
+	if !reflect.DeepEqual(
+		entry.ReadinessTags,
+		[]string{entry.Groups[0].Tag, entry.Groups[1].Tag},
+	) {
+		t.Fatalf(
+			"runtime readiness tags = %#v, want both route-visible groups",
+			entry.ReadinessTags,
+		)
 	}
 	if entry.Groups[0].Tag == entry.Groups[1].Tag {
 		t.Fatalf("colliding group names reused runtime tag: %+v", entry.Groups)
@@ -792,17 +1081,12 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
 			{
 				ID: "mobile-tailnet", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
-				TailscaleExitNode: "exit-node",
+				TailscaleExitNode: "exit-node", TailscaleMagicDNS: true,
 			},
 		},
-		RuleSets: []RuleSet{
-			{ID: "ts-hosts", Name: "Tailnet 域名", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"ts.example"}},
-		},
-		// 同桌面：tailnet 路由/DNS 只对被 active Mode 引用的线路生成（INV1c）。
+		// MagicDNS 只对被 active Mode 引用且显式勾选的线路生成（INV1c）。
 		Modes: []Mode{{
-			ID: "tailnet", Name: "Tailnet",
-			Bindings:      []RuleBinding{{RuleSetID: "ts-hosts", LineID: "mobile-tailnet"}},
-			DefaultLineID: "direct",
+			ID: "tailnet", Name: "Tailnet", DefaultLineID: "mobile-tailnet",
 		}},
 		ActiveModeID: "tailnet",
 		Tailscale:    TailscaleIdentity{Hostname: "xdial-mobile"},
@@ -836,19 +1120,18 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 		t.Fatalf("mobile tailscale endpoint must stay inside the existing sing-box layer: %v", endpoint)
 	}
 
-	// 移动端与桌面端保持相同语义：只接管 tailnet 内部网段。
-	tailnetRouteFound := false
+	magicDNSRouteFound := false
 	for _, rawRule := range cfg.Route["rules"].([]interface{}) {
 		rule := rawRule.(map[string]interface{})
-		if _, exists := rule["preferred_by"]; exists {
-			t.Fatalf("exit-node routes must not be implicitly grabbed: %v", rule)
-		}
-		if isTailnetRouteRule(rule, "tailscale-mobile-tailnet") {
-			tailnetRouteFound = true
+		if isMagicDNSRouteRule(rule, "tailscale-mobile-tailnet") {
+			magicDNSRouteFound = true
+			if _, hardcoded := rule["ip_cidr"]; hardcoded {
+				t.Fatalf("MagicDNS route must come from the current NetMap: %v", rule)
+			}
 		}
 	}
-	if !tailnetRouteFound {
-		t.Fatal("mobile tailnet internal CGNAT route is missing")
+	if !magicDNSRouteFound {
+		t.Fatal("mobile dynamic MagicDNS peer route is missing")
 	}
 	servers := cfg.DNS["servers"].([]interface{})
 	if len(servers) != 3 {
@@ -865,7 +1148,8 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 	tailscaleDNS := servers[1].(map[string]interface{})
 	if tailscaleDNS["type"] != "tailscale" ||
 		tailscaleDNS["endpoint"] != "tailscale-mobile-tailnet" ||
-		tailscaleDNS["accept_default_resolvers"] != false {
+		tailscaleDNS["accept_default_resolvers"] != false ||
+		tailscaleDNS["accept_search_domain"] != true {
 		t.Fatalf("unexpected Tailscale DNS transport: %v", tailscaleDNS)
 	}
 	dispatcher := servers[2].(map[string]interface{})
@@ -891,6 +1175,59 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 	}
 	if cfg.Route["default_domain_resolver"] != mobilePublicDNSTag {
 		t.Fatalf("NE control-plane resolver must stay public/direct: %v", cfg.Route)
+	}
+}
+
+func TestTailscaleMagicDNSOnUnreferencedLineHasNoSideEffects(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{ID: "tailnet", Type: LineTypeTailscale, Enabled: true, TailscaleMagicDNS: true},
+		},
+		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
+		ActiveModeID: "mode",
+	}
+	data, err := GenerateSingBoxFor(profile, 0, "", PlatformNE, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"type": "tailscale"`) ||
+		strings.Contains(string(data), `"preferred_by": "tailscale-tailnet"`) {
+		t.Fatalf("unreferenced Tailscale MagicDNS changed the data plane:\n%s", data)
+	}
+}
+
+func TestTailscaleLineWithoutMagicDNSToggleHasNoMagicDNSSideEffects(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{ID: "tailnet", Type: LineTypeTailscale, Enabled: true},
+		},
+		Modes: []Mode{{
+			ID: "mode", DefaultLineID: "tailnet",
+		}},
+		ActiveModeID: "mode",
+	}
+
+	data, err := GenerateSingBoxFor(profile, 0, "", PlatformNE, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, rawServer := range cfg.DNS["servers"].([]interface{}) {
+		server := rawServer.(map[string]interface{})
+		if server["type"] == "tailscale" {
+			t.Fatalf("Tailscale Line without the MagicDNS toggle registered a resolver: %v", server)
+		}
+	}
+	for _, rawRule := range cfg.Route["rules"].([]interface{}) {
+		rule := rawRule.(map[string]interface{})
+		if isMagicDNSRouteRule(rule, "tailscale-tailnet") {
+			t.Fatalf("Tailscale Line without the MagicDNS toggle registered peer routes: %v", rule)
+		}
 	}
 }
 
@@ -990,30 +1327,24 @@ func TestGenerateNETailscaleRejectsRelativeStatePath(t *testing.T) {
 	}
 }
 
-// Tailscale 的自动接管范围只有 tailnet 内部网段（100.64/10）。设计定案
-// （2026-07-26，来回三次的最终结论）：
-//   - exit node 广播的 0.0.0.0/0 绝不隐式全捞（preferred_by）——那会让
-//     「模式默认出口」永远失效，用户配的"默认直连"被整个抢走；
-//   - 想让默认流量走 exit node，把模式默认线路设为 Tailscale 线路（final
-//     即 endpoint tag，见 TestGenerateTailscaleExitNodeAsDefault）；
-//   - 100.64/10 必须接管，否则按 MagicDNS 名字访问 tailnet 设备会走 direct 黑洞。
-func TestNETailscaleRoutesOnlyTailnetCIDR(t *testing.T) {
+// MagicDNS 的动态归属排在 Mode 显式绑定之后：两者域名重叠时，
+// 用户的 CDN / 企业线路决定必须获胜。peer 范围只来自 NetMap，不硬编码 CIDR。
+func TestNETailscaleMagicDNSPreservesExplicitModePriority(t *testing.T) {
 	p := &Profile{
 		Lines: []Line{
 			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
 			{ID: "vpn", Name: "VPN", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com:8443"},
-			{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true, TailscaleExitNode: "exit-node"},
+			{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true, TailscaleExitNode: "exit-node", TailscaleMagicDNS: true},
 		},
 		RuleSets: []RuleSet{
-			{ID: "internal", Name: "内部域名", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"corp.example.com"}},
-			{ID: "ts-hosts", Name: "Tailnet 域名", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"ts.example"}},
+			{ID: "cdn", Name: "CDN", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"cdn.example.com"}},
+			{ID: "peer", Name: "Peer", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"peer.example.ts.net"}},
 		},
 		Modes: []Mode{{
 			ID: "split", Name: "分流",
-			// ts 线路必须被引用，tailnet CIDR 路由才会生成（INV1c 声明≠生效）。
 			Bindings: []RuleBinding{
-				{RuleSetID: "internal", LineID: "vpn"},
-				{RuleSetID: "ts-hosts", LineID: "ts"},
+				{RuleSetID: "cdn", LineID: "vpn"},
+				{RuleSetID: "peer", LineID: "ts"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -1029,26 +1360,31 @@ func TestNETailscaleRoutesOnlyTailnetCIDR(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	explicitFound, tailnetFound := false, false
-	for _, rawRule := range cfg.Route["rules"].([]interface{}) {
+	explicitIndex, magicDNSIndex := -1, -1
+	for index, rawRule := range cfg.Route["rules"].([]interface{}) {
 		rule := rawRule.(map[string]interface{})
-		if _, exists := rule["preferred_by"]; exists {
-			t.Fatalf("exit-node routes must not be implicitly grabbed: %v", rule)
-		}
 		if rule["outbound"] == "vpn" {
-			if domains, ok := rule["domain_suffix"].([]interface{}); ok && len(domains) == 1 && domains[0] == "corp.example.com" {
-				explicitFound = true
+			if domains, ok := rule["domain_suffix"].([]interface{}); ok && len(domains) == 1 && domains[0] == "cdn.example.com" {
+				explicitIndex = index
 			}
 		}
-		if isTailnetRouteRule(rule, "tailscale-ts") {
-			tailnetFound = true
+		if isMagicDNSRouteRule(rule, "tailscale-ts") {
+			magicDNSIndex = index
+		}
+		if cidrs, exists := rule["ip_cidr"]; exists &&
+			(strings.Contains(fmt.Sprint(cidrs), "100.64.0.0/10") ||
+				strings.Contains(fmt.Sprint(cidrs), "fd7a:115c:a1e0::/48")) {
+			t.Fatalf("MagicDNS peer ownership must not use hard-coded CIDRs: %v", rule)
 		}
 	}
-	if !explicitFound {
+	if explicitIndex < 0 {
 		t.Fatalf("expected the explicit VPN rule to survive, got %v", cfg.Route["rules"])
 	}
-	if !tailnetFound {
-		t.Fatalf("tailnet internal CGNAT route is missing: %v", cfg.Route["rules"])
+	if magicDNSIndex < 0 {
+		t.Fatalf("dynamic MagicDNS peer route is missing: %v", cfg.Route["rules"])
+	}
+	if explicitIndex >= magicDNSIndex {
+		t.Fatalf("explicit CDN rule must precede MagicDNS ownership: %v", cfg.Route["rules"])
 	}
 	// final 归模式所有：默认直连不被 exit node 抢走。
 	if cfg.Route["final"] != "direct" {
@@ -1624,41 +1960,212 @@ func TestDisabledReferencesWarnAndDoNotFallBackToDirect(t *testing.T) {
 	}
 }
 
-// 订阅/线路存在且 enabled 但生成不出 outbound 时，同样要有可读的 warning。
-func TestCollectProfileWarningsReportsUnavailableTargets(t *testing.T) {
-	p := &Profile{
+// active Mode 直接引用的 enabled Line 若生成不出 outbound，规划和生成都必须
+// fail-closed。它不是显式禁用，不能 warning 后让绑定或默认出口落到 direct。
+func TestActiveEnabledUnavailableLineFailsClosed(t *testing.T) {
+	lines := []Line{
+		{
+			ID:      "broken-ss",
+			Name:    "残缺 Shadowsocks",
+			Type:    LineTypeShadowsocks,
+			Enabled: true,
+		},
+		{
+			ID:             "broken-anytls",
+			Name:           "不兼容 AnyTLS",
+			Type:           LineTypeAnyTLS,
+			Enabled:        true,
+			AnyTLSServer:   "anytls.example.com",
+			AnyTLSPort:     443,
+			AnyTLSPassword: "secret",
+			TFO:            true,
+		},
+	}
+	for _, line := range lines {
+		for _, useAsDefault := range []bool{false, true} {
+			name := string(line.Type) + "/binding"
+			if useAsDefault {
+				name = string(line.Type) + "/default"
+			}
+			t.Run(name, func(t *testing.T) {
+				profile := &Profile{
+					Lines: []Line{
+						{ID: "direct", Type: LineTypeDirect, Enabled: true},
+						line,
+					},
+					RuleSets: []RuleSet{{
+						ID:      "rs",
+						Name:    "RS",
+						Type:    RuleSetTypeManual,
+						Enabled: true,
+						Domains: []string{"a.example.com"},
+					}},
+					Modes: []Mode{{
+						ID:            "m",
+						Name:          "M",
+						DefaultLineID: "direct",
+					}},
+					ActiveModeID: "m",
+				}
+				if useAsDefault {
+					profile.Modes[0].DefaultLineID = line.ID
+				} else {
+					profile.Modes[0].Bindings = []RuleBinding{{
+						RuleSetID: "rs",
+						LineID:    line.ID,
+					}}
+				}
+
+				if warnings, err := CollectProfileWarnings(profile); err == nil {
+					t.Fatalf("unavailable active line must be an error, got warnings %+v", warnings)
+				}
+				if data, err := GenerateSingBox(profile, 0, ""); err == nil {
+					t.Fatalf("unavailable active line generated a config:\n%s", data)
+				}
+				if plan, err := BuildConnectionPlan(profile); err == nil {
+					t.Fatalf("unavailable active line generated a plan: %+v", plan)
+				}
+			})
+		}
+	}
+}
+
+func TestUnavailableLineOutsideEffectiveModeDoesNotFail(t *testing.T) {
+	profile := &Profile{
 		Lines: []Line{
 			{ID: "direct", Type: LineTypeDirect, Enabled: true},
-			// 参数不完整：buildProxyOutbound 返回 nil。
-			{ID: "broken", Name: "残缺代理", Type: LineTypeShadowsocks, Enabled: true},
+			{ID: "unused", Type: LineTypeAnyTLS, Enabled: true, TFO: true},
+			{ID: "disabled", Type: LineTypeAnyTLS, Enabled: false, TFO: true},
 		},
 		RuleSets: []RuleSet{
-			{ID: "rs-a", Name: "A", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"a.example.com"}},
-			{ID: "rs-b", Name: "B", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"b.example.com"}},
+			{
+				ID:      "disabled-rule",
+				Type:    RuleSetTypeManual,
+				Enabled: false,
+				Domains: []string{"disabled.example.com"},
+			},
+			{
+				ID:      "enabled-rule",
+				Type:    RuleSetTypeManual,
+				Enabled: true,
+				Domains: []string{"enabled.example.com"},
+			},
 		},
-		Subscriptions: []Subscription{{ID: "empty-sub", Name: "空订阅", Enabled: true}},
 		Modes: []Mode{{
-			ID: "m", Name: "M",
+			ID: "m",
 			Bindings: []RuleBinding{
-				{RuleSetID: "rs-a", LineID: "broken"},
-				{RuleSetID: "rs-b", SubscriptionID: "empty-sub"},
+				{RuleSetID: "disabled-rule", LineID: "unused"},
+				{RuleSetID: "enabled-rule", LineID: "disabled"},
 			},
 			DefaultLineID: "direct",
 		}},
 		ActiveModeID: "m",
 	}
 
-	warnings, err := CollectProfileWarnings(p)
+	warnings, err := CollectProfileWarnings(profile)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("disabled or ineffective references must retain INV6 warning semantics: %v", err)
 	}
 	got := map[ProfileWarningKind]bool{}
-	for _, w := range warnings {
-		got[w.Kind] = true
+	for _, warning := range warnings {
+		got[warning.Kind] = true
 	}
-	for _, kind := range []ProfileWarningKind{WarningUnavailableLine, WarningUnavailableSubscription} {
+	for _, kind := range []ProfileWarningKind{WarningDisabledRuleSet, WarningDisabledLine} {
 		if !got[kind] {
-			t.Fatalf("missing %s warning, got %+v", kind, warnings)
+			t.Fatalf("missing %s warning: %+v", kind, warnings)
+		}
+	}
+	if _, err := GenerateSingBox(profile, 0, ""); err != nil {
+		t.Fatalf("unavailable Line outside the effective Mode must have no data-plane effect: %v", err)
+	}
+	if _, err := BuildConnectionPlan(profile); err != nil {
+		t.Fatalf("unavailable Line outside the effective Mode must not enter the plan: %v", err)
+	}
+}
+
+// active Mode 直接引用的 enabled Subscription 若没有任何节点能生成 outbound，
+// 必须和独立 Line 一样在校验、规划、生成三层都 fail-closed。
+func TestActiveEnabledUnavailableSubscriptionFailsClosed(t *testing.T) {
+	subscriptions := []Subscription{
+		{
+			ID:       "empty-sub",
+			Name:     "空订阅",
+			Enabled:  true,
+			Strategy: "selector",
+		},
+		{
+			ID:       "broken-anytls-sub",
+			Name:     "不兼容 AnyTLS 订阅",
+			Enabled:  true,
+			Strategy: "selector",
+			Lines: []Line{{
+				ID:             "broken-anytls",
+				Name:           "Broken AnyTLS",
+				Type:           LineTypeAnyTLS,
+				Enabled:        true,
+				AnyTLSServer:   "anytls.example.com",
+				AnyTLSPort:     443,
+				AnyTLSPassword: "secret",
+				TFO:            true,
+			}},
+		},
+	}
+	for _, subscription := range subscriptions {
+		for _, useAsDefault := range []bool{false, true} {
+			name := subscription.ID + "/binding"
+			if useAsDefault {
+				name = subscription.ID + "/default"
+			}
+			t.Run(name, func(t *testing.T) {
+				profile := &Profile{
+					Lines: []Line{{
+						ID: "direct", Type: LineTypeDirect, Enabled: true,
+					}},
+					RuleSets: []RuleSet{{
+						ID:      "rs",
+						Name:    "RS",
+						Type:    RuleSetTypeManual,
+						Enabled: true,
+						Domains: []string{"a.example.com"},
+					}},
+					Subscriptions: []Subscription{subscription},
+					Modes: []Mode{{
+						ID:            "m",
+						Name:          "M",
+						DefaultLineID: "direct",
+					}},
+					ActiveModeID: "m",
+				}
+				if useAsDefault {
+					profile.Modes[0].DefaultLineID = ""
+					profile.Modes[0].DefaultSubscriptionID =
+						subscription.ID
+				} else {
+					profile.Modes[0].Bindings = []RuleBinding{{
+						RuleSetID:      "rs",
+						SubscriptionID: subscription.ID,
+					}}
+				}
+
+				if warnings, err := CollectProfileWarnings(profile); err == nil {
+					t.Fatalf(
+						"unavailable active subscription must be an error, got warnings %+v",
+						warnings,
+					)
+				}
+				if data, err := GenerateSingBox(profile, 0, ""); err == nil {
+					t.Fatalf(
+						"unavailable active subscription generated a config:\n%s",
+						data,
+					)
+				}
+				if plan, err := BuildConnectionPlan(profile); err == nil {
+					t.Fatalf(
+						"unavailable active subscription generated a plan: %+v",
+						plan,
+					)
+				}
+			})
 		}
 	}
 }

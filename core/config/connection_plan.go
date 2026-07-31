@@ -131,7 +131,11 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 			detail = "建立 AnyConnect 会话并等待就绪"
 		case LineTypeTailscale:
 			preparation = "resume-and-probe"
-			detail = "恢复本机身份、选择 Exit Node 并验证真实出口"
+			if line.TailscaleMagicDNS {
+				detail = "恢复本机身份、验证 MagicDNS、选择 Exit Node 并验证真实出口"
+			} else {
+				detail = "恢复本机身份、选择 Exit Node 并验证真实出口"
+			}
 		}
 		add(ConnectionPlanTask{
 			ID:           taskID,

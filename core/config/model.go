@@ -13,6 +13,7 @@ const (
 	LineTypeTrojan      LineType = "trojan"
 	LineTypeShadowsocks LineType = "shadowsocks"
 	LineTypeVMess       LineType = "vmess"
+	LineTypeAnyTLS      LineType = "anytls"
 	LineTypeTailscale   LineType = "tailscale"
 )
 
@@ -46,11 +47,25 @@ type Line struct {
 	VMessUUID   string `json:"vmess_uuid,omitempty"`
 	VMessAltID  int    `json:"vmess_alt_id,omitempty"`
 
+	// AnyTLS
+	AnyTLSServer                   string   `json:"anytls_server,omitempty"`
+	AnyTLSPort                     int      `json:"anytls_port,omitempty"`
+	AnyTLSPassword                 string   `json:"anytls_password,omitempty"`
+	AnyTLSSNI                      string   `json:"anytls_sni,omitempty"`
+	AnyTLSClientFingerprint        string   `json:"anytls_client_fingerprint,omitempty"`
+	AnyTLSALPN                     []string `json:"anytls_alpn,omitempty"`
+	AnyTLSIdleSessionCheckInterval int      `json:"anytls_idle_session_check_interval,omitempty"`
+	AnyTLSIdleSessionTimeout       int      `json:"anytls_idle_session_timeout,omitempty"`
+	AnyTLSMinIdleSession           int      `json:"anytls_min_idle_session,omitempty"`
+
 	// Tailscale
 	//
 	// 身份（设备名、登录态、state 目录）不在这里 —— 它是整个 Profile 全局唯一的一份，
-	// 见 Profile.Tailscale。Line 上只留“这条线路怎么用那个 tailnet”，即选哪个出口。
+	// 见 Profile.Tailscale。Line 上只留“这条线路怎么用那个 tailnet”：
+	// 选哪个出口，以及是否显式启用这条线路的 MagicDNS 与节点路由。
+	// 两者都只在 Line 被 active Mode 引用时进入数据面。
 	TailscaleExitNode string `json:"tailscale_exit_node,omitempty"`
+	TailscaleMagicDNS bool   `json:"tailscale_magic_dns,omitempty"`
 
 	// TailscaleAuthKey 仅为旧移动端 Profile 兼容字段。D33 桌面控制面不得持久化它；
 	// Auth Key 只在用户显式注册请求里瞬时进入 setup session，日常桌面配置生成会忽略

@@ -18,7 +18,7 @@ struct MainPopover: View {
             }
             Divider()
             statusRow
-            if let report = state.engine.connectionReport {
+            if let report = state.engine.presentedConnectionReport {
                 transactionSummary(report)
             }
             actionRow

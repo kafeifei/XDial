@@ -31,6 +31,9 @@ struct ReconnectIncident: Codable, Equatable, Identifiable {
     let modeName: String
     var reasonCode: String
     var reasonMessage: String
+    var evidence: ConnectionFailureEvidence?
+    var systemDisconnectCode: String?
+    var systemDisconnectMessage: String?
     var outcome: String
     var events: [ReconnectIncidentEvent]
 
@@ -43,6 +46,9 @@ struct ReconnectIncident: Codable, Equatable, Identifiable {
         case modeName = "mode_name"
         case reasonCode = "reason_code"
         case reasonMessage = "reason_message"
+        case evidence
+        case systemDisconnectCode = "system_disconnect_code"
+        case systemDisconnectMessage = "system_disconnect_message"
         case outcome
         case events
     }
@@ -94,6 +100,9 @@ struct ReconnectIncidentHistory: Codable, Equatable {
             modeName: report?.mode.name ?? "",
             reasonCode: reasonCode,
             reasonMessage: reasonMessage,
+            evidence: report?.error?.evidence,
+            systemDisconnectCode: nil,
+            systemDisconnectMessage: nil,
             outcome: "recovering",
             events: []
         )
@@ -135,7 +144,7 @@ struct ReconnectIncidentHistory: Codable, Equatable {
         )
     }
 
-    mutating func updateReason(
+    mutating func recordSystemDisconnectReason(
         incidentID: String,
         code: String,
         message: String
@@ -146,10 +155,10 @@ struct ReconnectIncidentHistory: Codable, Equatable {
             return
         }
         if !code.isEmpty {
-            incidents[index].reasonCode = code
+            incidents[index].systemDisconnectCode = code
         }
         if !message.isEmpty {
-            incidents[index].reasonMessage = message
+            incidents[index].systemDisconnectMessage = message
         }
         incidents[index].append(
             type: "system-disconnect-reason",
@@ -243,7 +252,7 @@ enum ReconnectIncidentJournal {
         message: String
     ) {
         _ = mutate { history in
-            history.updateReason(
+            history.recordSystemDisconnectReason(
                 incidentID: incidentID,
                 code: code,
                 message: message

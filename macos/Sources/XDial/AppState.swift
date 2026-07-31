@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import ServiceManagement
@@ -26,6 +27,8 @@ final class AppState: ObservableObject {
     /// （链路断了、daemon 重启）时旧快照已经不存在，提示必须立刻消失，而
     /// objectWillChange 是变更前触发的，靠事件回调去清位会慢一拍。
     @Published private var configDirtyFlag = false
+    private var configurationChanges =
+        ConfigurationDirtyTracker<Profile>()
 
     var configDirty: Bool { configDirtyFlag && engineHoldsSnapshot }
 
@@ -40,10 +43,27 @@ final class AppState: ObservableObject {
             updateLaunchAtLogin()
         }
     }
+    @Published var autoConnect: Bool {
+        didSet {
+            xdialDefaults.set(autoConnect, forKey: "xdial.autoConnect")
+            if !autoConnect {
+                launchAutoConnectPending = false
+            }
+        }
+    }
 
     let engine = GoEngine.shared
     let installation = InstallationCoordinator.shared
     private var engineSubs = Set<AnyCancellable>()
+    private var sleepObserver: NSObjectProtocol?
+    private var wakeObserver: NSObjectProtocol?
+    private var sleepWakeIntent = SleepWakeConnectionIntent()
+    private var wakeReconnectGeneration = 0
+    private var wakeReconnectTask: Task<Void, Never>?
+    private var systemIsSleeping = false
+    private var initialStatusSynchronized = false
+    private var launchAutoConnectPending = false
+    private var connectionAttempts = ConnectionAttemptGate()
 
     private let profileKey = "xdial.profile"
     private let keychainPrefix = "xdial-line-"
@@ -230,18 +250,18 @@ final class AppState: ObservableObject {
         switch engine.status {
         case "connected": return tr("已连接", "Connected")
         case "connecting":
-            if let task = engine.connectionReport?.currentTask {
+            if let task = engine.presentedConnectionReport?.currentTask {
                 return task.name
             }
             return tr("正在连接…", "Connecting…")
         case "disconnecting": return tr("正在断开…", "Disconnecting…")
         case "reconnecting":
-            if let task = engine.connectionReport?.currentTask {
+            if let task = engine.presentedConnectionReport?.currentTask {
                 return task.name
             }
             return tr("正在重连…", "Reconnecting…")
         default:
-            if let report = engine.connectionReport,
+            if let report = engine.presentedConnectionReport,
                let failure = report.error,
                !failure.message.isEmpty {
                 return failure.message
@@ -320,6 +340,17 @@ final class AppState: ObservableObject {
             self.language = .system
         }
         self.launchAtLogin = xdialDefaults.bool(forKey: "xdial.launchAtLogin")
+        if let savedAutoConnect = xdialDefaults.object(
+            forKey: "xdial.autoConnect"
+        ) as? Bool {
+            self.autoConnect = savedAutoConnect
+        } else {
+            self.autoConnect = AutomaticConnectionPolicy.defaultEnabled
+            xdialDefaults.set(
+                self.autoConnect,
+                forKey: "xdial.autoConnect"
+            )
+        }
 
         engine.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -332,7 +363,9 @@ final class AppState: ObservableObject {
         installation.$report
             .sink { [weak self] _ in
                 DispatchQueue.main.async {
-                    self?.checkHelper()
+                    guard let self else { return }
+                    self.checkHelper()
+                    self.runLaunchAutoConnectIfNeeded()
                 }
             }
             .store(in: &engineSubs)
@@ -352,17 +385,40 @@ final class AppState: ObservableObject {
                         status: status,
                         report: report
                     )
+                    self.runLaunchAutoConnectIfNeeded()
                 }
             }
             .store(in: &engineSubs)
         loadSaved()
+        configurationChanges.load(
+            Self.runtimeConfigurationSnapshot(profile)
+        )
         checkHelper()
         installation.start()
-        engine.syncStatus()
+        launchAutoConnectPending = autoConnect
+        registerSleepWakeObservers()
+        engine.syncStatus { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.initialStatusSynchronized = true
+                self.runLaunchAutoConnectIfNeeded()
+            }
+        }
         #if DEBUG
         Self.current = self
         Self.debugServer.start()
         #endif
+    }
+
+    deinit {
+        wakeReconnectTask?.cancel()
+        let notificationCenter = NSWorkspace.shared.notificationCenter
+        if let sleepObserver {
+            notificationCenter.removeObserver(sleepObserver)
+        }
+        if let wakeObserver {
+            notificationCenter.removeObserver(wakeObserver)
+        }
     }
 
     #if DEBUG
@@ -467,30 +523,184 @@ final class AppState: ObservableObject {
         }
     }
 
-    func uninstall(deleteData: Bool, completion: @escaping (Bool, String?) -> Void) {
-        // 1. 断开连接
-        if engine.status == "connected" || engine.status == "connecting" || engine.status == "reconnecting" {
-            engine.stop()
-        }
-        // 2. 取消开机启动
-        if launchAtLogin { launchAtLogin = false }
-        // 3. 卸载 LaunchDaemon + helper（admin 权限）
-        do {
-            try PrivilegeManager.uninstall(deleteData: deleteData)
-        } catch {
-            completion(false, error.localizedDescription)
+    // MARK: - Automatic connection and sleep / wake
+
+    private func runLaunchAutoConnectIfNeeded() {
+        guard launchAutoConnectPending, !systemIsSleeping else { return }
+        guard initialStatusSynchronized else { return }
+
+        if AutomaticConnectionPolicy.holdsConnectionIntent(
+            runtimeStatus: engine.status
+        ) {
+            // 冷启动时系统里已经有一笔有效事务，不能再创建第二笔。
+            launchAutoConnectPending = false
             return
         }
-        // 4. 可选：删除用户数据
-        if deleteData {
-            xdialDefaults.removeObject(forKey: profileKey)
-            xdialDefaults.removeObject(forKey: "xdial.language")
-            xdialDefaults.removeObject(forKey: "xdial.launchAtLogin")
-            KeychainStore.deleteVault()
-            try? FileManager.default.removeItem(atPath: appLogPath())
+        guard installation.isReady else { return }
+        guard engine.status == "disconnected" else { return }
+        guard canConnect else {
+            launchAutoConnectPending = false
+            appLog(
+                "launch auto-connect skipped: active Mode is not ready"
+            )
+            return
         }
-        helperInstalled = false
-        completion(true, nil)
+        guard AutomaticConnectionPolicy.shouldConnectOnLaunch(
+            enabled: autoConnect,
+            initialStatusSynchronized: initialStatusSynchronized,
+            installationReady: installation.isReady,
+            runtimeStatus: engine.status,
+            canConnect: canConnect
+        ) else {
+            launchAutoConnectPending = false
+            return
+        }
+
+        launchAutoConnectPending = false
+        appLog("launch auto-connect started")
+        connect()
+    }
+
+    private func registerSleepWakeObservers() {
+        let notificationCenter = NSWorkspace.shared.notificationCenter
+        sleepObserver = notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleWillSleep()
+            }
+        }
+        wakeObserver = notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleDidWake()
+            }
+        }
+    }
+
+    private func handleWillSleep() {
+        systemIsSleeping = true
+        cancelWakeReconnectTask(clearIntent: false)
+        let shouldReconnect = sleepWakeIntent.prepareForSleep(
+            runtimeStatus: engine.status
+        )
+        connectionAttempts.cancel()
+        guard shouldReconnect else { return }
+
+        appLog("system will sleep: stopping active connection transaction")
+        NetworkInfo.shared.clear()
+        configDirtyFlag = false
+        configurationChanges.clear()
+        reconnectGeneration += 1
+        reconnecting = false
+        engine.stop()
+    }
+
+    private func handleDidWake() {
+        systemIsSleeping = false
+        guard sleepWakeIntent.consumeWakeReconnect() else {
+            runLaunchAutoConnectIfNeeded()
+            return
+        }
+
+        wakeReconnectGeneration += 1
+        let generation = wakeReconnectGeneration
+        wakeReconnectTask?.cancel()
+        appLog("system did wake: waiting for network before reconnect")
+        wakeReconnectTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if generation == self.wakeReconnectGeneration {
+                    self.wakeReconnectTask = nil
+                }
+            }
+            let disconnected = await self.waitForEngineToDisconnect(
+                generation: generation,
+                timeout: 12
+            )
+            guard
+                disconnected,
+                generation == self.wakeReconnectGeneration
+            else {
+                if generation == self.wakeReconnectGeneration {
+                    self.engine.lastError = self.tr(
+                        "唤醒后无法完成断开，请手动重连",
+                        "Could not finish disconnecting after wake; reconnect manually"
+                    )
+                }
+                return
+            }
+
+            let networkReady = await NetworkAvailabilityWaiter.wait(
+                timeout: 8
+            )
+            guard generation == self.wakeReconnectGeneration else {
+                return
+            }
+            if !networkReady {
+                // 与 XDVPN 一致：等待有上限；超时后仍进入正常连接事务，
+                // 由 Underlay 捕获与结构化报告 fail-closed，而不是无限挂起。
+                appLog(
+                    "wake reconnect network wait timed out; "
+                        + "starting bounded connection transaction"
+                )
+            }
+            guard self.engine.status == "disconnected" else { return }
+            guard self.canConnect else {
+                self.engine.lastError = self.tr(
+                    "唤醒后无法自动连接，请检查当前模式配置",
+                    "Could not reconnect after wake; check the active Mode configuration"
+                )
+                return
+            }
+            appLog("wake reconnect started")
+            self.connect()
+        }
+    }
+
+    private func waitForEngineToDisconnect(
+        generation: Int,
+        timeout: TimeInterval
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if engine.status == "disconnected" { return true }
+            if generation != wakeReconnectGeneration { return false }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return engine.status == "disconnected"
+    }
+
+    private func cancelWakeReconnectTask(clearIntent: Bool = true) {
+        wakeReconnectGeneration += 1
+        wakeReconnectTask?.cancel()
+        wakeReconnectTask = nil
+        if clearIntent {
+            sleepWakeIntent.cancel()
+        }
+    }
+
+    func uninstall(deleteData: Bool, completion: @escaping (Bool, String?) -> Void) {
+        connectionAttempts.cancel()
+        launchAutoConnectPending = false
+        if launchAtLogin { launchAtLogin = false }
+        ApplicationUninstaller.run(
+            deleteData: deleteData
+        ) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                self.helperInstalled = false
+                completion(true, nil)
+            case let .failure(error):
+                completion(false, error.localizedDescription)
+            }
+        }
     }
 
     private var lastVerifiedTransactionID = ""
@@ -533,9 +743,13 @@ final class AppState: ObservableObject {
             return
         }
         guard canConnect else { return }
+        let generation = connectionAttempts.begin()
         NetworkInfo.shared.clear()
         // 这次 save 本身就是在下发前落盘，不该把自己标成"未下发"
         save(markDirty: false)
+        configurationChanges.markApplied(
+            Self.runtimeConfigurationSnapshot(profile)
+        )
         configDirtyFlag = false
         let profileJSON = buildProfileJSON()
         let tailscaleLineIDs = profile.lines
@@ -546,34 +760,47 @@ final class AppState: ObservableObject {
         }
         stopTailscaleSetupSessions(
             lineIDs: tailscaleLineIDs,
-            profileJSON: profileJSON
+            profileJSON: profileJSON,
+            generation: generation
         )
     }
 
     private func stopTailscaleSetupSessions(
         lineIDs: [String],
-        profileJSON: String
+        profileJSON: String,
+        generation: Int
     ) {
+        guard connectionAttempts.isCurrent(generation) else { return }
         guard let lineID = lineIDs.first else {
             engine.start(profileJSON: profileJSON)
             return
         }
         engine.stopTailscaleSetup(lineID: lineID) { [weak self] in
-            self?.stopTailscaleSetupSessions(
+            guard let self,
+                  self.connectionAttempts.isCurrent(generation) else {
+                return
+            }
+            self.stopTailscaleSetupSessions(
                 lineIDs: Array(lineIDs.dropFirst()),
-                profileJSON: profileJSON
+                profileJSON: profileJSON,
+                generation: generation
             )
         }
     }
 
     func disconnect() {
+        // 用户明确断开必须压过尚未消费的冷启动自动连接意图。
+        launchAutoConnectPending = false
+        connectionAttempts.cancel()
+        cancelWakeReconnectTask()
         NetworkInfo.shared.clear()
         // 引擎不再攥着旧快照，残留提示没有意义
         configDirtyFlag = false
+        configurationChanges.clear()
         // 作废进行中的重连，免得它在用户明确要求断开之后又把连接拉起来
         reconnectGeneration += 1
         reconnecting = false
-        engine.stop()
+        engine.stop(userInitiated: true)
     }
 
     /// 每发起一次重连就 +1。进行中的等待循环每轮比对，代次对不上就自行退场 ——
@@ -593,6 +820,7 @@ final class AppState: ObservableObject {
             connect()
             return
         }
+        connectionAttempts.cancel()
         save(markDirty: false)
         reconnectGeneration += 1
         let gen = reconnectGeneration
@@ -688,6 +916,9 @@ final class AppState: ObservableObject {
             profile.lines[i].ssPassword = profile.lines[i].ssPassword.normalizedASCII()
             profile.lines[i].vmessServer = profile.lines[i].vmessServer.normalizedASCII()
             profile.lines[i].vmessUUID = profile.lines[i].vmessUUID.normalizedASCII()
+            profile.lines[i].anytlsServer = profile.lines[i].anytlsServer.normalizedASCII()
+            profile.lines[i].anytlsPassword = profile.lines[i].anytlsPassword.normalizedASCII()
+            profile.lines[i].anytlsSNI = profile.lines[i].anytlsSNI.normalizedASCII()
         }
         for i in profile.ruleSets.indices {
             profile.ruleSets[i].url = profile.ruleSets[i].url.normalizedASCII()
@@ -719,6 +950,10 @@ final class AppState: ObservableObject {
                 vault[id + "-vmess"] = sanitized.lines[i].vmessUUID
                 sanitized.lines[i].vmessUUID = ""
             }
+            if !sanitized.lines[i].anytlsPassword.isEmpty {
+                vault[id + "-anytls"] = sanitized.lines[i].anytlsPassword
+                sanitized.lines[i].anytlsPassword = ""
+            }
         }
         for si in sanitized.subscriptions.indices {
             let subID = sanitized.subscriptions[si].id
@@ -738,6 +973,10 @@ final class AppState: ObservableObject {
                     vault[k + "-vmess"] = line.vmessUUID
                     sanitized.subscriptions[si].lines[pi].vmessUUID = ""
                 }
+                if !line.anytlsPassword.isEmpty {
+                    vault[k + "-anytls"] = line.anytlsPassword
+                    sanitized.subscriptions[si].lines[pi].anytlsPassword = ""
+                }
             }
         }
 
@@ -749,9 +988,12 @@ final class AppState: ObservableObject {
         guard let data = try? JSONEncoder().encode(sanitized) else { return }
         xdialDefaults.set(data, forKey: profileKey)
 
-        if markDirty && engineHoldsSnapshot {
-            configDirtyFlag = true
-        }
+        configurationChanges.recordSave(
+            Self.runtimeConfigurationSnapshot(profile),
+            markDirty: markDirty,
+            engineHoldsSnapshot: engineHoldsSnapshot
+        )
+        configDirtyFlag = configurationChanges.isDirty
         synchronizeLineObservations(
             status: engine.status,
             report: engine.connectionReport
@@ -810,7 +1052,7 @@ final class AppState: ObservableObject {
             let oldPrefixes = [keychainPrefix, "xdial-port-", "xdial-exit-"]
             for line in loaded.lines {
                 for pfx in oldPrefixes {
-                    for suffix in ["vpn", "trojan", "ss", "vmess"] {
+                    for suffix in ["vpn", "trojan", "ss", "vmess", "anytls"] {
                         if let v = KeychainStore.load(account: pfx + line.id + "-" + suffix), !v.isEmpty {
                             vault[line.id + "-" + suffix] = v
                         }
@@ -826,6 +1068,7 @@ final class AppState: ObservableObject {
             if let v = vault[id + "-trojan"] { loaded.lines[i].trojanPassword = v }
             if let v = vault[id + "-ss"] { loaded.lines[i].ssPassword = v }
             if let v = vault[id + "-vmess"] { loaded.lines[i].vmessUUID = v }
+            if let v = vault[id + "-anytls"] { loaded.lines[i].anytlsPassword = v }
         }
         for si in loaded.subscriptions.indices {
             let subID = loaded.subscriptions[si].id
@@ -835,6 +1078,7 @@ final class AppState: ObservableObject {
                 if let v = vault[k + "-trojan"] { loaded.subscriptions[si].lines[pi].trojanPassword = v }
                 if let v = vault[k + "-ss"] { loaded.subscriptions[si].lines[pi].ssPassword = v }
                 if let v = vault[k + "-vmess"] { loaded.subscriptions[si].lines[pi].vmessUUID = v }
+                if let v = vault[k + "-anytls"] { loaded.subscriptions[si].lines[pi].anytlsPassword = v }
             }
         }
 
@@ -870,6 +1114,24 @@ final class AppState: ObservableObject {
 
     private static func newTailscaleHostname() -> String {
         "xdial-" + String(UUID().uuidString.lowercased().prefix(8))
+    }
+
+    private static func runtimeConfigurationSnapshot(
+        _ profile: Profile
+    ) -> Profile {
+        var snapshot = profile
+        for index in snapshot.lines.indices {
+            snapshot.lines[index].verified = false
+        }
+        for subscriptionIndex in snapshot.subscriptions.indices {
+            for lineIndex in
+                snapshot.subscriptions[subscriptionIndex].lines.indices
+            {
+                snapshot.subscriptions[subscriptionIndex]
+                    .lines[lineIndex].verified = false
+            }
+        }
+        return snapshot
     }
 
     // MARK: - Legacy 命名 key 迁移（比喻命名 → 正式命名）

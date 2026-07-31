@@ -59,6 +59,8 @@ func uriToLine(uri string) (config.Line, bool) {
 		return parseVMess(uri)
 	case strings.HasPrefix(uri, "trojan://"):
 		return parseTrojan(uri)
+	case strings.HasPrefix(uri, "anytls://"):
+		return parseAnyTLS(uri)
 	default:
 		return config.Line{}, false
 	}
@@ -193,6 +195,153 @@ func parseTrojan(uri string) (config.Line, bool) {
 		TrojanPassword: password,
 		TrojanSNI:      sni,
 	}, true
+}
+
+// anytls://password@server:port?sni=xxx&insecure=1#name
+func parseAnyTLS(uri string) (config.Line, bool) {
+	u, err := url.Parse(uri)
+	if err != nil || u.User == nil {
+		return config.Line{}, false
+	}
+
+	password := u.User.Username()
+	if password == "" {
+		password, _ = u.User.Password()
+	}
+	server := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	name, _ := url.QueryUnescape(u.Fragment)
+	query := u.Query()
+	sni := firstQueryValue(query, "sni", "peer", "server_name", "servername")
+
+	if server == "" || port == 0 || password == "" {
+		return config.Line{}, false
+	}
+	if sni == "" {
+		sni = server
+	}
+	if name == "" {
+		name = server
+	}
+
+	fingerprint := normalizeAnyTLSFingerprint(firstQueryValue(
+		query,
+		"client-fingerprint",
+		"client_fingerprint",
+		"fingerprint",
+		"fp",
+	))
+	alpn, ok := anyTLSQueryALPN(query)
+	if !ok {
+		return config.Line{}, false
+	}
+
+	line := config.Line{
+		ID:                      shortID(),
+		Name:                    name,
+		Type:                    config.LineTypeAnyTLS,
+		Enabled:                 true,
+		AnyTLSServer:            server,
+		AnyTLSPort:              port,
+		AnyTLSPassword:          password,
+		AnyTLSSNI:               sni,
+		AnyTLSClientFingerprint: fingerprint,
+		AnyTLSALPN:              alpn,
+	}
+	if value, exists := firstQueryEntry(
+		query,
+		"idle-session-check-interval",
+		"idle_session_check_interval",
+	); exists {
+		seconds, valid := parseAnyTLSSessionSeconds(value)
+		if !valid {
+			return config.Line{}, false
+		}
+		line.AnyTLSIdleSessionCheckInterval = seconds
+	}
+	if value, exists := firstQueryEntry(
+		query,
+		"idle-session-timeout",
+		"idle_session_timeout",
+	); exists {
+		seconds, valid := parseAnyTLSSessionSeconds(value)
+		if !valid {
+			return config.Line{}, false
+		}
+		line.AnyTLSIdleSessionTimeout = seconds
+	}
+	if value, exists := firstQueryEntry(
+		query,
+		"min-idle-session",
+		"min_idle_session",
+	); exists {
+		count, valid := parseAnyTLSMinIdleSession(value)
+		if !valid {
+			return config.Line{}, false
+		}
+		line.AnyTLSMinIdleSession = count
+	}
+
+	line.AllowInsecure, ok = anyTLSQueryBool(
+		query,
+		"insecure",
+		"allow_insecure",
+		"allowInsecure",
+		"skip-cert-verify",
+	)
+	if !ok {
+		return config.Line{}, false
+	}
+	line.UDP, ok = anyTLSQueryBool(query, "udp", "udp-relay")
+	if !ok {
+		return config.Line{}, false
+	}
+	if !config.LineHasUsableOutbound(&line) {
+		return config.Line{}, false
+	}
+	line.TFO, ok = anyTLSQueryBool(query, "tfo")
+	if !ok {
+		return config.Line{}, false
+	}
+	return line, true
+}
+
+func firstQueryValue(values url.Values, keys ...string) string {
+	value, _ := firstQueryEntry(values, keys...)
+	return value
+}
+
+func firstQueryEntry(values url.Values, keys ...string) (string, bool) {
+	for _, key := range keys {
+		if entries, exists := values[key]; exists && len(entries) > 0 {
+			return entries[0], true
+		}
+	}
+	return "", false
+}
+
+func anyTLSQueryBool(values url.Values, keys ...string) (bool, bool) {
+	value, exists := firstQueryEntry(values, keys...)
+	if !exists {
+		return false, true
+	}
+	return parseOptionalBool(value)
+}
+
+func anyTLSQueryALPN(values url.Values) ([]string, bool) {
+	rawValues, exists := values["alpn"]
+	if !exists {
+		return nil, true
+	}
+	var protocols []string
+	for _, rawValue := range rawValues {
+		items, valid := splitAnyTLSALPN(rawValue)
+		if !valid {
+			return nil, false
+		}
+		protocols = append(protocols, items...)
+	}
+	return normalizeAnyTLSALPN(protocols), true
 }
 
 func parseHostPort(s string) (string, int) {

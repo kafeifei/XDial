@@ -27,7 +27,7 @@ targets:
     info:
       path: TransparentProxyExtension/Info.plist
       properties:
-        CFBundleDisplayName: XDial Transparent Proxy
+        CFBundleDisplayName: XDial Network Extension
         CFBundlePackageType: SYSX
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
@@ -43,11 +43,14 @@ targets:
         # outer .systemextension filename.
         PRODUCT_NAME: "$(PRODUCT_BUNDLE_IDENTIFIER)"
         MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "77"
+        CURRENT_PROJECT_VERSION: "87"
         ENABLE_APP_SANDBOX: YES
       configs:
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Development
+          PROVISIONING_PROFILE_SPECIFIER: XDial Debug Extension Both Macs 2026
           CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxy.entitlements
         Release:
           PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.transparent-proxy
@@ -90,11 +93,14 @@ targets:
       base:
         PRODUCT_NAME: XDial
         MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "77"
+        CURRENT_PROJECT_VERSION: "87"
         ENABLE_USER_SCRIPT_SANDBOXING: NO
       configs:
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Development
+          PROVISIONING_PROFILE_SPECIFIER: XDial Debug Host Both Macs 2026
           CODE_SIGN_ENTITLEMENTS: XDial.entitlements
         Release:
           PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial
@@ -183,6 +189,7 @@ targets:
     sources:
       - Tests
       - Shared
+      - Sources/XDial/Models.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.tests

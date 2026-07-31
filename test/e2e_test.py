@@ -364,6 +364,7 @@ def inject_vault_passwords(profile: dict) -> int:
         "trojan": "trojan_password",
         "ss": "ss_password",
         "vmess": "vmess_uuid",
+        "anytls": "anytls_password",
         "tsauth": "tailscale_auth_key",
     }
     injected = 0

@@ -34,7 +34,15 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     var reportHandler: ReportHandler?
     var activationStatusHandler: ActivationStatusHandler?
     var activeTransactionID: String? {
-        currentTransactionID
+        TransparentProxyRuntimeGate.connectionProofTransactionID(
+            currentTransactionID: currentTransactionID,
+            automaticReconnectInProgress:
+                automaticReconnectInProgress,
+            reconnectTransactionID:
+                automaticReconnectTransactionID,
+            networkExtensionSessionTransactionID:
+                networkExtensionSessionTransactionID
+        )
     }
 
     private var manager: NETransparentProxyManager?
@@ -42,6 +50,11 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var activationRequest: OSSystemExtensionRequest?
     private var activationCompletion: ((Result<Void, Error>) -> Void)?
     private var activationPurpose: ActivationPurpose?
+    private var activationVerificationRequest:
+        OSSystemExtensionRequest?
+    private var deactivationRequest: OSSystemExtensionRequest?
+    private var deactivationCompletion:
+        ((Result<Void, Error>) -> Void)?
     private var startAttemptID: UUID?
     private var startIntentID: UUID?
     private var currentTransactionID: String?
@@ -53,6 +66,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var underlayMonitor: HostUnderlayMonitor?
     private var automaticReconnectInProgress = false
     private var automaticReconnectTrigger: AutomaticReconnectTrigger?
+    private var automaticReconnectTransactionID: String?
+    private var networkExtensionSessionTransactionID: String?
     private let automaticReconnectRetryPolicy =
         AutomaticReconnectRetryPolicy()
     private var automaticReconnectAttemptsUsed = 0
@@ -114,6 +129,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         requestedProfileJSON = profileJSON
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        automaticReconnectTransactionID = nil
+        networkExtensionSessionTransactionID = nil
         connectedSessionTransactionID = nil
         activeReconnectIncidentID = nil
         stableResetIncidentID = nil
@@ -184,6 +201,33 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             purpose: .installation,
             completion: completion
         )
+    }
+
+    /// Explicit uninstall path. Upgrades never deactivate the current
+    /// extension: an activation request replaces the same bundle identifier
+    /// in place. Uninstall first removes this app's transparent-proxy
+    /// configuration so the provider can exit, then deactivates the embedded
+    /// extension without relying on an app deletion or a reboot.
+    func uninstallSystemExtension(
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard
+            activationCompletion == nil,
+            activationVerificationRequest == nil,
+            deactivationCompletion == nil
+        else {
+            completion(.failure(ManagerError.activationInProgress))
+            return
+        }
+        removeOwnedNetworkConfigurations { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                self.submitDeactivation(completion: completion)
+            case let .failure(error):
+                completion(.failure(error))
+            }
+        }
     }
 
     func probeLineOutboundAddress(
@@ -301,6 +345,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         activeUnderlay = nil
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        automaticReconnectTransactionID = nil
+        networkExtensionSessionTransactionID = nil
         connectedSessionTransactionID = nil
         if let incidentID = activeReconnectIncidentID {
             ReconnectIncidentJournal.finish(
@@ -324,6 +370,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 self.publishFailure(error)
             case .success(nil):
                 self.manager = nil
+                self.networkExtensionSessionTransactionID = nil
                 self.finishOrphanedTransactionIfNeeded()
                 self.publishRuntimeStatus("disconnected", error: nil)
             case let .success(manager?):
@@ -349,6 +396,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 self.publishFailure(error)
             case .success(nil):
                 self.manager = nil
+                self.networkExtensionSessionTransactionID = nil
                 self.finishOrphanedTransactionIfNeeded()
                 self.publishRuntimeStatus("disconnected", error: nil)
             case let .success(manager?):
@@ -367,7 +415,11 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         purpose: ActivationPurpose,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        guard activationCompletion == nil else {
+        guard
+            activationCompletion == nil,
+            activationVerificationRequest == nil,
+            deactivationCompletion == nil
+        else {
             completion(.failure(ManagerError.activationInProgress))
             return
         }
@@ -385,12 +437,150 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         OSSystemExtensionManager.shared.submitRequest(request)
     }
 
+    private func verifyActivatedExtension() {
+        guard let expectedVersion = bundledExtensionVersion else {
+            finishActivation(
+                .failure(
+                    ManagerError.extensionVerificationFailed(
+                        expectedVersion: "unknown"
+                    )
+                )
+            )
+            return
+        }
+        activationRequest = nil
+        let request = OSSystemExtensionRequest.propertiesRequest(
+            forExtensionWithIdentifier: extensionIdentifier,
+            queue: .main
+        )
+        request.delegate = self
+        activationVerificationRequest = request
+        OSSystemExtensionManager.shared.submitRequest(request)
+    }
+
+    private var bundledExtensionVersion: String? {
+        let extensionURL = Bundle.main.bundleURL
+            .appendingPathComponent(
+                "Contents/Library/SystemExtensions",
+                isDirectory: true
+            )
+            .appendingPathComponent(
+                "\(extensionIdentifier).systemextension",
+                isDirectory: true
+            )
+        return Bundle(url: extensionURL)?.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String
+    }
+
+    private func removeOwnedNetworkConfigurations(
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        NETransparentProxyManager.loadAllFromPreferences {
+            [weak self] managers, error in
+            guard let self else { return }
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            let owned = (managers ?? []).filter {
+                ($0.protocolConfiguration as? NETunnelProviderProtocol)?
+                    .providerBundleIdentifier == self.extensionIdentifier
+            }
+            self.removeOwnedNetworkConfigurations(
+                ArraySlice(owned),
+                completion: completion
+            )
+        }
+    }
+
+    private func removeOwnedNetworkConfigurations(
+        _ managers: ArraySlice<NETransparentProxyManager>,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard let manager = managers.first else {
+            self.manager = nil
+            completion(.success(()))
+            return
+        }
+        manager.connection.stopVPNTunnel()
+        waitForManagerToStop(
+            manager,
+            attemptsRemaining: 100
+        ) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case let .failure(error):
+                completion(.failure(error))
+            case .success:
+                manager.removeFromPreferences { [weak self] error in
+                    guard let self else { return }
+                    if let error {
+                        completion(.failure(error))
+                        return
+                    }
+                    self.removeOwnedNetworkConfigurations(
+                        managers.dropFirst(),
+                        completion: completion
+                    )
+                }
+            }
+        }
+    }
+
+    private func waitForManagerToStop(
+        _ manager: NETransparentProxyManager,
+        attemptsRemaining: Int,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        switch manager.connection.status {
+        case .disconnected, .invalid:
+            completion(.success(()))
+        default:
+            guard attemptsRemaining > 0 else {
+                completion(.failure(ManagerError.stopTimedOut))
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                [weak self] in
+                self?.waitForManagerToStop(
+                    manager,
+                    attemptsRemaining: attemptsRemaining - 1,
+                    completion: completion
+                )
+            }
+        }
+    }
+
+    private func submitDeactivation(
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        deactivationCompletion = completion
+        let request = OSSystemExtensionRequest.deactivationRequest(
+            forExtensionWithIdentifier: extensionIdentifier,
+            queue: .main
+        )
+        request.delegate = self
+        deactivationRequest = request
+        OSSystemExtensionManager.shared.submitRequest(request)
+    }
+
+    private func finishDeactivation(
+        _ result: Result<Void, Error>
+    ) {
+        let completion = deactivationCompletion
+        deactivationCompletion = nil
+        deactivationRequest = nil
+        completion?(result)
+    }
+
     private func finishActivation(_ result: Result<Void, Error>) {
         let purpose = activationPurpose
         let completion = activationCompletion
         activationCompletion = nil
         activationPurpose = nil
         activationRequest = nil
+        activationVerificationRequest = nil
         if purpose == .installation {
             switch result {
             case .success:
@@ -487,6 +677,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             let attemptID = UUID()
             startAttemptID = attemptID
             activeUnderlay = underlay
+            networkExtensionSessionTransactionID = transactionID
             do {
                 var options: [String: NSObject] = [
                     "profile": profileJSON as NSString,
@@ -515,6 +706,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             } catch {
                 if startAttemptID == attemptID {
                     startAttemptID = nil
+                }
+                if networkExtensionSessionTransactionID ==
+                    transactionID {
+                    networkExtensionSessionTransactionID = nil
                 }
                 publishFailure(error)
             }
@@ -830,6 +1025,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 && connectedSessionTransactionID ==
                     reportBeforeRecovery?.transactionID
                 && !automaticReconnectInProgress
+            networkExtensionSessionTransactionID = nil
             connectedSessionTransactionID = nil
             cancelStableConnectionReset()
             stopUnderlayMonitoring()
@@ -951,8 +1147,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         if !shouldContinueAutomaticReconnect {
             automaticReconnectInProgress = false
             automaticReconnectTrigger = nil
+            automaticReconnectTransactionID = nil
             cancelAutomaticReconnectRetry(resetAttempts: false)
         }
+        networkExtensionSessionTransactionID = nil
         connectedSessionTransactionID = nil
         cancelStableConnectionReset()
         stopUnderlayMonitoring()
@@ -997,6 +1195,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     ) {
         automaticReconnectInProgress = true
         automaticReconnectTrigger = .unexpectedDisconnect
+        automaticReconnectTransactionID = nil
         let reasonCode = report?.error?.code
             ?? ConnectionFailureCode.providerSessionLost
         let reasonMessage = report?.error?.message
@@ -1118,6 +1317,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
 
     private func publishLatestReport() {
         let localReport = ConnectionReportJournal.read()
+        var candidate: ConnectionReport?
+        var shouldMirrorProviderReport = false
+
         if let providerReport =
             PrivilegeManager.probeProviderConnectionReport(),
            currentTransactionID == nil ||
@@ -1127,23 +1329,31 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 .isSystemDisconnectConfirmationSuccessor(
                     of: providerReport
                 ) {
-                currentTransactionID = localReport.transactionID
-                publishReport(localReport)
-                return
+                candidate = localReport
+            } else {
+                candidate = providerReport
+                shouldMirrorProviderReport = true
             }
-            currentTransactionID = providerReport.transactionID
-            try? ConnectionReportJournal.write(providerReport)
-            publishReport(providerReport)
-            return
+        } else if let localReport,
+                  currentTransactionID == nil ||
+                    localReport.transactionID == currentTransactionID {
+            candidate = localReport
         }
+
         guard
-            let report = localReport,
-            currentTransactionID == nil ||
-                report.transactionID == currentTransactionID
+            let report = candidate,
+            ConnectionReportLiveProjection.shouldAdoptPersisted(
+                report,
+                currentTransactionID: currentTransactionID
+            )
         else {
             return
         }
+
         currentTransactionID = report.transactionID
+        if shouldMirrorProviderReport {
+            try? ConnectionReportJournal.write(report)
+        }
         publishReport(report)
     }
 
@@ -1205,6 +1415,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        automaticReconnectTransactionID = nil
         cancelAutomaticReconnectRetry(resetAttempts: false)
         if isNewSession || stableConnectionResetWorkItem == nil {
             scheduleStableConnectionReset(
@@ -1286,7 +1497,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         let runtimeStatus = TransparentProxyRuntimeGate.resolve(
             systemStatus: systemStatus,
             report: report,
-            activeTransactionID: currentTransactionID,
+            activeTransactionID: activeTransactionID,
             previousStatus: lastPublishedRuntimeStatus
         )
         lastPublishedRuntimeStatus = runtimeStatus
@@ -1371,7 +1582,13 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     }
 
     private func finishOrphanedTransactionIfNeeded() {
-        guard let report = ConnectionReportJournal.read() else {
+        guard
+            let report = ConnectionReportJournal.read(),
+            ConnectionReportLiveProjection.shouldAdoptPersisted(
+                report,
+                currentTransactionID: currentTransactionID
+            )
+        else {
             return
         }
         currentTransactionID = report.transactionID
@@ -1434,12 +1651,14 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         startIntentID = intentID
         automaticReconnectInProgress = true
         automaticReconnectTrigger = .underlayChange
+        automaticReconnectTransactionID = nil
         automaticReconnectAttemptsUsed += 1
         connectedSessionTransactionID = nil
         do {
             let transactionID = try beginTransaction(
                 profileJSON: profileJSON
             )
+            automaticReconnectTransactionID = transactionID
             updateReport(transactionID: transactionID) {
                 $0.updateTask(id: "underlay:system", state: .ready)
                 $0.setState(.preparing)
@@ -1567,6 +1786,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                         let transactionID = try self.beginTransaction(
                             profileJSON: profileJSON
                         )
+                        self.automaticReconnectTransactionID =
+                            transactionID
                         if let incidentID =
                             self.activeReconnectIncidentID {
                             ReconnectIncidentJournal.append(
@@ -1642,6 +1863,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 >= automaticReconnectRetryPolicy.maxAttempts
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        automaticReconnectTransactionID = nil
+        networkExtensionSessionTransactionID = nil
         cancelAutomaticReconnectRetry(resetAttempts: false)
         if let incidentID = activeReconnectIncidentID {
             ReconnectIncidentJournal.finish(
@@ -1698,8 +1921,23 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         _ request: OSSystemExtensionRequest,
         didFinishWithResult result: OSSystemExtensionRequest.Result
     ) {
+        if request === deactivationRequest {
+            guard result == .completed else {
+                finishDeactivation(
+                    .failure(ManagerError.deactivationDeferredBySystem)
+                )
+                return
+            }
+            finishDeactivation(.success(()))
+            return
+        }
+        guard request === activationRequest else { return }
         guard result == .completed else {
             finishActivation(.failure(ManagerError.rebootRequired))
+            return
+        }
+        if activationPurpose == .installation {
+            verifyActivatedExtension()
             return
         }
         finishActivation(.success(()))
@@ -1709,7 +1947,61 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         _ request: OSSystemExtensionRequest,
         didFailWithError error: Error
     ) {
+        if request === deactivationRequest {
+            let nsError = error as NSError
+            if nsError.domain == OSSystemExtensionErrorDomain,
+               nsError.code
+                == OSSystemExtensionError.Code.extensionNotFound.rawValue {
+                finishDeactivation(.success(()))
+            } else {
+                finishDeactivation(.failure(error))
+            }
+            return
+        }
+        if request === activationVerificationRequest {
+            finishActivation(.failure(error))
+            return
+        }
+        guard request === activationRequest else { return }
         finishActivation(.failure(error))
+    }
+
+    func request(
+        _ request: OSSystemExtensionRequest,
+        foundProperties properties: [OSSystemExtensionProperties]
+    ) {
+        guard request === activationVerificationRequest else {
+            return
+        }
+        let snapshots = properties.map {
+            SystemExtensionPropertySnapshot(
+                bundleIdentifier: $0.bundleIdentifier,
+                bundleVersion: $0.bundleVersion,
+                isEnabled: $0.isEnabled,
+                isAwaitingUserApproval:
+                    $0.isAwaitingUserApproval,
+                isUninstalling: $0.isUninstalling
+            )
+        }
+        let expectedVersion = bundledExtensionVersion ?? "unknown"
+        guard
+            SystemExtensionActivationVerifier
+                .containsReadyCurrentVersion(
+                    snapshots,
+                    expectedIdentifier: extensionIdentifier,
+                    expectedVersion: expectedVersion
+                )
+        else {
+            finishActivation(
+                .failure(
+                    ManagerError.extensionVerificationFailed(
+                        expectedVersion: expectedVersion
+                    )
+                )
+            )
+            return
+        }
+        finishActivation(.success(()))
     }
 }
 
@@ -2095,6 +2387,8 @@ private enum ManagerError: LocalizedError {
     case providerStartFailed
     case underlayUnavailable
     case systemDNSUnavailable
+    case extensionVerificationFailed(expectedVersion: String)
+    case deactivationDeferredBySystem
     case rebootRequired
     case stopTimedOut
     case startTimedOut
@@ -2120,6 +2414,10 @@ private enum ManagerError: LocalizedError {
             "无法读取 XDial 启动前的系统网络接口"
         case .systemDNSUnavailable:
             "无法读取 XDial 启动前的系统 DNS"
+        case let .extensionVerificationFailed(expectedVersion):
+            "macOS 未登记并启用当前 XDial 网络扩展（build \(expectedVersion)）"
+        case .deactivationDeferredBySystem:
+            "macOS 仍在占用 XDial 网络扩展；请退出其他正在运行的 XDial 后重试卸载"
         case .rebootRequired:
             "XDial 网络扩展需要重启 macOS 后才能启用"
         case .stopTimedOut:

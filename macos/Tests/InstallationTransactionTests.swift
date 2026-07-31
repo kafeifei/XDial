@@ -1,6 +1,169 @@
 import XCTest
 
 final class InstallationTransactionTests: XCTestCase {
+    func testReplacementExitWaiterExcludesCurrentInvalidAndDuplicates() {
+        XCTAssertEqual(
+            ApplicationReplacementExitWaiter
+                .otherProcessIdentifiers(
+                    currentProcessIdentifier: 42,
+                    candidateProcessIdentifiers:
+                        [0, -1, 42, 81, 81, 82]
+                ),
+            Set([81, 82])
+        )
+    }
+
+    func testReplacementExitWaiterUsesFreshSnapshotUntilExit() {
+        var now: TimeInterval = 10
+        var snapshots = [
+            Set<Int32>([81]),
+            Set<Int32>([81]),
+            Set<Int32>(),
+        ]
+        var sleepCount = 0
+
+        XCTAssertTrue(
+            ApplicationReplacementExitWaiter.wait(
+                timeout: 5,
+                pollInterval: 0.5,
+                monotonicNow: { now },
+                sleep: {
+                    sleepCount += 1
+                    now += $0
+                },
+                requestGracefulTermination: { _ in },
+                remainingProcessIdentifiers: {
+                    snapshots.removeFirst()
+                }
+            )
+        )
+        XCTAssertEqual(sleepCount, 2)
+        XCTAssertEqual(now, 11)
+    }
+
+    func testReplacementExitWaiterStopsAtDeadline() {
+        var now: TimeInterval = 20
+        var sleepDurations: [TimeInterval] = []
+
+        XCTAssertFalse(
+            ApplicationReplacementExitWaiter.wait(
+                timeout: 1,
+                pollInterval: 0.4,
+                monotonicNow: { now },
+                sleep: {
+                    sleepDurations.append($0)
+                    now += $0
+                },
+                requestGracefulTermination: { _ in },
+                remainingProcessIdentifiers: {
+                    Set<Int32>([81])
+                }
+            )
+        )
+        XCTAssertEqual(
+            sleepDurations.reduce(0, +),
+            1,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testReplacementExitWaiterReturnsImmediatelyWhenAlreadyGone() {
+        var slept = false
+
+        XCTAssertTrue(
+            ApplicationReplacementExitWaiter.wait(
+                timeout: 12,
+                pollInterval: 0.05,
+                monotonicNow: { 100 },
+                sleep: { _ in slept = true },
+                requestGracefulTermination: { _ in },
+                remainingProcessIdentifiers: { [] }
+            )
+        )
+        XCTAssertFalse(slept)
+    }
+
+    func testReplacementExitWaiterRequestsNewProcessOnce() {
+        var now: TimeInterval = 10
+        var snapshots = [
+            Set<Int32>([81]),
+            Set<Int32>([81, 82]),
+            Set<Int32>([82]),
+            Set<Int32>(),
+        ]
+        var requested: [Int32] = []
+
+        XCTAssertTrue(
+            ApplicationReplacementExitWaiter.wait(
+                timeout: 5,
+                pollInterval: 0.5,
+                monotonicNow: { now },
+                sleep: { now += $0 },
+                requestGracefulTermination: {
+                    requested.append($0)
+                },
+                remainingProcessIdentifiers: {
+                    snapshots.removeFirst()
+                }
+            )
+        )
+        XCTAssertEqual(requested, [81, 82])
+    }
+
+    func testReplacementExitWaiterDoesNotRepeatVisibleProcess() {
+        var now: TimeInterval = 10
+        var snapshots = [
+            Set<Int32>([81]),
+            Set<Int32>([81]),
+            Set<Int32>([81]),
+            Set<Int32>(),
+        ]
+        var requested: [Int32] = []
+
+        XCTAssertTrue(
+            ApplicationReplacementExitWaiter.wait(
+                timeout: 5,
+                pollInterval: 0.5,
+                monotonicNow: { now },
+                sleep: { now += $0 },
+                requestGracefulTermination: {
+                    requested.append($0)
+                },
+                remainingProcessIdentifiers: {
+                    snapshots.removeFirst()
+                }
+            )
+        )
+        XCTAssertEqual(requested, [81])
+    }
+
+    func testReplacementExitWaiterRequestsReappearingProcessAgain() {
+        var now: TimeInterval = 10
+        var snapshots = [
+            Set<Int32>([81, 82]),
+            Set<Int32>([82]),
+            Set<Int32>([81, 82]),
+            Set<Int32>(),
+        ]
+        var requested: [Int32] = []
+
+        XCTAssertTrue(
+            ApplicationReplacementExitWaiter.wait(
+                timeout: 5,
+                pollInterval: 0.5,
+                monotonicNow: { now },
+                sleep: { now += $0 },
+                requestGracefulTermination: {
+                    requested.append($0)
+                },
+                remainingProcessIdentifiers: {
+                    snapshots.removeFirst()
+                }
+            )
+        )
+        XCTAssertEqual(requested, [81, 82, 81])
+    }
+
     func testSystemExtensionFilenameMustMatchBundleIdentifier() {
         let identifier = "com.kafeifei.xdial.transparent-proxy"
         XCTAssertTrue(
@@ -26,9 +189,115 @@ final class InstallationTransactionTests: XCTestCase {
         )
     }
 
+    func testInstallationMarkerInvalidatesOlderReportSchema() {
+        XCTAssertEqual(
+            InstallationBuildMarker.make(
+                bundleIdentifier: "com.kafeifei.xdial",
+                bundleVersion: "79"
+            ),
+            "com.kafeifei.xdial:79:installation-v4"
+        )
+    }
+
+    func testSystemExtensionOnlyVerifiesCurrentEnabledVersion() {
+        let expected = SystemExtensionPropertySnapshot(
+            bundleIdentifier:
+                "com.kafeifei.xdial.transparent-proxy",
+            bundleVersion: "79",
+            isEnabled: true,
+            isAwaitingUserApproval: false,
+            isUninstalling: false
+        )
+        XCTAssertTrue(
+            SystemExtensionActivationVerifier
+                .containsReadyCurrentVersion(
+                    [expected],
+                    expectedIdentifier:
+                        "com.kafeifei.xdial.transparent-proxy",
+                    expectedVersion: "79"
+                )
+        )
+        XCTAssertFalse(
+            SystemExtensionActivationVerifier
+                .containsReadyCurrentVersion(
+                    [
+                        SystemExtensionPropertySnapshot(
+                            bundleIdentifier:
+                                expected.bundleIdentifier,
+                            bundleVersion: "78",
+                            isEnabled: true,
+                            isAwaitingUserApproval: false,
+                            isUninstalling: false
+                        ),
+                    ],
+                    expectedIdentifier:
+                        expected.bundleIdentifier,
+                    expectedVersion: "79"
+                )
+        )
+        XCTAssertFalse(
+            SystemExtensionActivationVerifier
+                .containsReadyCurrentVersion(
+                    [
+                        SystemExtensionPropertySnapshot(
+                            bundleIdentifier:
+                                expected.bundleIdentifier,
+                            bundleVersion:
+                                expected.bundleVersion,
+                            isEnabled: false,
+                            isAwaitingUserApproval: false,
+                            isUninstalling: false
+                        ),
+                    ],
+                    expectedIdentifier:
+                        expected.bundleIdentifier,
+                    expectedVersion: expected.bundleVersion
+                )
+        )
+    }
+
+    func testRelocationAllowsKnownDebugReleaseReplacementForSameTeam() {
+        XCTAssertTrue(
+            XDialApplicationIdentifierPolicy.permitsReplacement(
+                existingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                incomingIdentifier:
+                    XDialApplicationIdentifierPolicy.debug,
+                teamIdentifiersMatch: true
+            )
+        )
+        XCTAssertFalse(
+            XDialApplicationIdentifierPolicy.permitsReplacement(
+                existingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                incomingIdentifier:
+                    XDialApplicationIdentifierPolicy.debug,
+                teamIdentifiersMatch: false
+            )
+        )
+        XCTAssertFalse(
+            XDialApplicationIdentifierPolicy.permitsReplacement(
+                existingIdentifier: "com.example.not-xdial",
+                incomingIdentifier:
+                    XDialApplicationIdentifierPolicy.debug,
+                teamIdentifiersMatch: true
+            )
+        )
+    }
+
     func testInstallationOnlyFinishesWhenEveryTaskIsReady() {
         var report = InstallationReport.fresh(
             applicationAlreadyInstalled: true
+        )
+        XCTAssertEqual(report.schemaVersion, 4)
+        XCTAssertEqual(
+            report.tasks.last?.id,
+            "system-extension"
+        )
+        XCTAssertFalse(
+            report.tasks.contains {
+                $0.id == "system-extension-cleanup"
+            }
         )
         report.finish()
         XCTAssertFalse(report.isReady)

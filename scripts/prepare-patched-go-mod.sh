@@ -11,6 +11,11 @@ input_manifest_name="inputs.manifest"
 module_path="github.com/sagernet/tailscale"
 expected_version="v1.92.4-sing-box-1.13-mod.7.0.20260717155615-b353b93d194a"
 patch_dir="${repo_root}/patches/tailscale"
+sing_box_module_path="github.com/sagernet/sing-box"
+sing_box_expected_version="v1.14.0-beta.2"
+sing_box_patch_dir="${repo_root}/patches/sing-box"
+sslcon_source_dir="${repo_root}/third_party/sslcon"
+sslcon_patch_dir="${repo_root}/patches/sslcon"
 
 cleanup() {
 	if [[ -n "${staging_dir}" && -d "${staging_dir}" ]]; then
@@ -22,7 +27,7 @@ trap cleanup EXIT
 write_input_manifest() {
 	local input_file
 
-	echo "xdial-patched-go-inputs-v1"
+	echo "xdial-patched-go-inputs-v2"
 	for input_file in \
 		"${repo_root}/go.mod" \
 		"${repo_root}/go.sum" \
@@ -33,6 +38,17 @@ write_input_manifest() {
 		[[ -f "${input_file}" ]] || continue
 		cksum "${input_file}"
 	done
+	for input_file in "${sing_box_patch_dir}"/*.patch; do
+		[[ -f "${input_file}" ]] || continue
+		cksum "${input_file}"
+	done
+	for input_file in "${sslcon_patch_dir}"/*.patch; do
+		[[ -f "${input_file}" ]] || continue
+		cksum "${input_file}"
+	done
+	while IFS= read -r input_file; do
+		cksum "${input_file}"
+	done < <(find "${sslcon_source_dir}" -type f -print | LC_ALL=C sort)
 }
 
 atomic_exchange() {
@@ -90,6 +106,8 @@ case "${1:-}" in
 		if [[ \
 			-f "${output_dir}/xdial.work" &&
 			-d "${output_dir}/tailscale" &&
+			-d "${output_dir}/sing-box" &&
+			-d "${output_dir}/sslcon" &&
 			-f "${output_dir}/${input_manifest_name}" \
 		]] && cmp -s \
 			<(write_input_manifest) \
@@ -114,6 +132,16 @@ if [[ "${actual_version}" != "${expected_version}" ]]; then
 	exit 1
 fi
 
+sing_box_actual_version="$(
+	cd "${repo_root}"
+	GOWORK=off GOFLAGS= go list -mod=readonly -m -f '{{.Version}}' "${sing_box_module_path}"
+)"
+if [[ "${sing_box_actual_version}" != "${sing_box_expected_version}" ]]; then
+	echo "error: ${sing_box_module_path} is ${sing_box_actual_version}; patch expects ${sing_box_expected_version}" >&2
+	echo "error: review the upstream fix before changing the pinned version" >&2
+	exit 1
+fi
+
 case "${output_dir}" in
 	"${repo_root}"/build/*) ;;
 	*)
@@ -133,6 +161,9 @@ cp "${repo_root}/go.sum" "${staging_dir}/xdial.sum"
 GOWORK=off GOFLAGS= go mod download \
 	-modfile="${staging_dir}/xdial.mod" \
 	"${module_path}@${expected_version}"
+GOWORK=off GOFLAGS= go mod download \
+	-modfile="${staging_dir}/xdial.mod" \
+	"${sing_box_module_path}@${sing_box_expected_version}"
 
 module_cache="$(GOWORK=off GOFLAGS= go env GOMODCACHE)"
 source_dir="${module_cache}/${module_path}@${expected_version}"
@@ -140,6 +171,35 @@ if [[ ! -d "${source_dir}" ]]; then
 	echo "error: downloaded module directory not found: ${source_dir}" >&2
 	exit 1
 fi
+
+sing_box_source_dir="${module_cache}/${sing_box_module_path}@${sing_box_expected_version}"
+if [[ ! -d "${sing_box_source_dir}" ]]; then
+	echo "error: downloaded module directory not found: ${sing_box_source_dir}" >&2
+	exit 1
+fi
+
+patched_sing_box_dir="${staging_dir}/sing-box"
+cp -R "${sing_box_source_dir}" "${patched_sing_box_dir}"
+chmod -R u+w "${patched_sing_box_dir}"
+
+sing_box_patch_files=()
+for patch_file in "${sing_box_patch_dir}"/*.patch; do
+	[[ -f "${patch_file}" ]] || continue
+	sing_box_patch_files+=("${patch_file}")
+done
+if [[ "${#sing_box_patch_files[@]}" -eq 0 ]]; then
+	echo "error: no sing-box patches found in ${sing_box_patch_dir}" >&2
+	exit 1
+fi
+for patch_file in "${sing_box_patch_files[@]}"; do
+	(
+		cd "${patched_sing_box_dir}"
+		patch -p1 --batch --forward < "${patch_file}"
+	)
+done
+
+grep -Fq 'if allowedIP.Bits() == 0 {' \
+	"${patched_sing_box_dir}/protocol/tailscale/endpoint.go"
 
 patched_module_dir="${staging_dir}/tailscale"
 cp -R "${source_dir}" "${patched_module_dir}"
@@ -280,16 +340,55 @@ if grep -Eq 'DebugPickNewDERP\(|DebugForcePreferDERP\(|RotateDiscoKey\(|SetDisco
 	exit 1
 fi
 
+patched_sslcon_dir="${staging_dir}/sslcon"
+cp -R "${sslcon_source_dir}" "${patched_sslcon_dir}"
+chmod -R u+w "${patched_sslcon_dir}"
+
+sslcon_patch_files=()
+for patch_file in "${sslcon_patch_dir}"/*.patch; do
+	[[ -f "${patch_file}" ]] || continue
+	sslcon_patch_files+=("${patch_file}")
+done
+if [[ "${#sslcon_patch_files[@]}" -eq 0 ]]; then
+	echo "error: no sslcon patches found in ${sslcon_patch_dir}" >&2
+	exit 1
+fi
+for patch_file in "${sslcon_patch_files[@]}"; do
+	(
+		cd "${patched_sslcon_dir}"
+		patch -p1 --batch --forward < "${patch_file}"
+	)
+done
+
+grep -Fq 'func (c *ClientConfig) SetXDialForceDPD(seconds int)' \
+	"${patched_sslcon_dir}/base/config.go"
+grep -Fq 'func (cSess *ConnSession) XDialDiagnosticsJSON() string' \
+	"${patched_sslcon_dir}/session/xdial_liveness.go"
+grep -Fq 'reason.PeerPayloadLength,' \
+	"${patched_sslcon_dir}/session/xdial_liveness.go"
+grep -Fq 'SchemaVersion:   2,' \
+	"${patched_sslcon_dir}/session/xdial_liveness.go"
+grep -Fq 'func TestReadTLSPayloadBoundsAndSanitizesDisconnectReason(' \
+	"${patched_sslcon_dir}/vpn/xdial_liveness_test.go"
+grep -Fq 'func TestXDialLateOldSessionCloseCannotClearNewSession(' \
+	"${patched_sslcon_dir}/session/xdial_liveness_test.go"
+
 GOWORK=off GOFLAGS= go mod edit \
 	-modfile="${staging_dir}/xdial.mod" \
 	-replace="${module_path}=${output_dir}/tailscale"
+GOWORK=off GOFLAGS= go mod edit \
+	-modfile="${staging_dir}/xdial.mod" \
+	-replace="${sing_box_module_path}=${output_dir}/sing-box"
+GOWORK=off GOFLAGS= go mod edit \
+	-modfile="${staging_dir}/xdial.mod" \
+	-replace="sslcon=${output_dir}/sslcon"
 
 # gomobile overwrites GOFLAGS for each target architecture, so a -modfile
 # replacement is not inherited by the actual bind build. An explicit GOWORK
 # survives that boundary and makes the patched module the workspace module.
 (
 	cd "${staging_dir}"
-	GOWORK=off GOFLAGS= go work init ../.. ./tailscale
+	GOWORK=off GOFLAGS= go work init ../.. ./tailscale ./sing-box ./sslcon
 	mv go.work xdial.work
 )
 write_input_manifest > "${staging_dir}/${input_manifest_name}"
@@ -306,6 +405,24 @@ if [[ "${resolved_dir}" != "${staging_dir}/tailscale" ]]; then
 	echo "error: patched workspace resolved ${module_path} to ${resolved_dir}" >&2
 	exit 1
 fi
+resolved_sing_box_dir="$(
+	cd "${repo_root}"
+	GOWORK="${staging_dir}/xdial.work" GOFLAGS= \
+		go list -m -f '{{.Dir}}' "${sing_box_module_path}"
+)"
+if [[ "${resolved_sing_box_dir}" != "${staging_dir}/sing-box" ]]; then
+	echo "error: patched workspace resolved ${sing_box_module_path} to ${resolved_sing_box_dir}" >&2
+	exit 1
+fi
+resolved_sslcon_dir="$(
+	cd "${repo_root}"
+	GOWORK="${staging_dir}/xdial.work" GOFLAGS= \
+		go list -m -f '{{.Dir}}' sslcon
+)"
+if [[ "${resolved_sslcon_dir}" != "${staging_dir}/sslcon" ]]; then
+	echo "error: patched workspace resolved sslcon to ${resolved_sslcon_dir}" >&2
+	exit 1
+fi
 
 if [[ -e "${output_dir}" || -L "${output_dir}" ]]; then
 	# RENAME_SWAP / RENAME_EXCHANGE keeps the old output visible until the new
@@ -320,5 +437,7 @@ fi
 staging_dir=""
 
 echo "prepared patched ${module_path}@${expected_version}"
+echo "prepared patched ${sing_box_module_path}@${sing_box_expected_version}"
+echo "prepared patched sslcon from ${sslcon_source_dir}"
 echo "modfile: ${output_dir}/xdial.mod"
 echo "workfile: ${output_dir}/xdial.work"

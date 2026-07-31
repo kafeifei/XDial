@@ -43,16 +43,19 @@ final class EmbeddedSingBoxRuntime {
         struct Tailscale: Decodable {
             let endpointTag: String
             let exitNode: String
+            let magicDNSEnabled: Bool
 
             enum CodingKeys: String, CodingKey {
                 case endpointTag = "endpoint_tag"
                 case exitNode = "exit_node"
+                case magicDNSEnabled = "magic_dns_enabled"
             }
         }
 
         let configJSON: String
         let plan: ConnectionPlan
         let lineOutbounds: [String: String]
+        let subscriptionOutbounds: [String: [String]]
         let ruleSetTags: [String]
         let anyConnect: AnyConnect?
         let tailscale: Tailscale?
@@ -61,6 +64,7 @@ final class EmbeddedSingBoxRuntime {
             case configJSON = "config_json"
             case plan
             case lineOutbounds = "line_outbounds"
+            case subscriptionOutbounds = "subscription_outbounds"
             case ruleSetTags = "rule_set_tags"
             case anyConnect = "anyconnect"
             case tailscale
@@ -159,6 +163,7 @@ final class EmbeddedSingBoxRuntime {
         let authURL: String
         let healthCount: Int
         let controlSelfHomePresent: Bool
+        let magicDNSReady: Bool
         let readiness: Readiness
         let exitNodes: [ExitNode]
 
@@ -167,8 +172,17 @@ final class EmbeddedSingBoxRuntime {
             case authURL = "auth_url"
             case healthCount = "health_count"
             case controlSelfHomePresent = "control_self_home_present"
+            case magicDNSReady = "magic_dns_ready"
             case readiness
             case exitNodes = "exit_nodes"
+        }
+    }
+
+    private struct RuntimeDiagnostics: Decodable {
+        let handshakeCompleted: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case handshakeCompleted = "handshake_completed"
         }
     }
 
@@ -184,7 +198,8 @@ final class EmbeddedSingBoxRuntime {
 
     init(
         logger: Logger,
-        onFatalError: @escaping @Sendable (Error) -> Void
+        onFatalError:
+            @escaping @Sendable (ConnectionRuntimeFailure) -> Void
     ) {
         self.logger = logger
         callback = EngineCallback(
@@ -248,10 +263,23 @@ final class EmbeddedSingBoxRuntime {
                 .filter { $0.kind == "line" }
                 .map(\.resourceID)
         )
+        let plannedSubscriptionIDs = Set(
+            envelope.plan.tasks
+                .filter { $0.kind == "subscription" }
+                .map(\.resourceID)
+        )
         guard
             !plannedLineIDs.contains(""),
             Set(envelope.lineOutbounds.keys) == plannedLineIDs,
             envelope.lineOutbounds.values.allSatisfy({ !$0.isEmpty }),
+            !plannedSubscriptionIDs.contains(""),
+            Set(envelope.subscriptionOutbounds.keys) ==
+                plannedSubscriptionIDs,
+            envelope.subscriptionOutbounds.values.allSatisfy({ tags in
+                !tags.isEmpty &&
+                    tags.allSatisfy({ !$0.isEmpty }) &&
+                    Set(tags).count == tags.count
+            }),
             !envelope.ruleSetTags.contains(""),
             Set(envelope.ruleSetTags).count ==
                 envelope.ruleSetTags.count
@@ -267,6 +295,14 @@ final class EmbeddedSingBoxRuntime {
         guard let instance = LibboxNew(callback) else {
             throw RuntimeError.unavailable
         }
+        let anyConnectTaskID = envelope.plan.tasks.first {
+            $0.kind == "line" && $0.resourceType == "vpn"
+        }?.id
+        callback.attach(
+            engine: instance,
+            taskID: anyConnectTaskID ?? "data-plane:sing-box",
+            reporter: reporter
+        )
 #if DEBUG
         instance.setDebugRoutingProbeEnabled(true)
 #endif
@@ -306,10 +342,64 @@ final class EmbeddedSingBoxRuntime {
             reporter.setTasks(
                 kind: "line",
                 state: .ready,
-                excludingResourceType: "tailscale"
+                matchingResourceType: "direct"
             )
-            reporter.setTasks(kind: "subscription", state: .ready)
-            reporter.setTask(id: "dns:mode", state: .ready)
+            let proxyTargets = try ProxyResourceReadiness.targets(
+                plan: envelope.plan,
+                lineOutbounds: envelope.lineOutbounds,
+                subscriptionOutbounds:
+                    envelope.subscriptionOutbounds
+            )
+            try ProxyResourceReadiness.verifyConcurrently(
+                proxyTargets,
+                probe: { target, outboundTag in
+                    do {
+                        try self.checkCancellation(cancellation)
+                        var probeError: NSError?
+                        let address = instance.probeOutboundIP(
+                            outboundTag,
+                            timeoutMS: 8_000,
+                            error: &probeError
+                        )
+                        try self.checkCancellation(cancellation)
+                        guard probeError == nil, !address.isEmpty else {
+                            throw ProxyResourceReadiness.failure(
+                                target: target,
+                                reason:
+                                    probeError?.localizedDescription
+                                        ?? "exact outbound probe returned no address"
+                            )
+                        }
+                    } catch {
+                        if cancellation.isCancelled ||
+                            error is ConnectionRuntimeFailure
+                        {
+                            throw error
+                        }
+                        throw ProxyResourceReadiness.failure(
+                            target: target,
+                            reason: error.localizedDescription
+                        )
+                    }
+                    self.logger.notice(
+                        "proxy-resource-outbound-ready kind=\(target.taskKind, privacy: .public) type=\(target.resourceType, privacy: .public) resource=\(target.resourceID, privacy: .public)"
+                    )
+                },
+                markReady: { target in
+                    logger.notice(
+                        "proxy-resource-egress-ready kind=\(target.taskKind, privacy: .public) type=\(target.resourceType, privacy: .public) resource=\(target.resourceID, privacy: .public)"
+                    )
+                    reporter.note(
+                        code: target.readyCode,
+                        message: target.readyMessage,
+                        taskID: target.taskID
+                    )
+                    reporter.setTask(
+                        id: target.taskID,
+                        state: .ready
+                    )
+                }
+            )
             if let tailscale = envelope.tailscale {
                 let taskID = envelope.plan.tasks.first {
                     $0.kind == "line" &&
@@ -324,6 +414,12 @@ final class EmbeddedSingBoxRuntime {
                         cancellation: cancellation
                     )
                 } catch {
+                    if let failure =
+                        error as? ConnectionRuntimeFailure
+                    {
+                        reporter.fail(failure)
+                        throw failure
+                    }
                     let reportCode =
                         (error as? RuntimeError)?.reportCode
                             ?? "tailscale-readiness-failed"
@@ -346,11 +442,22 @@ final class EmbeddedSingBoxRuntime {
                     matchingResourceType: "tailscale"
                 )
             }
+            if envelope.anyConnect != nil {
+                try waitForAnyConnectRecovery(
+                    instance,
+                    cancellation: cancellation
+                )
+                reporter.setTasks(
+                    kind: "line",
+                    state: .ready,
+                    matchingResourceType: "vpn"
+                )
+            }
+            reporter.setTask(id: "dns:mode", state: .ready)
             try checkCancellation(cancellation)
             engineLock.lock()
             engine = instance
             engineLock.unlock()
-            callback.markRunning()
             reporter.setTask(
                 id: "data-plane:sing-box",
                 state: .ready
@@ -363,6 +470,7 @@ final class EmbeddedSingBoxRuntime {
                 ruleSetTags: Set(envelope.ruleSetTags)
             )
         } catch {
+            callback.markStopped()
             try? instance.stop()
             throw error
         }
@@ -500,6 +608,7 @@ final class EmbeddedSingBoxRuntime {
         var lastState = "NoState"
         var lastProbeError: Error?
         var lastObservedExitNode: TailscaleStatus.ExitNode?
+        var lastMagicDNSReady = false
         var lastPostProbeSample:
             (status: TailscaleStatus, node: TailscaleStatus.ExitNode)?
         var lastReadinessSummary = ""
@@ -527,6 +636,8 @@ final class EmbeddedSingBoxRuntime {
                 throw RuntimeError.invalidTailscaleStatus
             }
             lastState = status.backendState
+            lastMagicDNSReady =
+                status.backendState == "Running" && status.magicDNSReady
             let readinessSummary =
                 "controlGeneration=\(status.readiness.control.generation) " +
                 "controlClient=\(status.readiness.control.clientPresent) " +
@@ -554,6 +665,10 @@ final class EmbeddedSingBoxRuntime {
                 throw RuntimeError.tailscaleLoginRequired
             }
             if status.backendState == "Running" {
+                if target.magicDNSEnabled && !status.magicDNSReady {
+                    Thread.sleep(forTimeInterval: 0.2)
+                    continue
+                }
                 let selected = status.exitNodes.first {
                     $0.id == target.exitNode || $0.ip == target.exitNode
                 }
@@ -630,6 +745,9 @@ final class EmbeddedSingBoxRuntime {
             Thread.sleep(forTimeInterval: 0.2)
         }
         try checkCancellation(cancellation)
+        if target.magicDNSEnabled, !lastMagicDNSReady {
+            throw RuntimeError.tailscaleMagicDNSUnavailable
+        }
         if let selected = lastObservedExitNode,
             (!selected.online || !selected.selected)
         {
@@ -795,9 +913,31 @@ final class EmbeddedSingBoxRuntime {
         return (status, selected)
     }
 
+    private func waitForAnyConnectRecovery(
+        _ instance: LibboxLibbox,
+        cancellation: ConnectionCancellation
+    ) throws {
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline {
+            try checkCancellation(cancellation)
+            let diagnosticsJSON = instance.diagnostics()
+            if let data = diagnosticsJSON.data(using: .utf8),
+               let diagnostics = try? JSONDecoder().decode(
+                    RuntimeDiagnostics.self,
+                    from: data
+               ),
+               diagnostics.handshakeCompleted {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        throw RuntimeError.anyConnectRecoveryTimedOut
+    }
+
     private func checkCancellation(
         _ cancellation: ConnectionCancellation
     ) throws {
+        try callback.throwIfFailed()
         if cancellation.isCancelled {
             throw RuntimeError.cancelled
         }
@@ -822,54 +962,164 @@ private final class PreparationCallback:
 }
 
 private final class EngineCallback: NSObject, LibboxCallbackProtocol {
+    private struct DiagnosticsEnvelope: Decodable {
+        let anyConnect: AnyConnectFailureEvidence?
+
+        enum CodingKeys: String, CodingKey {
+            case anyConnect = "anyconnect"
+        }
+    }
+
     private let logger: Logger
-    private let onFatalError: @Sendable (Error) -> Void
+    private let onFatalError:
+        @Sendable (ConnectionRuntimeFailure) -> Void
     private let lock = NSLock()
-    private var running = false
+    private var gate = EngineCallbackRuntimeGate()
+    private weak var engine: LibboxLibbox?
+    private weak var reporter: ConnectionTransactionReporter?
+    private var taskID = "data-plane:sing-box"
+    private var fatalFailure: ConnectionRuntimeFailure?
 
     init(
         logger: Logger,
-        onFatalError: @escaping @Sendable (Error) -> Void
+        onFatalError:
+            @escaping @Sendable (ConnectionRuntimeFailure) -> Void
     ) {
         self.logger = logger
         self.onFatalError = onFatalError
     }
 
-    func markRunning() {
+    func attach(
+        engine: LibboxLibbox,
+        taskID: String,
+        reporter: ConnectionTransactionReporter
+    ) {
         lock.lock()
-        running = true
+        self.engine = engine
+        self.reporter = reporter
+        self.taskID = taskID
+        fatalFailure = nil
+        gate.beginStart()
         lock.unlock()
     }
 
     func markStopped() {
         lock.lock()
-        running = false
+        gate.stop()
+        engine = nil
+        reporter = nil
         lock.unlock()
     }
 
     func onStatusChanged(_ statusJSON: String?) {
+        let lineStatus: AnyConnectLineRuntimeStatus?
+        if let statusJSON,
+           let data = statusJSON.data(using: .utf8) {
+            lineStatus = try? JSONDecoder().decode(
+                AnyConnectLineRuntimeStatus.self,
+                from: data
+            )
+        } else {
+            lineStatus = nil
+        }
+        lock.lock()
+        gate.consumeStatus(statusJSON)
+        let currentReporter = reporter
+        let currentTaskID = taskID
+        lock.unlock()
+        if let lineStatus,
+           lineStatus.isAnyConnect,
+           let currentReporter {
+            switch lineStatus.state {
+            case .reconnecting:
+                currentReporter.setTask(
+                    id: currentTaskID,
+                    state: .running
+                )
+                currentReporter.note(
+                    code: "anyconnect-line-reconnecting",
+                    message:
+                        "AnyConnect 线路正在局部重连（\(lineStatus.attempt)/\(lineStatus.maxAttempts)）",
+                    taskID: currentTaskID
+                )
+            case .connected:
+                currentReporter.setTask(
+                    id: currentTaskID,
+                    state: .ready
+                )
+                currentReporter.note(
+                    code: "anyconnect-line-reconnected",
+                    message: "AnyConnect 线路已恢复，其他线路未重启",
+                    taskID: currentTaskID
+                )
+            }
+        }
         logger.notice(
             "engine-status value=\(statusJSON ?? "-", privacy: .private)"
         )
     }
 
     func onError(_ code: Int, message: String?) {
-        let error = NSError(
-            domain: "com.kafeifei.xdial.transparent-proxy",
-            code: code,
-            userInfo: [
-                NSLocalizedDescriptionKey:
-                    message ?? "sing-box data plane failed",
-            ]
-        )
-        logger.error(
-            "engine-error code=\(code) message=\(message ?? "-", privacy: .private)"
-        )
         lock.lock()
-        let shouldCancel = running
+        let shouldCancel = gate.consumeFatalError()
+        let currentEngine = engine
+        let failureTaskID = taskID
+        guard shouldCancel else {
+            lock.unlock()
+            logger.error(
+                "engine-error ignored phase=not-running code=\(code)"
+            )
+            return
+        }
+
+        let anyConnect: AnyConnectFailureEvidence?
+        if let diagnosticsJSON = currentEngine?.diagnostics(),
+           let data = diagnosticsJSON.data(using: .utf8) {
+            anyConnect = try? JSONDecoder().decode(
+                DiagnosticsEnvelope.self,
+                from: data
+            ).anyConnect
+        } else {
+            anyConnect = nil
+        }
+        let anyConnectReportCode = anyConnect?.reportCode
+        let reportCode =
+            anyConnectReportCode ?? "data-plane-failed"
+        let reportMessage: String
+        if anyConnectReportCode != nil {
+            reportMessage =
+                anyConnect?.publicFailureMessage ??
+                "AnyConnect 会话意外结束"
+        } else {
+            reportMessage =
+                message ?? "sing-box data plane failed"
+        }
+        let evidence = anyConnect.map {
+            ConnectionFailureEvidence(anyConnect: $0)
+        }
+        let failure = ConnectionRuntimeFailure(
+            code: reportCode,
+            message: reportMessage,
+            taskID: anyConnectReportCode == nil
+                ? "data-plane:sing-box"
+                : failureTaskID,
+            evidence: evidence
+        )
+        fatalFailure = failure
+        engine = nil
         lock.unlock()
-        if shouldCancel {
-            onFatalError(error)
+        logger.error(
+            "engine-error code=\(code) report-code=\(reportCode, privacy: .public)"
+        )
+        onFatalError(failure)
+    }
+
+    func throwIfFailed() throws {
+        lock.lock()
+        let failure = fatalFailure
+        lock.unlock()
+        if let failure {
+            throw failure
         }
     }
 }
@@ -883,6 +1133,7 @@ private enum RuntimeError: Error {
     case underlayEgressUnavailable(String)
     case tailscaleLoginRequired
     case tailscaleReadinessTimedOut(String)
+    case tailscaleMagicDNSUnavailable
     case tailscaleExitNodeUnavailable
     case tailscaleControlClientMissing
     case tailscaleNetInfoResetMissing
@@ -893,6 +1144,7 @@ private enum RuntimeError: Error {
     case tailscalePeerHandshakeUnavailable
     case tailscaleEgressUnavailable(String)
     case tailscaleUnavailable(String)
+    case anyConnectRecoveryTimedOut
     case lineCapabilityUnavailable
     case diagnosticsUnavailable
     case cancelled
@@ -917,6 +1169,8 @@ extension RuntimeError: LocalizedError {
             "内置 Tailscale 需要重新登录"
         case let .tailscaleReadinessTimedOut(state):
             "内置 Tailscale 出口未在 30 秒内就绪（\(state)）"
+        case .tailscaleMagicDNSUnavailable:
+            "当前 Tailnet 未启用或尚未发布可用的 MagicDNS 配置"
         case .tailscaleExitNodeUnavailable:
             "所选 Tailscale Exit Node 已离线或未被当前运行时选中"
         case .tailscaleControlClientMissing:
@@ -937,6 +1191,8 @@ extension RuntimeError: LocalizedError {
             "内置 Tailscale 出口无法承载真实流量（\(reason)）"
         case let .tailscaleUnavailable(state):
             "内置 Tailscale 不可用（\(state)）"
+        case .anyConnectRecoveryTimedOut:
+            "AnyConnect 线路未能在 60 秒内完成局部重连"
         case .lineCapabilityUnavailable:
             "所选线路不属于当前连接计划"
         case .diagnosticsUnavailable:
@@ -952,6 +1208,8 @@ extension RuntimeError: LocalizedError {
             ConnectionFailureCode.underlayEgressUnavailable
         case .tailscaleExitNodeUnavailable:
             "tailscale-exit-node-unavailable"
+        case .tailscaleMagicDNSUnavailable:
+            "tailscale-magic-dns-unavailable"
         case .tailscaleControlClientMissing:
             "tailscale-control-client-missing"
         case .tailscaleNetInfoResetMissing:
@@ -966,6 +1224,8 @@ extension RuntimeError: LocalizedError {
             "tailscale-home-derp-not-ready"
         case .tailscalePeerHandshakeUnavailable:
             "tailscale-peer-handshake-failed"
+        case .anyConnectRecoveryTimedOut:
+            "anyconnect-line-reconnect-timeout"
         default:
             "tailscale-readiness-failed"
         }

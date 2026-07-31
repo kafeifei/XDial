@@ -25,6 +25,7 @@ type tailscaleStatusPayload struct {
 	AuthURL                string                    `json:"auth_url"`
 	HealthCount            int                       `json:"health_count"`
 	ControlSelfHomePresent bool                      `json:"control_self_home_present"`
+	MagicDNSReady          bool                      `json:"magic_dns_ready"`
 	Readiness              tailscaleReadinessPayload `json:"readiness"`
 	ExitNodes              []tailscaleStatusExitNode `json:"exit_nodes"`
 }
@@ -610,8 +611,11 @@ func encodeTailscaleStatus(
 		AuthURL:                status.AuthURL,
 		HealthCount:            len(status.Health),
 		ControlSelfHomePresent: status.Self != nil && status.Self.Relay != "",
-		Readiness:              readiness,
-		ExitNodes:              make([]tailscaleStatusExitNode, 0),
+		MagicDNSReady: status.CurrentTailnet != nil &&
+			status.CurrentTailnet.MagicDNSEnabled &&
+			strings.TrimSpace(status.CurrentTailnet.MagicDNSSuffix) != "",
+		Readiness: readiness,
+		ExitNodes: make([]tailscaleStatusExitNode, 0),
 	}
 	for peerPublicKey, peer := range status.Peer {
 		if peer == nil || !peer.ExitNodeOption {

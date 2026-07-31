@@ -21,17 +21,14 @@ func TestGenerateNEConfigIncludesTailscaleEndpointWithMobileDNSDispatcher(t *tes
 	profile := config.Profile{
 		Lines: []config.Line{
 			{ID: "direct", Type: config.LineTypeDirect, Enabled: true},
-			{ID: "tailnet", Type: config.LineTypeTailscale, Enabled: true},
+			{
+				ID: "tailnet", Type: config.LineTypeTailscale, Enabled: true,
+				TailscaleMagicDNS: true,
+			},
 		},
-		RuleSets: []config.RuleSet{
-			{ID: "ts-hosts", Type: config.RuleSetTypeManual, Enabled: true, Domains: []string{"ts.example"}},
-		},
-		// tailscale DNS 分支只对被 active Mode 引用的线路生成（INV1c 声明≠生效），
-		// 本用例验证的是"用上 Tailscale 时 dispatcher 链完整"，故显式绑定。
+		// MagicDNS 只对 active Mode 引用且显式勾选的线路生成。
 		Modes: []config.Mode{{
-			ID:            "mode",
-			Bindings:      []config.RuleBinding{{RuleSetID: "ts-hosts", LineID: "tailnet"}},
-			DefaultLineID: "direct",
+			ID: "mode", DefaultLineID: "tailnet",
 		}},
 		ActiveModeID: "mode",
 		Tailscale:    config.TailscaleIdentity{Hostname: "xdial-mobile"},
@@ -64,14 +61,16 @@ func TestGenerateNEConfigIncludesTailscaleEndpointWithMobileDNSDispatcher(t *tes
 		servers[0].(map[string]interface{})["tag"] != "xdial-public-dns" ||
 		servers[1].(map[string]interface{})["type"] != "tailscale" ||
 		servers[1].(map[string]interface{})["accept_default_resolvers"] != false ||
+		servers[1].(map[string]interface{})["accept_search_domain"] != true ||
 		servers[2].(map[string]interface{})["type"] != "xdial-mobile" {
 		t.Fatalf("NetworkExtension mobile DNS chain is incomplete: %v", servers)
 	}
 	if dns["final"] != "xdial-mobile-dns" {
 		t.Fatalf("NetworkExtension DNS final must use dispatcher: %v", dns)
 	}
-	if _, exists := dns["rules"]; exists {
-		t.Fatalf("NetworkExtension must not route all DNS directly through Tailscale: %v", dns)
+	rules, ok := dns["rules"].([]interface{})
+	if !ok || len(rules) != 2 {
+		t.Fatalf("NetworkExtension must expose dynamic and short-name MagicDNS rules: %v", dns)
 	}
 	route := document["route"].(map[string]interface{})
 	if route["default_domain_resolver"] != "xdial-public-dns" {
@@ -747,6 +746,30 @@ func TestGenerateConnectionPlanIsSideEffectFreeAndCredentialFree(t *testing.T) {
 	}
 }
 
+func TestGenerateConnectionPlanRejectsUnavailableActiveProxyLine(t *testing.T) {
+	profile := config.Profile{
+		Lines: []config.Line{{
+			ID:             "anytls",
+			Name:           "AnyTLS",
+			Type:           config.LineTypeAnyTLS,
+			Enabled:        true,
+			AnyTLSServer:   "anytls.example.com",
+			AnyTLSPort:     443,
+			AnyTLSPassword: "secret",
+			TFO:            true,
+		}},
+		Modes:        []config.Mode{{ID: "mode", DefaultLineID: "anytls"}},
+		ActiveModeID: "mode",
+	}
+	profileData, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planJSON, err := GenerateConnectionPlan(string(profileData)); err == nil {
+		t.Fatalf("unavailable active proxy Line must fail before preparation, got %s", planJSON)
+	}
+}
+
 func TestActiveLineOutboundsUsesExactConnectionPlan(t *testing.T) {
 	profile := &config.Profile{
 		Lines: []config.Line{
@@ -803,6 +826,211 @@ func TestActiveLineOutboundsUsesExactConnectionPlan(t *testing.T) {
 	}
 }
 
+func TestActiveSubscriptionOutboundsUsesExactGeneratorCatalog(t *testing.T) {
+	profile := transparentProxySubscriptionCapabilityProfile()
+	plan, err := config.BuildConnectionPlan(&profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := activeSubscriptionOutbounds(&profile, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := config.BuildSubscriptionRuntimeCatalog(
+		&profile,
+		config.PlatformTransparentProxy,
+	)
+	var readinessTags []string
+	for _, subscription := range catalog.Subscriptions {
+		if subscription.ID == "active-sub" {
+			readinessTags = subscription.ReadinessTags
+			break
+		}
+	}
+	if len(readinessTags) == 0 {
+		t.Fatalf("generator catalog omitted active subscription readiness tags: %+v", catalog)
+	}
+	if !reflect.DeepEqual(got, map[string][]string{"active-sub": readinessTags}) {
+		t.Fatalf("active Subscription capabilities = %#v, want readiness tags %#v", got, readinessTags)
+	}
+	if _, loaded := got["unused-sub"]; loaded {
+		t.Fatalf("unreferenced Subscription escaped into active capabilities: %#v", got)
+	}
+}
+
+func TestActiveSubscriptionOutboundsFailsClosed(t *testing.T) {
+	t.Run("missing active runtime outbound", func(t *testing.T) {
+		profile := &config.Profile{}
+		plan := &config.ConnectionPlan{Tasks: []config.ConnectionPlanTask{{
+			ID:         "subscription:missing",
+			Kind:       config.ConnectionTaskSubscription,
+			ResourceID: "missing",
+		}}}
+		if _, err := activeSubscriptionOutbounds(profile, plan); err == nil ||
+			!strings.Contains(err.Error(), "has no runtime outbound") {
+			t.Fatalf("missing active Subscription runtime outbound must fail closed, got %v", err)
+		}
+	})
+
+	t.Run("conflicting active runtime outbounds", func(t *testing.T) {
+		profile := &config.Profile{Subscriptions: []config.Subscription{
+			{
+				ID:       "duplicate",
+				Enabled:  true,
+				Strategy: "selector",
+				Lines: []config.Line{{
+					ID: "one", Name: "One", Type: config.LineTypeTrojan, Enabled: true,
+					TrojanServer: "one.example", TrojanPort: 443, TrojanPassword: "secret",
+				}},
+				ProxyGroups: []config.ProxyGroup{{
+					Name: "First", Type: "select", Proxies: []string{"One"},
+				}},
+			},
+			{
+				ID:       "duplicate",
+				Enabled:  true,
+				Strategy: "selector",
+				Lines: []config.Line{{
+					ID: "two", Name: "Two", Type: config.LineTypeTrojan, Enabled: true,
+					TrojanServer: "two.example", TrojanPort: 443, TrojanPassword: "secret",
+				}},
+				ProxyGroups: []config.ProxyGroup{{
+					Name: "Second", Type: "select", Proxies: []string{"Two"},
+				}},
+			},
+		}}
+		plan := &config.ConnectionPlan{Tasks: []config.ConnectionPlanTask{{
+			ID:         "subscription:duplicate",
+			Kind:       config.ConnectionTaskSubscription,
+			ResourceID: "duplicate",
+		}}}
+		if _, err := activeSubscriptionOutbounds(profile, plan); err == nil ||
+			!strings.Contains(err.Error(), "conflicting runtime outbounds") {
+			t.Fatalf("conflicting active Subscription runtime outbounds must fail closed, got %v", err)
+		}
+	})
+}
+
+func TestGenerateTransparentProxySessionCarriesActiveSubscriptionOutbound(t *testing.T) {
+	profile := transparentProxySubscriptionCapabilityProfile()
+	profileData, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionJSON, err := GenerateTransparentProxySession(
+		string(profileData),
+		t.TempDir(),
+		29876,
+		"session-user",
+		"session-password",
+		"utun-underlay",
+		`["100.100.100.100"]`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var session transparentProxySession
+	if err := json.Unmarshal([]byte(sessionJSON), &session); err != nil {
+		t.Fatal(err)
+	}
+	readinessTags := session.SubscriptionOutbounds["active-sub"]
+	if len(readinessTags) == 0 {
+		t.Fatalf("active Subscription capability is missing: %#v", session.SubscriptionOutbounds)
+	}
+	mainTag := readinessTags[0]
+	if _, loaded := session.SubscriptionOutbounds["unused-sub"]; loaded {
+		t.Fatalf(
+			"unreferenced Subscription escaped into session capabilities: %#v",
+			session.SubscriptionOutbounds,
+		)
+	}
+
+	var generated config.SingBoxConfig
+	if err := json.Unmarshal([]byte(session.ConfigJSON), &generated); err != nil {
+		t.Fatal(err)
+	}
+	if final, _ := generated.Route["final"].(string); final != mainTag {
+		t.Fatalf(
+			"Subscription capability main tag %q does not match generated route.final %q",
+			mainTag,
+			final,
+		)
+	}
+	foundMainOutbound := false
+	foundAnyTLSNode := false
+	for _, outbound := range generated.Outbounds {
+		tag, _ := outbound["tag"].(string)
+		switch tag {
+		case mainTag:
+			foundMainOutbound = true
+		case "proxy-active-sub-anytls":
+			foundAnyTLSNode = outbound["type"] == "anytls"
+		}
+	}
+	if !foundMainOutbound || !foundAnyTLSNode {
+		t.Fatalf(
+			"generated data plane is missing main or AnyTLS outbound: main=%v anytls=%v",
+			foundMainOutbound,
+			foundAnyTLSNode,
+		)
+	}
+}
+
+func transparentProxySubscriptionCapabilityProfile() config.Profile {
+	return config.Profile{
+		Subscriptions: []config.Subscription{
+			{
+				ID:       "active-sub",
+				Name:     "Active AnyTLS",
+				Enabled:  true,
+				Strategy: "selector",
+				Lines: []config.Line{{
+					ID:             "anytls",
+					Name:           "AnyTLS",
+					Type:           config.LineTypeAnyTLS,
+					Enabled:        true,
+					AnyTLSServer:   "anytls.example.com",
+					AnyTLSPort:     443,
+					AnyTLSPassword: "secret",
+				}},
+				ProxyGroups: []config.ProxyGroup{
+					{
+						Name: "Unavailable",
+						Type: "select",
+						Proxies: []string{
+							"Missing",
+						},
+					},
+					{
+						Name:     "Primary",
+						Type:     "select",
+						Proxies:  []string{"AnyTLS"},
+						Selected: "AnyTLS",
+					},
+				},
+			},
+			{
+				ID:       "unused-sub",
+				Name:     "Unused",
+				Enabled:  true,
+				Strategy: "selector",
+				Lines: []config.Line{{
+					ID: "unused", Name: "Unused", Type: config.LineTypeTrojan, Enabled: true,
+					TrojanServer: "unused.example", TrojanPort: 443, TrojanPassword: "secret",
+				}},
+			},
+		},
+		Modes: []config.Mode{{
+			ID:                    "mode",
+			Name:                  "Subscription",
+			DefaultSubscriptionID: "active-sub",
+		}},
+		ActiveModeID: "mode",
+	}
+}
+
 func TestActiveRouteRuleSetTagsComeFromGeneratedDataPlane(t *testing.T) {
 	got, err := activeRouteRuleSetTags([]byte(`{
 		"route": {
@@ -830,6 +1058,7 @@ func TestGenerateTransparentProxySessionCarriesActiveTailscaleReadinessTarget(t 
 				Type:              config.LineTypeTailscale,
 				Enabled:           true,
 				TailscaleExitNode: "100.64.0.9",
+				TailscaleMagicDNS: true,
 			},
 		},
 		RuleSets: []config.RuleSet{{
@@ -870,7 +1099,8 @@ func TestGenerateTransparentProxySessionCarriesActiveTailscaleReadinessTarget(t 
 	}
 	if session.Tailscale == nil ||
 		session.Tailscale.EndpointTag != "tailscale-japan" ||
-		session.Tailscale.ExitNode != "100.64.0.9" {
+		session.Tailscale.ExitNode != "100.64.0.9" ||
+		!session.Tailscale.MagicDNSEnabled {
 		t.Fatalf("Tailscale readiness target is incomplete: %+v", session.Tailscale)
 	}
 	if !reflect.DeepEqual(session.LineOutbounds, map[string]string{
@@ -878,5 +1108,72 @@ func TestGenerateTransparentProxySessionCarriesActiveTailscaleReadinessTarget(t 
 		"japan":  "tailscale-japan",
 	}) {
 		t.Fatalf("active Line capabilities are incomplete: %#v", session.LineOutbounds)
+	}
+}
+
+func TestGenerateTransparentProxySessionCarriesMagicDNSToggle(t *testing.T) {
+	profile := config.Profile{
+		Lines: []config.Line{
+			{
+				ID: "tailnet", Type: config.LineTypeTailscale, Enabled: true,
+				TailscaleExitNode: "100.64.0.9", TailscaleMagicDNS: true,
+			},
+		},
+		Modes: []config.Mode{{
+			ID: "mode", DefaultLineID: "tailnet",
+		}},
+		ActiveModeID: "mode",
+	}
+	profileData, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionJSON, err := GenerateTransparentProxySession(
+		string(profileData),
+		t.TempDir(),
+		29876,
+		"session-user",
+		"session-password",
+		"utun-underlay",
+		`["100.100.100.100"]`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var session transparentProxySession
+	if err := json.Unmarshal([]byte(sessionJSON), &session); err != nil {
+		t.Fatal(err)
+	}
+	if session.Tailscale == nil ||
+		session.Tailscale.EndpointTag != "tailscale-tailnet" ||
+		session.Tailscale.ExitNode != "100.64.0.9" ||
+		!session.Tailscale.MagicDNSEnabled {
+		t.Fatalf("MagicDNS readiness target is incomplete: %+v", session.Tailscale)
+	}
+}
+
+func TestGenerateTransparentProxySessionStillRequiresExitNodeWithMagicDNS(t *testing.T) {
+	profile := config.Profile{
+		Lines: []config.Line{{
+			ID: "tailnet", Type: config.LineTypeTailscale, Enabled: true,
+			TailscaleMagicDNS: true,
+		}},
+		Modes:        []config.Mode{{ID: "mode", DefaultLineID: "tailnet"}},
+		ActiveModeID: "mode",
+	}
+	profileData, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GenerateTransparentProxySession(
+		string(profileData),
+		t.TempDir(),
+		29876,
+		"session-user",
+		"session-password",
+		"utun-underlay",
+		`["100.100.100.100"]`,
+	); err == nil || !strings.Contains(err.Error(), "exit node is missing") {
+		t.Fatalf("Tailscale without an Exit Node was accepted: %v", err)
 	}
 }
