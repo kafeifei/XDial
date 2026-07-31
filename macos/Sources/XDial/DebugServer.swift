@@ -145,6 +145,8 @@ final class DebugServer {
         dict["language"] = s.language.rawValue
         dict["launchAtLogin"] = s.launchAtLogin
         dict["autoConnect"] = s.autoConnect
+        dict["wakeReconnectPhase"] =
+            s.wakeReconnectPhase?.rawValue ?? ""
         dict["activeModeID"] = s.profile.activeModeID
         // 配置改了但引擎还在跑旧快照 —— 验收改动是否真正生效必须看这个
         dict["configDirty"] = s.configDirty

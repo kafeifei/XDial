@@ -60,6 +60,8 @@ final class AppState: ObservableObject {
     private var sleepWakeIntent = SleepWakeConnectionIntent()
     private var wakeReconnectGeneration = 0
     private var wakeReconnectTask: Task<Void, Never>?
+    @Published private(set) var wakeReconnectPhase:
+        WakeReconnectPhase?
     private var systemIsSleeping = false
     private var initialStatusSynchronized = false
     private var launchAutoConnectPending = false
@@ -90,7 +92,17 @@ final class AppState: ObservableObject {
     }
 
     var isConnected: Bool { engine.isConnected }
-    var isBusy: Bool { engine.isBusy }
+    var isBusy: Bool {
+        engine.isBusy || wakeReconnectPhase != nil
+    }
+
+    var presentedConnectionReport: ConnectionReport? {
+        if let wakeReconnectPhase,
+           !wakeReconnectPhase.presentsConnectionReport {
+            return nil
+        }
+        return engine.presentedConnectionReport
+    }
 
     func tailscaleConfigurationStatus(
         for lineID: String
@@ -228,7 +240,9 @@ final class AppState: ObservableObject {
     }
 
     var canConnect: Bool {
-        guard !isBusy else { return false }
+        // 宿主的唤醒恢复态会让 UI 显示忙碌，但它最终仍要进入这里发起连接。
+        // 真正阻止新事务的只能是引擎自身的连接/断开状态。
+        guard !engine.isBusy else { return false }
         guard installation.isReady else { return false }
         guard let s = activeMode else { return false }
         // 必须有效的 VPN 凭据（如果模式用到 VPN）
@@ -248,6 +262,12 @@ final class AppState: ObservableObject {
     }
 
     var statusText: String {
+        if let wakeReconnectPhase {
+            return tr(
+                wakeReconnectPhase.zhStatusText,
+                wakeReconnectPhase.enStatusText
+            )
+        }
         switch engine.status {
         case "connected": return tr("已连接", "Connected")
         case "connecting":
@@ -262,7 +282,7 @@ final class AppState: ObservableObject {
             }
             return tr("正在重连…", "Reconnecting…")
         default:
-            if let report = engine.presentedConnectionReport,
+            if let report = presentedConnectionReport,
                let failure = report.error,
                !failure.message.isEmpty {
                 return failure.message
@@ -379,6 +399,12 @@ final class AppState: ObservableObject {
                     guard let self else { return }
                     let status = self.engine.status
                     let report = self.engine.connectionReport
+                    if self.wakeReconnectPhase == .startingConnection,
+                       AutomaticConnectionPolicy.holdsConnectionIntent(
+                           runtimeStatus: status
+                       ) {
+                        self.wakeReconnectPhase = nil
+                    }
                     if status == "connected", let report {
                         self.markUsedLinesVerified(report: report)
                     }
@@ -612,6 +638,7 @@ final class AppState: ObservableObject {
         wakeReconnectGeneration += 1
         let generation = wakeReconnectGeneration
         wakeReconnectTask?.cancel()
+        wakeReconnectPhase = .finishingDisconnect
         appLog("system did wake: waiting for network before reconnect")
         wakeReconnectTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -629,6 +656,7 @@ final class AppState: ObservableObject {
                 generation == self.wakeReconnectGeneration
             else {
                 if generation == self.wakeReconnectGeneration {
+                    self.wakeReconnectPhase = nil
                     self.engine.lastError = self.tr(
                         "唤醒后无法完成断开，请手动重连",
                         "Could not finish disconnecting after wake; reconnect manually"
@@ -637,6 +665,7 @@ final class AppState: ObservableObject {
                 return
             }
 
+            self.wakeReconnectPhase = .waitingForNetwork
             let networkReady = await NetworkAvailabilityWaiter.wait(
                 timeout: 8
             )
@@ -651,15 +680,20 @@ final class AppState: ObservableObject {
                         + "starting bounded connection transaction"
                 )
             }
-            guard self.engine.status == "disconnected" else { return }
+            guard self.engine.status == "disconnected" else {
+                self.wakeReconnectPhase = nil
+                return
+            }
             guard self.canConnect else {
                 self.engine.lastError = self.tr(
                     "唤醒后无法自动连接，请检查当前模式配置",
                     "Could not reconnect after wake; check the active Mode configuration"
                 )
+                self.wakeReconnectPhase = nil
                 return
             }
             appLog("wake reconnect started")
+            self.wakeReconnectPhase = .startingConnection
             self.connectAutomatically()
         }
     }
@@ -681,6 +715,7 @@ final class AppState: ObservableObject {
         wakeReconnectGeneration += 1
         wakeReconnectTask?.cancel()
         wakeReconnectTask = nil
+        wakeReconnectPhase = nil
         if clearIntent {
             sleepWakeIntent.cancel()
         }
