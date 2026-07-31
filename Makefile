@@ -84,8 +84,8 @@ test-patched-sslcon: $(PATCHED_WORKFILE)
 		GOWORK='$(PATCHED_WORKFILE)' GOFLAGS= go test -race \
 			./session ./vpn -count=1
 
-test: $(PATCHED_WORKFILE) test-patched-tailscale test-patched-sing-box test-patched-sslcon
-	$(PATCHED_GO_ENV) go test -tags '$(MOBILE_LIBBOX_TAGS)' ./core/... -v -count=1
+test: $(PATCHED_WORKFILE) test-patched-tailscale test-patched-sing-box test-patched-sslcon sing-box-test-validator
+	PATH="$(dir $(SING_BOX_TEST_BINARY)):$(PATH)" $(PATCHED_GO_ENV) go test -tags '$(MOBILE_LIBBOX_TAGS)' ./core/... -v -count=1
 
 test-macos-transaction:
 	@! rg -n 'probeNetwork|127\.0\.0\.1:9090|test-out' macos/Sources/XDial
@@ -103,8 +103,8 @@ test-macos-transaction:
 		-configuration Debug -destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-tests test
 
-test-smoke: $(PATCHED_WORKFILE)
-	$(PATCHED_GO_ENV) go test ./core/config/ -run TestSmoke -v -count=1 -timeout 120s
+test-smoke: $(PATCHED_WORKFILE) sing-box-test-validator
+	PATH="$(dir $(SING_BOX_TEST_BINARY)):$(PATH)" $(PATCHED_GO_ENV) go test ./core/config/ -run TestSmoke -v -count=1 -timeout 120s
 
 all: cli app
 
