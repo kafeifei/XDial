@@ -382,10 +382,10 @@ func generateSingBox(
 	routeRules = append(routeRules, ordinaryModeRules...)
 
 	// 用户在 active Tailscale Line 上勾选 MagicDNS 后，才加入
-	// endpoint 根据当前 NetMap 动态申报的域名与 peer 地址归属。
-	// 它排在 Mode 的显式规则之后，避免 Tailnet 分域 DNS 与用户的
-	// CDN/企业域名绑定重叠时抢走用户裁决；又排在订阅供给规则
-	// 之前，保证常见的大范围订阅规则不会吞掉 Tailnet 节点。
+	// endpoint 根据当前 NetMap 动态申报的 peer 路由归属。这里只是
+	// route 优先级：Mode 显式绑定仍在前，MagicDNS 路由在订阅供给
+	// 规则之前。DNS 快照的最高优先级由 buildTransparentProxyDNS
+	// 独立表达，不得从本段 route 顺序反推。
 	routeRules = append(routeRules, buildMagicDNSRouteRules(
 		activeMagicDNSTags,
 		platform.isTransparentProxy(),
@@ -867,9 +867,8 @@ func buildDNS(
 		rules = append(rules, rule)
 	}
 
-	// 只有 active Mode 实际引用的 Tailscale Line 显式勾选 MagicDNS 时才启用。
-	// preferred_by 从 endpoint 的当前 NetMap 动态读取分域归属；短节点名由
-	// accept_search_domain 依次追加 Tailscale 搜索域。两者都不接受公共回落。
+	// 历史外部进程路径没有 Provider Prepare 阶段的内存快照注入接口，
+	// 暂保留 endpoint 原生 DNS；新的 hosts 密封语义只在 Transparent Proxy 生效。
 	for _, endpointTag := range magicDNSEndpointTags {
 		serverTag := mobileTailscaleDNSTag(endpointTag)
 		servers = append(servers, buildTailnetDNSServer(endpointTag))
@@ -959,16 +958,22 @@ func buildTransparentProxyDNS(
 		transparentSystemDNSTag: true,
 		desktopPublicDNSTag:     needsProxyEndpointBootstrap,
 	}
+	// 运行期快照归属必须先于 Mode 中的普通 DNS 分域求值。
+	// 这里只安装空的纯内存 hosts transport 与静态 preferred_by
+	// 规则；精确记录和 owned suffix 由 Provider 在 sing-box instance
+	// Start 之后、系统网络 Commit 之前注入。
+	for _, endpointTag := range magicDNSEndpointTags {
+		serverTag := TailscaleMagicDNSDNSServerTag(endpointTag)
+		servers = append(servers, buildTailnetHostsDNSServer(endpointTag))
+		seenResolver[serverTag] = true
+		rules = append(rules, buildTailnetHostsDNSRules(serverTag)...)
+	}
 
-	ensureResolver := func(resolverTag, outTag string, tailnet bool) {
+	ensureResolver := func(resolverTag, outTag string) {
 		if seenResolver[resolverTag] {
 			return
 		}
 		seenResolver[resolverTag] = true
-		if tailnet {
-			servers = append(servers, buildTailnetDNSServer(outTag))
-			return
-		}
 		switch resolverTag {
 		case transparentEnterpriseDNSTag:
 			servers = append(servers, map[string]interface{}{
@@ -1004,19 +1009,11 @@ func buildTransparentProxyDNS(
 		switch ruleSet.Type {
 		case RuleSetTypeManual:
 			if len(ruleSet.Domains) > 0 {
-				ensureResolver(resolverTag, outTag, false)
+				ensureResolver(resolverTag, outTag)
 				if dnsRulesOpen {
 					rules = append(rules, map[string]interface{}{
 						"domain_suffix": ruleSet.Domains,
 						"server":        resolverTag,
-					})
-				} else if len(magicDNSEndpointTags) > 0 {
-					// 这条域名 binding 位于 IP/混合规则之后，按既定
-					// 保守语义仍用启动前系统 DNS。显式列出它可防止
-					// 后续 MagicDNS 对重叠后缀取得优先权。
-					rules = append(rules, map[string]interface{}{
-						"domain_suffix": ruleSet.Domains,
-						"server":        transparentSystemDNSTag,
 					})
 				}
 			}
@@ -1031,18 +1028,11 @@ func buildTransparentProxyDNS(
 				dnsRulesOpen = false
 				continue
 			}
-			ensureResolver(resolverTag, outTag, false)
+			ensureResolver(resolverTag, outTag)
 			if dnsRulesOpen {
 				rule := map[string]interface{}{
 					"rule_set": sbRuleSetTag(ruleSet),
 					"server":   resolverTag,
-				}
-				applyURLRuleSetInvert(rule, ruleSet)
-				rules = append(rules, rule)
-			} else if len(magicDNSEndpointTags) > 0 {
-				rule := map[string]interface{}{
-					"rule_set": sbRuleSetTag(ruleSet),
-					"server":   transparentSystemDNSTag,
 				}
 				applyURLRuleSetInvert(rule, ruleSet)
 				rules = append(rules, rule)
@@ -1062,7 +1052,7 @@ func buildTransparentProxyDNS(
 				continue
 			}
 			if rule.outTag == rejectTag {
-				if dnsRulesOpen || len(magicDNSEndpointTags) > 0 {
+				if dnsRulesOpen {
 					rules = append(rules, map[string]interface{}{
 						rule.matchKey: rule.values,
 						"action":      "reject",
@@ -1071,32 +1061,18 @@ func buildTransparentProxyDNS(
 				continue
 			}
 			resolverTag := transparentProxyResolverForOutbound(rule.outTag)
-			ensureResolver(resolverTag, rule.outTag, false)
+			ensureResolver(resolverTag, rule.outTag)
 			if dnsRulesOpen {
 				rules = append(rules, map[string]interface{}{
 					rule.matchKey: rule.values,
 					"server":      resolverTag,
 				})
-			} else if len(magicDNSEndpointTags) > 0 {
-				rules = append(rules, map[string]interface{}{
-					rule.matchKey: rule.values,
-					"server":      transparentSystemDNSTag,
-				})
 			}
 		}
 	}
 
-	// MagicDNS 是 Line 上的显式能力开关，不是 RuleSet。它位于当前
-	// Mode 与订阅的显式 DNS 规则之后：重叠域名由用户绑定优先，
-	// 其余 MagicDNS 名称和单标签节点名才由 Tailscale 原生解析器回答。
-	for _, endpointTag := range magicDNSEndpointTags {
-		serverTag := mobileTailscaleDNSTag(endpointTag)
-		ensureResolver(serverTag, endpointTag, true)
-		rules = append(rules, buildTailnetDNSRules(serverTag)...)
-	}
-
 	defaultResolverTag := transparentProxyResolverForOutbound(defaultOutboundTag)
-	ensureResolver(defaultResolverTag, defaultOutboundTag, false)
+	ensureResolver(defaultResolverTag, defaultOutboundTag)
 	dnsConfig := map[string]interface{}{
 		"servers":           servers,
 		"final":             defaultResolverTag,
@@ -1132,8 +1108,15 @@ func validateTransparentProxySystemDNS(systemDNS []string) (string, error) {
 	return primary, nil
 }
 
-func mobileTailscaleDNSTag(endpointTag string) string {
+// TailscaleMagicDNSDNSServerTag exposes the exact DNS transport tag generated
+// for an active Tailscale endpoint. Platform consumers must use this exported
+// value instead of reimplementing the tag rule.
+func TailscaleMagicDNSDNSServerTag(endpointTag string) string {
 	return "xdial-dns-" + endpointTag
+}
+
+func mobileTailscaleDNSTag(endpointTag string) string {
+	return TailscaleMagicDNSDNSServerTag(endpointTag)
 }
 
 func buildTailnetDNSServer(endpointTag string) map[string]interface{} {
@@ -1143,6 +1126,18 @@ func buildTailnetDNSServer(endpointTag string) map[string]interface{} {
 		"endpoint":                 endpointTag,
 		"accept_default_resolvers": false,
 		"accept_search_domain":     true,
+	}
+}
+
+func buildTailnetHostsDNSServer(endpointTag string) map[string]interface{} {
+	return map[string]interface{}{
+		"type": "hosts",
+		"tag":  TailscaleMagicDNSDNSServerTag(endpointTag),
+		// upstream hosts 在 path 为空时会默认读取系统 hosts 文件。
+		// patched memory_only 是一个显式、跨平台的密封开关：禁止
+		// 任何文件输入，只接受本次会话在内存中注入的快照。
+		"memory_only": true,
+		"predefined":  map[string][]string{},
 	}
 }
 
@@ -1159,25 +1154,29 @@ func buildTailnetDNSRules(serverTag string) []map[string]interface{} {
 	}
 }
 
+func buildTailnetHostsDNSRules(serverTag string) []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"preferred_by":  serverTag,
+			"server":        serverTag,
+			"disable_cache": true,
+		},
+	}
+}
+
 func buildMagicDNSRouteRules(
 	endpointTags []string,
 	resolveBeforeRoute bool,
 ) (rules []map[string]interface{}) {
 	for _, endpointTag := range endpointTags {
 		if resolveBeforeRoute {
-			resolverTag := mobileTailscaleDNSTag(endpointTag)
-			rules = append(rules,
-				map[string]interface{}{
-					"domain_regex": []string{tailnetSingleLabelDomainRegex},
-					"action":       "resolve",
-					"server":       resolverTag,
-				},
-				map[string]interface{}{
-					"preferred_by": endpointTag,
-					"action":       "resolve",
-					"server":       resolverTag,
-				},
-			)
+			resolverTag := TailscaleMagicDNSDNSServerTag(endpointTag)
+			rules = append(rules, map[string]interface{}{
+				"preferred_by":  resolverTag,
+				"action":        "resolve",
+				"server":        resolverTag,
+				"disable_cache": true,
+			})
 		}
 		rules = append(rules, map[string]interface{}{
 			"preferred_by": endpointTag,

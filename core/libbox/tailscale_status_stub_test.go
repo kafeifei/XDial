@@ -18,6 +18,17 @@ func TestTailscaleStatusUnavailableWithoutMobileDataPlane(t *testing.T) {
 	}
 }
 
+func TestPrepareTailscaleDNSUnavailableWithoutMobileDataPlane(t *testing.T) {
+	engine := New(nil)
+	_, err := engine.PrepareTailscaleDNS("private-endpoint-name", "private-dns-server")
+	if err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("expected unavailable error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "private-endpoint-name") || strings.Contains(err.Error(), "private-dns-server") {
+		t.Fatalf("error leaked runtime tags: %v", err)
+	}
+}
+
 func TestTailscaleLogoutUnavailableWithoutMobileDataPlane(t *testing.T) {
 	engine := New(nil)
 	err := engine.TailscaleLogout("private-endpoint-name")

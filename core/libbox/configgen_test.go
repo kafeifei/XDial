@@ -16,6 +16,41 @@ import (
 	"github.com/kafeifei/xdial/core/config"
 )
 
+func TestStartStandaloneRouteResolvePreferredByMemoryDNS(t *testing.T) {
+	platform := &xdPlatformInterface{}
+	platform.setDefaultInterface("test0", 1)
+	instance := &Libbox{platform: platform}
+	configJSON := `{
+		"log":{"disabled":true},
+		"dns":{
+			"servers":[{
+				"type":"hosts",
+				"tag":"memory-dns",
+				"memory_only":true,
+				"predefined":{"member":["100.64.0.8"]}
+			}],
+			"final":"memory-dns"
+		},
+		"inbounds":[],
+		"outbounds":[{"type":"direct","tag":"direct"}],
+		"route":{
+			"rules":[{
+				"preferred_by":"memory-dns",
+				"action":"resolve",
+				"server":"memory-dns",
+				"disable_cache":true
+			}],
+			"final":"direct"
+		}
+	}`
+	if err := instance.StartStandalone(configJSON); err != nil {
+		t.Fatalf("start route resolve with memory DNS ownership: %v", err)
+	}
+	if err := instance.Stop(); err != nil {
+		t.Fatalf("stop route resolve with memory DNS ownership: %v", err)
+	}
+}
+
 func TestGenerateNEConfigIncludesTailscaleEndpointWithMobileDNSDispatcher(t *testing.T) {
 	basePath := t.TempDir()
 	profile := config.Profile{
@@ -1100,7 +1135,8 @@ func TestGenerateTransparentProxySessionCarriesActiveTailscaleReadinessTarget(t 
 	if session.Tailscale == nil ||
 		session.Tailscale.EndpointTag != "tailscale-japan" ||
 		session.Tailscale.ExitNode != "100.64.0.9" ||
-		!session.Tailscale.MagicDNSEnabled {
+		!session.Tailscale.MagicDNSEnabled ||
+		session.Tailscale.DNSServerTag != config.TailscaleMagicDNSDNSServerTag("tailscale-japan") {
 		t.Fatalf("Tailscale readiness target is incomplete: %+v", session.Tailscale)
 	}
 	if !reflect.DeepEqual(session.LineOutbounds, map[string]string{
@@ -1147,7 +1183,8 @@ func TestGenerateTransparentProxySessionCarriesMagicDNSToggle(t *testing.T) {
 	if session.Tailscale == nil ||
 		session.Tailscale.EndpointTag != "tailscale-tailnet" ||
 		session.Tailscale.ExitNode != "100.64.0.9" ||
-		!session.Tailscale.MagicDNSEnabled {
+		!session.Tailscale.MagicDNSEnabled ||
+		session.Tailscale.DNSServerTag != config.TailscaleMagicDNSDNSServerTag("tailscale-tailnet") {
 		t.Fatalf("MagicDNS readiness target is incomplete: %+v", session.Tailscale)
 	}
 }

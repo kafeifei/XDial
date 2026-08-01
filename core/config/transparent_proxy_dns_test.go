@@ -409,23 +409,25 @@ func TestTransparentProxyMagicDNSToggleCompilesDynamicDNSAndPeerRoutes(t *testin
 		Modes: []Mode{{
 			ID: "mode",
 			Bindings: []RuleBinding{
-				{RuleSetID: "ip-first", LineID: "direct"},
 				{RuleSetID: "cdn", LineID: "direct"},
+				{RuleSetID: "ip-first", LineID: "direct"},
 			},
 			DefaultLineID: "tailnet",
 		}},
 		ActiveModeID: "mode",
 	}
 
+	profile.Lines[1].TailscaleMagicDNS = false
+	withoutMagicDNS, _ := generateTransparentProxyDNSTestConfig(t, profile)
+	profile.Lines[1].TailscaleMagicDNS = true
 	cfg, raw := generateTransparentProxyDNSTestConfig(t, profile)
-	resolverTag := mobileTailscaleDNSTag("tailscale-tailnet")
+	resolverTag := TailscaleMagicDNSDNSServerTag("tailscale-tailnet")
 	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
-		`{"action":"resolve","server":"xdial-system-dns"}`,
-		`{"ip_cidr":["203.0.113.0/24"],"outbound":"direct"}`,
 		`{"action":"resolve","domain_suffix":["cdn.example.com"],"server":"xdial-system-dns"}`,
 		`{"domain_suffix":["cdn.example.com"],"outbound":"direct"}`,
-		`{"action":"resolve","domain_regex":["^[^.]+$"],"server":"` + resolverTag + `"}`,
-		`{"action":"resolve","preferred_by":"tailscale-tailnet","server":"` + resolverTag + `"}`,
+		`{"action":"resolve","server":"xdial-system-dns"}`,
+		`{"ip_cidr":["203.0.113.0/24"],"outbound":"direct"}`,
+		`{"action":"resolve","disable_cache":true,"preferred_by":"` + resolverTag + `","server":"` + resolverTag + `"}`,
 		`{"outbound":"tailscale-tailnet","preferred_by":"tailscale-tailnet"}`,
 		`{"action":"resolve","server":"proxy-dns-tailscale-tailnet"}`,
 	})
@@ -434,31 +436,61 @@ func TestTransparentProxyMagicDNSToggleCompilesDynamicDNSAndPeerRoutes(t *testin
 	if len(servers) != 3 {
 		t.Fatalf("expected system, Tailscale, and default-Line DNS servers, got %v", servers)
 	}
+	for _, rawServer := range servers {
+		server := rawServer.(map[string]interface{})
+		if server["type"] == "tailscale" {
+			t.Fatalf("MagicDNS must not instantiate the inline Tailscale DNS service: %v", server)
+		}
+	}
 	tailnetDNS := servers[1].(map[string]interface{})
-	if tailnetDNS["type"] != "tailscale" ||
+	if tailnetDNS["type"] != "hosts" ||
 		tailnetDNS["tag"] != resolverTag ||
-		tailnetDNS["endpoint"] != "tailscale-tailnet" ||
-		tailnetDNS["accept_default_resolvers"] != false ||
-		tailnetDNS["accept_search_domain"] != true {
-		t.Fatalf("unexpected Tailnet DNS server: %v", tailnetDNS)
+		tailnetDNS["memory_only"] != true {
+		t.Fatalf("unexpected in-memory Tailnet hosts server: %v", tailnetDNS)
+	}
+	if _, exists := tailnetDNS["path"]; exists {
+		t.Fatalf("in-memory Tailnet hosts server must not read files: %v", tailnetDNS)
+	}
+	if predefined, ok := tailnetDNS["predefined"].(map[string]interface{}); !ok || len(predefined) != 0 {
+		t.Fatalf("generated Tailnet hosts snapshot must start empty: %v", tailnetDNS)
 	}
 	dnsRules := cfg.DNS["rules"].([]interface{})
-	if len(dnsRules) != 3 {
-		t.Fatalf("expected explicit CDN followed by dynamic MagicDNS rules, got %v", dnsRules)
+	if len(dnsRules) != 2 {
+		t.Fatalf("expected highest-priority MagicDNS followed by explicit CDN DNS, got %v", dnsRules)
 	}
 	first := dnsRules[0].(map[string]interface{})
 	second := dnsRules[1].(map[string]interface{})
-	third := dnsRules[2].(map[string]interface{})
-	if first["server"] != transparentSystemDNSTag ||
-		!reflect.DeepEqual(first["domain_suffix"], []interface{}{"cdn.example.com"}) {
-		t.Fatalf("explicit CDN DNS ownership must precede MagicDNS: %v", dnsRules)
+	if first["preferred_by"] != resolverTag || first["server"] != resolverTag || first["disable_cache"] != true {
+		t.Fatalf("MagicDNS ownership must be first, dynamic, and uncached: %v", first)
 	}
-	if second["preferred_by"] != resolverTag || second["server"] != resolverTag {
-		t.Fatalf("MagicDNS ownership is not dynamic: %v", second)
+	if second["server"] != transparentSystemDNSTag ||
+		!reflect.DeepEqual(second["domain_suffix"], []interface{}{"cdn.example.com"}) {
+		t.Fatalf("ordinary Mode DNS ownership must follow MagicDNS: %v", dnsRules)
 	}
-	if third["server"] != resolverTag ||
-		!reflect.DeepEqual(third["domain_regex"], []interface{}{tailnetSingleLabelDomainRegex}) {
-		t.Fatalf("short Tailnet names are not routed to MagicDNS: %v", third)
+	ordinaryDNS := func(source SingBoxConfig) map[string]interface{} {
+		servers := make([]interface{}, 0)
+		for _, rawServer := range source.DNS["servers"].([]interface{}) {
+			server := rawServer.(map[string]interface{})
+			if server["tag"] != resolverTag {
+				servers = append(servers, server)
+			}
+		}
+		rules := make([]interface{}, 0)
+		for _, rawRule := range source.DNS["rules"].([]interface{}) {
+			rule := rawRule.(map[string]interface{})
+			if rule["preferred_by"] != resolverTag {
+				rules = append(rules, rule)
+			}
+		}
+		return map[string]interface{}{
+			"servers":           servers,
+			"rules":             rules,
+			"final":             source.DNS["final"],
+			"independent_cache": source.DNS["independent_cache"],
+		}
+	}
+	if before, after := ordinaryDNS(withoutMagicDNS), ordinaryDNS(cfg); !reflect.DeepEqual(before, after) {
+		t.Fatalf("enabling MagicDNS changed unrelated DNS behavior:\n--- before ---\n%v\n--- after ---\n%v", before, after)
 	}
 	for _, forbidden := range []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"} {
 		if strings.Contains(string(raw), forbidden) {
