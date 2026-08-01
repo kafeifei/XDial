@@ -23,6 +23,7 @@ final class EmbeddedSingBoxRuntime {
         let credentials: SOCKSCredentials
         let lineOutbounds: [String: String]
         let ruleSetTags: Set<String>
+        let dnsCaptureDomains: [String]
     }
 
     private struct SessionEnvelope: Decodable {
@@ -400,13 +401,14 @@ final class EmbeddedSingBoxRuntime {
                     )
                 }
             )
+            var dnsCaptureDomains: [String] = []
             if let tailscale = envelope.tailscale {
                 let taskID = envelope.plan.tasks.first {
                     $0.kind == "line" &&
                         $0.resourceType == "tailscale"
                 }?.id ?? "data-plane:sing-box"
                 do {
-                    try waitForTailscale(
+                    dnsCaptureDomains = try waitForTailscale(
                         instance,
                         target: tailscale,
                         reporter: reporter,
@@ -467,7 +469,8 @@ final class EmbeddedSingBoxRuntime {
                 port: port,
                 credentials: credentials,
                 lineOutbounds: envelope.lineOutbounds,
-                ruleSetTags: Set(envelope.ruleSetTags)
+                ruleSetTags: Set(envelope.ruleSetTags),
+                dnsCaptureDomains: dnsCaptureDomains
             )
         } catch {
             callback.markStopped()
@@ -588,7 +591,7 @@ final class EmbeddedSingBoxRuntime {
         reporter: ConnectionTransactionReporter,
         taskID: String,
         cancellation: ConnectionCancellation
-    ) throws {
+    ) throws -> [String] {
         try checkCancellation(cancellation)
         var underlayProbeError: NSError?
         let underlayAddress = instance.probeOutboundIP(
@@ -697,7 +700,32 @@ final class EmbeddedSingBoxRuntime {
                         logger.notice(
                             "tailscale-ready endpoint=\(target.endpointTag, privacy: .public)"
                         )
-                        return
+                        if !target.magicDNSEnabled {
+                            return []
+                        }
+                        var domainsError: NSError?
+                        let domainsJSON =
+                            instance.tailscaleDNSCaptureDomains(
+                                target.endpointTag,
+                                error: &domainsError
+                            )
+                        if let domainsError {
+                            throw domainsError
+                        }
+                        guard
+                            let domainsData = domainsJSON.data(
+                                using: .utf8
+                            ),
+                            let domains = try? JSONDecoder().decode(
+                                [String].self,
+                                from: domainsData
+                            )
+                        else {
+                            throw RuntimeError.invalidTailscaleStatus
+                        }
+                        return try TransparentProxyDNSCapturePlan.validate(
+                            domains
+                        )
                     }
                     if let latest = latestSelectedExitNode(
                             instance,

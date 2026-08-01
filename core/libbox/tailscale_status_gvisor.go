@@ -251,6 +251,21 @@ func (l *Libbox) TailscaleStatus(endpointTag string) (string, error) {
 	)
 }
 
+// TailscaleDNSCaptureDomains returns the current endpoint-owned DNS suffixes,
+// exact hosts and single-label aliases for the Provider's ingress rules. It is
+// deliberately separate from TailscaleStatus so setup/UI status stays redacted.
+func (l *Libbox) TailscaleDNSCaptureDomains(endpointTag string) (string, error) {
+	endpoint, _, _, err := l.tailscaleRuntime(endpointTag)
+	if err != nil {
+		return "", err
+	}
+	data, err := json.Marshal(endpoint.DNSCaptureDomains())
+	if err != nil {
+		return "", fmt.Errorf("Tailscale DNS capture domains are unavailable")
+	}
+	return string(data), nil
+}
+
 // ProbeTailscalePeer distinguishes path discovery from authenticated
 // WireGuard traffic to one exact peer. It deliberately returns only path
 // class, latency and a bounded error class; public endpoints, DERP regions,

@@ -1,0 +1,69 @@
+diff --git a/protocol/tailscale/dns_transport.go b/protocol/tailscale/dns_transport.go
+--- a/protocol/tailscale/dns_transport.go
++++ b/protocol/tailscale/dns_transport.go
+@@ -261,14 +261,26 @@ func (t *DNSTransport) PreferredDomain(domain string) bool {
+ 	t.access.RLock()
+ 	hosts := t.hosts
+ 	routes := t.routes
++	searchDomains := t.searchDomains
+ 	t.access.RUnlock()
+ 	if _, loaded := hosts[domain]; loaded {
+ 		return true
+ 	}
++	// MagicDNS accepts single-label member aliases by expanding the Tailnet's
++	// search domains. Only report an alias as endpoint-owned when it expands
++	// to a host currently present in the live DNS config.
++	if mDNS.CountLabel(domain) == 1 {
++		singleLabel := strings.TrimSuffix(domain, ".")
++		for _, searchDomain := range searchDomains {
++			if _, loaded := hosts[mDNS.Fqdn(singleLabel+"."+searchDomain)]; loaded {
++				return true
++			}
++		}
++	}
+ 	for suffix := range routes {
+ 		if mDNS.IsSubDomain(suffix, domain) {
+ 			return true
+ 		}
+ 	}
+ 	return false
+ }
+diff --git a/protocol/tailscale/dns_transport_xdial_test.go b/protocol/tailscale/dns_transport_xdial_test.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/tailscale/dns_transport_xdial_test.go
+@@ -0,0 +1,34 @@
++package tailscale
++
++import (
++	"net/netip"
++	"testing"
++)
++
++func TestXDialTailscaleDNSPreferredDomainMatchesKnownShortAlias(t *testing.T) {
++	transport := &DNSTransport{
++		hosts: map[string][]netip.Addr{
++			"mba32k.example-tailnet.ts.net.": {
++				netip.MustParseAddr("100.64.0.8"),
++			},
++		},
++		searchDomains: []string{"example-tailnet.ts.net."},
++	}
++
++	for _, domain := range []string{
++		"mba32k.",
++		"mba32k.example-tailnet.ts.net.",
++	} {
++		if !transport.PreferredDomain(domain) {
++			t.Errorf("expected %q to use Tailscale DNS", domain)
++		}
++	}
++	for _, domain := range []string{
++		"unknown.",
++		"mba32k.other-tailnet.ts.net.",
++	} {
++		if transport.PreferredDomain(domain) {
++			t.Errorf("did not expect %q to use Tailscale DNS", domain)
++		}
++	}
++}

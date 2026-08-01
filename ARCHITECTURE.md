@@ -292,7 +292,10 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   创建第二个系统 TUN、接管系统 DNS、接受系统级 peer 路由或发布路由。Tailscale Line
   提供一个默认关闭的可见 `MagicDNS` 勾选项；只有该 Line 被 active Mode 引用且勾选时，
   生成器才成对启用 endpoint 原生 DNS server 与动态 `preferred_by` peer 路由。归属范围
-  只能来自当前 NetMap，不得硬编码 `100.64.0.0/10`、IPv6 前缀、搜索域或默认路由。
+  只能来自当前 NetMap：域名侧读取 endpoint 收到的 `DNS Config` 中 `Hosts`、`Routes` 和
+  `SearchDomains`，地址侧读取 peer `AllowedIPs`；不得硬编码 `100.64.0.0/10`、IPv6
+  前缀、搜索域或默认路由。`AllowedIPs` 中由 Exit Node 带来的 `0.0.0.0/0` 与 `::/0`
+  必须排除，不能把默认出口伪装成 peer / subnet 归属。
   Mode 的显式规则优先于这个能力规则；流量是否走 Tailscale、是否使用 exit node，仍由
   用户可见的 Line 参数和 Mode 决定。
 - **与 Underlay 的边界**：官方 Tailscale、XDVPN、企业 VPN、Wi-Fi 和网线仍共同组成
@@ -383,8 +386,24 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   推动重连状态机。
 - **启动与失败语义**：完整 sing-box 实例及 active Tailscale Line 的真实出口探测必须
   先成功，之后才能提交 Transparent Proxy 网络设置。启动失败不得安装半成品网络配置；
-  已接管 flow 的转发失败必须关闭该 flow，不得回落系统直连。用户显式断开后，系统回到
-  原 Underlay。
+  已接管 flow 的转发失败必须关闭该 flow，不得回落系统直连。冷启动或唤醒产生的自动
+  连接意图如果启动失败，只能在完整 Rollback 且已证明系统接管移除后进入与完整恢复相同
+  的 2 / 5 / 10 / 20 / 30 秒有界重试；等待必须在 UI 显示结构化倒计时并允许用户立即
+  消费当前已排定的尝试。用户显式点击连接失败不得自动循环拉起；用户显式断开后，系统
+  回到原 Underlay，并立即取消倒计时与恢复意图。
+- **MagicDNS 系统接入事故证据（2026-08-01）**：已提交事务中，Tailscale endpoint 与
+  `dns:mode` 都曾被标记为 ready，但系统解析器仍把启动前 Wi-Fi resolver 作为查询目的地，
+  成员短名得到 NXDOMAIN；仅凭 ready 状态不能证明系统 DNS 已进入 XDial。Apple 为
+  Transparent Proxy 提供的受支持 DNS 捕获入口是 destination-domain network rule，
+  `NEDNSSettings` 则会被该 Provider 类型忽略。因此启用 MagicDNS 时，Provider 必须在
+  Commit 前从同一 endpoint 的实时 `DNS Config` 取得当前域名后缀、完整主机名和可展开的
+  单标签别名，为它们生成 port 53 的 destination-host rules，再追加普通全流量规则。
+  捕获列表为空、畸形或超过有界上限时连接必须失败，不能把“控制面存在 MagicDNS 后缀”
+  冒充系统查询已经能进入 XDial。该列表只是 Ingress 捕获事实，不参与 Mode 裁决；
+  Tailscale 默认 resolver 仍不得成为 XDial 的全局 DNS final。实机曾从当前 endpoint
+  导入 87 条捕获名；直发 DNS 得到成员地址，且未被旧 NXDOMAIN 缓存污染的新成员短名可由
+  `dscacheutil` 解析。macOS 可能继续缓存修复前的 NXDOMAIN；验收应使用新名称或在用户授权
+  下刷新 mDNSResponder，不能把旧负缓存误判为当前数据面失败。
 - **入口演进证据（2026-07-29）**：build 21 正确签名、嵌入并激活 System Extension，
   但 Provider 内捕获的 `NWPath` 把已有全流量 VPN 折叠成物理接口；build 22 能收到宿主
   的虚拟默认接口快照，但生成配置还没有把它写入 `route.default_interface`。两次都只

@@ -77,6 +77,53 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
         ))
     }
 
+    func testLaunchAutoConnectCanRetryACompletedLineFailure() {
+        let policy = AutomaticReconnectRetryPolicy()
+        let report = failedReport(code: "tailscale-peer-handshake-failed")
+
+        XCTAssertEqual(
+            policy.delay(
+                after: report,
+                attemptsUsed: 0,
+                trigger: .automaticConnection
+            ),
+            2
+        )
+    }
+
+    func testRuntimeStateExposesRetryCountdown() {
+        let now = Date(timeIntervalSinceReferenceDate: 100)
+        let state = AutomaticReconnectRuntimeState(
+            inProgress: true,
+            trigger: .automaticConnection,
+            attemptsUsed: 1,
+            maxAttempts: 5,
+            stableResetAt: nil,
+            retryAt: now.addingTimeInterval(2),
+            retryAttempt: 1
+        )
+
+        XCTAssertEqual(
+            state.retryCountdownSeconds(
+                at: now.addingTimeInterval(0.1)
+            ),
+            2
+        )
+        XCTAssertEqual(
+            state.retryCountdownSeconds(
+                at: now.addingTimeInterval(1.1)
+            ),
+            1
+        )
+        XCTAssertEqual(
+            state.retryCountdownSeconds(
+                at: now.addingTimeInterval(2.1)
+            ),
+            0
+        )
+        XCTAssertEqual(state.retryAttempt, 1)
+    }
+
     func testDoesNotRetryBeforeRollbackCompletes() {
         let policy = AutomaticReconnectRetryPolicy()
         var report = failedReport(

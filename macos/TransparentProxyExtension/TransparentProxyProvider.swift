@@ -211,7 +211,16 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 let settings = NETransparentProxyNetworkSettings(
                     tunnelRemoteAddress: "127.0.0.1"
                 )
-                settings.includedNetworkRules = [
+                settings.includedNetworkRules = session.dnsCaptureDomains.map {
+                    domain in
+                    NENetworkRule(
+                        destinationHostEndpoint: .hostPort(
+                            host: NWEndpoint.Host(domain),
+                            port: NWEndpoint.Port(rawValue: 53)!
+                        ),
+                        protocol: .any
+                    )
+                } + [
                     NENetworkRule(
                         remoteNetworkEndpoint: nil,
                         remotePrefix: 0,
@@ -221,6 +230,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                         direction: .outbound
                     ),
                 ]
+                self.logger.notice(
+                    "dns-capture-rules count=\(session.dnsCaptureDomains.count, privacy: .public)"
+                )
                 let commitID = UUID()
                 let replacedRelays = self.relayRegistry.activate(
                     generation: generation,

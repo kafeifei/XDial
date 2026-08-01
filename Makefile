@@ -76,7 +76,7 @@ test-patched-tailscale: $(PATCHED_WORKFILE)
 test-patched-sing-box: $(PATCHED_WORKFILE)
 	$(PATCHED_GO_ENV) go test -tags '$(DESKTOP_GO_TAGS)' \
 		github.com/sagernet/sing-box/protocol/tailscale \
-		-run '^TestXDialPreferredRouteSetExcludesExitDefaults$$' \
+		-run '^TestXDial(DNSCaptureDomainsFollowTailscaleConfig|PreferredRouteSetExcludesExitDefaults|TailscaleDNSPreferredDomainMatchesKnownShortAlias)$$' \
 		-count=1
 
 test-patched-sslcon: $(PATCHED_WORKFILE)

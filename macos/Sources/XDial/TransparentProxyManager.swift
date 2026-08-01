@@ -66,12 +66,17 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var underlayMonitor: HostUnderlayMonitor?
     private var automaticReconnectInProgress = false
     private var automaticReconnectTrigger: AutomaticReconnectTrigger?
+    private var pendingInitialRetryTrigger: AutomaticReconnectTrigger?
     private var automaticReconnectTransactionID: String?
     private var networkExtensionSessionTransactionID: String?
     private let automaticReconnectRetryPolicy =
         AutomaticReconnectRetryPolicy()
     private var automaticReconnectAttemptsUsed = 0
     private var automaticReconnectRetryWorkItem: DispatchWorkItem?
+    private var automaticReconnectRetryToken: UUID?
+    private var automaticReconnectRetryAt: Date?
+    private var automaticReconnectRetryAttempt: Int?
+    private var automaticReconnectRetryFailedTransactionID: String?
     private var stableConnectionResetWorkItem: DispatchWorkItem?
     private var stableConnectionResetAt: Date?
     private var connectedSessionTransactionID: String?
@@ -92,7 +97,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             trigger: automaticReconnectTrigger,
             attemptsUsed: automaticReconnectAttemptsUsed,
             maxAttempts: automaticReconnectRetryPolicy.maxAttempts,
-            stableResetAt: stableConnectionResetAt
+            stableResetAt: stableConnectionResetAt,
+            retryAt: automaticReconnectRetryAt,
+            retryAttempt: automaticReconnectRetryAttempt
         )
     }
 
@@ -106,7 +113,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         stableConnectionResetWorkItem?.cancel()
     }
 
-    func start(profileJSON: String) {
+    func start(
+        profileJSON: String,
+        automaticRetryTrigger: AutomaticReconnectTrigger? = nil
+    ) {
         guard !profileJSON.isEmpty else {
             publishFailure(ManagerError.missingProfile)
             return
@@ -129,6 +139,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         requestedProfileJSON = profileJSON
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        pendingInitialRetryTrigger = automaticRetryTrigger
         automaticReconnectTransactionID = nil
         networkExtensionSessionTransactionID = nil
         connectedSessionTransactionID = nil
@@ -345,6 +356,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         activeUnderlay = nil
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        pendingInitialRetryTrigger = nil
         automaticReconnectTransactionID = nil
         networkExtensionSessionTransactionID = nil
         connectedSessionTransactionID = nil
@@ -1141,15 +1153,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     }
 
     private func publishFailure(_ error: Error) {
-        let shouldContinueAutomaticReconnect =
+        let wasAutomaticReconnect =
             automaticReconnectInProgress
                 && automaticReconnectTrigger != nil
-        if !shouldContinueAutomaticReconnect {
-            automaticReconnectInProgress = false
-            automaticReconnectTrigger = nil
-            automaticReconnectTransactionID = nil
-            cancelAutomaticReconnectRetry(resetAttempts: false)
-        }
         networkExtensionSessionTransactionID = nil
         connectedSessionTransactionID = nil
         cancelStableConnectionReset()
@@ -1175,10 +1181,21 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 )
             }
         }
+        let report = ConnectionReportJournal.read()
+        let shouldContinueAutomaticReconnect =
+            wasAutomaticReconnect
+                || beginInitialFailureRecoveryIfEligible(report: report)
+        if !shouldContinueAutomaticReconnect {
+            automaticReconnectInProgress = false
+            automaticReconnectTrigger = nil
+            pendingInitialRetryTrigger = nil
+            automaticReconnectTransactionID = nil
+            cancelAutomaticReconnectRetry(resetAttempts: false)
+        }
         if shouldContinueAutomaticReconnect {
             publishRuntimeStatus("reconnecting", error: nil)
             handleAutomaticReconnectAfterDisconnect(
-                report: ConnectionReportJournal.read()
+                report: report
             )
             return
         }
@@ -1186,6 +1203,45 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             "disconnected",
             error: error.localizedDescription
         )
+    }
+
+    private func beginInitialFailureRecoveryIfEligible(
+        report: ConnectionReport?
+    ) -> Bool {
+        guard
+            pendingInitialRetryTrigger == .automaticConnection,
+            let report,
+            report.transactionID == currentTransactionID,
+            report.state == .failed,
+            report.rollbackComplete,
+            report.systemTakeoverRemoved,
+            requestedProfileJSON != nil,
+            startIntentID != nil
+        else {
+            return false
+        }
+        pendingInitialRetryTrigger = nil
+        automaticReconnectInProgress = true
+        automaticReconnectTrigger = .automaticConnection
+        automaticReconnectTransactionID = report.transactionID
+        let reasonCode = report.error?.code ?? "launch-auto-connect-failed"
+        let reasonMessage = report.error?.message
+            ?? "Launch auto-connect failed"
+        let incidentID = ReconnectIncidentJournal.begin(
+            at: Date(),
+            trigger: .automaticConnection,
+            report: report,
+            reasonCode: reasonCode,
+            reasonMessage: reasonMessage
+        )
+        activeReconnectIncidentID = incidentID.isEmpty
+            ? nil
+            : incidentID
+        appLog(
+            "Transparent Proxy launch auto-connect failed; "
+                + "entering bounded retry code=\(reasonCode)"
+        )
+        return true
     }
 
     private func beginUnexpectedDisconnectRecovery(
@@ -1415,6 +1471,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        pendingInitialRetryTrigger = nil
         automaticReconnectTransactionID = nil
         cancelAutomaticReconnectRetry(resetAttempts: false)
         if isNewSession || stableConnectionResetWorkItem == nil {
@@ -1758,100 +1815,127 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             "Transparent Proxy automatic reconnect retry "
                 + "\(retryNumber) scheduled after \(delay)s"
         )
+        let token = UUID()
+        automaticReconnectRetryToken = token
+        automaticReconnectRetryAt = Date().addingTimeInterval(delay)
+        automaticReconnectRetryAttempt = retryNumber
+        automaticReconnectRetryFailedTransactionID =
+            failedTransactionID
         let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.automaticReconnectRetryWorkItem = nil
-            guard
-                self.automaticReconnectInProgress,
-                self.currentTransactionID == failedTransactionID,
-                let profileJSON = self.requestedProfileJSON,
-                let manager = self.manager,
-                self.startIntentID != nil
-            else {
-                return
-            }
-            let intentID = UUID()
-            self.startIntentID = intentID
-            HostUnderlayCapture.start { [weak self] result in
-                guard let self else { return }
-                guard
-                    self.startIntentID == intentID,
-                    self.automaticReconnectInProgress
-                else {
-                    return
-                }
-                switch result {
-                case let .success(snapshot):
-                    do {
-                        let transactionID = try self.beginTransaction(
-                            profileJSON: profileJSON
-                        )
-                        self.automaticReconnectTransactionID =
-                            transactionID
-                        if let incidentID =
-                            self.activeReconnectIncidentID {
-                            ReconnectIncidentJournal.append(
-                                incidentID: incidentID,
-                                type: "retry-started",
-                                attempt: retryNumber,
-                                transactionID: transactionID
-                            )
-                        }
-                        self.updateReport(
-                            transactionID: transactionID
-                        ) {
-                            $0.updateTask(
-                                id: "underlay:system",
-                                state: .ready
-                            )
-                            $0.setState(.preparing)
-                        }
-                    } catch {
-                        self.publishFailure(error)
-                        return
-                    }
-                    appLog(
-                        "Transparent Proxy automatic reconnect retry "
-                            + "\(retryNumber) captured default="
-                            + snapshot.defaultInterface.name
-                    )
-                    self.publishRuntimeStatus(
-                        "reconnecting",
-                        error: nil
-                    )
-                    self.startConnection(
-                        manager,
-                        profileJSON: profileJSON,
-                        underlay: snapshot,
-                        intentID: intentID,
-                        debugFailureStage: nil
-                    )
-                case let .failure(error):
-                    guard let nextDelay =
-                        self.automaticReconnectRetryPolicy
-                        .delayForNextAttempt(
-                            attemptsUsed:
-                                self.automaticReconnectAttemptsUsed
-                        )
-                    else {
-                        self.finishAutomaticReconnect(
-                            report: ConnectionReportJournal.read(),
-                            message: error.localizedDescription
-                        )
-                        return
-                    }
-                    self.scheduleAutomaticReconnectRetry(
-                        failedTransactionID: failedTransactionID,
-                        delay: nextDelay
-                    )
-                }
-            }
+            self?.performScheduledAutomaticReconnectRetry(token: token)
         }
         automaticReconnectRetryWorkItem = work
         DispatchQueue.main.asyncAfter(
             deadline: .now() + delay,
             execute: work
         )
+    }
+
+    @discardableResult
+    func retryAutomaticReconnectNow() -> Bool {
+        guard let token = automaticReconnectRetryToken else {
+            return false
+        }
+        performScheduledAutomaticReconnectRetry(token: token)
+        return true
+    }
+
+    private func performScheduledAutomaticReconnectRetry(
+        token: UUID
+    ) {
+        guard
+            automaticReconnectRetryToken == token,
+            let failedTransactionID =
+                automaticReconnectRetryFailedTransactionID,
+            let retryNumber = automaticReconnectRetryAttempt
+        else {
+            return
+        }
+        automaticReconnectRetryWorkItem?.cancel()
+        automaticReconnectRetryWorkItem = nil
+        automaticReconnectRetryToken = nil
+        automaticReconnectRetryAt = nil
+        automaticReconnectRetryAttempt = nil
+        automaticReconnectRetryFailedTransactionID = nil
+        guard
+            automaticReconnectInProgress,
+            currentTransactionID == failedTransactionID,
+            let profileJSON = requestedProfileJSON,
+            let manager,
+            startIntentID != nil
+        else {
+            return
+        }
+        publishRuntimeStatus("reconnecting", error: nil)
+        let intentID = UUID()
+        startIntentID = intentID
+        HostUnderlayCapture.start { [weak self] result in
+            guard let self else { return }
+            guard
+                self.startIntentID == intentID,
+                self.automaticReconnectInProgress
+            else {
+                return
+            }
+            switch result {
+            case let .success(snapshot):
+                do {
+                    let transactionID = try self.beginTransaction(
+                        profileJSON: profileJSON
+                    )
+                    self.automaticReconnectTransactionID =
+                        transactionID
+                    if let incidentID = self.activeReconnectIncidentID {
+                        ReconnectIncidentJournal.append(
+                            incidentID: incidentID,
+                            type: "retry-started",
+                            attempt: retryNumber,
+                            transactionID: transactionID
+                        )
+                    }
+                    self.updateReport(transactionID: transactionID) {
+                        $0.updateTask(
+                            id: "underlay:system",
+                            state: .ready
+                        )
+                        $0.setState(.preparing)
+                    }
+                } catch {
+                    self.publishFailure(error)
+                    return
+                }
+                appLog(
+                    "Transparent Proxy automatic reconnect retry "
+                        + "\(retryNumber) captured default="
+                        + snapshot.defaultInterface.name
+                )
+                self.publishRuntimeStatus("reconnecting", error: nil)
+                self.startConnection(
+                    manager,
+                    profileJSON: profileJSON,
+                    underlay: snapshot,
+                    intentID: intentID,
+                    debugFailureStage: nil
+                )
+            case let .failure(error):
+                guard let nextDelay =
+                    self.automaticReconnectRetryPolicy
+                    .delayForNextAttempt(
+                        attemptsUsed: self.automaticReconnectAttemptsUsed
+                    )
+                else {
+                    self.finishAutomaticReconnect(
+                        report: ConnectionReportJournal.read(),
+                        message: error.localizedDescription
+                    )
+                    return
+                }
+                self.scheduleAutomaticReconnectRetry(
+                    failedTransactionID: failedTransactionID,
+                    delay: nextDelay
+                )
+            }
+        }
     }
 
     private func finishAutomaticReconnect(
@@ -1887,6 +1971,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     ) {
         automaticReconnectRetryWorkItem?.cancel()
         automaticReconnectRetryWorkItem = nil
+        automaticReconnectRetryToken = nil
+        automaticReconnectRetryAt = nil
+        automaticReconnectRetryAttempt = nil
+        automaticReconnectRetryFailedTransactionID = nil
         if resetAttempts {
             automaticReconnectAttemptsUsed = 0
         }
