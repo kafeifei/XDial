@@ -198,6 +198,35 @@ func TestGenerate_DesktopTailscale(t *testing.T) {
 	singboxCheckConfig(t, data, "tailscale-desktop")
 }
 
+func TestGenerate_TransparentProxyTailscaleMemoryHosts(t *testing.T) {
+	if _, err := exec.LookPath("sing-box"); err != nil {
+		t.Skip("sing-box not installed")
+	}
+	tailnet := tailscaleLine()
+	tailnet.TailscaleMagicDNS = true
+	p := &Profile{
+		Lines: []Line{directLine(), tailnet},
+		Modes: []Mode{{
+			ID: "tailnet", Name: "Tailnet", DefaultLineID: "tailscale-1",
+		}},
+		ActiveModeID: "tailnet",
+		Tailscale:    tailscaleIdentity(),
+	}
+	data, err := GenerateSingBoxTransparentProxy(
+		p,
+		29876,
+		"session-user",
+		"session-password",
+		t.TempDir(),
+		"en0",
+		[]string{"192.0.2.53"},
+	)
+	if err != nil {
+		t.Fatalf("[tailscale-transparent-proxy] GenerateSingBoxTransparentProxy: %v", err)
+	}
+	singboxCheckConfig(t, data, "tailscale-transparent-proxy")
+}
+
 func TestGenerate_NETailscale(t *testing.T) {
 	tailnet := tailscaleLine()
 	tailnet.TailscaleMagicDNS = true

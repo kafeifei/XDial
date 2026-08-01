@@ -15,6 +15,7 @@ package config
 // buildDNS 这类**裁决逻辑**函数——否则断言会退化成“生成器等于它自己”。
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"sort"
@@ -1204,6 +1205,98 @@ func TestINV7_DomainBindingsAndDNSRulesAgree(t *testing.T) {
 		if !traced {
 			t.Errorf("dns.rules[%d] 是一条追溯不到任何域名绑定的域名分支：\n%s", index, invPretty(rule))
 		}
+	}
+}
+
+// INV1e —— Transparent Proxy 的 MagicDNS 快照仍只能由
+// “active Mode 引用 + Line 可见开关”成对启用。开关未成立时不得出现
+// hosts transport、DNS 归属或 peer route；成立后 DNS 必须使用纯内存
+// hosts 且排在普通 Mode DNS 之前。
+func TestINV1e_TransparentProxyMagicDNSIsMemoryOnlyAndExplicit(t *testing.T) {
+	generate := func(profile *Profile) ([]byte, map[string]interface{}) {
+		t.Helper()
+		data, err := GenerateSingBoxTransparentProxy(
+			profile,
+			29876,
+			"session-user",
+			"session-password",
+			invBasePath,
+			invUnderlay,
+			[]string{"100.100.100.100"},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cfg map[string]interface{}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return data, cfg
+	}
+
+	baselineProfile := invBaseProfile()
+	baseline, _ := generate(baselineProfile)
+	unreferenced := invBaseProfile()
+	line := invTailscaleLine()
+	line.TailscaleMagicDNS = true
+	unreferenced.Lines = append(unreferenced.Lines, line)
+	got, _ := generate(unreferenced)
+	if !bytes.Equal(baseline, got) {
+		t.Fatalf("未被 active Mode 引用的 MagicDNS 改变了 Transparent Proxy 配置\n--- baseline ---\n%s\n--- got ---\n%s", baseline, got)
+	}
+
+	active := invBaseProfile()
+	line = invTailscaleLine()
+	active.Lines = append(active.Lines, line)
+	active.Modes[0].DefaultLineID = line.ID
+	_, disabledCfg := generate(active)
+	for _, server := range invDNSServers(t, disabledCfg) {
+		if server["type"] == "hosts" || server["tag"] == TailscaleMagicDNSDNSServerTag("tailscale-ts") {
+			t.Fatalf("未勾选 MagicDNS 时不得生成 hosts DNS server: %s", invPretty(server))
+		}
+	}
+	for _, rule := range invRouteRules(t, disabledCfg) {
+		if rule["preferred_by"] == "tailscale-ts" ||
+			rule["preferred_by"] == TailscaleMagicDNSDNSServerTag("tailscale-ts") {
+			t.Fatalf("未勾选 MagicDNS 时不得生成快照解析或 peer route: %s", invPretty(rule))
+		}
+	}
+
+	active.Lines[len(active.Lines)-1].TailscaleMagicDNS = true
+	_, enabledCfg := generate(active)
+	serverTag := TailscaleMagicDNSDNSServerTag("tailscale-ts")
+	var hostsServer map[string]interface{}
+	for _, server := range invDNSServers(t, enabledCfg) {
+		if server["tag"] == serverTag {
+			hostsServer = server
+		}
+		if server["type"] == "tailscale" {
+			t.Fatalf("Transparent Proxy 不得启动 inline Tailscale DNS server: %s", invPretty(server))
+		}
+	}
+	if hostsServer == nil || hostsServer["type"] != "hosts" || hostsServer["memory_only"] != true {
+		t.Fatalf("MagicDNS 必须生成纯内存 hosts server: %s", invPretty(hostsServer))
+	}
+	if _, exists := hostsServer["path"]; exists {
+		t.Fatalf("纯内存 hosts server 不得读取文件: %s", invPretty(hostsServer))
+	}
+	rules := invDNSRules(enabledCfg)
+	if len(rules) == 0 || rules[0]["preferred_by"] != serverTag ||
+		rules[0]["server"] != serverTag || rules[0]["disable_cache"] != true {
+		t.Fatalf("MagicDNS 归属必须最高优先且禁用缓存: %s", invPretty(rules))
+	}
+	var foundResolve, foundPeerRoute bool
+	for _, rule := range invRouteRules(t, enabledCfg) {
+		if rule["preferred_by"] == serverTag && rule["action"] == "resolve" &&
+			rule["server"] == serverTag && rule["disable_cache"] == true {
+			foundResolve = true
+		}
+		if rule["preferred_by"] == "tailscale-ts" && rule["outbound"] == "tailscale-ts" {
+			foundPeerRoute = true
+		}
+	}
+	if !foundResolve || !foundPeerRoute {
+		t.Fatalf("MagicDNS DNS 快照与 Tailscale peer route 必须成对生成: %s", invPretty(invRouteRules(t, enabledCfg)))
 	}
 }
 

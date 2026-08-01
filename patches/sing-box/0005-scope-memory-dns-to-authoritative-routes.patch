@@ -1,0 +1,179 @@
+diff --git a/dns/transport/hosts/hosts.go b/dns/transport/hosts/hosts.go
+--- a/dns/transport/hosts/hosts.go
++++ b/dns/transport/hosts/hosts.go
+@@ -70,6 +70,13 @@ func (t *Transport) Start(stage adapter.StartStage) error {
+ }
+ 
+ func (t *Transport) Close() error {
++	if t.memoryOnly {
++		t.access.Lock()
++		t.predefined = nil
++		t.owned = nil
++		t.files = nil
++		t.access.Unlock()
++	}
+ 	return nil
+ }
+ 
+diff --git a/dns/transport/hosts/hosts_test.go b/dns/transport/hosts/hosts_test.go
+--- a/dns/transport/hosts/hosts_test.go
++++ b/dns/transport/hosts/hosts_test.go
+@@ -55,6 +55,13 @@ func TestXDialMemoryOnlyHostsReplacePredefined(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Len(t, response.Answer, 1)
+ 	require.Contains(t, response.Answer[0].String(), address.String())
++	require.NoError(t, transport.Close())
++	require.False(t, transport.PreferredDomain("mba32k."))
++	require.False(t, transport.PreferredDomain("unknown.example-tailnet.ts.net."))
++	response, err = transport.Exchange(context.Background(), newHostsTestQuery("mba32k.", dns.TypeA))
++	require.NoError(t, err)
++	require.Equal(t, dns.RcodeNameError, response.Rcode)
++	require.Empty(t, response.Answer)
+ }
+ 
+ func TestXDialSystemHostsTransportRejectsRuntimeReplacement(t *testing.T) {
+diff --git a/protocol/tailscale/endpoint.go b/protocol/tailscale/endpoint.go
+--- a/protocol/tailscale/endpoint.go
++++ b/protocol/tailscale/endpoint.go
+@@ -1081,18 +1081,31 @@ func tailscaleDNSMemorySnapshotFromConfig(dnsCfg *tsDNS.Config) tailscaleDNSMemor
+ 		return true
+ 	}
+ 
+-	searchDomains := make([]string, 0, len(dnsCfg.SearchDomains))
+-	for _, fqdn := range dnsCfg.SearchDomains {
++	for fqdn, resolvers := range dnsCfg.Routes {
++		if len(resolvers) != 0 {
++			continue
++		}
+ 		domain := strings.ToLower(fqdn.WithoutTrailingDot())
++		// A root route would make the injected transport authoritative for all
++		// DNS. It is never imported into XDial's scoped MagicDNS snapshot.
++		if domain == "" {
++			continue
++		}
+ 		if !addOwnedDomain(domain) {
+ 			return tailscaleDNSMemorySnapshotState{errorCode: errorCode}
+ 		}
+-		searchDomains = append(searchDomains, domain)
+ 	}
+-	for fqdn := range dnsCfg.Routes {
+-		if !addOwnedDomain(fqdn.WithoutTrailingDot()) {
+-			return tailscaleDNSMemorySnapshotState{errorCode: errorCode}
++
++	if len(dnsCfg.SearchDomains) > tailscaleDNSMaxDomains {
++		return tailscaleDNSMemorySnapshotState{errorCode: tailscaleDNSSnapshotTooLarge}
++	}
++	searchDomains := make([]string, 0, len(dnsCfg.SearchDomains))
++	for _, fqdn := range dnsCfg.SearchDomains {
++		domain := strings.ToLower(fqdn.WithoutTrailingDot())
++		if !validTailscaleDNSDomain(domain) {
++			return tailscaleDNSMemorySnapshotState{errorCode: tailscaleDNSSnapshotInvalid}
+ 		}
++		searchDomains = append(searchDomains, domain)
+ 	}
+ 	for fqdn, addresses := range dnsCfg.Hosts {
+ 		host := strings.ToLower(fqdn.WithoutTrailingDot())
+diff --git a/protocol/tailscale/endpoint_dns_capture_xdial_test.go b/protocol/tailscale/endpoint_dns_capture_xdial_test.go
+--- a/protocol/tailscale/endpoint_dns_capture_xdial_test.go
++++ b/protocol/tailscale/endpoint_dns_capture_xdial_test.go
+@@ -41,6 +41,51 @@ func TestXDialDNSCaptureDomainsFollowTailscaleConfig(t *testing.T) {
+ 	}
+ }
+ 
++func TestXDialDNSMemorySnapshotOnlyOwnsAuthoritativeRoutes(t *testing.T) {
++	authoritative := mustXDialFQDN(t, "example-tailnet.ts.net")
++	forwarded := mustXDialFQDN(t, "corp.example.com")
++	member := mustXDialFQDN(t, "mba32k.example-tailnet.ts.net")
++	forwardedHost := mustXDialFQDN(t, "secret.corp.example.com")
++	outsideHost := mustXDialFQDN(t, "outside.public.example")
++	state := tailscaleDNSMemorySnapshotFromConfig(&tsDNS.Config{
++		SearchDomains: []dnsname.FQDN{authoritative, forwarded},
++		Routes: map[dnsname.FQDN][]*dnstype.Resolver{
++			authoritative: nil,
++			forwarded:     {{Addr: "10.0.0.53"}},
++		},
++		Hosts: map[dnsname.FQDN][]netip.Addr{
++			member:        {netip.MustParseAddr("100.64.0.8")},
++			forwardedHost: {netip.MustParseAddr("100.64.0.9")},
++			outsideHost:   {netip.MustParseAddr("100.64.0.10")},
++		},
++	})
++	if state.errorCode != tailscaleDNSSnapshotValid {
++		t.Fatalf("snapshot error code = %d", state.errorCode)
++	}
++	if state.snapshot.RecordCount != 5 {
++		t.Fatalf("record count = %d, want 5", state.snapshot.RecordCount)
++	}
++	if !reflect.DeepEqual(state.snapshot.OwnedDomains, []string{"example-tailnet.ts.net"}) {
++		t.Fatalf("owned domains = %v", state.snapshot.OwnedDomains)
++	}
++	for _, expectedHost := range []string{
++		"mba32k.example-tailnet.ts.net",
++		"mba32k",
++		"secret.corp.example.com",
++		"secret",
++		"outside.public.example",
++	} {
++		if _, found := state.snapshot.Hosts[expectedHost]; !found {
++			t.Fatalf("Tailscale exact host or search alias is missing: %q", expectedHost)
++		}
++	}
++	for _, domain := range state.snapshot.CaptureDomains {
++		if domain == "corp.example.com" {
++			t.Fatalf("forwarded route became locally authoritative: %q", domain)
++		}
++	}
++}
++
+ func TestXDialDNSMemorySnapshotIncludesExactHostsAndShortAliases(t *testing.T) {
+ 	tailnet := mustXDialFQDN(t, "example-tailnet.ts.net")
+ 	member := mustXDialFQDN(t, "mba32k.example-tailnet.ts.net")
+@@ -58,6 +103,9 @@ func TestXDialDNSMemorySnapshotIncludesExactHostsAndShortAliases(t *testing.T) {
+ 	if state.errorCode != tailscaleDNSSnapshotValid {
+ 		t.Fatalf("snapshot error code = %d", state.errorCode)
+ 	}
++	if state.snapshot.RecordCount != 4 {
++		t.Fatalf("record count = %d, want 4", state.snapshot.RecordCount)
++	}
+ 	wantAddresses := []netip.Addr{address4, address6}
+ 	for _, name := range []string{"mba32k", "mba32k.example-tailnet.ts.net"} {
+ 		if !reflect.DeepEqual(state.snapshot.Hosts[name], wantAddresses) {
+@@ -92,15 +140,37 @@ func TestXDialDNSMemorySnapshotRejectsOversizedDomainSetWithoutLeakingValue(t *te
+ }
+ 
+ func TestXDialDNSMemorySnapshotRejectsEmptyHostRecord(t *testing.T) {
++	tailnet := mustXDialFQDN(t, "example-tailnet.ts.net")
+ 	member := mustXDialFQDN(t, "private-member.example-tailnet.ts.net")
+ 	state := tailscaleDNSMemorySnapshotFromConfig(&tsDNS.Config{
+-		Hosts: map[dnsname.FQDN][]netip.Addr{member: nil},
++		Routes: map[dnsname.FQDN][]*dnstype.Resolver{tailnet: nil},
++		Hosts:  map[dnsname.FQDN][]netip.Addr{member: nil},
+ 	})
+ 	if state.errorCode != tailscaleDNSSnapshotInvalid {
+ 		t.Fatalf("snapshot error code = %d, want invalid", state.errorCode)
+ 	}
+ }
+ 
++func TestXDialDNSMemorySnapshotRejectsOversizedAddressRecordSet(t *testing.T) {
++	tailnet := mustXDialFQDN(t, "example-tailnet.ts.net")
++	member := mustXDialFQDN(t, "member.example-tailnet.ts.net")
++	addresses := make([]netip.Addr, tailscaleDNSMaxAddresses+1)
++	for index := range addresses {
++		var raw [16]byte
++		raw[0] = 0xfd
++		raw[14] = byte(index >> 8)
++		raw[15] = byte(index)
++		addresses[index] = netip.AddrFrom16(raw)
++	}
++	state := tailscaleDNSMemorySnapshotFromConfig(&tsDNS.Config{
++		Routes: map[dnsname.FQDN][]*dnstype.Resolver{tailnet: nil},
++		Hosts:  map[dnsname.FQDN][]netip.Addr{member: addresses},
++	})
++	if state.errorCode != tailscaleDNSSnapshotTooLarge {
++		t.Fatalf("snapshot error code = %d, want too large", state.errorCode)
++	}
++}
++
+ func mustXDialFQDN(t *testing.T, value string) dnsname.FQDN {
+ 	t.Helper()
+ 	fqdn, err := dnsname.ToFQDN(value)

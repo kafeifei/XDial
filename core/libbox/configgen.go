@@ -73,6 +73,7 @@ type transparentProxyTailscale struct {
 	EndpointTag     string `json:"endpoint_tag"`
 	ExitNode        string `json:"exit_node"`
 	MagicDNSEnabled bool   `json:"magic_dns_enabled"`
+	DNSServerTag    string `json:"dns_server_tag,omitempty"`
 }
 
 // GenerateConnectionPlan compiles the active Mode into a side-effect-free,
@@ -277,10 +278,15 @@ func generateTransparentProxySession(
 		if endpointTag == "" {
 			return "", fmt.Errorf("Tailscale runtime endpoint is missing")
 		}
+		dnsServerTag := ""
+		if tailscaleLine.TailscaleMagicDNS {
+			dnsServerTag = config.TailscaleMagicDNSDNSServerTag(endpointTag)
+		}
 		session.Tailscale = &transparentProxyTailscale{
 			EndpointTag:     endpointTag,
 			ExitNode:        exitNode,
 			MagicDNSEnabled: tailscaleLine.TailscaleMagicDNS,
+			DNSServerTag:    dnsServerTag,
 		}
 	}
 	encoded, err := json.Marshal(session)

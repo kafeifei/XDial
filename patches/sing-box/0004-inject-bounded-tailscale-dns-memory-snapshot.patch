@@ -1,0 +1,528 @@
+diff --git a/dns/transport/hosts/hosts.go b/dns/transport/hosts/hosts.go
+--- a/dns/transport/hosts/hosts.go
++++ b/dns/transport/hosts/hosts.go
+@@ -4,6 +4,9 @@ import (
+ 	"context"
+ 	"net/netip"
+ 	"os"
++	"sort"
++	"strings"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	C "github.com/sagernet/sing-box/constant"
+@@ -27,7 +30,10 @@ var (
+ type Transport struct {
+ 	dns.TransportAdapter
+ 	files      []*File
++	access     sync.RWMutex
+ 	predefined map[string][]netip.Addr
++	owned      []string
++	memoryOnly bool
+ }
+ 
+ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, options option.HostsDNSServerOptions) (adapter.DNSTransport, error) {
+@@ -35,7 +41,7 @@ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, opti
+ 		files      []*File
+ 		predefined = make(map[string][]netip.Addr)
+ 	)
+-	if len(options.Path) == 0 {
++	if len(options.Path) == 0 && !options.MemoryOnly {
+ 		defaultFile, err := NewDefault()
+ 		if err != nil {
+ 			return nil, err
+@@ -55,6 +61,7 @@ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, opti
+ 		TransportAdapter: dns.NewTransportAdapter(C.DNSTypeHosts, tag, nil),
+ 		files:            files,
+ 		predefined:       predefined,
++		memoryOnly:       options.MemoryOnly,
+ 	}, nil
+ }
+ 
+@@ -70,9 +77,17 @@ func (t *Transport) Reset() {
+ }
+ 
+ func (t *Transport) PreferredDomain(domain string) bool {
++	domain = mDNS.CanonicalName(domain)
++	t.access.RLock()
++	defer t.access.RUnlock()
+ 	if _, loaded := t.predefined[domain]; loaded {
+ 		return true
+ 	}
++	for _, suffix := range t.owned {
++		if domain == suffix || strings.HasSuffix(domain, "."+suffix) {
++			return true
++		}
++	}
+ 	for _, file := range t.files {
+ 		if len(file.Lookup(domain)) > 0 {
+ 			return true
+@@ -85,6 +100,8 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
+ 	question := message.Question[0]
+ 	domain := mDNS.CanonicalName(question.Name)
+ 	if question.Qtype == mDNS.TypeA || question.Qtype == mDNS.TypeAAAA {
++		t.access.RLock()
++		defer t.access.RUnlock()
+ 		if addresses, ok := t.predefined[domain]; ok {
+ 			return dns.FixedResponse(message.Id, question, addresses, C.DefaultDNSTTL), nil
+ 		}
+@@ -105,6 +122,47 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
+ 	}, nil
+ }
+ 
++// ReplacePredefined atomically replaces the transport's in-memory records and
++// authoritative suffixes. The caller retains no ownership of supplied values.
++func (t *Transport) ReplacePredefined(predefined map[string][]netip.Addr, owned []string) error {
++	if !t.memoryOnly {
++		return os.ErrPermission
++	}
++	next := make(map[string][]netip.Addr, len(predefined))
++	for domain, addresses := range predefined {
++		canonicalDomain := mDNS.CanonicalName(domain)
++		if canonicalDomain == "." || len(addresses) == 0 {
++			return os.ErrInvalid
++		}
++		clonedAddresses := make([]netip.Addr, len(addresses))
++		for index, address := range addresses {
++			if !address.IsValid() || address.Zone() != "" {
++				return os.ErrInvalid
++			}
++			clonedAddresses[index] = address
++		}
++		next[canonicalDomain] = clonedAddresses
++	}
++	nextOwnedSet := make(map[string]bool, len(owned))
++	for _, domain := range owned {
++		canonicalDomain := mDNS.CanonicalName(domain)
++		if canonicalDomain == "." {
++			return os.ErrInvalid
++		}
++		nextOwnedSet[canonicalDomain] = true
++	}
++	nextOwned := make([]string, 0, len(nextOwnedSet))
++	for domain := range nextOwnedSet {
++		nextOwned = append(nextOwned, domain)
++	}
++	sort.Strings(nextOwned)
++	t.access.Lock()
++	t.predefined = next
++	t.owned = nextOwned
++	t.access.Unlock()
++	return nil
++}
++
+ func (t *Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+ 	callback(t.Exchange(ctx, message))
+ }
+diff --git a/dns/transport/hosts/hosts_test.go b/dns/transport/hosts/hosts_test.go
+--- a/dns/transport/hosts/hosts_test.go
++++ b/dns/transport/hosts/hosts_test.go
+@@ -7,8 +7,11 @@ import (
+ 	"runtime"
+ 	"testing"
+ 
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 
++	"github.com/miekg/dns"
+ 	"github.com/stretchr/testify/require"
+ )
+ 
+@@ -28,3 +31,55 @@ func TestHosts(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestXDialMemoryOnlyHostsReplacePredefined(t *testing.T) {
++	rawTransport, err := NewTransport(
++		context.Background(),
++		log.NewNOPFactory().NewLogger("test"),
++		"tailscale-memory",
++		option.HostsDNSServerOptions{MemoryOnly: true},
++	)
++	require.NoError(t, err)
++	transport := rawTransport.(*Transport)
++	require.Empty(t, transport.files)
++
++	address := netip.MustParseAddr("100.64.0.8")
++	records := map[string][]netip.Addr{"MBA32K": {address}}
++	require.NoError(t, transport.ReplacePredefined(records, []string{"example-tailnet.ts.net"}))
++	records["MBA32K"][0] = netip.MustParseAddr("100.64.0.9")
++
++	require.True(t, transport.PreferredDomain("mba32k."))
++	require.True(t, transport.PreferredDomain("unknown.example-tailnet.ts.net."))
++	require.False(t, transport.PreferredDomain("unknown.public.example."))
++	response, err := transport.Exchange(context.Background(), newHostsTestQuery("mba32k.", dns.TypeA))
++	require.NoError(t, err)
++	require.Len(t, response.Answer, 1)
++	require.Contains(t, response.Answer[0].String(), address.String())
++}
++
++func TestXDialSystemHostsTransportRejectsRuntimeReplacement(t *testing.T) {
++	transport := &Transport{}
++	err := transport.ReplacePredefined(map[string][]netip.Addr{
++		"private.tailnet": {netip.MustParseAddr("100.64.0.8")},
++	}, []string{"tailnet"})
++	require.ErrorIs(t, err, os.ErrPermission)
++}
++
++func TestXDialMemoryOnlyHostsRejectsRootOwnershipWithoutMutation(t *testing.T) {
++	transport := &Transport{
++		predefined: map[string][]netip.Addr{
++			"existing.": {netip.MustParseAddr("100.64.0.7")},
++		},
++		memoryOnly: true,
++	}
++	err := transport.ReplacePredefined(map[string][]netip.Addr{
++		"new.tailnet": {netip.MustParseAddr("100.64.0.8")},
++	}, []string{"."})
++	require.ErrorIs(t, err, os.ErrInvalid)
++	require.True(t, transport.PreferredDomain("existing."))
++	require.False(t, transport.PreferredDomain("new.tailnet."))
++}
++
++func newHostsTestQuery(domain string, queryType uint16) *dns.Msg {
++	return &dns.Msg{Question: []dns.Question{{Name: domain, Qtype: queryType}}}
++}
+diff --git a/option/dns.go b/option/dns.go
+--- a/option/dns.go
++++ b/option/dns.go
+@@ -179,6 +179,7 @@ type HostsDNSServerOptions struct {
+ 	Path       badoption.Listable[string]                                `json:"path,omitempty"`
+ 	Predefined *badjson.TypedMap[string, badoption.Listable[netip.Addr]] `json:"predefined,omitempty"`
++	MemoryOnly bool                                                      `json:"memory_only,omitempty"`
+ }
+ 
+ type RawLocalDNSServerOptions struct {
+	DialerOptions
+diff --git a/protocol/tailscale/endpoint.go b/protocol/tailscale/endpoint.go
+--- a/protocol/tailscale/endpoint.go
++++ b/protocol/tailscale/endpoint.go
+@@ -105,6 +105,7 @@ type Endpoint struct {
+ 	dnsCfg            *tsDNS.Config
+ 	routeDomains      common.TypedValue[map[string]bool]
+ 	dnsCaptureDomains common.TypedValue[[]string]
++	dnsMemorySnapshot common.TypedValue[tailscaleDNSMemorySnapshotState]
+ 	routePrefixes     atomic.Pointer[netipx.IPSet]
+ 
+ 	acceptRoutes               bool
+@@ -921,6 +922,24 @@ func (t *Endpoint) Server() *tsnet.Server {
+ // aliases currently owned by this endpoint's Tailscale DNS configuration.
+ func (t *Endpoint) DNSCaptureDomains() []string {
+ 	return append([]string(nil), t.dnsCaptureDomains.Load()...)
++}
++
++// DNSMemorySnapshot returns one immutable, bounded copy of the endpoint's
++// current DNS ownership and host records. Domain names and addresses stay
++// inside the data-plane process; callers must not log or persist this value.
++func (t *Endpoint) DNSMemorySnapshot() (DNSMemorySnapshot, error) {
++	state := t.dnsMemorySnapshot.Load()
++	if state.errorCode != tailscaleDNSSnapshotValid {
++		switch state.errorCode {
++		case tailscaleDNSSnapshotTooLarge:
++			return DNSMemorySnapshot{}, fmt.Errorf("Tailscale DNS snapshot exceeds safe limits")
++		case tailscaleDNSSnapshotInvalid:
++			return DNSMemorySnapshot{}, fmt.Errorf("Tailscale DNS snapshot is invalid")
++		default:
++			return DNSMemorySnapshot{}, fmt.Errorf("Tailscale DNS snapshot is unavailable")
++		}
++	}
++	return cloneDNSMemorySnapshot(state.snapshot), nil
+ }
+ 
+ func (t *Endpoint) onReconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *tsDNS.Config) {
+@@ -941,7 +960,9 @@ func (t *Endpoint) onReconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg
+ 		routeDomains[fqdn.WithoutTrailingDot()] = true
+ 	}
+ 	t.routeDomains.Store(routeDomains)
+-	t.dnsCaptureDomains.Store(tailscaleDNSCaptureDomains(dnsCfg))
++	dnsMemorySnapshot := tailscaleDNSMemorySnapshotFromConfig(dnsCfg)
++	t.dnsMemorySnapshot.Store(dnsMemorySnapshot)
++	t.dnsCaptureDomains.Store(append([]string(nil), dnsMemorySnapshot.snapshot.CaptureDomains...))
+ 
+ 	t.routePrefixes.Store(tailscalePreferredRouteSet(cfg.Peers))
+ 
+@@ -972,41 +993,181 @@ func tailscalePreferredRouteSet(peers []wgcfg.Peer) *netipx.IPSet {
+ }
+ 
+ func tailscaleDNSCaptureDomains(dnsCfg *tsDNS.Config) []string {
++	return tailscaleDNSMemorySnapshotFromConfig(dnsCfg).snapshot.CaptureDomains
++}
++
++const (
++	tailscaleDNSMaxDomains   = 2_048
++	tailscaleDNSMaxAddresses = 4_096
++
++	tailscaleDNSSnapshotUnavailable uint8 = iota
++	tailscaleDNSSnapshotValid
++	tailscaleDNSSnapshotTooLarge
++	tailscaleDNSSnapshotInvalid
++)
++
++// DNSMemorySnapshot contains the endpoint-owned host records and domains for
++// one connection-generation snapshot. It has no serialization tags by design.
++type DNSMemorySnapshot struct {
++	Hosts          map[string][]netip.Addr
++	CaptureDomains []string
++	OwnedDomains   []string
++	RecordCount    int
++}
++
++type tailscaleDNSMemorySnapshotState struct {
++	snapshot  DNSMemorySnapshot
++	errorCode uint8
++}
++
++func tailscaleDNSMemorySnapshotFromConfig(dnsCfg *tsDNS.Config) tailscaleDNSMemorySnapshotState {
+ 	if dnsCfg == nil {
+-		return nil
++		return tailscaleDNSMemorySnapshotState{errorCode: tailscaleDNSSnapshotUnavailable}
++	}
++	captureDomains := make(map[string]bool)
++	ownedDomains := make(map[string]bool)
++	hosts := make(map[string][]netip.Addr)
++	addressCount := 0
++	errorCode := tailscaleDNSSnapshotValid
++	addCaptureDomain := func(domain string) bool {
++		domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
++		if !validTailscaleDNSDomain(domain) {
++			errorCode = tailscaleDNSSnapshotInvalid
++			return false
++		}
++		if !captureDomains[domain] && len(captureDomains) >= tailscaleDNSMaxDomains {
++			errorCode = tailscaleDNSSnapshotTooLarge
++			return false
++		}
++		captureDomains[domain] = true
++		return true
+ 	}
+-	seen := make(map[string]bool)
+-	add := func(domain string) {
++	addOwnedDomain := func(domain string) bool {
+ 		domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+-		if domain != "" {
+-			seen[domain] = true
++		if !addCaptureDomain(domain) {
++			return false
+ 		}
++		ownedDomains[domain] = true
++		return true
+ 	}
+-	searchDomains := make([]string, 0, len(dnsCfg.SearchDomains))
+-	for _, fqdn := range dnsCfg.SearchDomains {
+-		domain := fqdn.WithoutTrailingDot()
+-		add(domain)
+-		searchDomains = append(searchDomains, strings.ToLower(domain))
+-	}
+-	for fqdn := range dnsCfg.Routes {
+-		add(fqdn.WithoutTrailingDot())
+-	}
+-	for fqdn := range dnsCfg.Hosts {
++	addHost := func(domain string, addresses []netip.Addr) bool {
++		domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
++		if domain == "" || len(addresses) == 0 || !addCaptureDomain(domain) {
++			if errorCode == tailscaleDNSSnapshotValid {
++				errorCode = tailscaleDNSSnapshotInvalid
++			}
++			return false
++		}
++		seenAddresses := make(map[netip.Addr]bool, len(hosts[domain])+len(addresses))
++		for _, address := range hosts[domain] {
++			seenAddresses[address] = true
++		}
++		for _, address := range addresses {
++			if !address.IsValid() || address.Zone() != "" || !address.IsGlobalUnicast() {
++				errorCode = tailscaleDNSSnapshotInvalid
++				return false
++			}
++			if seenAddresses[address] {
++				continue
++			}
++			if addressCount >= tailscaleDNSMaxAddresses {
++				errorCode = tailscaleDNSSnapshotTooLarge
++				return false
++			}
++			hosts[domain] = append(hosts[domain], address)
++			seenAddresses[address] = true
++			addressCount++
++		}
++		return true
++	}
++
++	searchDomains := make([]string, 0, len(dnsCfg.SearchDomains))
++	for _, fqdn := range dnsCfg.SearchDomains {
++		domain := strings.ToLower(fqdn.WithoutTrailingDot())
++		if !addOwnedDomain(domain) {
++			return tailscaleDNSMemorySnapshotState{errorCode: errorCode}
++		}
++		searchDomains = append(searchDomains, domain)
++	}
++	for fqdn := range dnsCfg.Routes {
++		if !addOwnedDomain(fqdn.WithoutTrailingDot()) {
++			return tailscaleDNSMemorySnapshotState{errorCode: errorCode}
++		}
++	}
++	for fqdn, addresses := range dnsCfg.Hosts {
+ 		host := strings.ToLower(fqdn.WithoutTrailingDot())
+-		add(host)
++		if !addHost(host, addresses) {
++			return tailscaleDNSMemorySnapshotState{errorCode: errorCode}
++		}
+ 		for _, searchDomain := range searchDomains {
+ 			relative, found := strings.CutSuffix(host, "."+searchDomain)
+ 			if found && relative != "" && !strings.Contains(relative, ".") {
+-				add(relative)
++				if !addHost(relative, addresses) {
++					return tailscaleDNSMemorySnapshotState{errorCode: errorCode}
++				}
+ 			}
+ 		}
+ 	}
+-	domains := make([]string, 0, len(seen))
+-	for domain := range seen {
++	domains := make([]string, 0, len(captureDomains))
++	for domain := range captureDomains {
+ 		domains = append(domains, domain)
+ 	}
+ 	sort.Strings(domains)
+-	return domains
++	owned := make([]string, 0, len(ownedDomains))
++	for domain := range ownedDomains {
++		owned = append(owned, domain)
++	}
++	sort.Strings(owned)
++	for _, addresses := range hosts {
++		sort.Slice(addresses, func(left, right int) bool {
++			return addresses[left].Compare(addresses[right]) < 0
++		})
++	}
++	if len(hosts) == 0 || addressCount == 0 || len(domains) == 0 {
++		return tailscaleDNSMemorySnapshotState{errorCode: tailscaleDNSSnapshotInvalid}
++	}
++	return tailscaleDNSMemorySnapshotState{
++		snapshot: DNSMemorySnapshot{
++			Hosts:          hosts,
++			CaptureDomains: domains,
++			OwnedDomains:   owned,
++			RecordCount:    addressCount,
++		},
++		errorCode: tailscaleDNSSnapshotValid,
++	}
++}
++
++func validTailscaleDNSDomain(domain string) bool {
++	if len(domain) == 0 || len(domain) > 253 {
++		return false
++	}
++	for _, label := range strings.Split(domain, ".") {
++		if len(label) == 0 || len(label) > 63 {
++			return false
++		}
++		for _, character := range []byte(label) {
++			if (character >= 'a' && character <= 'z') ||
++				(character >= '0' && character <= '9') ||
++				character == '-' || character == '_' {
++				continue
++			}
++			return false
++		}
++	}
++	return true
++}
++
++func cloneDNSMemorySnapshot(snapshot DNSMemorySnapshot) DNSMemorySnapshot {
++	hosts := make(map[string][]netip.Addr, len(snapshot.Hosts))
++	for domain, addresses := range snapshot.Hosts {
++		hosts[domain] = append([]netip.Addr(nil), addresses...)
++	}
++	return DNSMemorySnapshot{
++		Hosts:          hosts,
++		CaptureDomains: append([]string(nil), snapshot.CaptureDomains...),
++		OwnedDomains:   append([]string(nil), snapshot.OwnedDomains...),
++		RecordCount:    snapshot.RecordCount,
++	}
+ }
+ 
+ func addressFromAddr(destination netip.Addr) tcpip.Address {
+diff --git a/protocol/tailscale/endpoint_dns_capture_xdial_test.go b/protocol/tailscale/endpoint_dns_capture_xdial_test.go
+--- a/protocol/tailscale/endpoint_dns_capture_xdial_test.go
++++ b/protocol/tailscale/endpoint_dns_capture_xdial_test.go
+@@ -1,8 +1,10 @@
+ package tailscale
+ 
+ import (
++	"fmt"
+ 	"net/netip"
+ 	"reflect"
++	"strings"
+ 	"testing"
+ 
+ 	tsDNS "github.com/sagernet/tailscale/net/dns"
+@@ -39,6 +41,66 @@ func TestXDialDNSCaptureDomainsFollowTailscaleConfig(t *testing.T) {
+ 	}
+ }
+ 
++func TestXDialDNSMemorySnapshotIncludesExactHostsAndShortAliases(t *testing.T) {
++	tailnet := mustXDialFQDN(t, "example-tailnet.ts.net")
++	member := mustXDialFQDN(t, "mba32k.example-tailnet.ts.net")
++	address4 := netip.MustParseAddr("100.64.0.8")
++	address6 := netip.MustParseAddr("fd7a:115c:a1e0::8")
++	state := tailscaleDNSMemorySnapshotFromConfig(&tsDNS.Config{
++		SearchDomains: []dnsname.FQDN{tailnet},
++		Routes: map[dnsname.FQDN][]*dnstype.Resolver{
++			tailnet: nil,
++		},
++		Hosts: map[dnsname.FQDN][]netip.Addr{
++			member: {address4, address6},
++		},
++	})
++	if state.errorCode != tailscaleDNSSnapshotValid {
++		t.Fatalf("snapshot error code = %d", state.errorCode)
++	}
++	wantAddresses := []netip.Addr{address4, address6}
++	for _, name := range []string{"mba32k", "mba32k.example-tailnet.ts.net"} {
++		if !reflect.DeepEqual(state.snapshot.Hosts[name], wantAddresses) {
++			t.Fatalf("record address count for %q = %d, want %d", name, len(state.snapshot.Hosts[name]), len(wantAddresses))
++		}
++	}
++
++	clone := cloneDNSMemorySnapshot(state.snapshot)
++	clone.Hosts["mba32k"][0] = netip.MustParseAddr("100.64.0.9")
++	clone.CaptureDomains[0] = "changed.invalid"
++	if state.snapshot.Hosts["mba32k"][0] != address4 || state.snapshot.CaptureDomains[0] == "changed.invalid" {
++		t.Fatal("snapshot clone shares mutable storage")
++	}
++}
++
++func TestXDialDNSMemorySnapshotRejectsOversizedDomainSetWithoutLeakingValue(t *testing.T) {
++	routes := make(map[dnsname.FQDN][]*dnstype.Resolver, tailscaleDNSMaxDomains+1)
++	privateMarker := "must-not-leak-private-domain"
++	for index := 0; index <= tailscaleDNSMaxDomains; index++ {
++		routes[mustXDialFQDN(t, fmt.Sprintf("%s-%d.example", privateMarker, index))] = nil
++	}
++	state := tailscaleDNSMemorySnapshotFromConfig(&tsDNS.Config{Routes: routes})
++	if state.errorCode != tailscaleDNSSnapshotTooLarge {
++		t.Fatalf("snapshot error code = %d, want too large", state.errorCode)
++	}
++	endpoint := &Endpoint{}
++	endpoint.dnsMemorySnapshot.Store(state)
++	_, err := endpoint.DNSMemorySnapshot()
++	if err == nil || strings.Contains(err.Error(), privateMarker) {
++		t.Fatalf("unexpected snapshot error: %v", err)
++	}
++}
++
++func TestXDialDNSMemorySnapshotRejectsEmptyHostRecord(t *testing.T) {
++	member := mustXDialFQDN(t, "private-member.example-tailnet.ts.net")
++	state := tailscaleDNSMemorySnapshotFromConfig(&tsDNS.Config{
++		Hosts: map[dnsname.FQDN][]netip.Addr{member: nil},
++	})
++	if state.errorCode != tailscaleDNSSnapshotInvalid {
++		t.Fatalf("snapshot error code = %d, want invalid", state.errorCode)
++	}
++}
++
+ func mustXDialFQDN(t *testing.T, value string) dnsname.FQDN {
+ 	t.Helper()
+ 	fqdn, err := dnsname.ToFQDN(value)

@@ -11,7 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	boxTailscale "github.com/sagernet/sing-box/protocol/tailscale"
+	"github.com/sagernet/sing/service"
 	tailLocal "github.com/sagernet/tailscale/client/local"
 	"github.com/sagernet/tailscale/ipn/ipnstate"
 	"github.com/sagernet/tailscale/tailcfg"
@@ -28,6 +31,15 @@ type tailscaleStatusPayload struct {
 	MagicDNSReady          bool                      `json:"magic_dns_ready"`
 	Readiness              tailscaleReadinessPayload `json:"readiness"`
 	ExitNodes              []tailscaleStatusExitNode `json:"exit_nodes"`
+}
+
+type tailscaleDNSPreparationPayload struct {
+	CaptureDomains []string `json:"capture_domains"`
+	RecordCount    int      `json:"record_count"`
+}
+
+type tailscaleDNSMemoryTransport interface {
+	ReplacePredefined(map[string][]netip.Addr, []string) error
 }
 
 type tailscaleReadinessPayload struct {
@@ -264,6 +276,65 @@ func (l *Libbox) TailscaleDNSCaptureDomains(endpointTag string) (string, error) 
 		return "", fmt.Errorf("Tailscale DNS capture domains are unavailable")
 	}
 	return string(data), nil
+}
+
+// PrepareTailscaleDNS atomically reads one immutable DNS Config snapshot from
+// the running endpoint and installs it into a memory-only hosts transport. The
+// returned metadata intentionally excludes every host address; the snapshot
+// itself never leaves this process and is never persisted.
+func (l *Libbox) PrepareTailscaleDNS(endpointTag string, dnsServerTag string) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.running || l.box == nil || l.runtimeCtx == nil || l.runtimeCtx.Err() != nil {
+		return "", fmt.Errorf("connection is not running")
+	}
+	rawEndpoint, found := l.box.Endpoint().Get(strings.TrimSpace(endpointTag))
+	endpoint, ok := rawEndpoint.(*boxTailscale.Endpoint)
+	if !found || !ok {
+		return "", fmt.Errorf("Tailscale endpoint is unavailable")
+	}
+	snapshot, err := endpoint.DNSMemorySnapshot()
+	if err != nil {
+		return "", err
+	}
+	transportManager := service.FromContext[adapter.DNSTransportManager](l.runtimeCtx)
+	if transportManager == nil {
+		return "", fmt.Errorf("Tailscale DNS memory transport is unavailable")
+	}
+	rawTransport, found := transportManager.Transport(strings.TrimSpace(dnsServerTag))
+	if !found {
+		return "", fmt.Errorf("Tailscale DNS memory transport is unavailable")
+	}
+	metadata, err := installTailscaleDNSMemorySnapshot(snapshot, rawTransport)
+	if err != nil {
+		return "", err
+	}
+	if l.routingProbe != nil {
+		l.routingProbe.replaceDNSSnapshotAddresses(snapshot.Hosts)
+	}
+	return metadata, nil
+}
+
+func installTailscaleDNSMemorySnapshot(snapshot boxTailscale.DNSMemorySnapshot, rawTransport adapter.DNSTransport) (string, error) {
+	if len(snapshot.CaptureDomains) == 0 || len(snapshot.CaptureDomains) > 2_048 ||
+		snapshot.RecordCount < 1 || snapshot.RecordCount > 4_096 {
+		return "", fmt.Errorf("Tailscale DNS snapshot is invalid")
+	}
+	transport, ok := rawTransport.(tailscaleDNSMemoryTransport)
+	if !ok || rawTransport.Type() != C.DNSTypeHosts {
+		return "", fmt.Errorf("Tailscale DNS memory transport is unavailable")
+	}
+	if err := transport.ReplacePredefined(snapshot.Hosts, snapshot.OwnedDomains); err != nil {
+		return "", fmt.Errorf("Tailscale DNS memory snapshot could not be installed")
+	}
+	payload, err := json.Marshal(tailscaleDNSPreparationPayload{
+		CaptureDomains: snapshot.CaptureDomains,
+		RecordCount:    snapshot.RecordCount,
+	})
+	if err != nil {
+		return "", fmt.Errorf("Tailscale DNS preparation status is unavailable")
+	}
+	return string(payload), nil
 }
 
 // ProbeTailscalePeer distinguishes path discovery from authenticated

@@ -231,7 +231,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     ),
                 ]
                 self.logger.notice(
-                    "dns-capture-rules count=\(session.dnsCaptureDomains.count, privacy: .public)"
+                    "dns-capture-rules count=\(session.dnsCaptureDomains.count, privacy: .public) tailscale-records=\(session.tailscaleDNSRecordCount, privacy: .public)"
                 )
                 let commitID = UUID()
                 let replacedRelays = self.relayRegistry.activate(

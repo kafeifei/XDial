@@ -51,6 +51,7 @@ struct ProviderDiagnosticsRequest: Codable, Equatable {
 struct ProviderRoutingProbeSnapshot: Codable, Equatable {
     let probeID: String
     let matchCount: Int
+    let candidateAddressCount: Int
     let outboundTagCounts: [String: Int]
     let lineIDCounts: [String: Int]
     let ruleSetTag: String?
@@ -58,6 +59,7 @@ struct ProviderRoutingProbeSnapshot: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case probeID = "probe_id"
         case matchCount = "match_count"
+        case candidateAddressCount = "candidate_address_count"
         case outboundTagCounts = "outbound_tag_counts"
         case lineIDCounts = "line_id_counts"
         case ruleSetTag = "rule_set_tag"
@@ -66,12 +68,14 @@ struct ProviderRoutingProbeSnapshot: Codable, Equatable {
     init(
         probeID: String,
         matchCount: Int,
+        candidateAddressCount: Int = 0,
         outboundTagCounts: [String: Int],
         lineIDCounts: [String: Int] = [:],
         ruleSetTag: String? = nil
     ) {
         self.probeID = probeID
         self.matchCount = matchCount
+        self.candidateAddressCount = candidateAddressCount
         self.outboundTagCounts = outboundTagCounts
         self.lineIDCounts = lineIDCounts
         self.ruleSetTag = ruleSetTag
@@ -81,6 +85,10 @@ struct ProviderRoutingProbeSnapshot: Codable, Equatable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         probeID = try values.decode(String.self, forKey: .probeID)
         matchCount = try values.decode(Int.self, forKey: .matchCount)
+        candidateAddressCount = try values.decodeIfPresent(
+            Int.self,
+            forKey: .candidateAddressCount
+        ) ?? 0
         outboundTagCounts = try values.decode(
             [String: Int].self,
             forKey: .outboundTagCounts
@@ -122,6 +130,7 @@ struct ProviderRoutingProbeSnapshot: Codable, Equatable {
         return ProviderRoutingProbeSnapshot(
             probeID: probeID,
             matchCount: max(0, matchCount),
+            candidateAddressCount: max(0, candidateAddressCount),
             outboundTagCounts: filteredTags,
             lineIDCounts: attributedLines,
             ruleSetTag: ruleSetTag.flatMap {

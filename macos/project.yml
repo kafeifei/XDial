@@ -43,7 +43,7 @@ targets:
         # outer .systemextension filename.
         PRODUCT_NAME: "$(PRODUCT_BUNDLE_IDENTIFIER)"
         MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "89"
+        CURRENT_PROJECT_VERSION: "94"
         ENABLE_APP_SANDBOX: YES
       configs:
         Debug:
@@ -93,7 +93,7 @@ targets:
       base:
         PRODUCT_NAME: XDial
         MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "89"
+        CURRENT_PROJECT_VERSION: "94"
         ENABLE_USER_SCRIPT_SANDBOXING: NO
       configs:
         Debug:

@@ -24,6 +24,7 @@ final class EmbeddedSingBoxRuntime {
         let lineOutbounds: [String: String]
         let ruleSetTags: Set<String>
         let dnsCaptureDomains: [String]
+        let tailscaleDNSRecordCount: Int
     }
 
     private struct SessionEnvelope: Decodable {
@@ -45,11 +46,13 @@ final class EmbeddedSingBoxRuntime {
             let endpointTag: String
             let exitNode: String
             let magicDNSEnabled: Bool
+            let dnsServerTag: String?
 
             enum CodingKeys: String, CodingKey {
                 case endpointTag = "endpoint_tag"
                 case exitNode = "exit_node"
                 case magicDNSEnabled = "magic_dns_enabled"
+                case dnsServerTag = "dns_server_tag"
             }
         }
 
@@ -283,7 +286,11 @@ final class EmbeddedSingBoxRuntime {
             }),
             !envelope.ruleSetTags.contains(""),
             Set(envelope.ruleSetTags).count ==
-                envelope.ruleSetTags.count
+                envelope.ruleSetTags.count,
+            envelope.tailscale.map({ tailscale in
+                !tailscale.magicDNSEnabled ||
+                    !(tailscale.dnsServerTag ?? "").isEmpty
+            }) ?? true
         else {
             throw RuntimeError.invalidSessionEnvelope
         }
@@ -401,14 +408,15 @@ final class EmbeddedSingBoxRuntime {
                     )
                 }
             )
-            var dnsCaptureDomains: [String] = []
+            var preparedTailscaleDNS:
+                TransparentProxyPreparedTailscaleDNS?
             if let tailscale = envelope.tailscale {
                 let taskID = envelope.plan.tasks.first {
                     $0.kind == "line" &&
                         $0.resourceType == "tailscale"
                 }?.id ?? "data-plane:sing-box"
                 do {
-                    dnsCaptureDomains = try waitForTailscale(
+                    preparedTailscaleDNS = try waitForTailscale(
                         instance,
                         target: tailscale,
                         reporter: reporter,
@@ -470,7 +478,10 @@ final class EmbeddedSingBoxRuntime {
                 credentials: credentials,
                 lineOutbounds: envelope.lineOutbounds,
                 ruleSetTags: Set(envelope.ruleSetTags),
-                dnsCaptureDomains: dnsCaptureDomains
+                dnsCaptureDomains:
+                    preparedTailscaleDNS?.captureDomains ?? [],
+                tailscaleDNSRecordCount:
+                    preparedTailscaleDNS?.recordCount ?? 0
             )
         } catch {
             callback.markStopped()
@@ -591,7 +602,7 @@ final class EmbeddedSingBoxRuntime {
         reporter: ConnectionTransactionReporter,
         taskID: String,
         cancellation: ConnectionCancellation
-    ) throws -> [String] {
+    ) throws -> TransparentProxyPreparedTailscaleDNS? {
         try checkCancellation(cancellation)
         var underlayProbeError: NSError?
         let underlayAddress = instance.probeOutboundIP(
@@ -701,31 +712,55 @@ final class EmbeddedSingBoxRuntime {
                             "tailscale-ready endpoint=\(target.endpointTag, privacy: .public)"
                         )
                         if !target.magicDNSEnabled {
-                            return []
+                            return nil
                         }
-                        var domainsError: NSError?
-                        let domainsJSON =
-                            instance.tailscaleDNSCaptureDomains(
+                        guard let dnsServerTag = target.dnsServerTag else {
+                            throw RuntimeError.invalidSessionEnvelope
+                        }
+                        try checkCancellation(cancellation)
+                        var preparationError: NSError?
+                        // Snapshot and replace happen atomically in Libbox.
+                        // Only bounded ingress metadata crosses into Swift so
+                        // member address mappings cannot reach reports or
+                        // Provider configuration.
+                        let metadataJSON =
+                            instance.prepareTailscaleDNS(
                                 target.endpointTag,
-                                error: &domainsError
+                                dnsServerTag: dnsServerTag,
+                                error: &preparationError
                             )
-                        if let domainsError {
-                            throw domainsError
-                        }
-                        guard
-                            let domainsData = domainsJSON.data(
-                                using: .utf8
-                            ),
-                            let domains = try? JSONDecoder().decode(
-                                [String].self,
-                                from: domainsData
+                        if preparationError != nil {
+                            throw ConnectionRuntimeFailure(
+                                code:
+                                    "tailscale-dns-preparation-failed",
+                                message:
+                                    "无法准备当前 Tailnet 的内存 DNS 记录",
+                                taskID: "dns:mode",
+                                evidence: nil
                             )
-                        else {
-                            throw RuntimeError.invalidTailscaleStatus
                         }
-                        return try TransparentProxyDNSCapturePlan.validate(
-                            domains
+                        let prepared:
+                            TransparentProxyPreparedTailscaleDNS
+                        do {
+                            prepared = try
+                                TransparentProxyDNSCapturePlan
+                                .decodePreparedTailscaleDNS(
+                                    metadataJSON
+                                )
+                        } catch {
+                            throw ConnectionRuntimeFailure(
+                                code:
+                                    "tailscale-dns-preparation-failed",
+                                message: error.localizedDescription,
+                                taskID: "dns:mode",
+                                evidence: nil
+                            )
+                        }
+                        try checkCancellation(cancellation)
+                        logger.notice(
+                            "tailscale-dns-prepared records=\(prepared.recordCount) capture-domains=\(prepared.captureDomains.count)"
                         )
+                        return prepared
                     }
                     if let latest = latestSelectedExitNode(
                             instance,

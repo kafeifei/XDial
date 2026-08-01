@@ -515,6 +515,8 @@ final class DebugServer {
                     "transactionID": report.transactionID,
                     "probeID": snapshot.probeID,
                     "matchCount": snapshot.matchCount,
+                    "candidateAddressCount":
+                        snapshot.candidateAddressCount,
                     "outboundTagCounts": snapshot.outboundTagCounts,
                     "lineIDCounts": snapshot.lineIDCounts,
                     "ruleSetTag": snapshot.ruleSetTag ?? "",

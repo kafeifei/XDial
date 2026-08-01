@@ -11,7 +11,10 @@ import (
 	"time"
 
 	box "github.com/sagernet/sing-box"
+	boxHosts "github.com/sagernet/sing-box/dns/transport/hosts"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	boxTailscale "github.com/sagernet/sing-box/protocol/tailscale"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/tailscale/ipn/ipnstate"
 	"github.com/sagernet/tailscale/types/key"
@@ -317,6 +320,48 @@ func TestTailscaleStatusErrorDoesNotEchoEndpointTag(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "private-endpoint-name") {
 		t.Fatalf("error leaked endpoint tag: %v", err)
+	}
+}
+
+func TestInstallTailscaleDNSMemorySnapshotReturnsOnlyBoundedMetadata(t *testing.T) {
+	rawTransport, err := boxHosts.NewTransport(
+		context.Background(),
+		log.NewNOPFactory().NewLogger("test"),
+		"tailscale-memory",
+		option.HostsDNSServerOptions{MemoryOnly: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateAddress := netip.MustParseAddr("100.64.0.8")
+	metadata, err := installTailscaleDNSMemorySnapshot(
+		boxTailscale.DNSMemorySnapshot{
+			Hosts: map[string][]netip.Addr{
+				"mba32k": {privateAddress},
+			},
+			CaptureDomains: []string{"mba32k", "example-tailnet.ts.net"},
+			OwnedDomains:   []string{"example-tailnet.ts.net"},
+			RecordCount:    1,
+		},
+		rawTransport,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(metadata, privateAddress.String()) {
+		t.Fatalf("preparation metadata leaked a Tailnet address: %s", metadata)
+	}
+	var payload tailscaleDNSPreparationPayload
+	if err := stdjson.Unmarshal([]byte(metadata), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.RecordCount != 1 || len(payload.CaptureDomains) != 2 {
+		t.Fatalf("unexpected preparation metadata: %+v", payload)
+	}
+	preferred := rawTransport.(interface{ PreferredDomain(string) bool })
+	if !preferred.PreferredDomain("mba32k.") ||
+		!preferred.PreferredDomain("unknown.example-tailnet.ts.net.") {
+		t.Fatal("installed hosts transport did not expose exact and authoritative ownership")
 	}
 }
 
