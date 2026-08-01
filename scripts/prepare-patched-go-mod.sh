@@ -200,6 +200,10 @@ done
 
 grep -Fq 'if allowedIP.Bits() == 0 {' \
 	"${patched_sing_box_dir}/protocol/tailscale/endpoint.go"
+grep -Fq 'func (t *Endpoint) DNSCaptureDomains() []string {' \
+	"${patched_sing_box_dir}/protocol/tailscale/endpoint.go"
+grep -Fq 'singleLabel+"."+searchDomain' \
+	"${patched_sing_box_dir}/protocol/tailscale/dns_transport.go"
 
 patched_module_dir="${staging_dir}/tailscale"
 cp -R "${source_dir}" "${patched_module_dir}"

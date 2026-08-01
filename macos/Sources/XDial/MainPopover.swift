@@ -233,10 +233,18 @@ struct MainPopover: View {
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                 case "reconnecting":
-                    Button("重连中…") { state.disconnect() }
+                    if state.automaticReconnectState.retryAt != nil {
+                        automaticRetryControls
+                    } else {
+                        Button(
+                            state.tr("取消重连", "Cancel reconnect")
+                        ) {
+                            state.disconnect()
+                        }
                         .tint(.orange)
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
+                    }
                 case "disconnecting":
                     Button("断开中…") {}
                         .controlSize(.small)
@@ -273,6 +281,46 @@ struct MainPopover: View {
             }
             .menuStyle(.borderlessButton)
             .frame(width: 30)
+        }
+    }
+
+    private var automaticRetryControls: some View {
+        Group {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let retryState = state.automaticReconnectState
+                let seconds = retryState.retryCountdownSeconds(
+                    at: context.date
+                ) ?? 0
+                Button(
+                    state.tr(
+                        "立即重试（\(seconds) 秒）",
+                        "Retry now (\(seconds)s)"
+                    )
+                ) {
+                    state.retryAutomaticReconnectNow()
+                }
+                .tint(.orange)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .accessibilityIdentifier("automatic-reconnect-now")
+                .accessibilityLabel(state.tr("立即重试", "Retry now"))
+                .accessibilityValue(state.tr(
+                    "剩余 \(seconds) 秒",
+                    "\(seconds) seconds remaining"
+                ))
+            }
+
+            Button {
+                state.disconnect()
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help(state.tr("取消自动重试", "Cancel automatic retry"))
+            .accessibilityLabel(
+                state.tr("取消自动重试", "Cancel automatic retry")
+            )
         }
     }
 

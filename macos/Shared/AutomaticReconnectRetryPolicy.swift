@@ -7,6 +7,7 @@ enum ConnectionFailureCode {
 }
 
 enum AutomaticReconnectTrigger: String, Codable {
+    case automaticConnection = "automatic-connection"
     case underlayChange = "underlay-change"
     case unexpectedDisconnect = "unexpected-disconnect"
 }
@@ -17,6 +18,8 @@ struct AutomaticReconnectRuntimeState: Codable, Equatable {
     let attemptsUsed: Int
     let maxAttempts: Int
     let stableResetAt: Date?
+    let retryAt: Date?
+    let retryAttempt: Int?
 
     enum CodingKeys: String, CodingKey {
         case inProgress = "in_progress"
@@ -24,6 +27,13 @@ struct AutomaticReconnectRuntimeState: Codable, Equatable {
         case attemptsUsed = "attempts_used"
         case maxAttempts = "max_attempts"
         case stableResetAt = "stable_reset_at"
+        case retryAt = "retry_at"
+        case retryAttempt = "retry_attempt"
+    }
+
+    func retryCountdownSeconds(at date: Date) -> Int? {
+        guard let retryAt else { return nil }
+        return max(0, Int(ceil(retryAt.timeIntervalSince(date))))
     }
 }
 
@@ -61,6 +71,8 @@ struct AutomaticReconnectRetryPolicy {
             return nil
         }
         switch trigger {
+        case .automaticConnection:
+            break
         case .underlayChange:
             guard report.error?.code ==
                 ConnectionFailureCode.underlayEgressUnavailable else {

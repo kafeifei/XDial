@@ -71,6 +71,9 @@ final class GoEngine: ObservableObject {
     var isBusy: Bool {
         status == "connecting" || status == "disconnecting" || status == "reconnecting"
     }
+    var automaticReconnectState: AutomaticReconnectRuntimeState {
+        transparentProxy.automaticReconnectState
+    }
 
     private init() {
         connectionReport = ConnectionReportJournal.read()
@@ -95,7 +98,10 @@ final class GoEngine: ObservableObject {
 
     // MARK: - Public API
 
-    func start(profileJSON: String) {
+    func start(
+        profileJSON: String,
+        automaticRetryTrigger: AutomaticReconnectTrigger? = nil
+    ) {
         lastError = nil
         // The journal remains available for recovery and diagnostics, but the
         // previous terminal report must not flash while a new transaction is
@@ -104,7 +110,15 @@ final class GoEngine: ObservableObject {
         explicitlyStoppedTransactionID = nil
         transparentProxySystemStatus = "connecting"
         reconcileTransparentProxyStatus()
-        transparentProxy.start(profileJSON: profileJSON)
+        transparentProxy.start(
+            profileJSON: profileJSON,
+            automaticRetryTrigger: automaticRetryTrigger
+        )
+    }
+
+    @discardableResult
+    func retryAutomaticReconnectNow() -> Bool {
+        transparentProxy.retryAutomaticReconnectNow()
     }
 
 #if DEBUG

@@ -95,6 +95,9 @@ final class AppState: ObservableObject {
     var isBusy: Bool {
         engine.isBusy || wakeReconnectPhase != nil
     }
+    var automaticReconnectState: AutomaticReconnectRuntimeState {
+        engine.automaticReconnectState
+    }
 
     var presentedConnectionReport: ConnectionReport? {
         if let wakeReconnectPhase,
@@ -782,10 +785,12 @@ final class AppState: ObservableObject {
             appLog("automatic connection ignored after explicit disconnect")
             return
         }
-        beginConnection()
+        beginConnection(automaticRetryTrigger: .automaticConnection)
     }
 
-    private func beginConnection() {
+    private func beginConnection(
+        automaticRetryTrigger: AutomaticReconnectTrigger? = nil
+    ) {
         guard installation.isReady else {
             installation.start()
             installation.present()
@@ -810,18 +815,23 @@ final class AppState: ObservableObject {
         stopTailscaleSetupSessions(
             lineIDs: tailscaleLineIDs,
             profileJSON: profileJSON,
-            generation: generation
+            generation: generation,
+            automaticRetryTrigger: automaticRetryTrigger
         )
     }
 
     private func stopTailscaleSetupSessions(
         lineIDs: [String],
         profileJSON: String,
-        generation: Int
+        generation: Int,
+        automaticRetryTrigger: AutomaticReconnectTrigger?
     ) {
         guard connectionAttempts.isCurrent(generation) else { return }
         guard let lineID = lineIDs.first else {
-            engine.start(profileJSON: profileJSON)
+            engine.start(
+                profileJSON: profileJSON,
+                automaticRetryTrigger: automaticRetryTrigger
+            )
             return
         }
         engine.stopTailscaleSetup(lineID: lineID) { [weak self] in
@@ -832,9 +842,15 @@ final class AppState: ObservableObject {
             self.stopTailscaleSetupSessions(
                 lineIDs: Array(lineIDs.dropFirst()),
                 profileJSON: profileJSON,
-                generation: generation
+                generation: generation,
+                automaticRetryTrigger: automaticRetryTrigger
             )
         }
+    }
+
+    func retryAutomaticReconnectNow() {
+        guard engine.retryAutomaticReconnectNow() else { return }
+        objectWillChange.send()
     }
 
     func disconnect() {
