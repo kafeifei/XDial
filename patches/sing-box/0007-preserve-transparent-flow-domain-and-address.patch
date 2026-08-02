@@ -1,0 +1,228 @@
+diff --git a/option/simple.go b/option/simple.go
+--- a/option/simple.go
++++ b/option/simple.go
+@@ -7,8 +7,9 @@ import (
+ 
+ type SocksInboundOptions struct {
+ 	ListenOptions
+-	Users          []auth.User           `json:"users,omitempty"`
+-	DomainResolver *DomainResolveOptions `json:"domain_resolver,omitempty"`
++	Users             []auth.User           `json:"users,omitempty"`
++	DomainResolver    *DomainResolveOptions `json:"domain_resolver,omitempty"`
++	XDialFlowMetadata bool                  `json:"xdial_flow_metadata,omitempty"`
+ }
+ 
+ type HTTPMixedInboundOptions struct {
+diff --git a/protocol/socks/inbound.go b/protocol/socks/inbound.go
+--- a/protocol/socks/inbound.go
++++ b/protocol/socks/inbound.go
+@@ -28,11 +28,12 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+-	router        adapter.ConnectionRouterEx
+-	logger        logger.ContextLogger
+-	listener      *listener.Listener
+-	authenticator *auth.Authenticator
+-	udpTimeout    time.Duration
++	router            adapter.ConnectionRouterEx
++	logger            logger.ContextLogger
++	listener          *listener.Listener
++	authenticator     *auth.Authenticator
++	udpTimeout        time.Duration
++	xdialFlowMetadata bool
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SocksInboundOptions) (adapter.Inbound, error) {
+@@ -43,11 +44,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLog
+ 		udpTimeout = C.UDPTimeout
+ 	}
+ 	inbound := &Inbound{
+-		Adapter:       inbound.NewAdapter(C.TypeSOCKS, tag),
+-		router:        uot.NewRouter(router, logger),
+-		logger:        logger,
+-		authenticator: auth.NewAuthenticator(options.Users),
+-		udpTimeout:    udpTimeout,
++		Adapter:           inbound.NewAdapter(C.TypeSOCKS, tag),
++		router:            uot.NewRouter(router, logger),
++		logger:            logger,
++		authenticator:     auth.NewAuthenticator(options.Users),
++		udpTimeout:        udpTimeout,
++		xdialFlowMetadata: options.XDialFlowMetadata,
+ 	}
+ 	inbound.listener = listener.New(listener.Options{
+ 		Context:           ctx,
+@@ -85,6 +87,14 @@ func (h *Inbound) newUserConnection(ctx context.Context, conn net.Conn, metadata
+ func (h *Inbound) newUserConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
++	if h.xdialFlowMetadata {
++		encoded, err := applyXDialFlowMetadata(&metadata)
++		if encoded && err != nil {
++			N.CloseOnHandshakeFailure(conn, onClose, err)
++			h.logger.ErrorContext(ctx, "reject invalid XDial flow metadata")
++			return
++		}
++	}
+ 	user, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
+diff --git a/protocol/socks/xdial_flow_metadata.go b/protocol/socks/xdial_flow_metadata.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/socks/xdial_flow_metadata.go
+@@ -0,0 +1,67 @@
++package socks
++
++import (
++	"bytes"
++	"net/netip"
++	"strings"
++	"unicode/utf8"
++
++	"github.com/sagernet/sing-box/adapter"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++var xdialFlowMetadataMagic = []byte{0x00, 0x58, 0x44, 0x01}
++
++// applyXDialFlowMetadata decodes the authenticated loopback relay's bounded
++// SOCKS destination envelope. The original domain remains rule metadata while
++// the already-resolved NE endpoint becomes the transport destination.
++func applyXDialFlowMetadata(metadata *adapter.InboundContext) (bool, error) {
++	if !metadata.Destination.IsDomain() {
++		return false, nil
++	}
++	raw := []byte(metadata.Destination.Fqdn)
++	if !bytes.HasPrefix(raw, xdialFlowMetadataMagic) {
++		return false, nil
++	}
++	if len(raw) <= len(xdialFlowMetadataMagic) {
++		return true, E.New("invalid XDial flow metadata")
++	}
++
++	addressOffset := len(xdialFlowMetadataMagic) + 1
++	addressLength := 0
++	switch raw[len(xdialFlowMetadataMagic)] {
++	case 0x01:
++		addressLength = 4
++	case 0x04:
++		addressLength = 16
++	default:
++		return true, E.New("invalid XDial flow metadata")
++	}
++	hostnameOffset := addressOffset + addressLength
++	if len(raw) <= hostnameOffset {
++		return true, E.New("invalid XDial flow metadata")
++	}
++
++	address, validAddress := netip.AddrFromSlice(
++		raw[addressOffset:hostnameOffset],
++	)
++	if !validAddress || address.IsUnspecified() || address.IsMulticast() {
++		return true, E.New("invalid XDial flow metadata")
++	}
++	address = address.Unmap()
++	hostnameBytes := raw[hostnameOffset:]
++	if !utf8.Valid(hostnameBytes) || bytes.IndexByte(hostnameBytes, 0) >= 0 {
++		return true, E.New("invalid XDial flow metadata")
++	}
++	hostname := string(hostnameBytes)
++	if len(hostname) > 253 || strings.TrimSpace(hostname) != hostname ||
++		!M.IsDomainName(hostname) {
++		return true, E.New("invalid XDial flow metadata")
++	}
++
++	port := metadata.Destination.Port
++	metadata.Domain = hostname
++	metadata.Destination = M.SocksaddrFrom(address, port)
++	return true, nil
++}
+diff --git a/protocol/socks/xdial_flow_metadata_test.go b/protocol/socks/xdial_flow_metadata_test.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/socks/xdial_flow_metadata_test.go
+@@ -0,0 +1,82 @@
++package socks
++
++import (
++	"net/netip"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++func xdialEncodedDestination(family byte, address []byte, hostname string) string {
++	raw := append([]byte(nil), xdialFlowMetadataMagic...)
++	raw = append(raw, family)
++	raw = append(raw, address...)
++	raw = append(raw, hostname...)
++	return string(raw)
++}
++
++func TestXDialFlowMetadataPreservesDomainAndUsesIPv4Destination(t *testing.T) {
++	metadata := adapter.InboundContext{
++		Destination: M.Socksaddr{
++			Fqdn: xdialEncodedDestination(
++				0x01,
++				[]byte{100, 117, 141, 16},
++				"mbp128k",
++			),
++			Port: 22,
++		},
++	}
++
++	encoded, err := applyXDialFlowMetadata(&metadata)
++	require.NoError(t, err)
++	require.True(t, encoded)
++	require.Equal(t, "mbp128k", metadata.Domain)
++	require.Equal(t, netip.MustParseAddr("100.117.141.16"), metadata.Destination.Addr)
++	require.Equal(t, uint16(22), metadata.Destination.Port)
++	require.Empty(t, metadata.Destination.Fqdn)
++}
++
++func TestXDialFlowMetadataPreservesDomainAndUsesIPv6Destination(t *testing.T) {
++	address := netip.MustParseAddr("fd7a:115c:a1e0::1")
++	metadata := adapter.InboundContext{
++		Destination: M.Socksaddr{
++			Fqdn: xdialEncodedDestination(0x04, address.AsSlice(), "node.example.ts.net"),
++			Port: 443,
++		},
++	}
++
++	encoded, err := applyXDialFlowMetadata(&metadata)
++	require.NoError(t, err)
++	require.True(t, encoded)
++	require.Equal(t, "node.example.ts.net", metadata.Domain)
++	require.Equal(t, address, metadata.Destination.Addr)
++}
++
++func TestXDialFlowMetadataLeavesOrdinarySOCKSDomainUntouched(t *testing.T) {
++	metadata := adapter.InboundContext{
++		Destination: M.Socksaddr{Fqdn: "example.com", Port: 443},
++	}
++
++	encoded, err := applyXDialFlowMetadata(&metadata)
++	require.NoError(t, err)
++	require.False(t, encoded)
++	require.Empty(t, metadata.Domain)
++	require.Equal(t, "example.com", metadata.Destination.Fqdn)
++}
++
++func TestXDialFlowMetadataRejectsMalformedEnvelope(t *testing.T) {
++	metadata := adapter.InboundContext{
++		Destination: M.Socksaddr{
++			Fqdn: xdialEncodedDestination(0x09, nil, "mbp128k"),
++			Port: 22,
++		},
++	}
++
++	encoded, err := applyXDialFlowMetadata(&metadata)
++	require.Error(t, err)
++	require.True(t, encoded)
++	require.Empty(t, metadata.Domain)
++}

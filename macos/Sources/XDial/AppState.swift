@@ -1156,10 +1156,15 @@ final class AppState: ObservableObject {
                 .map(RuleSet.sanitizeEntry).filter { !$0.isEmpty }
             let cleanedCIDRs = loaded.ruleSets[i].cidrs
                 .map(RuleSet.sanitizeEntry).filter { !$0.isEmpty }
+            let cleanedApplications = RuleSet.sanitizeApplications(
+                loaded.ruleSets[i].applications
+            )
             if cleanedDomains != loaded.ruleSets[i].domains
-                || cleanedCIDRs != loaded.ruleSets[i].cidrs {
+                || cleanedCIDRs != loaded.ruleSets[i].cidrs
+                || cleanedApplications != loaded.ruleSets[i].applications {
                 loaded.ruleSets[i].domains = cleanedDomains
                 loaded.ruleSets[i].cidrs = cleanedCIDRs
+                loaded.ruleSets[i].applications = cleanedApplications
                 didMigrate = true
                 appLog("loadSaved: sanitized control chars in rule set \(loaded.ruleSets[i].id)")
             }

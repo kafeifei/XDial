@@ -3,10 +3,12 @@ import Foundation
 import Network
 @preconcurrency import NetworkExtension
 import OSLog
+import Security
 
 private struct ProviderRelayEndpoint: Sendable {
     let port: UInt16
     let credentials: SOCKSCredentials
+    let applicationCredentials: [String: SOCKSCredentials]
 }
 
 final class TransparentProxyProvider: NETransparentProxyProvider {
@@ -238,7 +240,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     generation: generation,
                     endpoint: ProviderRelayEndpoint(
                         port: session.port,
-                        credentials: session.credentials
+                        credentials: session.credentials,
+                        applicationCredentials:
+                            session.applicationCredentials
                     )
                 )
                 if replacedRelays.count > 0 {
@@ -677,12 +681,20 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         case .passThrough:
             return false
         }
+        guard let credentials = Self.credentials(
+            for: flow,
+            endpoint: reservation.endpoint
+        ) else {
+            relayRegistry.finish(reservation)
+            Self.reject(flow)
+            return true
+        }
         let handle: ProviderRelayHandle
         if let tcpFlow = flow as? NEAppProxyTCPFlow {
             handle = TCPFlowSOCKSRelay.makeHandle(
                 flow: tcpFlow,
                 socksPort: reservation.endpoint.port,
-                credentials: reservation.endpoint.credentials,
+                credentials: credentials,
                 trialID: reservation.generation,
                 logger: logger
             )
@@ -690,7 +702,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             handle = UDPFlowSOCKSRelay.makeHandle(
                 flow: udpFlow,
                 socksPort: reservation.endpoint.port,
-                credentials: reservation.endpoint.credentials,
+                credentials: credentials,
                 trialID: reservation.generation,
                 logger: logger
             )
@@ -713,6 +725,83 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             handle.cancel(with: AppProxyFlowCloseError.aborted)
         }
         return true
+    }
+
+    /// Only an audit-token-derived identity may select a derived SOCKS user.
+    /// `sourceAppSigningIdentifier` is used solely as a consistency check: if
+    /// it names an active application rule but cannot be proven by the audit
+    /// token, the claimed flow is closed rather than allowed to use the base
+    /// user and silently reach the Mode default.
+    private static func credentials(
+        for flow: NEAppProxyFlow,
+        endpoint: ProviderRelayEndpoint
+    ) -> SOCKSCredentials? {
+        let metadataIdentifier = flow.metaData.sourceAppSigningIdentifier
+        let auditIdentity = applicationIdentity(
+            auditToken: flow.metaData.sourceAppAuditToken
+        )
+        switch TransparentProxyApplicationCredentialDecision.select(
+            metadataSigningIdentifier: metadataIdentifier,
+            auditIdentity: auditIdentity,
+            activeCanonicalIdentities: Set(endpoint.applicationCredentials.keys)
+        ) {
+        case .base:
+            return endpoint.credentials
+        case let .application(canonicalIdentity):
+            // The pure selection logic can only return an identity from the
+            // supplied set. Still keep this lookup fail-closed if a future
+            // caller changes the endpoint map concurrently.
+            return endpoint.applicationCredentials[canonicalIdentity]
+        case .reject:
+            return nil
+        }
+    }
+
+    private static func applicationIdentity(
+        auditToken: Data?
+    ) -> TransparentProxyApplicationIdentity? {
+        guard let auditToken, !auditToken.isEmpty else {
+            return nil
+        }
+        let attributes = [
+            kSecGuestAttributeAudit as String: auditToken,
+        ] as CFDictionary
+        var code: SecCode?
+        guard SecCodeCopyGuestWithAttributes(
+            nil,
+            attributes,
+            SecCSFlags(rawValue: 0),
+            &code
+        ) == errSecSuccess, let code else {
+            return nil
+        }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(
+            code,
+            SecCSFlags(rawValue: 0),
+            &staticCode
+        ) == errSecSuccess, let staticCode else {
+            return nil
+        }
+        var rawInformation: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            staticCode,
+            SecCSFlags(rawValue: kSecCSSigningInformation),
+            &rawInformation
+        ) == errSecSuccess,
+        let information = rawInformation as? [String: Any],
+        let identifier = information[
+            kSecCodeInfoIdentifier as String
+        ] as? String,
+        let teamIdentifier = information[
+            kSecCodeInfoTeamIdentifier as String
+        ] as? String else {
+            return nil
+        }
+        return TransparentProxyApplicationIdentity(
+            teamIdentifier: teamIdentifier,
+            signingIdentifier: identifier
+        )
     }
 
     private static func reject(_ flow: NEAppProxyFlow) {

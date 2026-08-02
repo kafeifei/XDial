@@ -1348,6 +1348,7 @@ struct LineRow: View {
 struct RulesTab: View {
     @EnvironmentObject var state: AppState
     private let presetCatalog = RuleSetPresetCatalog.load()
+    @State private var applicationSelectionError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1377,6 +1378,9 @@ struct RulesTab: View {
                     Button(state.tr("手动域名/IP", "Manual Domain/IP")) {
                         addManual()
                     }
+                    Button(state.tr("应用", "Application")) {
+                        addApplication()
+                    }
                 } label: {
                     Label(
                         state.tr("添加规则", "Add Rule"),
@@ -1386,6 +1390,17 @@ struct RulesTab: View {
                 .menuStyle(.borderlessButton)
                 .padding(8)
             }
+        }
+        .alert(
+            state.tr("无法添加应用规则", "Could not add application rule"),
+            isPresented: Binding(
+                get: { applicationSelectionError != nil },
+                set: { if !$0 { applicationSelectionError = nil } }
+            )
+        ) {
+            Button(state.tr("好", "OK"), role: .cancel) {}
+        } message: {
+            Text(applicationSelectionError ?? "")
         }
     }
 
@@ -1414,6 +1429,25 @@ struct RulesTab: View {
         state.save()
     }
 
+    private func addApplication() {
+        do {
+            let applications = try ApplicationRulePicker.chooseApplications()
+            guard !applications.isEmpty else { return }
+            let id = "rule-" + String(UUID().uuidString.prefix(6))
+            state.profile.ruleSets.append(RuleSet(
+                id: id,
+                name: applications.count == 1
+                    ? applications[0].name
+                    : state.tr("应用规则", "Application Rule"),
+                type: "application",
+                applications: applications
+            ))
+            state.save()
+        } catch {
+            applicationSelectionError = error.localizedDescription
+        }
+    }
+
     private func delete(_ rule: RuleSet) {
         state.profile.ruleSets.removeAll { $0.id == rule.id }
         for i in state.profile.modes.indices {
@@ -1430,6 +1464,7 @@ struct RuleSetRow: View {
     @State private var domainsText = ""
     @State private var cidrsText = ""
     @State private var loaded = false
+    @State private var applicationSelectionError: String?
     @EnvironmentObject var state: AppState
 
     private func saveDomainsAndCIDRs() {
@@ -1464,18 +1499,33 @@ struct RuleSetRow: View {
                     }
                     if rule.type == "url" {
                         urlFields
+                    } else if rule.type == "application" {
+                        applicationFields
                     } else {
                         manualFields
                     }
                 }
             }
         )
+        .alert(
+            state.tr("无法读取应用签名", "Could not read application signature"),
+            isPresented: Binding(
+                get: { applicationSelectionError != nil },
+                set: { if !$0 { applicationSelectionError = nil } }
+            )
+        ) {
+            Button(state.tr("好", "OK"), role: .cancel) {}
+        } message: {
+            Text(applicationSelectionError ?? "")
+        }
     }
 
     private var ruleTypeLabel: String {
         switch rule.type {
         case "url":
             return "URL"
+        case "application":
+            return state.tr("应用", "Application")
         default:
             return state.tr("手动", "Manual")
         }
@@ -1543,6 +1593,99 @@ struct RuleSetRow: View {
             domainsText = rule.domains.joined(separator: "\n")
             cidrsText = rule.cidrs.joined(separator: "\n")
             loaded = true
+        }
+    }
+
+    private var applicationFields: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if rule.applications.isEmpty {
+                Text(state.tr(
+                    "尚未选择应用。此规则只匹配所选应用的签名身份。",
+                    "No application selected. This rule matches signed app identities only."
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else {
+                ForEach(rule.applications) { application in
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(nsImage: NSWorkspace.shared.icon(
+                            forFile: application.path
+                        ))
+                        .resizable()
+                        .frame(width: 18, height: 18)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(application.name)
+                                .font(.caption)
+                            Text(application.identities.joined(separator: "\n"))
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Spacer(minLength: 0)
+                        Button(role: .destructive) {
+                            rule.applications.removeAll {
+                                $0.path == application.path
+                            }
+                            state.save()
+                        } label: {
+                            Image(systemName: "minus.circle")
+                        }
+                        .buttonStyle(.plain)
+                        .help(state.tr("移除应用", "Remove application"))
+                    }
+                }
+            }
+            HStack(spacing: 8) {
+                Button(state.tr("添加应用…", "Add Application…")) {
+                    chooseApplications(replacing: false)
+                }
+                if !rule.applications.isEmpty {
+                    Button(state.tr("替换…", "Replace…")) {
+                        chooseApplications(replacing: true)
+                    }
+                }
+            }
+            .controlSize(.small)
+            Text(state.tr(
+                "匹配 Team ID / signing identifier；路径只用于显示，不参与分流。",
+                "Matches Team ID / signing identifier; paths are display-only."
+            ))
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.leading, 18)
+    }
+
+    private func chooseApplications(replacing: Bool) {
+        do {
+            let selected = try ApplicationRulePicker.chooseApplications()
+            guard !selected.isEmpty else { return }
+            rule.applications = RuleSet.sanitizeApplications(
+                replacing ? selected : rule.applications + selected
+            )
+            state.save()
+        } catch {
+            applicationSelectionError = error.localizedDescription
+        }
+    }
+}
+
+private enum ApplicationRulePicker {
+    static func chooseApplications() throws -> [ApplicationRuleApplication] {
+        let panel = NSOpenPanel()
+        panel.title = "选择应用"
+        panel.prompt = "选择"
+        panel.message = "将读取应用及其嵌套签名组件的 Team ID 和 signing identifier。"
+        panel.allowsMultipleSelection = true
+        // 把 .app 作为 file package 选择；若只允许目录同时又禁止进入 package，
+        // NSOpenPanel 会把目标显示出来却无法选中。
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.treatsFilePackagesAsDirectories = false
+        panel.allowedContentTypes = [.applicationBundle]
+        guard panel.runModal() == .OK else { return [] }
+        return try panel.urls.map {
+            try ApplicationRuleSignatureCollector.collect(at: $0)
         }
     }
 }

@@ -21,6 +21,10 @@ final class EmbeddedSingBoxRuntime {
     struct Session {
         let port: UInt16
         let credentials: SOCKSCredentials
+        /// Active application identities mapped to their per-session SOCKS
+        /// usernames. The password stays the ordinary loopback session
+        /// password; this map is never persisted or exposed in diagnostics.
+        let applicationCredentials: [String: SOCKSCredentials]
         let lineOutbounds: [String: String]
         let ruleSetTags: Set<String>
         let dnsCaptureDomains: [String]
@@ -61,6 +65,7 @@ final class EmbeddedSingBoxRuntime {
         let lineOutbounds: [String: String]
         let subscriptionOutbounds: [String: [String]]
         let ruleSetTags: [String]
+        let applicationCredentials: [String: String]?
         let anyConnect: AnyConnect?
         let tailscale: Tailscale?
 
@@ -70,6 +75,7 @@ final class EmbeddedSingBoxRuntime {
             case lineOutbounds = "line_outbounds"
             case subscriptionOutbounds = "subscription_outbounds"
             case ruleSetTags = "rule_set_tags"
+            case applicationCredentials = "application_credentials"
             case anyConnect = "anyconnect"
             case tailscale
         }
@@ -287,6 +293,11 @@ final class EmbeddedSingBoxRuntime {
             !envelope.ruleSetTags.contains(""),
             Set(envelope.ruleSetTags).count ==
                 envelope.ruleSetTags.count,
+            (envelope.applicationCredentials ?? [:]).allSatisfy({ entry in
+                !entry.key.isEmpty &&
+                    !entry.value.isEmpty &&
+                    entry.value.utf8.count <= 255
+            }),
             envelope.tailscale.map({ tailscale in
                 !tailscale.magicDNSEnabled ||
                     !(tailscale.dnsServerTag ?? "").isEmpty
@@ -476,6 +487,18 @@ final class EmbeddedSingBoxRuntime {
             return Session(
                 port: port,
                 credentials: credentials,
+                applicationCredentials: Dictionary(
+                    uniqueKeysWithValues: (envelope.applicationCredentials ?? [:])
+                        .map { identity, username in
+                            (
+                                identity,
+                                SOCKSCredentials(
+                                    username: username,
+                                    password: credentials.password
+                                )
+                            )
+                        }
+                ),
                 lineOutbounds: envelope.lineOutbounds,
                 ruleSetTags: Set(envelope.ruleSetTags),
                 dnsCaptureDomains:
