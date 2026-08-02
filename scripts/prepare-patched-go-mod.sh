@@ -222,6 +222,12 @@ grep -Fq 'item = NewPreferredByDNSItem(ctx, options.PreferredBy)' \
 	"${patched_sing_box_dir}/route/rule/rule_default.go"
 grep -Fq 'func TestXDialResolvePreferredByUsesDNSTransport(' \
 	"${patched_sing_box_dir}/route/rule/rule_preferred_by_resolve_xdial_test.go"
+grep -Fq 'XDialFlowMetadata bool' \
+	"${patched_sing_box_dir}/option/simple.go"
+grep -Fq 'func applyXDialFlowMetadata(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata.go"
+grep -Fq 'func TestXDialFlowMetadataPreservesDomainAndUsesIPv4Destination(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata_test.go"
 
 patched_module_dir="${staging_dir}/tailscale"
 cp -R "${source_dir}" "${patched_module_dir}"

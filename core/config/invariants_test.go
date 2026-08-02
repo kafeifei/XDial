@@ -733,6 +733,35 @@ func invMatchesModeBinding(profile *Profile, rule map[string]interface{}) bool {
 			continue
 		}
 		switch ruleSet.Type {
+		case RuleSetTypeApplication:
+			identities := applicationRuleSetIdentities(ruleSet)
+			users := invStrings(rule["auth_user"])
+			// Route rules intentionally carry only derived SOCKS usernames, not
+			// signing identities. Match the exact active RuleSet cardinality and
+			// the fixed "." + lowercase SHA-256 suffix shape; generator tests
+			// separately prove the exact derivation.
+			if len(identities) == 0 || len(users) != len(identities) {
+				continue
+			}
+			seen := map[string]bool{}
+			valid := true
+			for _, user := range users {
+				separator := strings.LastIndexByte(user, '.')
+				if separator <= 0 || len(user)-separator-1 != 64 || seen[user] {
+					valid = false
+					break
+				}
+				for _, character := range user[separator+1:] {
+					if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+						valid = false
+						break
+					}
+				}
+				seen[user] = true
+			}
+			if valid {
+				return true
+			}
 		case RuleSetTypeURL:
 			if rule["rule_set"] == sbRuleSetTag(ruleSet) {
 				return true
@@ -894,6 +923,52 @@ func TestINV4_NoHiddenRouteRules(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// INV4 的应用规则版本：Transparent Proxy 的应用归因只允许通过 active
+// Mode binding 生成原生 auth_user route rule，不能由某个已声明应用隐式注入。
+func TestINV4_ApplicationRuleIsTraceableToActiveModeBinding(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{ID: "px", Type: LineTypeTrojan, Enabled: true,
+				TrojanServer: "px.example", TrojanPort: 443, TrojanPassword: "secret", TrojanSNI: "px.example"},
+		},
+		RuleSets: []RuleSet{
+			{ID: "active-app", Type: RuleSetTypeApplication, Enabled: true,
+				Applications: []ApplicationMatch{{Identities: []string{"Q6L2SF6YDW/com.anthropic.claude"}}}},
+			{ID: "unbound-app", Type: RuleSetTypeApplication, Enabled: true,
+				Applications: []ApplicationMatch{{Identities: []string{"Q6L2SF6YDW/com.anthropic.unbound"}}}},
+		},
+		Modes: []Mode{{
+			ID:            "mode",
+			Bindings:      []RuleBinding{{RuleSetID: "active-app", LineID: "px"}},
+			DefaultLineID: "direct",
+		}},
+		ActiveModeID: "mode",
+	}
+	raw, err := GenerateSingBoxTransparentProxy(
+		profile, invSocksPort, "session-user", "session-password", t.TempDir(), invUnderlay, []string{"1.1.1.1"},
+	)
+	if err != nil {
+		t.Fatalf("GenerateSingBoxTransparentProxy: %v", err)
+	}
+	var generated map[string]interface{}
+	if err := json.Unmarshal(raw, &generated); err != nil {
+		t.Fatal(err)
+	}
+	var applicationRules []map[string]interface{}
+	for _, rule := range invRouteRules(t, generated) {
+		if _, exists := rule["auth_user"]; exists {
+			applicationRules = append(applicationRules, rule)
+			if !invMatchesModeBinding(profile, rule) {
+				t.Fatalf("application route cannot be traced to its Mode binding: %s", invPretty(rule))
+			}
+		}
+	}
+	if len(applicationRules) != 1 {
+		t.Fatalf("only the active Mode application binding may generate a route: %s", invPretty(applicationRules))
 	}
 }
 

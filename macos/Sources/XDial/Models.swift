@@ -282,10 +282,71 @@ struct TailscaleRuntimeStatus: Decodable, Hashable {
     var isRunning: Bool { backendState.lowercased() == "running" }
 }
 
+/// 一个被用户选入应用 RuleSet 的 app。`path` 仅用于在控制面展示和重新选择；
+/// 数据面只匹配 codesign 导出的稳定身份，不能把可移动的本机路径当成策略条件。
+struct ApplicationRuleApplication: Codable, Identifiable, Hashable {
+    var name: String
+    var path: String
+    var identities: [String]
+
+    var id: String { path }
+
+    init(name: String, path: String, identities: [String]) {
+        self.name = name
+        self.path = path
+        self.identities = Self.normalizedIdentities(identities)
+    }
+
+    /// Team ID 与 signing identifier 都来自 Security.framework。把它们作为一个
+    /// 原子值持久化，避免仅凭 bundle identifier 把另一团队的同名代码误判为所选 app。
+    static func canonicalIdentity(
+        teamIdentifier: String,
+        signingIdentifier: String
+    ) -> String? {
+        let team = teamIdentifier.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).uppercased()
+        let identifier = signingIdentifier.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard
+            team.count == 10,
+            team.unicodeScalars.allSatisfy({
+                ($0.value >= 65 && $0.value <= 90)
+                    || ($0.value >= 48 && $0.value <= 57)
+            }),
+            !identifier.isEmpty,
+            !identifier.contains("/"),
+            identifier.unicodeScalars.allSatisfy({
+                !CharacterSet.controlCharacters.contains($0)
+                    && !$0.properties.isWhitespace
+            })
+        else {
+            return nil
+        }
+        return "\(team)/\(identifier)"
+    }
+
+    static func normalizedIdentities(_ identities: [String]) -> [String] {
+        Array(Set(identities.compactMap { identity in
+            let pieces = identity.split(
+                separator: "/",
+                maxSplits: 1,
+                omittingEmptySubsequences: false
+            )
+            guard pieces.count == 2 else { return nil }
+            return canonicalIdentity(
+                teamIdentifier: String(pieces[0]),
+                signingIdentifier: String(pieces[1])
+            )
+        })).sorted()
+    }
+}
+
 struct RuleSet: Codable, Identifiable, Hashable {
     var id: String
     var name: String
-    var type: String  // url / manual
+    var type: String  // url / manual / application
     var enabled: Bool = true
     var url: String = ""
     var format: String = "auto"
@@ -294,6 +355,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
     var invert: Bool = false
     var domains: [String] = []
     var cidrs: [String] = []
+    var applications: [ApplicationRuleApplication] = []
 
     init(
         id: String,
@@ -304,7 +366,8 @@ struct RuleSet: Codable, Identifiable, Hashable {
         format: String = "auto",
         invert: Bool = false,
         domains: [String] = [],
-        cidrs: [String] = []
+        cidrs: [String] = [],
+        applications: [ApplicationRuleApplication] = []
     ) {
         self.id = id
         self.name = name
@@ -315,6 +378,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
         self.invert = invert
         self.domains = domains
         self.cidrs = cidrs
+        self.applications = applications
     }
 
     enum CodingKeys: String, CodingKey {
@@ -327,6 +391,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
         case invert
         case domains
         case cidrs
+        case applications
     }
 
     init(from decoder: Decoder) throws {
@@ -358,6 +423,10 @@ struct RuleSet: Codable, Identifiable, Hashable {
             [String].self,
             forKey: .cidrs
         ) ?? []
+        applications = try values.decodeIfPresent(
+            [ApplicationRuleApplication].self,
+            forKey: .applications
+        ) ?? []
     }
 
     /// 清洗单条域名/CIDR 条目：剥掉所有控制与格式类字符（粘贴常混入
@@ -368,6 +437,42 @@ struct RuleSet: Codable, Identifiable, Hashable {
         let stripped = String(String.UnicodeScalarView(
             raw.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }))
         return stripped.trimmingCharacters(in: .whitespaces)
+    }
+
+    static func sanitizeApplications(
+        _ applications: [ApplicationRuleApplication]
+    ) -> [ApplicationRuleApplication] {
+        var applicationsByPath: [String: ApplicationRuleApplication] = [:]
+        for application in applications {
+            let path = application.path.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            let identities = ApplicationRuleApplication.normalizedIdentities(
+                application.identities
+            )
+            guard !path.isEmpty, !identities.isEmpty else { continue }
+            let name = sanitizeEntry(application.name)
+            let normalized = ApplicationRuleApplication(
+                name: name.isEmpty
+                    ? URL(fileURLWithPath: path).deletingPathExtension()
+                        .lastPathComponent
+                    : name,
+                path: path,
+                identities: identities
+            )
+            if let existing = applicationsByPath[path] {
+                applicationsByPath[path] = ApplicationRuleApplication(
+                    name: existing.name,
+                    path: path,
+                    identities: existing.identities + identities
+                )
+            } else {
+                applicationsByPath[path] = normalized
+            }
+        }
+        return applicationsByPath.values.sorted { lhs, rhs in
+            lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
+        }
     }
 }
 

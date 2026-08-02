@@ -92,8 +92,9 @@ type Line struct {
 type RuleSetType string
 
 const (
-	RuleSetTypeURL    RuleSetType = "url"
-	RuleSetTypeManual RuleSetType = "manual"
+	RuleSetTypeURL         RuleSetType = "url"
+	RuleSetTypeManual      RuleSetType = "manual"
+	RuleSetTypeApplication RuleSetType = "application"
 )
 
 // RuleSetMatchKind 是 NetworkExtension 在严格下载并解析远程规则集后写入的
@@ -107,6 +108,15 @@ const (
 	RuleSetMatchIP      RuleSetMatchKind = "ip"
 	RuleSetMatchMixed   RuleSetMatchKind = "mixed"
 )
+
+// ApplicationMatch 是一个由用户选择的 macOS 应用的展示信息和稳定签名身份。
+// Name / Path 只供控制面显示；数据面只按 Identities 匹配，避免应用移动或改名
+// 改变路由语义。每个 identity 使用 "TEAMID/bundle.identifier" 的规范形式。
+type ApplicationMatch struct {
+	Name       string   `json:"name,omitempty"`
+	Path       string   `json:"path,omitempty"`
+	Identities []string `json:"identities"`
+}
 
 // RuleSet 规则：匹配哪些流量
 type RuleSet struct {
@@ -125,6 +135,10 @@ type RuleSet struct {
 	// 手动规则
 	Domains []string `json:"domains,omitempty"`
 	CIDRs   []string `json:"cidrs,omitempty"`
+
+	// 应用规则。它只保存签名身份及控制面展示元数据，不携带任何 Line 或
+	// Mode 信息；只有 active Mode 的 binding 才会把它编译为数据面规则。
+	Applications []ApplicationMatch `json:"applications,omitempty"`
 
 	RuntimeMatchKind RuleSetMatchKind `json:"-"`
 }

@@ -745,6 +745,80 @@ func TestGenerateTransparentProxySessionCarriesActiveAnyConnectOnlyInEnvelope(t 
 	}
 }
 
+func TestGenerateTransparentProxySessionCarriesOnlyActiveApplicationCredentials(t *testing.T) {
+	profile := config.Profile{
+		Lines: []config.Line{
+			{ID: "direct", Type: config.LineTypeDirect, Enabled: true},
+			{
+				ID: "us", Type: config.LineTypeTrojan, Enabled: true,
+				TrojanServer: "us.example.com", TrojanPort: 443,
+				TrojanPassword: "secret", TrojanSNI: "us.example.com",
+			},
+		},
+		RuleSets: []config.RuleSet{
+			{
+				ID: "active-app", Type: config.RuleSetTypeApplication, Enabled: true,
+				Applications: []config.ApplicationMatch{{
+					Name: "Claude",
+					Identities: []string{
+						"Q6L2SF6YDW/com.anthropic.claudefordesktop",
+						"Q6L2SF6YDW/com.anthropic.claudefordesktop.helper",
+					},
+				}},
+			},
+			{
+				ID: "unbound-app", Type: config.RuleSetTypeApplication, Enabled: true,
+				Applications: []config.ApplicationMatch{{
+					Identities: []string{"Q6L2SF6YDW/com.anthropic.unbound"},
+				}},
+			},
+			{
+				ID: "disabled-app", Type: config.RuleSetTypeApplication, Enabled: false,
+				Applications: []config.ApplicationMatch{{
+					Identities: []string{"Q6L2SF6YDW/com.anthropic.disabled"},
+				}},
+			},
+		},
+		Modes: []config.Mode{{
+			ID: "mode",
+			Bindings: []config.RuleBinding{
+				{RuleSetID: "active-app", LineID: "us"},
+				{RuleSetID: "disabled-app", LineID: "us"},
+			},
+			DefaultLineID: "direct",
+		}},
+		ActiveModeID: "mode",
+	}
+	profileData, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionJSON, err := GenerateTransparentProxySession(
+		string(profileData), t.TempDir(), 29876, "session-user", "session-password",
+		"utun-underlay", `["100.100.100.100"]`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var session transparentProxySession
+	if err := json.Unmarshal([]byte(sessionJSON), &session); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"Q6L2SF6YDW/com.anthropic.claudefordesktop":        config.ApplicationSOCKSUsername("session-user", "Q6L2SF6YDW/com.anthropic.claudefordesktop"),
+		"Q6L2SF6YDW/com.anthropic.claudefordesktop.helper": config.ApplicationSOCKSUsername("session-user", "Q6L2SF6YDW/com.anthropic.claudefordesktop.helper"),
+	}
+	if !reflect.DeepEqual(session.ApplicationCredentials, want) {
+		t.Fatalf("application credentials = %#v, want %#v", session.ApplicationCredentials, want)
+	}
+	if _, exists := session.ApplicationCredentials["Q6L2SF6YDW/com.anthropic.unbound"]; exists {
+		t.Fatalf("unbound application escaped into session credentials: %#v", session.ApplicationCredentials)
+	}
+	if _, exists := session.ApplicationCredentials["Q6L2SF6YDW/com.anthropic.disabled"]; exists {
+		t.Fatalf("disabled application escaped into session credentials: %#v", session.ApplicationCredentials)
+	}
+}
+
 func TestGenerateConnectionPlanIsSideEffectFreeAndCredentialFree(t *testing.T) {
 	profile := config.Profile{
 		Lines: []config.Line{{

@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -195,6 +197,19 @@ func generateSingBox(
 	if _, err := inspectModeReferences(profile, mode); err != nil {
 		return nil, err
 	}
+	activeApplicationIdentities := activeApplicationRuleSetIdentities(profile, mode)
+	if len(activeApplicationIdentities) > 0 && !platform.isTransparentProxy() {
+		// 只有 macOS Transparent Proxy 能取得系统交付的 source app 归因。
+		// 其他入口若跳过规则会让受约束应用静默落到 Mode 默认出口，必须拒绝。
+		return nil, fmt.Errorf("active application rule sets require the macOS transparent proxy ingress")
+	}
+	if platform.isTransparentProxy() && transparentIngress == nil {
+		return nil, fmt.Errorf("transparent proxy ingress is unavailable")
+	}
+	if len(activeApplicationIdentities) > 0 &&
+		len(transparentIngress.username)+1+sha256.Size*2 > 255 {
+		return nil, fmt.Errorf("transparent proxy session username is too long for application rules")
+	}
 	activeLineIDs, activeSubscriptionIDs := effectiveActiveTargetIDs(profile, mode)
 	activeVPNIDs := effectiveActiveVPNLineIDs(profile, mode)
 	activeTailscaleIDs := effectiveActiveTailscaleLineIDs(profile, mode)
@@ -365,6 +380,7 @@ func generateSingBox(
 			mode,
 			subTagMap,
 			validTags,
+			transparentIngress.username,
 		)
 	}
 
@@ -372,7 +388,6 @@ func generateSingBox(
 	// 先于订阅规则匹配，否则订阅里的大网段（如 1.0.0.0/8）会吞掉 /32，
 	// 让路由验收测到订阅语义而不是两条显式绑定。
 	routeRules = append(routeRules, acceptanceModeRules...)
-
 	// 模式的普通规则排在订阅自带规则之前。
 	//
 	// 架构约束：Mode 是唯一裁决者，订阅只是"自带规则的供给源"（D28）。订阅那几百条
@@ -508,10 +523,11 @@ func generateSingBox(
 
 	inbound := buildTUNInbound(vpnServerIP, platform)
 	if platform.isTransparentProxy() {
-		if transparentIngress == nil {
-			return nil, fmt.Errorf("transparent proxy ingress is unavailable")
+		var inboundErr error
+		inbound, inboundErr = buildTransparentProxyInbound(*transparentIngress, activeApplicationIdentities)
+		if inboundErr != nil {
+			return nil, inboundErr
 		}
-		inbound = buildTransparentProxyInbound(*transparentIngress)
 	}
 
 	cfg := SingBoxConfig{
@@ -531,17 +547,44 @@ func generateSingBox(
 
 func buildTransparentProxyInbound(
 	ingress transparentProxyIngress,
-) map[string]interface{} {
-	return map[string]interface{}{
-		"type":        "socks",
-		"tag":         "transparent-proxy-in",
-		"listen":      "127.0.0.1",
-		"listen_port": ingress.port,
-		"users": []map[string]interface{}{{
-			"username": ingress.username,
+	applicationIdentities []string,
+) (map[string]interface{}, error) {
+	users := []map[string]interface{}{{
+		"username": ingress.username,
+		"password": ingress.password,
+	}}
+	seen := map[string]bool{ingress.username: true}
+	for _, identity := range applicationIdentities {
+		username := ApplicationSOCKSUsername(ingress.username, identity)
+		if len(username) > 255 {
+			return nil, fmt.Errorf("transparent proxy session username is too long for application rules")
+		}
+		if seen[username] {
+			continue
+		}
+		seen[username] = true
+		users = append(users, map[string]interface{}{
+			"username": username,
 			"password": ingress.password,
-		}},
+		})
 	}
+	return map[string]interface{}{
+		"type":                "socks",
+		"tag":                 "transparent-proxy-in",
+		"listen":              "127.0.0.1",
+		"listen_port":         ingress.port,
+		"xdial_flow_metadata": true,
+		"users":               users,
+	}, nil
+}
+
+// ApplicationSOCKSUsername derives a per-flow SOCKS username from the session
+// credential and the OS-supplied signing identity. The raw identity never
+// enters the data-plane config, while SOCKS authentication and route matching
+// can join on this deterministic value.
+func ApplicationSOCKSUsername(baseUsername, identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return baseUsername + "." + hex.EncodeToString(sum[:])
 }
 
 // effectiveActiveTargetIDs 只返回活动模式真正引用的线路和订阅。未使用但 enabled 的
@@ -568,6 +611,58 @@ func effectiveActiveTargetIDs(profile *Profile, mode *Mode) (map[string]bool, ma
 		addTarget(binding.LineID, binding.SubscriptionID)
 	}
 	return lineIDs, subscriptionIDs
+}
+
+// activeApplicationRuleSetIdentities returns only identities that are both
+// enabled and bound by the active Mode. Unbound rules must create neither
+// route entries nor additional accepted SOCKS credentials.
+func activeApplicationRuleSetIdentities(profile *Profile, mode *Mode) []string {
+	seen := make(map[string]struct{})
+	var identities []string
+	for _, binding := range mode.Bindings {
+		ruleSet := profile.FindRuleSet(binding.RuleSetID)
+		if ruleSet == nil || !ruleSet.Enabled || ruleSet.Type != RuleSetTypeApplication {
+			continue
+		}
+		for _, identity := range applicationRuleSetIdentities(ruleSet) {
+			if _, exists := seen[identity]; exists {
+				continue
+			}
+			seen[identity] = struct{}{}
+			identities = append(identities, identity)
+		}
+	}
+	return identities
+}
+
+// ActiveApplicationSOCKSCredentials exposes the active Mode's identity →
+// derived SOCKS username map to the macOS session envelope. It follows the
+// exact same Mode boundary and derivation used by the generated inbound and
+// route rules, so Swift never has to reproduce the hash algorithm.
+func ActiveApplicationSOCKSCredentials(profile *Profile, baseUsername string) (map[string]string, error) {
+	if profile == nil {
+		return nil, fmt.Errorf("profile is nil")
+	}
+	mode := profile.ActiveMode()
+	if mode == nil {
+		return nil, fmt.Errorf("no active mode")
+	}
+	if _, err := inspectModeReferences(profile, mode); err != nil {
+		return nil, err
+	}
+	baseUsername = strings.TrimSpace(baseUsername)
+	if baseUsername == "" {
+		return nil, fmt.Errorf("transparent proxy session username is invalid for application rules")
+	}
+	identities := activeApplicationRuleSetIdentities(profile, mode)
+	if len(identities) > 0 && len(baseUsername)+1+sha256.Size*2 > 255 {
+		return nil, fmt.Errorf("transparent proxy session username is too long for application rules")
+	}
+	credentials := make(map[string]string)
+	for _, identity := range identities {
+		credentials[identity] = ApplicationSOCKSUsername(baseUsername, identity)
+	}
+	return credentials, nil
 }
 
 func effectiveActiveVPNLineIDs(profile *Profile, mode *Mode) map[string]bool {
@@ -1217,11 +1312,13 @@ func buildNESystemRouteRules() []map[string]interface{} {
 // - 手动 IP：启动前系统 DNS → IP route；
 // - 已检查为纯域名/纯 IP 的本地规则集分别走同样两条路径；
 // - 混合或无法安全分类的规则集按用户约定走保守的系统 DNS。
+// - 应用身份：原生 SOCKS auth_user → route，不参与 DNS。
 func buildTransparentProxyModeRouteRules(
 	profile *Profile,
 	mode *Mode,
 	subTagMap map[string]string,
 	validTags map[string]bool,
+	baseUsername string,
 ) (rules []map[string]interface{}) {
 	for _, binding := range mode.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
@@ -1232,7 +1329,7 @@ func buildTransparentProxyModeRouteRules(
 		if outTag == "" {
 			continue
 		}
-		rules = append(rules, compileTransparentProxyRuleSet(ruleSet, outTag)...)
+		rules = append(rules, compileTransparentProxyRuleSet(ruleSet, outTag, baseUsername)...)
 	}
 	return
 }
@@ -1266,8 +1363,21 @@ func bindingOutboundTag(
 	return outTag
 }
 
-func compileTransparentProxyRuleSet(ruleSet *RuleSet, outTag string) []map[string]interface{} {
+func compileTransparentProxyRuleSet(ruleSet *RuleSet, outTag, baseUsername string) []map[string]interface{} {
 	switch ruleSet.Type {
+	case RuleSetTypeApplication:
+		identities := applicationRuleSetIdentities(ruleSet)
+		if len(identities) == 0 {
+			return nil
+		}
+		users := make([]string, 0, len(identities))
+		for _, identity := range identities {
+			users = append(users, ApplicationSOCKSUsername(baseUsername, identity))
+		}
+		return []map[string]interface{}{{
+			"auth_user": users,
+			"outbound":  outTag,
+		}}
 	case RuleSetTypeManual:
 		var rules []map[string]interface{}
 		if len(ruleSet.Domains) > 0 {
@@ -1418,6 +1528,28 @@ func buildRouteRule(c *RuleSet, outTag string) map[string]interface{} {
 		return rule
 	}
 	return nil
+}
+
+// applicationRuleSetIdentities flattens the user-visible application entries
+// into the sing-box match list. The order stays stable for readable generated
+// config, while duplicates across an app bundle and its helpers cannot alter
+// matching semantics.
+func applicationRuleSetIdentities(ruleSet *RuleSet) []string {
+	if ruleSet == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var identities []string
+	for _, application := range ruleSet.Applications {
+		for _, identity := range application.Identities {
+			if _, exists := seen[identity]; exists {
+				continue
+			}
+			seen[identity] = struct{}{}
+			identities = append(identities, identity)
+		}
+	}
+	return identities
 }
 
 func applyURLRuleSetInvert(rule map[string]interface{}, ruleSet *RuleSet) {

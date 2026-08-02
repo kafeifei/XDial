@@ -1,6 +1,10 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
 
 // 本文件实现 INV6：模式引用的完整性检查，把"引用解析不了"这件事分成两类处理。
 //
@@ -21,6 +25,11 @@ import "fmt"
 // 所以模式引用 "direct" 时即使 profile 的 Lines 里没有对应条目也不算悬空。
 // 这是既有约定（默认 profile 里有这条线路，但大量精简配置直接引用它）。
 const builtinDirectLineID = "direct"
+
+// sourceAppIdentityPattern 对应 Transparent Proxy 从 audit token 得到的稳定
+// 应用身份。只接受 Team ID 和 bundle signing identifier 的组合，避免控制面
+// 为 SOCKS 派生凭据接受任意字符串。
+var sourceAppIdentityPattern = regexp.MustCompile(`^[A-Z0-9]{10}/[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$`)
 
 // ProfileWarningKind 标识一条降级警告的类别。字符串值会进 JSON，
 // 供 daemon/UI 直接消费，不要随意改名。
@@ -129,7 +138,7 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 		}
 
 		switch ruleSet.Type {
-		case RuleSetTypeURL, RuleSetTypeManual:
+		case RuleSetTypeURL, RuleSetTypeManual, RuleSetTypeApplication:
 		default:
 			return nil, fmt.Errorf(
 				"mode %q references rule set %q with unsupported type %q",
@@ -150,6 +159,12 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 					ruleSetLabel(ruleSet), modeLabel(mode)),
 			})
 			continue
+		}
+		if ruleSet.Type == RuleSetTypeApplication {
+			if err := validateApplicationRuleSet(ruleSet); err != nil {
+				return nil, fmt.Errorf("mode %q references invalid application rule set %q: %w",
+					mode.ID, ruleSet.ID, err)
+			}
 		}
 
 		if subscription != nil {
@@ -248,6 +263,24 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 	}
 
 	return warnings, nil
+}
+
+func validateApplicationRuleSet(ruleSet *RuleSet) error {
+	if len(ruleSet.Applications) == 0 {
+		return fmt.Errorf("applications is empty")
+	}
+	for applicationIndex, application := range ruleSet.Applications {
+		if len(application.Identities) == 0 {
+			return fmt.Errorf("application #%d has no signing identities", applicationIndex+1)
+		}
+		for identityIndex, identity := range application.Identities {
+			if identity == "" || strings.TrimSpace(identity) != identity ||
+				!sourceAppIdentityPattern.MatchString(identity) {
+				return fmt.Errorf("application #%d identity #%d is invalid", applicationIndex+1, identityIndex+1)
+			}
+		}
+	}
+	return nil
 }
 
 // lineHasUsableOutbound 判断一条 enabled 线路能不能真的生成出 outbound。

@@ -4,6 +4,12 @@ import Network
 import OSLog
 
 enum TCPFlowSOCKSRelay {
+    private struct RelayDestination {
+        let host: String
+        let port: UInt16
+        let encodedFlowMetadata: Data?
+    }
+
     private enum RelayError: Error {
         case invalidDestination
         case socksUnavailable
@@ -44,7 +50,9 @@ enum TCPFlowSOCKSRelay {
                             connection,
                             credentials: credentials,
                             host: destination.host,
-                            port: destination.port
+                            port: destination.port,
+                            encodedFlowMetadata:
+                                destination.encodedFlowMetadata
                         )
                         stage = "flow-open"
                         try await open(flow)
@@ -121,7 +129,7 @@ enum TCPFlowSOCKSRelay {
 
     private static func destination(
         for flow: NEAppProxyTCPFlow
-    ) throws -> (host: String, port: UInt16) {
+    ) throws -> RelayDestination {
         guard case let .hostPort(endpointHost, endpointPort) = flow.remoteFlowEndpoint else {
             throw RelayError.invalidDestination
         }
@@ -129,7 +137,17 @@ enum TCPFlowSOCKSRelay {
         guard !host.isEmpty else {
             throw RelayError.invalidDestination
         }
-        return (host, endpointPort.rawValue)
+        let encodedFlowMetadata = flow.remoteHostname.flatMap {
+            TransparentProxyFlowMetadata.encode(
+                hostname: $0,
+                endpointHost: endpointHost
+            )
+        }
+        return RelayDestination(
+            host: host,
+            port: endpointPort.rawValue,
+            encodedFlowMetadata: encodedFlowMetadata
+        )
     }
 
     private static func start(_ connection: NWConnection) async throws {
@@ -161,7 +179,8 @@ enum TCPFlowSOCKSRelay {
         _ connection: NWConnection,
         credentials: SOCKSCredentials?,
         host: String,
-        port: UInt16
+        port: UInt16,
+        encodedFlowMetadata: Data?
     ) async throws {
         let method: UInt8 = credentials == nil ? 0x00 : 0x02
         try await send(Data([0x05, 0x01, method]), to: connection)
@@ -174,7 +193,16 @@ enum TCPFlowSOCKSRelay {
         }
 
         var request = Data([0x05, 0x01, 0x00])
-        if let address = IPv4Address(host) {
+        if let encodedFlowMetadata {
+            guard !encodedFlowMetadata.isEmpty,
+                  encodedFlowMetadata.count <= 255
+            else {
+                throw RelayError.invalidDestination
+            }
+            request.append(0x03)
+            request.append(UInt8(encodedFlowMetadata.count))
+            request.append(encodedFlowMetadata)
+        } else if let address = IPv4Address(host) {
             request.append(0x01)
             request.append(contentsOf: address.rawValue)
         } else if let address = IPv6Address(host) {
