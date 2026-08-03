@@ -57,7 +57,9 @@ final class AppState: ObservableObject {
     private var engineSubs = Set<AnyCancellable>()
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
-    private var sleepWakeIntent = SleepWakeConnectionIntent()
+    private var screenWakeObserver: NSObjectProtocol?
+    private var sessionActiveObserver: NSObjectProtocol?
+    private var connectionDesired = ConnectionDesiredState()
     private var wakeReconnectGeneration = 0
     private var wakeReconnectTask: Task<Void, Never>?
     @Published private(set) var wakeReconnectPhase:
@@ -66,7 +68,6 @@ final class AppState: ObservableObject {
     private var initialStatusSynchronized = false
     private var launchAutoConnectPending = false
     private var connectionAttempts = ConnectionAttemptGate()
-    private var connectionIntent = ConnectionIntentLatch()
 
     private let profileKey = "xdial.profile"
     private let keychainPrefix = "xdial-line-"
@@ -402,6 +403,12 @@ final class AppState: ObservableObject {
                     guard let self else { return }
                     let status = self.engine.status
                     let report = self.engine.connectionReport
+                    if self.initialStatusSynchronized {
+                        self.synchronizeConnectionDesiredState(
+                            runtimeStatus: status,
+                            report: report
+                        )
+                    }
                     if self.wakeReconnectPhase == .startingConnection,
                        AutomaticConnectionPolicy.holdsConnectionIntent(
                            runtimeStatus: status
@@ -416,6 +423,9 @@ final class AppState: ObservableObject {
                         report: report
                     )
                     self.runLaunchAutoConnectIfNeeded()
+                    self.restoreAdoptedRuntimeIfNeeded(
+                        runtimeStatus: status
+                    )
                 }
             }
             .store(in: &engineSubs)
@@ -431,6 +441,10 @@ final class AppState: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.initialStatusSynchronized = true
+                self.synchronizeConnectionDesiredState(
+                    runtimeStatus: self.engine.status,
+                    report: self.engine.connectionReport
+                )
                 self.runLaunchAutoConnectIfNeeded()
             }
         }
@@ -448,6 +462,12 @@ final class AppState: ObservableObject {
         }
         if let wakeObserver {
             notificationCenter.removeObserver(wakeObserver)
+        }
+        if let screenWakeObserver {
+            notificationCenter.removeObserver(screenWakeObserver)
+        }
+        if let sessionActiveObserver {
+            notificationCenter.removeObserver(sessionActiveObserver)
         }
     }
 
@@ -555,21 +575,70 @@ final class AppState: ObservableObject {
 
     // MARK: - Automatic connection and sleep / wake
 
+    var desiredConnectionStateForDiagnostics: String {
+        switch connectionDesired.value {
+        case .unresolved:
+            return "unresolved"
+        case .disconnected(explicit: true):
+            return "disconnected_explicit"
+        case .disconnected(explicit: false):
+            return "disconnected"
+        case .connected:
+            return "connected"
+        }
+    }
+
+    var desiredConnectionModeIDForDiagnostics: String {
+        connectionDesired.modeID ?? ""
+    }
+
+    var desiredConnectionOwnershipForDiagnostics: String {
+        connectionDesired.runtimeOwnership?.rawValue ?? ""
+    }
+
+    var systemIsSleepingForDiagnostics: Bool { systemIsSleeping }
+
+    private func synchronizeConnectionDesiredState(
+        runtimeStatus: String,
+        report: ConnectionReport?
+    ) {
+        if AutomaticConnectionPolicy.holdsConnectionIntent(
+            runtimeStatus: runtimeStatus
+        ) {
+            let modeID = report?.mode.id ?? activeMode?.id ?? ""
+            if !modeID.isEmpty {
+                connectionDesired.observeExistingConnection(modeID: modeID)
+            }
+            return
+        }
+
+        if runtimeStatus == "disconnected", !launchAutoConnectPending {
+            connectionDesired.settleInitialDisconnection()
+        }
+    }
+
     private func runLaunchAutoConnectIfNeeded() {
-        guard launchAutoConnectPending, !systemIsSleeping else { return }
-        guard initialStatusSynchronized else { return }
+        guard initialStatusSynchronized, !systemIsSleeping else { return }
+        synchronizeConnectionDesiredState(
+            runtimeStatus: engine.status,
+            report: engine.connectionReport
+        )
+        guard launchAutoConnectPending else { return }
 
         if AutomaticConnectionPolicy.holdsConnectionIntent(
             runtimeStatus: engine.status
         ) {
-            // 冷启动时系统里已经有一笔有效事务，不能再创建第二笔。
-            launchAutoConnectPending = false
+            // 冷启动时系统里已经有一笔有效事务，不能再创建第二笔；但这份
+            // 自动连接请求也不能在这里被消费。安装事务可能紧接着替换
+            // System Extension，使旧 Provider 会话掉线。请求要一直保留到
+            // 真正发起新连接，或用户明确断开。
             return
         }
         guard installation.isReady else { return }
         guard engine.status == "disconnected" else { return }
         guard canConnect else {
             launchAutoConnectPending = false
+            connectionDesired.settleInitialDisconnection()
             appLog(
                 "launch auto-connect skipped: active Mode is not ready"
             )
@@ -583,6 +652,7 @@ final class AppState: ObservableObject {
             canConnect: canConnect
         ) else {
             launchAutoConnectPending = false
+            connectionDesired.settleInitialDisconnection()
             return
         }
 
@@ -608,19 +678,46 @@ final class AppState: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.handleDidWake()
+                self?.handleWakeSignal(trigger: "workspace_did_wake")
+            }
+        }
+        screenWakeObserver = notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleWakeSignal(trigger: "screens_did_wake")
+            }
+        }
+        sessionActiveObserver = notificationCenter.addObserver(
+            forName: NSWorkspace.sessionDidBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleWakeSignal(trigger: "session_did_become_active")
             }
         }
     }
 
     private func handleWillSleep() {
         systemIsSleeping = true
-        cancelWakeReconnectTask(clearIntent: false)
-        let shouldReconnect = sleepWakeIntent.prepareForSleep(
-            runtimeStatus: engine.status
+        cancelWakeReconnectTask()
+        synchronizeConnectionDesiredState(
+            runtimeStatus: engine.status,
+            report: engine.connectionReport
         )
         connectionAttempts.cancel()
-        guard shouldReconnect else { return }
+        let action = DesiredConnectionReconcilePolicy.decide(
+            desired: connectionDesired,
+            activeModeID: activeMode?.id ?? "",
+            systemIsSleeping: systemIsSleeping,
+            runtimeStatus: engine.status,
+            canConnect: canConnect,
+            networkWaitCompleted: false
+        )
+        guard action == .stopRuntime else { return }
 
         appLog("system will sleep: stopping active connection transaction")
         NetworkInfo.shared.clear()
@@ -631,18 +728,105 @@ final class AppState: ObservableObject {
         engine.stop()
     }
 
-    private func handleDidWake() {
+    private func handleWakeSignal(trigger: String) {
         systemIsSleeping = false
-        guard sleepWakeIntent.consumeWakeReconnect() else {
+        synchronizeConnectionDesiredState(
+            runtimeStatus: engine.status,
+            report: engine.connectionReport
+        )
+        reconcileDesiredConnection(trigger: trigger)
+    }
+
+    private func restoreAdoptedRuntimeIfNeeded(
+        runtimeStatus: String
+    ) {
+        guard initialStatusSynchronized,
+              installation.isReady,
+              !systemIsSleeping,
+              runtimeStatus == "disconnected",
+              connectionDesired.beginRestoringAdoptedRuntime()
+        else {
+            return
+        }
+        appLog(
+            "adopted runtime disconnected: current host claimed recovery"
+        )
+        reconcileDesiredConnection(trigger: "adopted_runtime_lost")
+    }
+
+    private func reconcileDesiredConnection(trigger: String) {
+        guard connectionDesired.wantsConnection else {
+            let action = DesiredConnectionReconcilePolicy.decide(
+                desired: connectionDesired,
+                activeModeID: activeMode?.id ?? "",
+                systemIsSleeping: systemIsSleeping,
+                runtimeStatus: engine.status,
+                canConnect: canConnect,
+                networkWaitCompleted: false
+            )
+            if action == .stopRuntime {
+                cancelWakeReconnectTask()
+                engine.stop(userInitiated: true)
+            }
             runLaunchAutoConnectIfNeeded()
             return
         }
+        if wakeReconnectTask != nil
+            || wakeReconnectPhase == .startingConnection {
+            appLog("wake signal \(trigger): reconcile already in progress")
+            return
+        }
 
+        let action = DesiredConnectionReconcilePolicy.decide(
+            desired: connectionDesired,
+            activeModeID: activeMode?.id ?? "",
+            systemIsSleeping: systemIsSleeping,
+            runtimeStatus: engine.status,
+            canConnect: canConnect,
+            networkWaitCompleted: false
+        )
+        switch action {
+        case .none:
+            cancelWakeReconnectTask()
+        case .waitForRuntime, .waitForNetwork:
+            scheduleDesiredConnectionReconcile(trigger: trigger)
+        case .stopRuntime:
+            cancelWakeReconnectTask()
+            engine.stop(userInitiated: true)
+        case .waitForWake:
+            cancelWakeReconnectTask()
+        case let .modeChanged(expectedModeID, activeModeID):
+            failDesiredConnectionReconcile(
+                message: tr(
+                    "无法恢复连接：当前模式已变化，请手动连接",
+                    "Could not restore the connection because the active Mode changed"
+                ),
+                log: "connection restore blocked: desired Mode \(expectedModeID), active Mode \(activeModeID)"
+            )
+        case .configurationUnavailable:
+            failDesiredConnectionReconcile(
+                message: tr(
+                    "无法自动恢复连接，请检查当前模式配置",
+                    "Could not restore the connection; check the active Mode configuration"
+                ),
+                log: "connection restore blocked: active Mode is not ready"
+            )
+        case .startAutomatically:
+            // networkWaitCompleted 为 false 时不会直接进入 start。
+            scheduleDesiredConnectionReconcile(trigger: trigger)
+        }
+    }
+
+    private func scheduleDesiredConnectionReconcile(trigger: String) {
         wakeReconnectGeneration += 1
         let generation = wakeReconnectGeneration
         wakeReconnectTask?.cancel()
-        wakeReconnectPhase = .finishingDisconnect
-        appLog("system did wake: waiting for network before reconnect")
+        wakeReconnectPhase = engine.status == "disconnected"
+            ? .waitingForNetwork
+            : .finishingDisconnect
+        appLog(
+            "connection reconcile trigger \(trigger)"
+        )
         wakeReconnectTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
@@ -656,9 +840,13 @@ final class AppState: ObservableObject {
             )
             guard
                 disconnected,
-                generation == self.wakeReconnectGeneration
+                generation == self.wakeReconnectGeneration,
+                !self.systemIsSleeping,
+                !Task.isCancelled
             else {
-                if generation == self.wakeReconnectGeneration {
+                if generation == self.wakeReconnectGeneration,
+                   !self.systemIsSleeping,
+                   !Task.isCancelled {
                     self.wakeReconnectPhase = nil
                     self.engine.lastError = self.tr(
                         "唤醒后无法完成断开，请手动重连",
@@ -672,7 +860,9 @@ final class AppState: ObservableObject {
             let networkReady = await NetworkAvailabilityWaiter.wait(
                 timeout: 8
             )
-            guard generation == self.wakeReconnectGeneration else {
+            guard generation == self.wakeReconnectGeneration,
+                  !self.systemIsSleeping,
+                  !Task.isCancelled else {
                 return
             }
             if !networkReady {
@@ -683,22 +873,55 @@ final class AppState: ObservableObject {
                         + "starting bounded connection transaction"
                 )
             }
-            guard self.engine.status == "disconnected" else {
+            let action = DesiredConnectionReconcilePolicy.decide(
+                desired: self.connectionDesired,
+                activeModeID: self.activeMode?.id ?? "",
+                systemIsSleeping: self.systemIsSleeping,
+                runtimeStatus: self.engine.status,
+                canConnect: self.canConnect,
+                networkWaitCompleted: true
+            )
+            switch action {
+            case let .startAutomatically(modeID):
+                appLog("wake reconnect started for Mode \(modeID)")
+                self.wakeReconnectPhase = .startingConnection
+                if !self.connectAutomatically(expectedModeID: modeID) {
+                    self.wakeReconnectPhase = nil
+                }
+            case .none:
                 self.wakeReconnectPhase = nil
-                return
-            }
-            guard self.canConnect else {
-                self.engine.lastError = self.tr(
-                    "唤醒后无法自动连接，请检查当前模式配置",
-                    "Could not reconnect after wake; check the active Mode configuration"
+            case let .modeChanged(expectedModeID, activeModeID):
+                self.failDesiredConnectionReconcile(
+                    message: self.tr(
+                        "无法恢复连接：当前模式已变化，请手动连接",
+                        "Could not restore the connection because the active Mode changed"
+                    ),
+                    log: "connection restore blocked: desired Mode \(expectedModeID), active Mode \(activeModeID)"
                 )
+            case .configurationUnavailable:
+                self.failDesiredConnectionReconcile(
+                    message: self.tr(
+                        "无法自动恢复连接，请检查当前模式配置",
+                        "Could not restore the connection; check the active Mode configuration"
+                    ),
+                    log: "connection restore blocked: active Mode is not ready"
+                )
+            case .stopRuntime:
                 self.wakeReconnectPhase = nil
-                return
+                self.engine.stop(userInitiated: true)
+            case .waitForWake, .waitForRuntime, .waitForNetwork:
+                self.wakeReconnectPhase = nil
             }
-            appLog("wake reconnect started")
-            self.wakeReconnectPhase = .startingConnection
-            self.connectAutomatically()
         }
+    }
+
+    private func failDesiredConnectionReconcile(
+        message: String,
+        log: String
+    ) {
+        cancelWakeReconnectTask()
+        engine.lastError = message
+        appLog(log)
     }
 
     private func waitForEngineToDisconnect(
@@ -709,24 +932,24 @@ final class AppState: ObservableObject {
         while Date() < deadline {
             if engine.status == "disconnected" { return true }
             if generation != wakeReconnectGeneration { return false }
+            if systemIsSleeping || Task.isCancelled { return false }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
         return engine.status == "disconnected"
     }
 
-    private func cancelWakeReconnectTask(clearIntent: Bool = true) {
+    private func cancelWakeReconnectTask() {
         wakeReconnectGeneration += 1
         wakeReconnectTask?.cancel()
         wakeReconnectTask = nil
         wakeReconnectPhase = nil
-        if clearIntent {
-            sleepWakeIntent.cancel()
-        }
     }
 
     func uninstall(deleteData: Bool, completion: @escaping (Bool, String?) -> Void) {
+        connectionDesired.userRequestedDisconnection()
         connectionAttempts.cancel()
         launchAutoConnectPending = false
+        cancelWakeReconnectTask()
         if launchAtLogin { launchAtLogin = false }
         ApplicationUninstaller.run(
             deleteData: deleteData
@@ -776,16 +999,32 @@ final class AppState: ObservableObject {
     // MARK: - Connect
 
     func connect() {
-        connectionIntent.userRequestedConnection()
+        guard let activeMode else { return }
+        connectionDesired.userRequestedConnection(modeID: activeMode.id)
+        cancelWakeReconnectTask()
         beginConnection()
     }
 
-    private func connectAutomatically() {
-        guard connectionIntent.allowsAutomaticConnection else {
+    @discardableResult
+    private func connectAutomatically(
+        expectedModeID: String? = nil
+    ) -> Bool {
+        guard let activeMode else { return false }
+        if let expectedModeID, expectedModeID != activeMode.id {
+            appLog(
+                "automatic connection ignored: desired Mode "
+                    + "\(expectedModeID), active Mode \(activeMode.id)"
+            )
+            return false
+        }
+        guard connectionDesired.automaticConnectionRequested(
+            modeID: activeMode.id
+        ) else {
             appLog("automatic connection ignored after explicit disconnect")
-            return
+            return false
         }
         beginConnection(automaticRetryTrigger: .automaticConnection)
+        return true
     }
 
     private func beginConnection(
@@ -855,7 +1094,7 @@ final class AppState: ObservableObject {
 
     func disconnect() {
         // 用户明确断开必须压过尚未消费的冷启动自动连接意图。
-        connectionIntent.userRequestedDisconnection()
+        connectionDesired.userRequestedDisconnection()
         launchAutoConnectPending = false
         connectionAttempts.cancel()
         cancelWakeReconnectTask()

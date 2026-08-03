@@ -8,7 +8,7 @@ import Security
 private struct ProviderRelayEndpoint: Sendable {
     let port: UInt16
     let credentials: SOCKSCredentials
-    let applicationCredentials: [String: SOCKSCredentials]
+    let applicationBundleCredentials: [ApplicationBundleCredential]
 }
 
 final class TransparentProxyProvider: NETransparentProxyProvider {
@@ -241,8 +241,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     endpoint: ProviderRelayEndpoint(
                         port: session.port,
                         credentials: session.credentials,
-                        applicationCredentials:
-                            session.applicationCredentials
+                        applicationBundleCredentials:
+                            session.applicationBundleCredentials
                     )
                 )
                 if replacedRelays.count > 0 {
@@ -727,39 +727,38 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         return true
     }
 
-    /// Only an audit-token-derived identity may select a derived SOCKS user.
-    /// `sourceAppSigningIdentifier` is used solely as a consistency check: if
-    /// it names an active application rule but cannot be proven by the audit
-    /// token, the claimed flow is closed rather than allowed to use the base
-    /// user and silently reach the Mode default.
+    /// Resolve the real executable path from the kernel-provided audit token
+    /// and apply the first matching App Bundle selector in Mode binding order.
+    /// A raw metadata signing identifier is intentionally insufficient: it
+    /// loses the path ancestry that keeps bundled helpers scoped to their app.
     private static func credentials(
         for flow: NEAppProxyFlow,
         endpoint: ProviderRelayEndpoint
     ) -> SOCKSCredentials? {
-        let metadataIdentifier = flow.metaData.sourceAppSigningIdentifier
-        let auditIdentity = applicationIdentity(
-            auditToken: flow.metaData.sourceAppAuditToken
-        )
+        let auditToken = flow.metaData.sourceAppAuditToken
+        let auditTokenPresent = auditToken?.isEmpty == false
+        let executablePath = applicationExecutablePath(auditToken: auditToken)
         switch TransparentProxyApplicationCredentialDecision.select(
-            metadataSigningIdentifier: metadataIdentifier,
-            auditIdentity: auditIdentity,
-            activeCanonicalIdentities: Set(endpoint.applicationCredentials.keys)
+            auditTokenPresent: auditTokenPresent,
+            auditExecutablePath: executablePath,
+            activeBundlePaths: endpoint.applicationBundleCredentials.map(
+                \.bundlePath
+            )
         ) {
         case .base:
             return endpoint.credentials
-        case let .application(canonicalIdentity):
-            // The pure selection logic can only return an identity from the
-            // supplied set. Still keep this lookup fail-closed if a future
-            // caller changes the endpoint map concurrently.
-            return endpoint.applicationCredentials[canonicalIdentity]
+        case let .application(bundlePath):
+            return endpoint.applicationBundleCredentials.first {
+                $0.bundlePath == bundlePath
+            }?.credentials
         case .reject:
             return nil
         }
     }
 
-    private static func applicationIdentity(
+    private static func applicationExecutablePath(
         auditToken: Data?
-    ) -> TransparentProxyApplicationIdentity? {
+    ) -> String? {
         guard let auditToken, !auditToken.isEmpty else {
             return nil
         }
@@ -783,25 +782,16 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         ) == errSecSuccess, let staticCode else {
             return nil
         }
-        var rawInformation: CFDictionary?
-        guard SecCodeCopySigningInformation(
+        var rawPath: CFURL?
+        guard SecCodeCopyPath(
             staticCode,
-            SecCSFlags(rawValue: kSecCSSigningInformation),
-            &rawInformation
+            SecCSFlags(rawValue: 0),
+            &rawPath
         ) == errSecSuccess,
-        let information = rawInformation as? [String: Any],
-        let identifier = information[
-            kSecCodeInfoIdentifier as String
-        ] as? String,
-        let teamIdentifier = information[
-            kSecCodeInfoTeamIdentifier as String
-        ] as? String else {
+        let rawPath else {
             return nil
         }
-        return TransparentProxyApplicationIdentity(
-            teamIdentifier: teamIdentifier,
-            signingIdentifier: identifier
-        )
+        return (rawPath as URL).standardizedFileURL.path
     }
 
     private static func reject(_ flow: NEAppProxyFlow) {

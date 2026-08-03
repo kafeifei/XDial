@@ -197,8 +197,8 @@ func generateSingBox(
 	if _, err := inspectModeReferences(profile, mode); err != nil {
 		return nil, err
 	}
-	activeApplicationIdentities := activeApplicationRuleSetIdentities(profile, mode)
-	if len(activeApplicationIdentities) > 0 && !platform.isTransparentProxy() {
+	activeApplicationPaths := activeApplicationRuleSetPaths(profile, mode)
+	if len(activeApplicationPaths) > 0 && !platform.isTransparentProxy() {
 		// 只有 macOS Transparent Proxy 能取得系统交付的 source app 归因。
 		// 其他入口若跳过规则会让受约束应用静默落到 Mode 默认出口，必须拒绝。
 		return nil, fmt.Errorf("active application rule sets require the macOS transparent proxy ingress")
@@ -206,7 +206,7 @@ func generateSingBox(
 	if platform.isTransparentProxy() && transparentIngress == nil {
 		return nil, fmt.Errorf("transparent proxy ingress is unavailable")
 	}
-	if len(activeApplicationIdentities) > 0 &&
+	if len(activeApplicationPaths) > 0 &&
 		len(transparentIngress.username)+1+sha256.Size*2 > 255 {
 		return nil, fmt.Errorf("transparent proxy session username is too long for application rules")
 	}
@@ -524,7 +524,7 @@ func generateSingBox(
 	inbound := buildTUNInbound(vpnServerIP, platform)
 	if platform.isTransparentProxy() {
 		var inboundErr error
-		inbound, inboundErr = buildTransparentProxyInbound(*transparentIngress, activeApplicationIdentities)
+		inbound, inboundErr = buildTransparentProxyInbound(*transparentIngress, activeApplicationPaths)
 		if inboundErr != nil {
 			return nil, inboundErr
 		}
@@ -547,15 +547,15 @@ func generateSingBox(
 
 func buildTransparentProxyInbound(
 	ingress transparentProxyIngress,
-	applicationIdentities []string,
+	applicationBundlePaths []string,
 ) (map[string]interface{}, error) {
 	users := []map[string]interface{}{{
 		"username": ingress.username,
 		"password": ingress.password,
 	}}
 	seen := map[string]bool{ingress.username: true}
-	for _, identity := range applicationIdentities {
-		username := ApplicationSOCKSUsername(ingress.username, identity)
+	for _, bundlePath := range applicationBundlePaths {
+		username := ApplicationSOCKSUsername(ingress.username, bundlePath)
 		if len(username) > 255 {
 			return nil, fmt.Errorf("transparent proxy session username is too long for application rules")
 		}
@@ -579,11 +579,11 @@ func buildTransparentProxyInbound(
 }
 
 // ApplicationSOCKSUsername derives a per-flow SOCKS username from the session
-// credential and the OS-supplied signing identity. The raw identity never
+// credential and the selected App Bundle path. The raw path never
 // enters the data-plane config, while SOCKS authentication and route matching
 // can join on this deterministic value.
-func ApplicationSOCKSUsername(baseUsername, identity string) string {
-	sum := sha256.Sum256([]byte(identity))
+func ApplicationSOCKSUsername(baseUsername, applicationBundlePath string) string {
+	sum := sha256.Sum256([]byte(applicationBundlePath))
 	return baseUsername + "." + hex.EncodeToString(sum[:])
 }
 
@@ -613,33 +613,41 @@ func effectiveActiveTargetIDs(profile *Profile, mode *Mode) (map[string]bool, ma
 	return lineIDs, subscriptionIDs
 }
 
-// activeApplicationRuleSetIdentities returns only identities that are both
+// activeApplicationRuleSetPaths returns only App Bundle paths that are both
 // enabled and bound by the active Mode. Unbound rules must create neither
-// route entries nor additional accepted SOCKS credentials.
-func activeApplicationRuleSetIdentities(profile *Profile, mode *Mode) []string {
+// route entries nor additional accepted SOCKS credentials. Order follows the
+// Mode binding list so overlapping Bundle selectors preserve visible priority.
+func activeApplicationRuleSetPaths(profile *Profile, mode *Mode) []string {
 	seen := make(map[string]struct{})
-	var identities []string
+	var paths []string
 	for _, binding := range mode.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
 		if ruleSet == nil || !ruleSet.Enabled || ruleSet.Type != RuleSetTypeApplication {
 			continue
 		}
-		for _, identity := range applicationRuleSetIdentities(ruleSet) {
-			if _, exists := seen[identity]; exists {
+		for _, bundlePath := range applicationRuleSetPaths(ruleSet) {
+			if _, exists := seen[bundlePath]; exists {
 				continue
 			}
-			seen[identity] = struct{}{}
-			identities = append(identities, identity)
+			seen[bundlePath] = struct{}{}
+			paths = append(paths, bundlePath)
 		}
 	}
-	return identities
+	return paths
 }
 
-// ActiveApplicationSOCKSCredentials exposes the active Mode's identity →
-// derived SOCKS username map to the macOS session envelope. It follows the
+// ApplicationSOCKSCredential is one ordered App Bundle selector → derived
+// SOCKS username pair carried only in the macOS session envelope.
+type ApplicationSOCKSCredential struct {
+	BundlePath string `json:"bundle_path"`
+	Username   string `json:"username"`
+}
+
+// ActiveApplicationSOCKSCredentials exposes the active Mode's ordered Bundle
+// path → derived SOCKS username list to the macOS session envelope. It follows the
 // exact same Mode boundary and derivation used by the generated inbound and
 // route rules, so Swift never has to reproduce the hash algorithm.
-func ActiveApplicationSOCKSCredentials(profile *Profile, baseUsername string) (map[string]string, error) {
+func ActiveApplicationSOCKSCredentials(profile *Profile, baseUsername string) ([]ApplicationSOCKSCredential, error) {
 	if profile == nil {
 		return nil, fmt.Errorf("profile is nil")
 	}
@@ -654,13 +662,16 @@ func ActiveApplicationSOCKSCredentials(profile *Profile, baseUsername string) (m
 	if baseUsername == "" {
 		return nil, fmt.Errorf("transparent proxy session username is invalid for application rules")
 	}
-	identities := activeApplicationRuleSetIdentities(profile, mode)
-	if len(identities) > 0 && len(baseUsername)+1+sha256.Size*2 > 255 {
+	bundlePaths := activeApplicationRuleSetPaths(profile, mode)
+	if len(bundlePaths) > 0 && len(baseUsername)+1+sha256.Size*2 > 255 {
 		return nil, fmt.Errorf("transparent proxy session username is too long for application rules")
 	}
-	credentials := make(map[string]string)
-	for _, identity := range identities {
-		credentials[identity] = ApplicationSOCKSUsername(baseUsername, identity)
+	credentials := make([]ApplicationSOCKSCredential, 0, len(bundlePaths))
+	for _, bundlePath := range bundlePaths {
+		credentials = append(credentials, ApplicationSOCKSCredential{
+			BundlePath: bundlePath,
+			Username:   ApplicationSOCKSUsername(baseUsername, bundlePath),
+		})
 	}
 	return credentials, nil
 }
@@ -1366,13 +1377,13 @@ func bindingOutboundTag(
 func compileTransparentProxyRuleSet(ruleSet *RuleSet, outTag, baseUsername string) []map[string]interface{} {
 	switch ruleSet.Type {
 	case RuleSetTypeApplication:
-		identities := applicationRuleSetIdentities(ruleSet)
-		if len(identities) == 0 {
+		bundlePaths := applicationRuleSetPaths(ruleSet)
+		if len(bundlePaths) == 0 {
 			return nil
 		}
-		users := make([]string, 0, len(identities))
-		for _, identity := range identities {
-			users = append(users, ApplicationSOCKSUsername(baseUsername, identity))
+		users := make([]string, 0, len(bundlePaths))
+		for _, bundlePath := range bundlePaths {
+			users = append(users, ApplicationSOCKSUsername(baseUsername, bundlePath))
 		}
 		return []map[string]interface{}{{
 			"auth_user": users,
@@ -1530,26 +1541,26 @@ func buildRouteRule(c *RuleSet, outTag string) map[string]interface{} {
 	return nil
 }
 
-// applicationRuleSetIdentities flattens the user-visible application entries
-// into the sing-box match list. The order stays stable for readable generated
-// config, while duplicates across an app bundle and its helpers cannot alter
-// matching semantics.
-func applicationRuleSetIdentities(ruleSet *RuleSet) []string {
+// applicationRuleSetPaths flattens the user-visible App Bundle entries into
+// the sing-box match list. The order stays stable for readable generated config.
+func applicationRuleSetPaths(ruleSet *RuleSet) []string {
 	if ruleSet == nil {
 		return nil
 	}
 	seen := make(map[string]struct{})
-	var identities []string
+	var paths []string
 	for _, application := range ruleSet.Applications {
-		for _, identity := range application.Identities {
-			if _, exists := seen[identity]; exists {
-				continue
-			}
-			seen[identity] = struct{}{}
-			identities = append(identities, identity)
+		bundlePath, ok := canonicalApplicationBundlePath(application.Path)
+		if !ok {
+			continue
 		}
+		if _, exists := seen[bundlePath]; exists {
+			continue
+		}
+		seen[bundlePath] = struct{}{}
+		paths = append(paths, bundlePath)
 	}
-	return identities
+	return paths
 }
 
 func applyURLRuleSetInvert(rule map[string]interface{}, ruleSet *RuleSet) {

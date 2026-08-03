@@ -109,13 +109,12 @@ const (
 	RuleSetMatchMixed   RuleSetMatchKind = "mixed"
 )
 
-// ApplicationMatch 是一个由用户选择的 macOS 应用的展示信息和稳定签名身份。
-// Name / Path 只供控制面显示；数据面只按 Identities 匹配，避免应用移动或改名
-// 改变路由语义。每个 identity 使用 "TEAMID/bundle.identifier" 的规范形式。
+// ApplicationMatch 是一个由用户选择的 macOS App Bundle。数据面按 Path 的
+// Bundle 前缀匹配实际发起连接的可执行文件，与 Surge Mac 的 App Bundle 模式一致。
+// 旧 Profile 里的 identities 字段由 JSON 解码器忽略，不再参与任何路由语义。
 type ApplicationMatch struct {
-	Name       string   `json:"name,omitempty"`
-	Path       string   `json:"path,omitempty"`
-	Identities []string `json:"identities"`
+	Name string `json:"name,omitempty"`
+	Path string `json:"path"`
 }
 
 // RuleSet 规则：匹配哪些流量
@@ -136,7 +135,7 @@ type RuleSet struct {
 	Domains []string `json:"domains,omitempty"`
 	CIDRs   []string `json:"cidrs,omitempty"`
 
-	// 应用规则。它只保存签名身份及控制面展示元数据，不携带任何 Line 或
+	// 应用规则。它只保存 App Bundle 路径及控制面展示元数据，不携带任何 Line 或
 	// Mode 信息；只有 active Mode 的 binding 才会把它编译为数据面规则。
 	Applications []ApplicationMatch `json:"applications,omitempty"`
 

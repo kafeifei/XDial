@@ -66,6 +66,9 @@ struct XDialApp: App {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    private var terminationTask: Task<Void, Never>?
+    private var terminationApproved = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 设置窗口：不随失焦隐藏 + 出现在 Cmd+Tab
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { n in
@@ -98,15 +101,61 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let engine = GoEngine.shared
-        guard engine.status == "connected" || engine.status == "connecting" || engine.status == "reconnecting" else {
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        appLog("application termination: delegate entered")
+        if terminationApproved {
+            appLog("application termination: final exit approved")
             return .terminateNow
         }
-        Task { @MainActor in
-            engine.stop()
-            sender.reply(toApplicationShouldTerminate: true)
+        if terminationTask != nil {
+            return .terminateCancel
         }
-        return .terminateLater
+        let engine = GoEngine.shared
+        guard Self.requiresTerminationDrain(engine) else {
+            appLog("application termination: no active network transaction")
+            return .terminateNow
+        }
+
+        // terminateLater 会让 NSApplication.terminate() 进入嵌套 RunLoop；
+        // NE 的 completion 与 MainActor 投影在这个状态下都可能无法推进。先
+        // cancel 本轮退出，让主事件循环继续跑；回滚闭合后再发起第二轮退出。
+        appLog("application termination: draining active network transaction")
+        engine.stop(userInitiated: true)
+        let deadline = Date().addingTimeInterval(12)
+        terminationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while Date() < deadline,
+                  Self.requiresTerminationDrain(engine) {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            if Self.requiresTerminationDrain(engine) {
+                let report = engine.connectionReport
+                let reportState = report?.state.rawValue ?? "none"
+                appLog(
+                    "application termination: network drain timed out; "
+                        + "status=\(engine.status) "
+                        + "report=\(reportState) "
+                        + "rollback_complete="
+                        + "\(report?.rollbackComplete ?? false) "
+                        + "system_takeover_removed="
+                        + "\(report?.systemTakeoverRemoved ?? false)"
+                )
+            } else {
+                appLog("application termination: network drain completed")
+            }
+            self.terminationApproved = true
+            self.terminationTask = nil
+            NSApp.terminate(nil)
+        }
+        return .terminateCancel
+    }
+
+    @MainActor
+    private static func requiresTerminationDrain(
+        _ engine: GoEngine
+    ) -> Bool {
+        engine.requiresTerminationDrain()
     }
 }

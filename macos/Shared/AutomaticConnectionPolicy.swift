@@ -29,26 +29,174 @@ struct AutomaticConnectionPolicy {
     }
 }
 
-struct SleepWakeConnectionIntent {
-    private(set) var shouldReconnectAfterWake = false
+/// 用户对连接的长期期望。休眠、暗唤醒、网络变化和 Provider 状态都只是
+/// reconcile 的输入，绝不能消费或清除这份期望。这样短暂暗唤醒后立即再次
+/// 休眠，也不会把真正唤醒所需的恢复意图吃掉。
+struct ConnectionDesiredState: Equatable {
+    enum RuntimeOwnership: String, Equatable {
+        /// 冷启动时发现的既有 Provider 会话，不受当前宿主的有界重试托管。
+        case adopted
+        /// 既有会话已经丢失，当前宿主已领取一次恢复责任。
+        case restoring
+        /// 当前宿主发起的事务，失败与掉线由数据面的有界重试托管。
+        case owned
+    }
+
+    enum Value: Equatable {
+        case unresolved
+        case disconnected(explicit: Bool)
+        case connected(
+            modeID: String,
+            runtimeOwnership: RuntimeOwnership
+        )
+    }
+
+    private(set) var value: Value = .unresolved
+
+    var modeID: String? {
+        guard case let .connected(modeID, _) = value else { return nil }
+        return modeID
+    }
+
+    var wantsConnection: Bool { modeID != nil }
+
+    var runtimeOwnership: RuntimeOwnership? {
+        guard case let .connected(_, ownership) = value else { return nil }
+        return ownership
+    }
+
+    mutating func observeExistingConnection(modeID: String) {
+        // 冷启动同步只允许补齐未知事实。用户已经明确点过断开时，迟到的系统
+        // 状态回调不能反向恢复连接期望。
+        guard case .unresolved = value else { return }
+        value = .connected(
+            modeID: modeID,
+            runtimeOwnership: .adopted
+        )
+    }
+
+    mutating func userRequestedConnection(modeID: String) {
+        value = .connected(
+            modeID: modeID,
+            runtimeOwnership: .owned
+        )
+    }
 
     @discardableResult
-    mutating func prepareForSleep(runtimeStatus: String) -> Bool {
-        shouldReconnectAfterWake =
-            AutomaticConnectionPolicy.holdsConnectionIntent(
+    mutating func automaticConnectionRequested(modeID: String) -> Bool {
+        if case .disconnected(explicit: true) = value {
+            return false
+        }
+        value = .connected(
+            modeID: modeID,
+            runtimeOwnership: .owned
+        )
+        return true
+    }
+
+    @discardableResult
+    mutating func beginRestoringAdoptedRuntime() -> Bool {
+        guard case let .connected(modeID, .adopted) = value else {
+            return false
+        }
+        value = .connected(
+            modeID: modeID,
+            runtimeOwnership: .restoring
+        )
+        return true
+    }
+
+    mutating func userRequestedDisconnection() {
+        value = .disconnected(explicit: true)
+    }
+
+    mutating func settleInitialDisconnection() {
+        guard case .unresolved = value else { return }
+        value = .disconnected(explicit: false)
+    }
+
+    func permitsRestoration(activeModeID: String) -> Bool {
+        modeID == activeModeID
+    }
+}
+
+/// 所有休眠 / 唤醒恢复入口都先归一成同一项动作。调用方可以重复投递
+/// `didWake`、屏幕唤醒和会话激活；只要输入事实没变，决策就是幂等的。
+enum DesiredConnectionReconcileAction: Equatable {
+    case none
+    case stopRuntime
+    case waitForWake
+    case waitForRuntime
+    case waitForNetwork
+    case startAutomatically(modeID: String)
+    case modeChanged(expectedModeID: String, activeModeID: String)
+    case configurationUnavailable(modeID: String)
+}
+
+struct DesiredConnectionReconcilePolicy {
+    static func decide(
+        desired: ConnectionDesiredState,
+        activeModeID: String,
+        systemIsSleeping: Bool,
+        runtimeStatus: String,
+        canConnect: Bool,
+        networkWaitCompleted: Bool
+    ) -> DesiredConnectionReconcileAction {
+        guard let desiredModeID = desired.modeID else {
+            if AutomaticConnectionPolicy.holdsConnectionIntent(
                 runtimeStatus: runtimeStatus
+            ) {
+                return .stopRuntime
+            }
+            return .none
+        }
+
+        if systemIsSleeping {
+            if AutomaticConnectionPolicy.holdsConnectionIntent(
+                runtimeStatus: runtimeStatus
+            ) {
+                return .stopRuntime
+            }
+            return .waitForWake
+        }
+
+        guard desiredModeID == activeModeID else {
+            return .modeChanged(
+                expectedModeID: desiredModeID,
+                activeModeID: activeModeID
             )
-        return shouldReconnectAfterWake
-    }
+        }
 
-    mutating func consumeWakeReconnect() -> Bool {
-        let reconnect = shouldReconnectAfterWake
-        shouldReconnectAfterWake = false
-        return reconnect
+        if AutomaticConnectionPolicy.holdsConnectionIntent(
+            runtimeStatus: runtimeStatus
+        ) {
+            return .none
+        }
+        guard runtimeStatus == "disconnected" else {
+            return .waitForRuntime
+        }
+        guard networkWaitCompleted else {
+            return .waitForNetwork
+        }
+        guard canConnect else {
+            return .configurationUnavailable(modeID: desiredModeID)
+        }
+        return .startAutomatically(modeID: desiredModeID)
     }
+}
 
-    mutating func cancel() {
-        shouldReconnectAfterWake = false
+/// 宿主退出前必须等系统网络接管确实移除，而不能把异步 `stop()` 的调用返回
+/// 当成回滚完成。等待仍有上限，避免 macOS 回调丢失时应用永远无法退出。
+struct ApplicationTerminationPolicy {
+    static func requiresDrain(
+        runtimeStatus: String,
+        hasConnectionReport: Bool,
+        rollbackComplete: Bool,
+        systemTakeoverRemoved: Bool
+    ) -> Bool {
+        guard runtimeStatus == "disconnected" else { return true }
+        guard hasConnectionReport else { return false }
+        return !rollbackComplete || !systemTakeoverRemoved
     }
 }
 
@@ -68,20 +216,6 @@ struct ConnectionAttemptGate {
 
     func isCurrent(_ candidate: Int) -> Bool {
         candidate == generation
-    }
-}
-
-/// 显式断开在当前 App 生命周期内压过尚未送达的自动连接回调；只有用户再次
-/// 点连接/重连，或下一次冷启动，才恢复自动请求的进入资格。
-struct ConnectionIntentLatch {
-    private(set) var allowsAutomaticConnection = true
-
-    mutating func userRequestedConnection() {
-        allowsAutomaticConnection = true
-    }
-
-    mutating func userRequestedDisconnection() {
-        allowsAutomaticConnection = false
     }
 }
 

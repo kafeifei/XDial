@@ -41,32 +41,125 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
         }
     }
 
-    func testSleepReconnectIntentIsSingleUse() {
-        var intent = SleepWakeConnectionIntent()
+    func testInitialStatusAdoptsExistingConnectionOnlyWhileUnresolved() {
+        var desired = ConnectionDesiredState()
 
-        XCTAssertTrue(intent.prepareForSleep(
-            runtimeStatus: "connected"
+        desired.observeExistingConnection(modeID: "work")
+
+        XCTAssertEqual(desired.value, .connected(
+            modeID: "work",
+            runtimeOwnership: .adopted
         ))
-        XCTAssertTrue(intent.consumeWakeReconnect())
-        XCTAssertFalse(intent.consumeWakeReconnect())
+
+        desired.userRequestedDisconnection()
+        desired.observeExistingConnection(modeID: "stale")
+        XCTAssertEqual(
+            desired.value,
+            .disconnected(explicit: true)
+        )
     }
 
-    func testSleepDoesNotCreateIntentWhileDisconnected() {
-        var intent = SleepWakeConnectionIntent()
+    func testDarkWakeAndImmediateResleepDoNotConsumeConnectionDesire() {
+        var desired = ConnectionDesiredState()
+        desired.userRequestedConnection(modeID: "work")
 
-        XCTAssertFalse(intent.prepareForSleep(
-            runtimeStatus: "disconnected"
+        XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
+            desired: desired,
+            activeModeID: "work",
+            systemIsSleeping: true,
+            runtimeStatus: "connected",
+            canConnect: false,
+            networkWaitCompleted: false
+        ), .stopRuntime)
+        XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
+            desired: desired,
+            activeModeID: "work",
+            systemIsSleeping: false,
+            runtimeStatus: "disconnected",
+            canConnect: true,
+            networkWaitCompleted: false
+        ), .waitForNetwork)
+        XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
+            desired: desired,
+            activeModeID: "work",
+            systemIsSleeping: true,
+            runtimeStatus: "disconnected",
+            canConnect: false,
+            networkWaitCompleted: false
+        ), .waitForWake)
+        XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
+            desired: desired,
+            activeModeID: "work",
+            systemIsSleeping: false,
+            runtimeStatus: "disconnected",
+            canConnect: true,
+            networkWaitCompleted: false
+        ), .waitForNetwork)
+        XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
+            desired: desired,
+            activeModeID: "work",
+            systemIsSleeping: false,
+            runtimeStatus: "disconnected",
+            canConnect: true,
+            networkWaitCompleted: true
+        ), .startAutomatically(modeID: "work"))
+        XCTAssertEqual(desired.value, .connected(
+            modeID: "work",
+            runtimeOwnership: .owned
         ))
-        XCTAssertFalse(intent.consumeWakeReconnect())
     }
 
-    func testUserDisconnectCancelsPendingWakeReconnect() {
-        var intent = SleepWakeConnectionIntent()
-        intent.prepareForSleep(runtimeStatus: "reconnecting")
+    func testAdoptedRuntimeLossIsClaimedExactlyOnce() {
+        var desired = ConnectionDesiredState()
+        desired.observeExistingConnection(modeID: "work")
 
-        intent.cancel()
+        XCTAssertTrue(desired.beginRestoringAdoptedRuntime())
+        XCTAssertFalse(desired.beginRestoringAdoptedRuntime())
+        XCTAssertEqual(desired.value, .connected(
+            modeID: "work",
+            runtimeOwnership: .restoring
+        ))
 
-        XCTAssertFalse(intent.consumeWakeReconnect())
+        XCTAssertTrue(desired.automaticConnectionRequested(
+            modeID: "work"
+        ))
+        XCTAssertEqual(desired.value, .connected(
+            modeID: "work",
+            runtimeOwnership: .owned
+        ))
+    }
+
+    func testDuplicateWakeIsNoOpOnceConnectionTransactionStarted() {
+        var desired = ConnectionDesiredState()
+        desired.userRequestedConnection(modeID: "work")
+
+        for status in ["connecting", "reconnecting", "connected"] {
+            XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
+                desired: desired,
+                activeModeID: "work",
+                systemIsSleeping: false,
+                runtimeStatus: status,
+                canConnect: false,
+                networkWaitCompleted: false
+            ), .none)
+        }
+    }
+
+    func testWakeDoesNotSilentlyRestoreAChangedMode() {
+        var desired = ConnectionDesiredState()
+        desired.userRequestedConnection(modeID: "before-sleep")
+
+        XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
+            desired: desired,
+            activeModeID: "current",
+            systemIsSleeping: false,
+            runtimeStatus: "disconnected",
+            canConnect: true,
+            networkWaitCompleted: true
+        ), .modeChanged(
+            expectedModeID: "before-sleep",
+            activeModeID: "current"
+        ))
     }
 
     func testNewConnectionAttemptSupersedesPendingPreflight() {
@@ -88,20 +181,69 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
     }
 
     func testExplicitDisconnectBlocksLateAutomaticConnection() {
-        var intent = ConnectionIntentLatch()
+        var desired = ConnectionDesiredState()
 
-        intent.userRequestedDisconnection()
+        desired.userRequestedDisconnection()
 
-        XCTAssertFalse(intent.allowsAutomaticConnection)
+        XCTAssertFalse(desired.automaticConnectionRequested(
+            modeID: "work"
+        ))
+        XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
+            desired: desired,
+            activeModeID: "work",
+            systemIsSleeping: false,
+            runtimeStatus: "connecting",
+            canConnect: false,
+            networkWaitCompleted: false
+        ), .stopRuntime)
     }
 
     func testExplicitConnectReenablesConnectionIntent() {
-        var intent = ConnectionIntentLatch()
-        intent.userRequestedDisconnection()
+        var desired = ConnectionDesiredState()
+        desired.userRequestedDisconnection()
 
-        intent.userRequestedConnection()
+        desired.userRequestedConnection(modeID: "work")
 
-        XCTAssertTrue(intent.allowsAutomaticConnection)
+        XCTAssertTrue(desired.automaticConnectionRequested(
+            modeID: "work"
+        ))
+        XCTAssertEqual(desired.value, .connected(
+            modeID: "work",
+            runtimeOwnership: .owned
+        ))
+    }
+
+    func testTerminationWaitsForRuntimeAndSystemTakeoverRollback() {
+        XCTAssertTrue(ApplicationTerminationPolicy.requiresDrain(
+            runtimeStatus: "connected",
+            hasConnectionReport: true,
+            rollbackComplete: false,
+            systemTakeoverRemoved: false
+        ))
+        XCTAssertTrue(ApplicationTerminationPolicy.requiresDrain(
+            runtimeStatus: "disconnected",
+            hasConnectionReport: true,
+            rollbackComplete: false,
+            systemTakeoverRemoved: true
+        ))
+        XCTAssertTrue(ApplicationTerminationPolicy.requiresDrain(
+            runtimeStatus: "disconnected",
+            hasConnectionReport: true,
+            rollbackComplete: true,
+            systemTakeoverRemoved: false
+        ))
+        XCTAssertFalse(ApplicationTerminationPolicy.requiresDrain(
+            runtimeStatus: "disconnected",
+            hasConnectionReport: true,
+            rollbackComplete: true,
+            systemTakeoverRemoved: true
+        ))
+        XCTAssertFalse(ApplicationTerminationPolicy.requiresDrain(
+            runtimeStatus: "disconnected",
+            hasConnectionReport: false,
+            rollbackComplete: false,
+            systemTakeoverRemoved: false
+        ))
     }
 
     func testWakeRecoveryPhasesHidePreviousCancelledReport() {

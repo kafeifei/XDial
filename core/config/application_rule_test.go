@@ -16,17 +16,10 @@ func applicationRuleSetForTest() RuleSet {
 			{
 				Name: "Claude",
 				Path: "/Applications/Claude.app",
-				Identities: []string{
-					"Q6L2SF6YDW/com.anthropic.claudefordesktop",
-					"Q6L2SF6YDW/com.anthropic.claudefordesktop.helper",
-				},
 			},
 			{
-				Name: "Claude Code",
-				Identities: []string{
-					"Q6L2SF6YDW/com.anthropic.claudefordesktop.helper",
-					"Q6L2SF6YDW/com.anthropic.claude-code",
-				},
+				Name: "ChatGPT",
+				Path: "/Applications/ChatGPT.app",
 			},
 		},
 	}
@@ -131,9 +124,8 @@ func TestApplicationRuleSetTransparentProxyDoesNotEmitDNSActions(t *testing.T) {
 		t.Fatalf("application rule must not depend on DNS: %v", applicationRule)
 	}
 	wantUsers := []interface{}{
-		ApplicationSOCKSUsername("session-user", "Q6L2SF6YDW/com.anthropic.claudefordesktop"),
-		ApplicationSOCKSUsername("session-user", "Q6L2SF6YDW/com.anthropic.claudefordesktop.helper"),
-		ApplicationSOCKSUsername("session-user", "Q6L2SF6YDW/com.anthropic.claude-code"),
+		ApplicationSOCKSUsername("session-user", "/Applications/Claude.app"),
+		ApplicationSOCKSUsername("session-user", "/Applications/ChatGPT.app"),
 	}
 	if got := applicationRule["auth_user"]; !reflect.DeepEqual(got, wantUsers) {
 		t.Fatalf("application route users = %#v, want %#v", got, wantUsers)
@@ -144,44 +136,58 @@ func TestApplicationRuleSetTransparentProxyDoesNotEmitDNSActions(t *testing.T) {
 		t.Fatalf("invalid generated JSON: %v", err)
 	}
 	users := config.Inbounds[0]["users"].([]interface{})
-	if len(users) != 4 { // base session user + three unique application identities
-		t.Fatalf("SOCKS users = %v, want base + 3 application users", users)
+	if len(users) != 3 { // base session user + two App Bundle selectors
+		t.Fatalf("SOCKS users = %v, want base + 2 application users", users)
 	}
 	credentials, err := ActiveApplicationSOCKSCredentials(profile, "session-user")
 	if err != nil {
 		t.Fatalf("ActiveApplicationSOCKSCredentials: %v", err)
 	}
-	if credentials["Q6L2SF6YDW/com.anthropic.claude-code"] != wantUsers[2] {
+	if len(credentials) != 2 ||
+		credentials[0].BundlePath != "/Applications/Claude.app" ||
+		credentials[0].Username != wantUsers[0] {
 		t.Fatalf("session envelope credential drifted from route credential: %v", credentials)
 	}
 }
 
-func TestApplicationRuleSetRejectsEmptyAndMalformedIdentities(t *testing.T) {
-	makeProfile := func(applications []ApplicationMatch) *Profile {
-		return &Profile{
-			Lines: []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
-			RuleSets: []RuleSet{{
-				ID: "app", Type: RuleSetTypeApplication, Enabled: true, Applications: applications,
-			}},
-			Modes: []Mode{{
-				ID: "mode", Bindings: []RuleBinding{{RuleSetID: "app", LineID: "direct"}}, DefaultLineID: "direct",
-			}},
-			ActiveModeID: "mode",
-		}
-	}
-
+func TestApplicationRuleSetRejectsMalformedBundlePaths(t *testing.T) {
 	for name, applications := range map[string][]ApplicationMatch{
-		"no applications":           nil,
-		"no identities":             {{Name: "Claude"}},
-		"empty identity":            {{Identities: []string{""}}},
-		"bare bundle identifier":    {{Identities: []string{"com.anthropic.claudefordesktop"}}},
-		"malformed team identifier": {{Identities: []string{"anthropic/com.anthropic.claudefordesktop"}}},
-		"surrounding whitespace":    {{Identities: []string{" Q6L2SF6YDW/com.anthropic.claudefordesktop"}}},
+		"no applications":        nil,
+		"empty path":             {{Name: "Claude"}},
+		"relative path":          {{Path: "Applications/Claude.app"}},
+		"not app bundle":         {{Path: "/Applications/Claude"}},
+		"unclean path":           {{Path: "/Applications/Other/../Claude.app"}},
+		"surrounding whitespace": {{Path: " /Applications/Claude.app"}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := GenerateSingBox(makeProfile(applications), 0, ""); err == nil {
-				t.Fatal("invalid application identities must reject generation")
+			ruleSet := &RuleSet{
+				ID: "app", Type: RuleSetTypeApplication, Enabled: true,
+				Applications: applications,
+			}
+			if err := validateApplicationRuleSet(ruleSet); err == nil {
+				t.Fatal("invalid App Bundle paths must reject generation")
 			}
 		})
+	}
+}
+
+func TestApplicationRuleSetIgnoresLegacySigningIdentities(t *testing.T) {
+	var application ApplicationMatch
+	if err := json.Unmarshal([]byte(`{
+		"name":"Claude",
+		"path":"/Applications/Claude.app",
+		"identities":["Q6L2SF6YDW/computer_use","Q6L2SF6YDW/swift_addon"]
+	}`), &application); err != nil {
+		t.Fatal(err)
+	}
+	if application.Path != "/Applications/Claude.app" {
+		t.Fatalf("legacy profile lost App Bundle path: %#v", application)
+	}
+	ruleSet := &RuleSet{
+		ID: "claude", Type: RuleSetTypeApplication, Enabled: true,
+		Applications: []ApplicationMatch{application},
+	}
+	if err := validateApplicationRuleSet(ruleSet); err != nil {
+		t.Fatalf("legacy identities must be ignored once bundle path is present: %v", err)
 	}
 }

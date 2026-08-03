@@ -147,6 +147,14 @@ final class DebugServer {
         dict["autoConnect"] = s.autoConnect
         dict["wakeReconnectPhase"] =
             s.wakeReconnectPhase?.rawValue ?? ""
+        dict["desiredConnectionState"] =
+            s.desiredConnectionStateForDiagnostics
+        dict["desiredConnectionModeID"] =
+            s.desiredConnectionModeIDForDiagnostics
+        dict["desiredConnectionOwnership"] =
+            s.desiredConnectionOwnershipForDiagnostics
+        dict["systemIsSleeping"] =
+            s.systemIsSleepingForDiagnostics
         dict["activeModeID"] = s.profile.activeModeID
         // 配置改了但引擎还在跑旧快照 —— 验收改动是否真正生效必须看这个
         dict["configDirty"] = s.configDirty
@@ -388,6 +396,15 @@ final class DebugServer {
         case "reconnect":
             state.reconnect()
             return ok(["ok": true, "status": state.engine.status])
+        case "quit":
+            // 先把 HTTP 响应交还调用方，再走 NSApplication 的正常退出委托；
+            // make restart 因而能等待 Provider 回滚，而不是直接杀掉宿主。
+            appLog("DebugServer: graceful quit requested")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                appLog("DebugServer: invoking NSApplication terminate")
+                NSApp.terminate(nil)
+            }
+            return ok(["ok": true])
         case "prepare-system-extension":
             // 主线程同步轮询会阻塞 OSSystemExtensionRequest 的 main-queue
             // delegate，造成“实际已激活、接口却超时”的假阴性。挂起当前 Task 后，

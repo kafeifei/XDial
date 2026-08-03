@@ -759,23 +759,19 @@ func TestGenerateTransparentProxySessionCarriesOnlyActiveApplicationCredentials(
 			{
 				ID: "active-app", Type: config.RuleSetTypeApplication, Enabled: true,
 				Applications: []config.ApplicationMatch{{
-					Name: "Claude",
-					Identities: []string{
-						"Q6L2SF6YDW/com.anthropic.claudefordesktop",
-						"Q6L2SF6YDW/com.anthropic.claudefordesktop.helper",
-					},
+					Name: "Claude", Path: "/Applications/Claude.app",
 				}},
 			},
 			{
 				ID: "unbound-app", Type: config.RuleSetTypeApplication, Enabled: true,
 				Applications: []config.ApplicationMatch{{
-					Identities: []string{"Q6L2SF6YDW/com.anthropic.unbound"},
+					Path: "/Applications/Unbound.app",
 				}},
 			},
 			{
 				ID: "disabled-app", Type: config.RuleSetTypeApplication, Enabled: false,
 				Applications: []config.ApplicationMatch{{
-					Identities: []string{"Q6L2SF6YDW/com.anthropic.disabled"},
+					Path: "/Applications/Disabled.app",
 				}},
 			},
 		},
@@ -804,18 +800,20 @@ func TestGenerateTransparentProxySessionCarriesOnlyActiveApplicationCredentials(
 	if err := json.Unmarshal([]byte(sessionJSON), &session); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{
-		"Q6L2SF6YDW/com.anthropic.claudefordesktop":        config.ApplicationSOCKSUsername("session-user", "Q6L2SF6YDW/com.anthropic.claudefordesktop"),
-		"Q6L2SF6YDW/com.anthropic.claudefordesktop.helper": config.ApplicationSOCKSUsername("session-user", "Q6L2SF6YDW/com.anthropic.claudefordesktop.helper"),
+	want := []config.ApplicationSOCKSCredential{{
+		BundlePath: "/Applications/Claude.app",
+		Username: config.ApplicationSOCKSUsername(
+			"session-user", "/Applications/Claude.app",
+		),
+	}}
+	if !reflect.DeepEqual(session.ApplicationPathCredentials, want) {
+		t.Fatalf("application path credentials = %#v, want %#v", session.ApplicationPathCredentials, want)
 	}
-	if !reflect.DeepEqual(session.ApplicationCredentials, want) {
-		t.Fatalf("application credentials = %#v, want %#v", session.ApplicationCredentials, want)
-	}
-	if _, exists := session.ApplicationCredentials["Q6L2SF6YDW/com.anthropic.unbound"]; exists {
-		t.Fatalf("unbound application escaped into session credentials: %#v", session.ApplicationCredentials)
-	}
-	if _, exists := session.ApplicationCredentials["Q6L2SF6YDW/com.anthropic.disabled"]; exists {
-		t.Fatalf("disabled application escaped into session credentials: %#v", session.ApplicationCredentials)
+	for _, credential := range session.ApplicationPathCredentials {
+		if credential.BundlePath == "/Applications/Unbound.app" ||
+			credential.BundlePath == "/Applications/Disabled.app" {
+			t.Fatalf("inactive application escaped into session credentials: %#v", session.ApplicationPathCredentials)
+		}
 	}
 }
 

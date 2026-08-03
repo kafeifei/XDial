@@ -2,7 +2,7 @@ package config
 
 import (
 	"fmt"
-	"regexp"
+	"path/filepath"
 	"strings"
 )
 
@@ -25,11 +25,6 @@ import (
 // 所以模式引用 "direct" 时即使 profile 的 Lines 里没有对应条目也不算悬空。
 // 这是既有约定（默认 profile 里有这条线路，但大量精简配置直接引用它）。
 const builtinDirectLineID = "direct"
-
-// sourceAppIdentityPattern 对应 Transparent Proxy 从 audit token 得到的稳定
-// 应用身份。只接受 Team ID 和 bundle signing identifier 的组合，避免控制面
-// 为 SOCKS 派生凭据接受任意字符串。
-var sourceAppIdentityPattern = regexp.MustCompile(`^[A-Z0-9]{10}/[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$`)
 
 // ProfileWarningKind 标识一条降级警告的类别。字符串值会进 JSON，
 // 供 daemon/UI 直接消费，不要随意改名。
@@ -270,17 +265,29 @@ func validateApplicationRuleSet(ruleSet *RuleSet) error {
 		return fmt.Errorf("applications is empty")
 	}
 	for applicationIndex, application := range ruleSet.Applications {
-		if len(application.Identities) == 0 {
-			return fmt.Errorf("application #%d has no signing identities", applicationIndex+1)
-		}
-		for identityIndex, identity := range application.Identities {
-			if identity == "" || strings.TrimSpace(identity) != identity ||
-				!sourceAppIdentityPattern.MatchString(identity) {
-				return fmt.Errorf("application #%d identity #%d is invalid", applicationIndex+1, identityIndex+1)
-			}
+		if _, ok := canonicalApplicationBundlePath(application.Path); !ok {
+			return fmt.Errorf("application #%d bundle path is invalid", applicationIndex+1)
 		}
 	}
 	return nil
+}
+
+// canonicalApplicationBundlePath validates the persisted Surge-style App
+// Bundle selector without consulting the live filesystem. Planning remains
+// side-effect free, while the Provider can compare the exact same lexical path
+// against the audit-token-derived executable path at flow time.
+func canonicalApplicationBundlePath(raw string) (string, bool) {
+	if raw == "" || len(raw) > 4096 || strings.TrimSpace(raw) != raw ||
+		strings.IndexByte(raw, 0) >= 0 || !filepath.IsAbs(raw) {
+		return "", false
+	}
+	cleaned := filepath.Clean(raw)
+	base := filepath.Base(cleaned)
+	if cleaned != raw || len(base) <= len(".app") ||
+		!strings.HasSuffix(strings.ToLower(base), ".app") {
+		return "", false
+	}
+	return cleaned, true
 }
 
 // lineHasUsableOutbound 判断一条 enabled 线路能不能真的生成出 outbound。

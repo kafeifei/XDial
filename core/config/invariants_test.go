@@ -734,13 +734,13 @@ func invMatchesModeBinding(profile *Profile, rule map[string]interface{}) bool {
 		}
 		switch ruleSet.Type {
 		case RuleSetTypeApplication:
-			identities := applicationRuleSetIdentities(ruleSet)
+			bundlePaths := applicationRuleSetPaths(ruleSet)
 			users := invStrings(rule["auth_user"])
 			// Route rules intentionally carry only derived SOCKS usernames, not
-			// signing identities. Match the exact active RuleSet cardinality and
+			// Bundle paths. Match the exact active RuleSet cardinality and
 			// the fixed "." + lowercase SHA-256 suffix shape; generator tests
 			// separately prove the exact derivation.
-			if len(identities) == 0 || len(users) != len(identities) {
+			if len(bundlePaths) == 0 || len(users) != len(bundlePaths) {
 				continue
 			}
 			seen := map[string]bool{}
@@ -937,9 +937,9 @@ func TestINV4_ApplicationRuleIsTraceableToActiveModeBinding(t *testing.T) {
 		},
 		RuleSets: []RuleSet{
 			{ID: "active-app", Type: RuleSetTypeApplication, Enabled: true,
-				Applications: []ApplicationMatch{{Identities: []string{"Q6L2SF6YDW/com.anthropic.claude"}}}},
+				Applications: []ApplicationMatch{{Path: "/Applications/Claude.app"}}},
 			{ID: "unbound-app", Type: RuleSetTypeApplication, Enabled: true,
-				Applications: []ApplicationMatch{{Identities: []string{"Q6L2SF6YDW/com.anthropic.unbound"}}}},
+				Applications: []ApplicationMatch{{Path: "/Applications/Unbound.app"}}},
 		},
 		Modes: []Mode{{
 			ID:            "mode",

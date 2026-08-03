@@ -2,22 +2,7 @@ import Foundation
 import XCTest
 
 final class ApplicationRuleSetModelTests: XCTestCase {
-    func testApplicationIdentityCanonicalizesAndDeduplicates() {
-        let identities = ApplicationRuleApplication.normalizedIdentities([
-            "q6l2sf6ydw/com.anthropic.claude",
-            "Q6L2SF6YDW/com.anthropic.claude",
-            "Q6L2SF6YDW/com.anthropic.claude.helper",
-            "invalid",
-            "Q6L2SF6YDW/contains space",
-        ])
-
-        XCTAssertEqual(identities, [
-            "Q6L2SF6YDW/com.anthropic.claude",
-            "Q6L2SF6YDW/com.anthropic.claude.helper",
-        ])
-    }
-
-    func testApplicationRuleRoundTripsWithStableJSONKey() throws {
+    func testApplicationRulePersistsOnlyBundlePath() throws {
         let source = RuleSet(
             id: "claude",
             name: "Claude",
@@ -25,11 +10,7 @@ final class ApplicationRuleSetModelTests: XCTestCase {
             applications: [
                 ApplicationRuleApplication(
                     name: "Claude",
-                    path: "/Applications/Claude.app",
-                    identities: [
-                        "Q6L2SF6YDW/com.anthropic.claudefordesktop",
-                        "Q6L2SF6YDW/com.anthropic.claudefordesktop.helper",
-                    ]
+                    path: "/Applications/Claude.app"
                 ),
             ]
         )
@@ -43,41 +24,70 @@ final class ApplicationRuleSetModelTests: XCTestCase {
         )
         XCTAssertEqual(applications.count, 1)
         XCTAssertEqual(
-            applications[0]["identities"] as? [String],
-            [
-                "Q6L2SF6YDW/com.anthropic.claudefordesktop",
-                "Q6L2SF6YDW/com.anthropic.claudefordesktop.helper",
-            ]
+            applications[0]["path"] as? String,
+            "/Applications/Claude.app"
         )
+        XCTAssertNil(applications[0]["identities"])
 
         let decoded = try JSONDecoder().decode(RuleSet.self, from: data)
         XCTAssertEqual(decoded, source)
     }
 
-    func testSanitizeApplicationsRemovesInvalidAndMergesSamePath() {
+    func testLegacyIdentitiesAreDroppedDuringSanitization() throws {
+        let data = try XCTUnwrap("""
+        {
+          "name": "Claude",
+          "path": "/Applications/Claude.app",
+          "identities": [
+            "Q6L2SF6YDW/com.anthropic.claudefordesktop",
+            "Q6L2SF6YDW/computer_use"
+          ]
+        }
+        """.data(using: .utf8))
+        let legacy = try JSONDecoder().decode(
+            ApplicationRuleApplication.self,
+            from: data
+        )
+        let cleaned = RuleSet.sanitizeApplications([legacy])
+
+        XCTAssertEqual(cleaned, [
+            ApplicationRuleApplication(
+                name: "Claude",
+                path: "/Applications/Claude.app"
+            ),
+        ])
+        let encoded = try JSONEncoder().encode(cleaned[0])
+        let encodedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        XCTAssertNil(encodedObject["identities"])
+    }
+
+    func testSanitizeApplicationsNormalizesAndDeduplicatesBundlePaths() {
         let cleaned = RuleSet.sanitizeApplications([
             ApplicationRuleApplication(
                 name: "Claude",
-                path: "/Applications/Claude.app",
-                identities: ["Q6L2SF6YDW/com.anthropic.claude"]
+                path: "/Applications/Claude.app"
             ),
             ApplicationRuleApplication(
                 name: "Claude duplicate",
-                path: "/Applications/Claude.app",
-                identities: ["Q6L2SF6YDW/com.anthropic.claude.helper"]
+                path: "/Applications/Claude.app"
             ),
             ApplicationRuleApplication(
-                name: "No identity",
-                path: "/Applications/Bad.app",
-                identities: []
+                name: "Relative",
+                path: "Applications/Bad.app"
+            ),
+            ApplicationRuleApplication(
+                name: "Not app",
+                path: "/Applications/Bad.bundle"
             ),
         ])
 
-        XCTAssertEqual(cleaned.count, 1)
-        XCTAssertEqual(cleaned[0].name, "Claude")
-        XCTAssertEqual(cleaned[0].identities, [
-            "Q6L2SF6YDW/com.anthropic.claude",
-            "Q6L2SF6YDW/com.anthropic.claude.helper",
+        XCTAssertEqual(cleaned, [
+            ApplicationRuleApplication(
+                name: "Claude",
+                path: "/Applications/Claude.app"
+            ),
         ])
     }
 }
