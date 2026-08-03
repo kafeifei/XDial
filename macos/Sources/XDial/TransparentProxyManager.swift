@@ -375,6 +375,13 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         stopUnderlayMonitoring()
         startAttemptID = nil
         publishRuntimeStatus("disconnecting", error: nil)
+        if let manager {
+            // 正常退出发生在 NSApplication 的嵌套 RunLoop 中。此时再调用
+            // loadAllFromPreferences 会把真正的 stopVPNTunnel 延后到一个无法
+            // 执行的 completion。运行期已经持有精确 manager，必须直接停止。
+            stopLoadedManager(manager)
+            return
+        }
         withExistingManager { [weak self] result in
             guard let self else { return }
             switch result {
@@ -386,18 +393,51 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 self.finishOrphanedTransactionIfNeeded()
                 self.publishRuntimeStatus("disconnected", error: nil)
             case let .success(manager?):
-                self.installStatusObserver(for: manager)
-                if manager.connection.status == .disconnected
-                    || manager.connection.status == .invalid {
-                    self.publishRuntimeStatus(
-                        "disconnected",
-                        error: nil
-                    )
-                    return
-                }
-                manager.connection.stopVPNTunnel()
+                self.stopLoadedManager(manager)
             }
         }
+    }
+
+    private func stopLoadedManager(
+        _ manager: NETransparentProxyManager
+    ) {
+        installStatusObserver(for: manager)
+        if manager.connection.status == .disconnected
+            || manager.connection.status == .invalid {
+            publishStatus(for: manager)
+            return
+        }
+        manager.connection.stopVPNTunnel()
+        // stopVPNTunnel() 同步改变系统 session 的阶段；立即投影一次，避免
+        // 退出嵌套 RunLoop 期间只依赖异步 NEVPNStatusDidChange。
+        publishStatus(for: manager)
+    }
+
+    /// 退出的 Timer 必须直接读取系统 session 与 journal。GoEngine 的
+    /// @Published 投影通过 MainActor Task 更新，在 AppKit 的嵌套退出 RunLoop
+    /// 中可能暂时不推进，不能作为是否允许进程退出的唯一事实。
+    func terminationDrainSnapshot() -> (
+        runtimeStatus: String,
+        report: ConnectionReport?
+    ) {
+        if let manager {
+            switch manager.connection.status {
+            case .invalid, .disconnected:
+                publishStatus(for: manager)
+                return ("disconnected", ConnectionReportJournal.read())
+            case .disconnecting:
+                return ("disconnecting", ConnectionReportJournal.read())
+            case .connecting:
+                return ("connecting", ConnectionReportJournal.read())
+            case .connected:
+                return ("connected", ConnectionReportJournal.read())
+            case .reasserting:
+                return ("reconnecting", ConnectionReportJournal.read())
+            @unknown default:
+                return (lastPublishedRuntimeStatus, ConnectionReportJournal.read())
+            }
+        }
+        return (lastPublishedRuntimeStatus, ConnectionReportJournal.read())
     }
 
     func syncStatus() {

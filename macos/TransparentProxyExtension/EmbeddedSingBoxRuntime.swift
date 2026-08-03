@@ -14,6 +14,11 @@ struct InterfaceSnapshot {
     let systemDNSJSON: String
 }
 
+struct ApplicationBundleCredential: Sendable {
+    let bundlePath: String
+    let credentials: SOCKSCredentials
+}
+
 final class EmbeddedSingBoxRuntime {
     private static let networkStateGroup =
         "UVZM439VGU.com.kafeifei.xdial.network"
@@ -21,10 +26,10 @@ final class EmbeddedSingBoxRuntime {
     struct Session {
         let port: UInt16
         let credentials: SOCKSCredentials
-        /// Active application identities mapped to their per-session SOCKS
-        /// usernames. The password stays the ordinary loopback session
-        /// password; this map is never persisted or exposed in diagnostics.
-        let applicationCredentials: [String: SOCKSCredentials]
+        /// Active App Bundle selectors in Mode binding order, each paired with
+        /// its per-session SOCKS credentials. This list is never persisted or
+        /// exposed in diagnostics.
+        let applicationBundleCredentials: [ApplicationBundleCredential]
         let lineOutbounds: [String: String]
         let ruleSetTags: Set<String>
         let dnsCaptureDomains: [String]
@@ -32,6 +37,16 @@ final class EmbeddedSingBoxRuntime {
     }
 
     private struct SessionEnvelope: Decodable {
+        struct ApplicationPathCredential: Decodable {
+            let bundlePath: String
+            let username: String
+
+            enum CodingKeys: String, CodingKey {
+                case bundlePath = "bundle_path"
+                case username
+            }
+        }
+
         struct AnyConnect: Decodable {
             let server: String
             let username: String
@@ -65,7 +80,7 @@ final class EmbeddedSingBoxRuntime {
         let lineOutbounds: [String: String]
         let subscriptionOutbounds: [String: [String]]
         let ruleSetTags: [String]
-        let applicationCredentials: [String: String]?
+        let applicationPathCredentials: [ApplicationPathCredential]?
         let anyConnect: AnyConnect?
         let tailscale: Tailscale?
 
@@ -75,7 +90,7 @@ final class EmbeddedSingBoxRuntime {
             case lineOutbounds = "line_outbounds"
             case subscriptionOutbounds = "subscription_outbounds"
             case ruleSetTags = "rule_set_tags"
-            case applicationCredentials = "application_credentials"
+            case applicationPathCredentials = "application_path_credentials"
             case anyConnect = "anyconnect"
             case tailscale
         }
@@ -293,11 +308,13 @@ final class EmbeddedSingBoxRuntime {
             !envelope.ruleSetTags.contains(""),
             Set(envelope.ruleSetTags).count ==
                 envelope.ruleSetTags.count,
-            (envelope.applicationCredentials ?? [:]).allSatisfy({ entry in
-                !entry.key.isEmpty &&
-                    !entry.value.isEmpty &&
-                    entry.value.utf8.count <= 255
+            (envelope.applicationPathCredentials ?? []).allSatisfy({ entry in
+                TransparentProxyApplicationBundlePath(entry.bundlePath) != nil &&
+                    !entry.username.isEmpty &&
+                    entry.username.utf8.count <= 255
             }),
+            Set((envelope.applicationPathCredentials ?? []).map(\.bundlePath))
+                .count == (envelope.applicationPathCredentials ?? []).count,
             envelope.tailscale.map({ tailscale in
                 !tailscale.magicDNSEnabled ||
                     !(tailscale.dnsServerTag ?? "").isEmpty
@@ -487,18 +504,16 @@ final class EmbeddedSingBoxRuntime {
             return Session(
                 port: port,
                 credentials: credentials,
-                applicationCredentials: Dictionary(
-                    uniqueKeysWithValues: (envelope.applicationCredentials ?? [:])
-                        .map { identity, username in
-                            (
-                                identity,
-                                SOCKSCredentials(
-                                    username: username,
-                                    password: credentials.password
-                                )
+                applicationBundleCredentials:
+                    (envelope.applicationPathCredentials ?? []).map { entry in
+                        ApplicationBundleCredential(
+                            bundlePath: entry.bundlePath,
+                            credentials: SOCKSCredentials(
+                                username: entry.username,
+                                password: credentials.password
                             )
-                        }
-                ),
+                        )
+                    },
                 lineOutbounds: envelope.lineOutbounds,
                 ruleSetTags: Set(envelope.ruleSetTags),
                 dnsCaptureDomains:

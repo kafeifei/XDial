@@ -1,95 +1,76 @@
 import Foundation
 import Network
 
-/// A stable macOS code-signing identity. The value must stay byte-for-byte
-/// aligned with the identity collected by the control plane; it is the only
-/// application fact allowed across the transparent-proxy relay boundary.
-struct TransparentProxyApplicationIdentity: Sendable, Equatable {
-    let teamIdentifier: String
-    let signingIdentifier: String
+/// A normalized Surge-style App Bundle selector. The path is a directory
+/// boundary, not a raw string prefix: `/Applications/Foo.app2` must never
+/// match `/Applications/Foo.app`.
+struct TransparentProxyApplicationBundlePath: Sendable, Equatable {
+    let value: String
 
-    init?(teamIdentifier: String, signingIdentifier: String) {
+    init?(_ rawValue: String) {
         guard
-            Self.isValidTeamIdentifier(teamIdentifier),
-            Self.isValidSigningIdentifier(signingIdentifier)
+            rawValue.hasPrefix("/"),
+            rawValue.utf8.count <= 4096,
+            !rawValue.contains("\0")
         else {
             return nil
         }
-        self.teamIdentifier = teamIdentifier
-        self.signingIdentifier = signingIdentifier
-    }
-
-    var canonical: String {
-        "\(teamIdentifier)/\(signingIdentifier)"
-    }
-
-    private static func isValidTeamIdentifier(_ value: String) -> Bool {
-        let bytes = Array(value.utf8)
-        return bytes.count == 10 && bytes.allSatisfy {
-            ($0 >= 0x41 && $0 <= 0x5a) || ($0 >= 0x30 && $0 <= 0x39)
-        }
-    }
-
-    private static func isValidSigningIdentifier(_ value: String) -> Bool {
-        let bytes = Array(value.utf8)
+        let standardized = (rawValue as NSString).standardizingPath
+        let url = URL(fileURLWithPath: standardized)
         guard
-            let first = bytes.first,
-            let last = bytes.last,
-            isASCIIAlphanumeric(first),
-            isASCIIAlphanumeric(last)
+            standardized == rawValue,
+            url.pathExtension.localizedCaseInsensitiveCompare("app")
+                == .orderedSame,
+            !url.deletingPathExtension().lastPathComponent.isEmpty
         else {
-            return false
+            return nil
         }
-        return bytes.dropFirst().dropLast().allSatisfy {
-            isASCIIAlphanumeric($0) || $0 == 0x2e || $0 == 0x2d
-        }
+        value = standardized
     }
 
-    private static func isASCIIAlphanumeric(_ value: UInt8) -> Bool {
-        (value >= 0x41 && value <= 0x5a) ||
-            (value >= 0x61 && value <= 0x7a) ||
-            (value >= 0x30 && value <= 0x39)
+    func contains(executablePath rawExecutablePath: String) -> Bool {
+        guard rawExecutablePath.hasPrefix("/") else { return false }
+        let executablePath = (rawExecutablePath as NSString).standardizingPath
+        return executablePath == value || executablePath.hasPrefix(value + "/")
     }
 }
 
-/// The credential selection decision is deliberately pure so the security
-/// boundary can be tested without constructing a Network Extension flow. The
-/// application identity remains a routing *fact* only: the derived SOCKS user
-/// is selected here, while sing-box still makes the RuleSet decision.
+/// The credential selection decision is deliberately pure so path attribution
+/// can be tested without constructing a Network Extension flow. Bundle order
+/// is the active Mode binding order returned by Go and therefore must not be
+/// sorted or converted to a dictionary before matching.
 enum TransparentProxyApplicationCredentialDecision: Equatable {
     case base
-    case application(canonicalIdentity: String)
+    case application(bundlePath: String)
     case reject
 
-    /// Selects a credential identity only when the audit-token identity is an
-    /// exact active canonical identity. The metadata signing identifier is
-    /// never trusted as an identity; it may only corroborate the audit value.
     static func select(
-        metadataSigningIdentifier: String,
-        auditIdentity: TransparentProxyApplicationIdentity?,
-        activeCanonicalIdentities: Set<String>
+        auditTokenPresent: Bool,
+        auditExecutablePath: String?,
+        activeBundlePaths: [String]
     ) -> Self {
-        let metadataMatchesActive = activeCanonicalIdentities.contains {
-            $0.hasSuffix("/\(metadataSigningIdentifier)")
+        guard !activeBundlePaths.isEmpty else { return .base }
+        guard auditTokenPresent else {
+            // System flows can legitimately omit sourceAppAuditToken.
+            return .base
         }
-
-        guard let auditIdentity else {
-            return metadataMatchesActive ? .reject : .base
+        guard let auditExecutablePath else {
+            // A user process supplied an audit token but Security.framework
+            // could not resolve it. Do not silently send a selected app through
+            // the Mode default when attribution is unavailable.
+            return .reject
         }
-        let auditCanonicalIdentity = auditIdentity.canonical
-        let auditMatchesActive = activeCanonicalIdentities.contains(
-            auditCanonicalIdentity
-        )
-        guard
-            metadataSigningIdentifier.isEmpty ||
-                metadataSigningIdentifier == auditIdentity.signingIdentifier
-        else {
-            return metadataMatchesActive || auditMatchesActive ? .reject : .base
+        for rawBundlePath in activeBundlePaths {
+            guard let bundlePath = TransparentProxyApplicationBundlePath(
+                rawBundlePath
+            ) else {
+                return .reject
+            }
+            if bundlePath.contains(executablePath: auditExecutablePath) {
+                return .application(bundlePath: bundlePath.value)
+            }
         }
-        if auditMatchesActive {
-            return .application(canonicalIdentity: auditCanonicalIdentity)
-        }
-        return metadataMatchesActive ? .reject : .base
+        return .base
     }
 }
 

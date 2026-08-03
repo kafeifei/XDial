@@ -194,6 +194,17 @@ final class GoEngine: ObservableObject {
         transparentProxy.stop()
     }
 
+    func requiresTerminationDrain() -> Bool {
+        let snapshot = transparentProxy.terminationDrainSnapshot()
+        return ApplicationTerminationPolicy.requiresDrain(
+            runtimeStatus: snapshot.runtimeStatus,
+            hasConnectionReport: snapshot.report != nil,
+            rollbackComplete: snapshot.report?.rollbackComplete ?? false,
+            systemTakeoverRemoved:
+                snapshot.report?.systemTakeoverRemoved ?? false
+        )
+    }
+
     func parseSubscription(url: String, content: String = "", format: String = "auto",
                            completion: @escaping (Result<ParseResult, Error>) -> Void) {
         Task { [weak self] in

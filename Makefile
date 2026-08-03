@@ -5,6 +5,11 @@ GOBIN := $(shell go env GOPATH)/bin
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PLIST_VERSION := $(patsubst v%,%,$(VERSION))
 GO_LDFLAGS := -X main.version=$(VERSION)
+# macOS 只会替换构建号更高的 System Extension。Debug 构建若反复使用
+# project.yml 里的固定号，宿主 App 虽然已经更新，Provider 仍可能继续运行旧代码，
+# 而 properties API 又会因为版本号相同误报 ready。一次 make 调用内复用同一个
+# Unix 时间戳，确保 host 与 extension 配套且每次本地构建都能被系统识别为升级。
+DEBUG_BUILD_VERSION ?= $(shell date +%s)
 DESKTOP_GO_TAGS := with_gvisor,with_utls
 MOBILE_LIBBOX_TAGS := with_gvisor,with_utls
 MACOS_LIBBOX_FRAMEWORK := $(BUILD_DIR)/frameworks/macos/Libbox.xcframework
@@ -120,10 +125,12 @@ app: cli libbox-macos-xcframework
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Debug \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
+		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		build
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration Debug \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
+		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		build
 	rm -rf "$(APP_BUNDLE)"
 	ditto "$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app" "$(APP_BUNDLE)"
@@ -146,12 +153,24 @@ release: libbox-macos-xcframework
 	ditto "$(BUILD_DIR)/macos-xcode-release/Build/Products/Release/XDial.app" "$(RELEASE_BUNDLE)"
 	@echo "release bundle: $(RELEASE_BUNDLE) (version $(PLIST_VERSION))"
 
-# 一键重启:杀旧实例→重编→由应用安装事务替换 /Applications 中的旧版
-# →等 debug server 上线。不要在 build/ 留旧 App 容器，否则 macOS 会继续
-# 把它关联的 System Extension 显示为已安装。
-restart: app
-	@pkill -x XDial 2>/dev/null || true
-	@for i in $$(seq 1 20); do pgrep -x XDial >/dev/null || break; sleep 0.2; done
+# 一键重启:先让旧实例完成网络回滚→重编→由应用安装事务替换 /Applications
+# 中的旧版→等 debug server 上线。这里不能把 app 写成 prerequisite：Make 会先
+# 执行 prerequisite，导致仍在运行的旧宿主无法使用刚编译的正常退出实现。
+# 不要在 build/ 留旧 App 容器，否则 macOS 会继续把它关联的 System Extension
+# 显示为已安装。
+restart:
+	@if curl -s -m 1 http://127.0.0.1:19876/health >/dev/null 2>&1; then \
+		curl -s -m 2 -X POST http://127.0.0.1:19876/action \
+			-d '{"action":"quit"}' >/dev/null 2>&1 || true; \
+	else \
+		pkill -x XDial 2>/dev/null || true; \
+	fi
+	@for i in $$(seq 1 80); do pgrep -x XDial >/dev/null || break; sleep 0.2; done
+	@if pgrep -x XDial >/dev/null; then \
+		echo "! graceful XDial shutdown timed out; forcing host exit"; \
+		pkill -x XDial 2>/dev/null || true; \
+	fi
+	@$(MAKE) app DEBUG_BUILD_VERSION=$(DEBUG_BUILD_VERSION)
 	@rm -rf "$(BUILD_DIR)/XDial.previous.app"
 	@open "$(APP_BUNDLE)"
 	@for i in $$(seq 1 30); do \

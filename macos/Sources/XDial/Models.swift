@@ -282,64 +282,39 @@ struct TailscaleRuntimeStatus: Decodable, Hashable {
     var isRunning: Bool { backendState.lowercased() == "running" }
 }
 
-/// 一个被用户选入应用 RuleSet 的 app。`path` 仅用于在控制面展示和重新选择；
-/// 数据面只匹配 codesign 导出的稳定身份，不能把可移动的本机路径当成策略条件。
+/// 一个被用户选入应用 RuleSet 的 App Bundle。数据面按规范化 Bundle 路径前缀
+/// 匹配 audit token 对应的真实可执行文件，与 Surge Mac 的 App Bundle 模式一致。
 struct ApplicationRuleApplication: Codable, Identifiable, Hashable {
     var name: String
     var path: String
-    var identities: [String]
+    private var containedLegacyIdentities = false
 
     var id: String { path }
 
-    init(name: String, path: String, identities: [String]) {
+    init(name: String, path: String) {
         self.name = name
         self.path = path
-        self.identities = Self.normalizedIdentities(identities)
     }
 
-    /// Team ID 与 signing identifier 都来自 Security.framework。把它们作为一个
-    /// 原子值持久化，避免仅凭 bundle identifier 把另一团队的同名代码误判为所选 app。
-    static func canonicalIdentity(
-        teamIdentifier: String,
-        signingIdentifier: String
-    ) -> String? {
-        let team = teamIdentifier.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        ).uppercased()
-        let identifier = signingIdentifier.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
-        guard
-            team.count == 10,
-            team.unicodeScalars.allSatisfy({
-                ($0.value >= 65 && $0.value <= 90)
-                    || ($0.value >= 48 && $0.value <= 57)
-            }),
-            !identifier.isEmpty,
-            !identifier.contains("/"),
-            identifier.unicodeScalars.allSatisfy({
-                !CharacterSet.controlCharacters.contains($0)
-                    && !$0.properties.isWhitespace
-            })
-        else {
-            return nil
-        }
-        return "\(team)/\(identifier)"
+    enum CodingKeys: String, CodingKey {
+        case name
+        case path
+        case identities
     }
 
-    static func normalizedIdentities(_ identities: [String]) -> [String] {
-        Array(Set(identities.compactMap { identity in
-            let pieces = identity.split(
-                separator: "/",
-                maxSplits: 1,
-                omittingEmptySubsequences: false
-            )
-            guard pieces.count == 2 else { return nil }
-            return canonicalIdentity(
-                teamIdentifier: String(pieces[0]),
-                signingIdentifier: String(pieces[1])
-            )
-        })).sorted()
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        name = try values.decodeIfPresent(String.self, forKey: .name) ?? ""
+        path = try values.decode(String.self, forKey: .path)
+        // 旧版递归持久化的 signing identities 不再参与匹配。保留这个内存标记
+        // 只为让 loadSaved 的清洗迁移检测到差异并立即回写，新的编码永不输出它们。
+        containedLegacyIdentities = values.contains(.identities)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(name, forKey: .name)
+        try values.encode(path, forKey: .path)
     }
 }
 
@@ -444,29 +419,27 @@ struct RuleSet: Codable, Identifiable, Hashable {
     ) -> [ApplicationRuleApplication] {
         var applicationsByPath: [String: ApplicationRuleApplication] = [:]
         for application in applications {
-            let path = application.path.trimmingCharacters(
+            let rawPath = application.path.trimmingCharacters(
                 in: .whitespacesAndNewlines
             )
-            let identities = ApplicationRuleApplication.normalizedIdentities(
-                application.identities
-            )
-            guard !path.isEmpty, !identities.isEmpty else { continue }
+            guard rawPath.hasPrefix("/") else { continue }
+            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            guard
+                path == rawPath,
+                URL(fileURLWithPath: path).pathExtension
+                    .localizedCaseInsensitiveCompare("app") == .orderedSame,
+                URL(fileURLWithPath: path).deletingPathExtension()
+                    .lastPathComponent.isEmpty == false
+            else { continue }
             let name = sanitizeEntry(application.name)
             let normalized = ApplicationRuleApplication(
                 name: name.isEmpty
                     ? URL(fileURLWithPath: path).deletingPathExtension()
                         .lastPathComponent
                     : name,
-                path: path,
-                identities: identities
+                path: path
             )
-            if let existing = applicationsByPath[path] {
-                applicationsByPath[path] = ApplicationRuleApplication(
-                    name: existing.name,
-                    path: path,
-                    identities: existing.identities + identities
-                )
-            } else {
+            if applicationsByPath[path] == nil {
                 applicationsByPath[path] = normalized
             }
         }

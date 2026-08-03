@@ -1600,8 +1600,8 @@ struct RuleSetRow: View {
         VStack(alignment: .leading, spacing: 6) {
             if rule.applications.isEmpty {
                 Text(state.tr(
-                    "尚未选择应用。此规则只匹配所选应用的签名身份。",
-                    "No application selected. This rule matches signed app identities only."
+                    "尚未选择应用。此规则按所选 App Bundle 的路径匹配。",
+                    "No application selected. This rule matches the selected App Bundle path."
                 ))
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1616,7 +1616,7 @@ struct RuleSetRow: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(application.name)
                                 .font(.caption)
-                            Text(application.identities.joined(separator: "\n"))
+                            Text(application.path + "/")
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
@@ -1647,8 +1647,8 @@ struct RuleSetRow: View {
             }
             .controlSize(.small)
             Text(state.tr(
-                "匹配 Team ID / signing identifier；路径只用于显示，不参与分流。",
-                "Matches Team ID / signing identifier; paths are display-only."
+                "匹配 App Bundle 内实际发起连接的可执行文件，与 Surge Mac 一致。",
+                "Matches executables inside the App Bundle, like Surge Mac."
             ))
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -1675,7 +1675,7 @@ private enum ApplicationRulePicker {
         let panel = NSOpenPanel()
         panel.title = "选择应用"
         panel.prompt = "选择"
-        panel.message = "将读取应用及其嵌套签名组件的 Team ID 和 signing identifier。"
+        panel.message = "将按所选 App Bundle 的规范化路径匹配其内部可执行文件。"
         panel.allowsMultipleSelection = true
         // 把 .app 作为 file package 选择；若只允许目录同时又禁止进入 package，
         // NSOpenPanel 会把目标显示出来却无法选中。
@@ -1685,7 +1685,7 @@ private enum ApplicationRulePicker {
         panel.allowedContentTypes = [.applicationBundle]
         guard panel.runModal() == .OK else { return [] }
         return try panel.urls.map {
-            try ApplicationRuleSignatureCollector.collect(at: $0)
+            try ApplicationRuleBundleCollector.collect(at: $0)
         }
     }
 }

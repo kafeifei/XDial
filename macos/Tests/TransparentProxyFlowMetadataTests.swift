@@ -2,131 +2,107 @@ import Network
 import XCTest
 
 final class TransparentProxyFlowMetadataTests: XCTestCase {
-    func testCanonicalApplicationIdentityUsesTeamAndSigningIdentifier() throws {
-        let identity = try XCTUnwrap(
-            TransparentProxyApplicationIdentity(
-                teamIdentifier: "Q6L2SF6YDW",
-                signingIdentifier: "com.anthropic.claudefordesktop"
-            )
+    func testApplicationBundlePathAcceptsCanonicalAppBundle() throws {
+        let bundlePath = try XCTUnwrap(
+            TransparentProxyApplicationBundlePath("/Applications/Claude.app")
         )
 
-        XCTAssertEqual(
-            identity.canonical,
-            "Q6L2SF6YDW/com.anthropic.claudefordesktop"
+        XCTAssertEqual(bundlePath.value, "/Applications/Claude.app")
+    }
+
+    func testApplicationBundlePathRejectsAmbiguousPaths() {
+        XCTAssertNil(TransparentProxyApplicationBundlePath("Claude.app"))
+        XCTAssertNil(
+            TransparentProxyApplicationBundlePath("/Applications/Claude")
+        )
+        XCTAssertNil(
+            TransparentProxyApplicationBundlePath(
+                "/Applications/Other/../Claude.app"
+            )
+        )
+        XCTAssertNil(
+            TransparentProxyApplicationBundlePath("/Applications/Claude.app/")
         )
     }
 
-    func testRejectsAmbiguousApplicationIdentityComponents() {
-        XCTAssertNil(
-            TransparentProxyApplicationIdentity(
-                teamIdentifier: "TEAM/OTHER",
-                signingIdentifier: "com.example.app"
+    func testApplicationBundlePathContainsEveryNestedExecutable() throws {
+        let bundlePath = try XCTUnwrap(
+            TransparentProxyApplicationBundlePath("/Applications/Claude.app")
+        )
+
+        XCTAssertTrue(
+            bundlePath.contains(
+                executablePath: "/Applications/Claude.app/Contents/MacOS/Claude"
             )
         )
-        XCTAssertNil(
-            TransparentProxyApplicationIdentity(
-                teamIdentifier: "TEAM",
-                signingIdentifier: "com.example/app"
-            )
-        )
-        XCTAssertNil(
-            TransparentProxyApplicationIdentity(
-                teamIdentifier: "q6l2sf6ydw",
-                signingIdentifier: "com.example.app"
-            )
-        )
-        XCTAssertNil(
-            TransparentProxyApplicationIdentity(
-                teamIdentifier: "Q6L2SF6YDW",
-                signingIdentifier: "com.example."
+        XCTAssertTrue(
+            bundlePath.contains(
+                executablePath: "/Applications/Claude.app/Contents/Frameworks/"
+                    + "Claude Helper.app/Contents/MacOS/computer_use"
             )
         )
     }
 
-    func testApplicationCredentialDecisionUsesExactAuditIdentity() throws {
-        let auditIdentity = try XCTUnwrap(
-            TransparentProxyApplicationIdentity(
-                teamIdentifier: "Q6L2SF6YDW",
-                signingIdentifier: "com.anthropic.claudefordesktop"
-            )
+    func testApplicationBundlePathUsesDirectoryBoundary() throws {
+        let bundlePath = try XCTUnwrap(
+            TransparentProxyApplicationBundlePath("/Applications/Claude.app")
         )
 
+        XCTAssertFalse(
+            bundlePath.contains(
+                executablePath: "/Applications/Claude.app2/Contents/MacOS/Claude"
+            )
+        )
+        XCTAssertFalse(
+            bundlePath.contains(
+                executablePath: "/Applications/Other.app/Contents/MacOS/Claude"
+            )
+        )
+    }
+
+    func testApplicationCredentialDecisionUsesFirstMatchingModeBinding() {
         XCTAssertEqual(
             TransparentProxyApplicationCredentialDecision.select(
-                metadataSigningIdentifier: "com.anthropic.claudefordesktop",
-                auditIdentity: auditIdentity,
-                activeCanonicalIdentities: [auditIdentity.canonical]
-            ),
-            .application(canonicalIdentity: auditIdentity.canonical)
-        )
-    }
-
-    func testApplicationCredentialDecisionRejectsConfiguredMetadataWithoutAudit() {
-        XCTAssertEqual(
-            TransparentProxyApplicationCredentialDecision.select(
-                metadataSigningIdentifier: "com.anthropic.claudefordesktop",
-                auditIdentity: nil,
-                activeCanonicalIdentities: [
-                    "Q6L2SF6YDW/com.anthropic.claudefordesktop",
+                auditTokenPresent: true,
+                auditExecutablePath: "/Applications/Claude.app/Contents/"
+                    + "Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper",
+                activeBundlePaths: [
+                    "/Applications/Claude.app",
+                    "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app",
                 ]
+            ),
+            .application(bundlePath: "/Applications/Claude.app")
+        )
+    }
+
+    func testApplicationCredentialDecisionUsesBaseWithoutAuditToken() {
+        XCTAssertEqual(
+            TransparentProxyApplicationCredentialDecision.select(
+                auditTokenPresent: false,
+                auditExecutablePath: nil,
+                activeBundlePaths: ["/Applications/Claude.app"]
+            ),
+            .base
+        )
+    }
+
+    func testApplicationCredentialDecisionRejectsUnresolvableAuditToken() {
+        XCTAssertEqual(
+            TransparentProxyApplicationCredentialDecision.select(
+                auditTokenPresent: true,
+                auditExecutablePath: nil,
+                activeBundlePaths: ["/Applications/Claude.app"]
             ),
             .reject
         )
     }
 
-    func testApplicationCredentialDecisionRejectsTeamSpoofForSameBundle() throws {
-        let auditIdentity = try XCTUnwrap(
-            TransparentProxyApplicationIdentity(
-                teamIdentifier: "ABCDE12345",
-                signingIdentifier: "com.anthropic.claudefordesktop"
-            )
-        )
-
+    func testApplicationCredentialDecisionUsesBaseForUnrelatedFlow() {
         XCTAssertEqual(
             TransparentProxyApplicationCredentialDecision.select(
-                metadataSigningIdentifier: auditIdentity.signingIdentifier,
-                auditIdentity: auditIdentity,
-                activeCanonicalIdentities: [
-                    "Q6L2SF6YDW/com.anthropic.claudefordesktop",
-                ]
-            ),
-            .reject
-        )
-    }
-
-    func testApplicationCredentialDecisionRejectsConflictingMetadataAndAudit() throws {
-        let auditIdentity = try XCTUnwrap(
-            TransparentProxyApplicationIdentity(
-                teamIdentifier: "Q6L2SF6YDW",
-                signingIdentifier: "com.anthropic.claudefordesktop"
-            )
-        )
-
-        XCTAssertEqual(
-            TransparentProxyApplicationCredentialDecision.select(
-                metadataSigningIdentifier: "com.example.other",
-                auditIdentity: auditIdentity,
-                activeCanonicalIdentities: [auditIdentity.canonical]
-            ),
-            .reject
-        )
-    }
-
-    func testApplicationCredentialDecisionUsesBaseForUnrelatedFlow() throws {
-        let auditIdentity = try XCTUnwrap(
-            TransparentProxyApplicationIdentity(
-                teamIdentifier: "ABCDE12345",
-                signingIdentifier: "com.example.unrelated"
-            )
-        )
-
-        XCTAssertEqual(
-            TransparentProxyApplicationCredentialDecision.select(
-                metadataSigningIdentifier: auditIdentity.signingIdentifier,
-                auditIdentity: auditIdentity,
-                activeCanonicalIdentities: [
-                    "Q6L2SF6YDW/com.anthropic.claudefordesktop",
-                ]
+                auditTokenPresent: true,
+                auditExecutablePath: "/Applications/Safari.app/Contents/MacOS/Safari",
+                activeBundlePaths: ["/Applications/Claude.app"]
             ),
             .base
         )
