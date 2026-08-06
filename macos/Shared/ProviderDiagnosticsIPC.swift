@@ -4,6 +4,7 @@ enum ProviderDiagnosticsCommand: String, Codable {
     case probeLineOutboundAddress = "probe-line-outbound-address"
     case routingProbeSnapshot = "routing-probe-snapshot"
     case beginRouteProbe = "begin-route-probe"
+    case applicationAttributionSnapshot = "application-attribution-snapshot"
 }
 
 struct ProviderDiagnosticsRequest: Codable, Equatable {
@@ -167,25 +168,60 @@ struct ProviderBegunRouteProbe: Codable, Equatable {
     }
 }
 
+/// 仅描述当前 Provider 事务内的应用归因结果，不包含目标域名、IP、路径或凭据。
+struct ProviderApplicationAttributionSnapshot: Codable, Equatable {
+    let activeSelectorKindCounts: [String: Int]
+    let matchedFlowCount: Int
+    let matchedSelectorKindCounts: [String: Int]
+    let matchedRuleSetIDCounts: [String: Int]
+    let matchedLineIDCounts: [String: Int]
+    let matchedSubscriptionIDCounts: [String: Int]
+    let baseFlowCount: Int
+    let baseMissingSourceIdentityCount: Int
+    let rejectedFlowCount: Int
+    let rejectedUnresolvedAuditTokenCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case activeSelectorKindCounts = "active_selector_kind_counts"
+        case matchedFlowCount = "matched_flow_count"
+        case matchedSelectorKindCounts = "matched_selector_kind_counts"
+        case matchedRuleSetIDCounts = "matched_rule_set_id_counts"
+        case matchedLineIDCounts = "matched_line_id_counts"
+        case matchedSubscriptionIDCounts = "matched_subscription_id_counts"
+        case baseFlowCount = "base_flow_count"
+        case baseMissingSourceIdentityCount =
+            "base_missing_source_identity_count"
+        case rejectedFlowCount = "rejected_flow_count"
+        case rejectedUnresolvedAuditTokenCount =
+            "rejected_unresolved_audit_token_count"
+    }
+}
+
 struct ProviderDiagnosticsData: Codable, Equatable {
     let routingProbe: ProviderRoutingProbeSnapshot?
     let lineOutboundAddress: ProviderLineOutboundAddress?
     let begunRouteProbe: ProviderBegunRouteProbe?
+    let applicationAttribution:
+        ProviderApplicationAttributionSnapshot?
 
     enum CodingKeys: String, CodingKey {
         case routingProbe = "routing_probe"
         case lineOutboundAddress = "line_outbound_address"
         case begunRouteProbe = "begun_route_probe"
+        case applicationAttribution = "application_attribution"
     }
 
     init(
         routingProbe: ProviderRoutingProbeSnapshot? = nil,
         lineOutboundAddress: ProviderLineOutboundAddress? = nil,
-        begunRouteProbe: ProviderBegunRouteProbe? = nil
+        begunRouteProbe: ProviderBegunRouteProbe? = nil,
+        applicationAttribution:
+            ProviderApplicationAttributionSnapshot? = nil
     ) {
         self.routingProbe = routingProbe
         self.lineOutboundAddress = lineOutboundAddress
         self.begunRouteProbe = begunRouteProbe
+        self.applicationAttribution = applicationAttribution
     }
 }
 
@@ -420,6 +456,8 @@ enum ProviderDiagnosticsCodec {
 
         var allowedKeys = baseKeys
         switch command {
+        case .applicationAttributionSnapshot:
+            break
         case .routingProbeSnapshot:
             allowedKeys.insert("probe_id")
         case .probeLineOutboundAddress:
@@ -442,6 +480,8 @@ enum ProviderDiagnosticsCodec {
             throw ProviderDiagnosticsCodecError.invalidRequest
         }
         switch request.cmd {
+        case .applicationAttributionSnapshot:
+            break
         case .routingProbeSnapshot:
             guard
                 let probeID = request.probeID,

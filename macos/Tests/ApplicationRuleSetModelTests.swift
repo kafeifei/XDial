@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 
 final class ApplicationRuleSetModelTests: XCTestCase {
-    func testApplicationRulePersistsOnlyBundlePath() throws {
+    func testApplicationRulePersistsRootBundleIdentityAndPath() throws {
         let source = RuleSet(
             id: "claude",
             name: "Claude",
@@ -10,9 +10,11 @@ final class ApplicationRuleSetModelTests: XCTestCase {
             applications: [
                 ApplicationRuleApplication(
                     name: "Claude",
-                    path: "/Applications/Claude.app"
+                    path: "/Applications/Claude.app",
+                    bundleIdentifier: "com.anthropic.claudefordesktop"
                 ),
-            ]
+            ],
+            processes: ["claude", "Claude Helper*"]
         )
 
         let data = try JSONEncoder().encode(source)
@@ -27,7 +29,15 @@ final class ApplicationRuleSetModelTests: XCTestCase {
             applications[0]["path"] as? String,
             "/Applications/Claude.app"
         )
+        XCTAssertEqual(
+            applications[0]["bundle_identifier"] as? String,
+            "com.anthropic.claudefordesktop"
+        )
         XCTAssertNil(applications[0]["identities"])
+        XCTAssertEqual(
+            object["processes"] as? [String],
+            ["claude", "Claude Helper*"]
+        )
 
         let decoded = try JSONDecoder().decode(RuleSet.self, from: data)
         XCTAssertEqual(decoded, source)
@@ -37,7 +47,7 @@ final class ApplicationRuleSetModelTests: XCTestCase {
         let data = try XCTUnwrap("""
         {
           "name": "Claude",
-          "path": "/Applications/Claude.app",
+          "path": "/Applications/LegacyClaudeForTest.app",
           "identities": [
             "Q6L2SF6YDW/com.anthropic.claudefordesktop",
             "Q6L2SF6YDW/computer_use"
@@ -53,7 +63,7 @@ final class ApplicationRuleSetModelTests: XCTestCase {
         XCTAssertEqual(cleaned, [
             ApplicationRuleApplication(
                 name: "Claude",
-                path: "/Applications/Claude.app"
+                path: "/Applications/LegacyClaudeForTest.app"
             ),
         ])
         let encoded = try JSONEncoder().encode(cleaned[0])
@@ -67,11 +77,12 @@ final class ApplicationRuleSetModelTests: XCTestCase {
         let cleaned = RuleSet.sanitizeApplications([
             ApplicationRuleApplication(
                 name: "Claude",
-                path: "/Applications/Claude.app"
+                path: "/Applications/XDialSanitizeFixture.app",
+                bundleIdentifier: "com.anthropic.claudefordesktop"
             ),
             ApplicationRuleApplication(
                 name: "Claude duplicate",
-                path: "/Applications/Claude.app"
+                path: "/Applications/XDialSanitizeFixture.app"
             ),
             ApplicationRuleApplication(
                 name: "Relative",
@@ -86,8 +97,28 @@ final class ApplicationRuleSetModelTests: XCTestCase {
         XCTAssertEqual(cleaned, [
             ApplicationRuleApplication(
                 name: "Claude",
-                path: "/Applications/Claude.app"
+                path: "/Applications/XDialSanitizeFixture.app",
+                bundleIdentifier: "com.anthropic.claudefordesktop"
             ),
+        ])
+    }
+
+    func testSanitizeProcessesUsesSurgeProcessNameModes() {
+        let cleaned = RuleSet.sanitizeProcesses([
+            "claude",
+            "claude",
+            "Claude Helper*",
+            "/usr/local/bin/claude",
+            "/Applications/Claude.app/",
+            " bin/claude ",
+            "/Applications/Other/../Claude.app/",
+        ])
+
+        XCTAssertEqual(cleaned, [
+            "claude",
+            "Claude Helper*",
+            "/usr/local/bin/claude",
+            "/Applications/Claude.app/",
         ])
     }
 }

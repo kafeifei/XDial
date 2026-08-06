@@ -137,8 +137,8 @@ struct GeneralTab: View {
                     }
                     .toggleStyle(.switch)
                     Text(state.tr(
-                        "此选项控制 XDial 启动后连接当前模式。合盖前已有连接时，唤醒后仍会等待网络恢复并重新连接。",
-                        "This controls connecting the active Mode when XDial launches. A connection active before sleep is still restored after the network wakes."
+                        "此选项控制 XDial 启动后连接当前模式。运行中断线时，XDial 会尝试自动恢复连接。",
+                        "This controls connecting the active Mode when XDial launches. If the connection drops while running, XDial attempts to restore it automatically."
                     ))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1378,7 +1378,7 @@ struct RulesTab: View {
                     Button(state.tr("手动域名/IP", "Manual Domain/IP")) {
                         addManual()
                     }
-                    Button(state.tr("应用", "Application")) {
+                    Button(state.tr("应用程序", "Application")) {
                         addApplication()
                     }
                 } label: {
@@ -1392,7 +1392,10 @@ struct RulesTab: View {
             }
         }
         .alert(
-            state.tr("无法添加应用规则", "Could not add application rule"),
+            state.tr(
+                "无法添加应用程序规则",
+                "Could not add application rule"
+            ),
             isPresented: Binding(
                 get: { applicationSelectionError != nil },
                 set: { if !$0 { applicationSelectionError = nil } }
@@ -1438,7 +1441,7 @@ struct RulesTab: View {
                 id: id,
                 name: applications.count == 1
                     ? applications[0].name
-                    : state.tr("应用规则", "Application Rule"),
+                    : state.tr("应用程序规则", "Application Rule"),
                 type: "application",
                 applications: applications
             ))
@@ -1463,7 +1466,9 @@ struct RuleSetRow: View {
     @State private var expanded = true
     @State private var domainsText = ""
     @State private var cidrsText = ""
+    @State private var processesText = ""
     @State private var loaded = false
+    @State private var processesLoaded = false
     @State private var applicationSelectionError: String?
     @EnvironmentObject var state: AppState
 
@@ -1474,6 +1479,13 @@ struct RuleSetRow: View {
         rule.cidrs = cidrsText.split(whereSeparator: \.isNewline)
             .map { RuleSet.sanitizeEntry(String($0)) }
             .filter { !$0.isEmpty }
+        state.save()
+    }
+
+    private func saveProcesses() {
+        rule.processes = RuleSet.sanitizeProcesses(
+            processesText.split(whereSeparator: \.isNewline).map(String.init)
+        )
         state.save()
     }
 
@@ -1508,7 +1520,7 @@ struct RuleSetRow: View {
             }
         )
         .alert(
-            state.tr("无法读取应用签名", "Could not read application signature"),
+            state.tr("无法读取应用程序", "Could not read application"),
             isPresented: Binding(
                 get: { applicationSelectionError != nil },
                 set: { if !$0 { applicationSelectionError = nil } }
@@ -1525,7 +1537,7 @@ struct RuleSetRow: View {
         case "url":
             return "URL"
         case "application":
-            return state.tr("应用", "Application")
+            return state.tr("应用程序", "Application")
         default:
             return state.tr("手动", "Manual")
         }
@@ -1600,8 +1612,8 @@ struct RuleSetRow: View {
         VStack(alignment: .leading, spacing: 6) {
             if rule.applications.isEmpty {
                 Text(state.tr(
-                    "尚未选择应用。此规则按所选 App Bundle 的路径匹配。",
-                    "No application selected. This rule matches the selected App Bundle path."
+                    "尚未选择应用程序。",
+                    "No application selected."
                 ))
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1616,10 +1628,14 @@ struct RuleSetRow: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(application.name)
                                 .font(.caption)
-                            Text(application.path + "/")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
+                            HStack(spacing: 4) {
+                                Text(state.tr("自动匹配", "Automatic"))
+                                Text(application.path + "/")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                         }
                         Spacer(minLength: 0)
                         Button(role: .destructive) {
@@ -1631,12 +1647,15 @@ struct RuleSetRow: View {
                             Image(systemName: "minus.circle")
                         }
                         .buttonStyle(.plain)
-                        .help(state.tr("移除应用", "Remove application"))
+                        .help(state.tr(
+                            "移除应用程序",
+                            "Remove application"
+                        ))
                     }
                 }
             }
             HStack(spacing: 8) {
-                Button(state.tr("添加应用…", "Add Application…")) {
+                Button(state.tr("添加应用程序…", "Add Application…")) {
                     chooseApplications(replacing: false)
                 }
                 if !rule.applications.isEmpty {
@@ -1646,14 +1665,33 @@ struct RuleSetRow: View {
                 }
             }
             .controlSize(.small)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(state.tr(
+                    "附加程序规则（可选，每行一个）",
+                    "Additional process rules (optional, one per line)"
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                TextEditor(text: $processesText)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(height: 54)
+                    .border(Color.gray.opacity(0.3))
+                    .onChange(of: processesText) { _, _ in
+                        if processesLoaded { saveProcesses() }
+                    }
+            }
             Text(state.tr(
-                "匹配 App Bundle 内实际发起连接的可执行文件，与 Surge Mac 一致。",
-                "Matches executables inside the App Bundle, like Surge Mac."
+                "所选应用程序会自动覆盖程序包内的主程序和所有辅助程序。包外程序可填写文件名（支持 * 和 ?）、完整绝对路径，或以 / 结尾的目录路径。",
+                "Selected applications automatically include every executable in their bundles. For programs outside a bundle, enter a filename (with * or ?), an absolute path, or a directory path ending in /."
             ))
             .font(.caption2)
             .foregroundStyle(.secondary)
         }
         .padding(.leading, 18)
+        .onAppear {
+            processesText = rule.processes.joined(separator: "\n")
+            processesLoaded = true
+        }
     }
 
     private func chooseApplications(replacing: Bool) {
@@ -1673,9 +1711,9 @@ struct RuleSetRow: View {
 private enum ApplicationRulePicker {
     static func chooseApplications() throws -> [ApplicationRuleApplication] {
         let panel = NSOpenPanel()
-        panel.title = "选择应用"
+        panel.title = "选择应用程序"
         panel.prompt = "选择"
-        panel.message = "将按所选 App Bundle 的规范化路径匹配其内部可执行文件。"
+        panel.message = "选中后会自动匹配应用程序包内的主程序和所有辅助程序。"
         panel.allowsMultipleSelection = true
         // 把 .app 作为 file package 选择；若只允许目录同时又禁止进入 package，
         // NSOpenPanel 会把目标显示出来却无法选中。

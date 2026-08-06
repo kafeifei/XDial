@@ -29,9 +29,8 @@ struct AutomaticConnectionPolicy {
     }
 }
 
-/// 用户对连接的长期期望。休眠、暗唤醒、网络变化和 Provider 状态都只是
-/// reconcile 的输入，绝不能消费或清除这份期望。这样短暂暗唤醒后立即再次
-/// 休眠，也不会把真正唤醒所需的恢复意图吃掉。
+/// 用户对连接的长期期望。网络变化和 Provider 状态都只是
+/// reconcile 的输入，绝不能消费或清除这份期望。
 struct ConnectionDesiredState: Equatable {
     enum RuntimeOwnership: String, Equatable {
         /// 冷启动时发现的既有 Provider 会话，不受当前宿主的有界重试托管。
@@ -120,12 +119,11 @@ struct ConnectionDesiredState: Equatable {
     }
 }
 
-/// 所有休眠 / 唤醒恢复入口都先归一成同一项动作。调用方可以重复投递
+/// 所有断线 / 唤醒恢复入口都先归一成同一项动作。调用方可以重复投递
 /// `didWake`、屏幕唤醒和会话激活；只要输入事实没变，决策就是幂等的。
 enum DesiredConnectionReconcileAction: Equatable {
     case none
     case stopRuntime
-    case waitForWake
     case waitForRuntime
     case waitForNetwork
     case startAutomatically(modeID: String)
@@ -137,7 +135,6 @@ struct DesiredConnectionReconcilePolicy {
     static func decide(
         desired: ConnectionDesiredState,
         activeModeID: String,
-        systemIsSleeping: Bool,
         runtimeStatus: String,
         canConnect: Bool,
         networkWaitCompleted: Bool
@@ -149,15 +146,6 @@ struct DesiredConnectionReconcilePolicy {
                 return .stopRuntime
             }
             return .none
-        }
-
-        if systemIsSleeping {
-            if AutomaticConnectionPolicy.holdsConnectionIntent(
-                runtimeStatus: runtimeStatus
-            ) {
-                return .stopRuntime
-            }
-            return .waitForWake
         }
 
         guard desiredModeID == activeModeID else {
@@ -200,7 +188,7 @@ struct ApplicationTerminationPolicy {
     }
 }
 
-/// 连接前可能要异步结束 Tailscale 配置会话。新连接、显式断开或休眠发生后，
+/// 连接前可能要异步结束 Tailscale 配置会话。新连接或显式断开发生后，
 /// 旧回调不得再启动一笔过期的连接事务。
 struct ConnectionAttemptGate {
     private var generation = 0
@@ -219,8 +207,9 @@ struct ConnectionAttemptGate {
     }
 }
 
-/// 合盖连接已停止、但新的连接事务尚未开始时，宿主需要表达一段短暂的恢复态。
-/// 这段时间保留旧事务日志用于诊断，但不能把旧事务的 `cancelled` 当成当前状态展示。
+/// 唤醒时发现系统会话正在自行断开，或已经断开但新的连接事务尚未开始时，宿主需要
+/// 表达一段短暂的恢复态。这段时间保留旧事务日志用于诊断，但不能把旧事务的
+/// `cancelled` 当成当前状态展示。
 enum WakeReconnectPhase: String, CaseIterable {
     case finishingDisconnect = "finishing_disconnect"
     case waitingForNetwork = "waiting_for_network"

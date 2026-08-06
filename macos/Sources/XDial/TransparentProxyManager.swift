@@ -275,6 +275,32 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     }
 
     #if DEBUG
+    func applicationAttributionSnapshot(
+        transactionID: String,
+        completion: @escaping (
+            Result<ProviderApplicationAttributionSnapshot, Error>
+        ) -> Void
+    ) {
+        let request = ProviderDiagnosticsRequest(
+            cmd: .applicationAttributionSnapshot,
+            transactionID: transactionID
+        )
+        sendProviderDiagnostics(request, timeout: 5) { result in
+            switch result {
+            case let .failure(error):
+                completion(.failure(error))
+            case let .success(data):
+                guard let snapshot = data.applicationAttribution else {
+                    completion(.failure(
+                        ProviderDiagnosticsHostError.payloadMismatch
+                    ))
+                    return
+                }
+                completion(.success(snapshot))
+            }
+        }
+    }
+
     func routingProbeSnapshot(
         transactionID: String,
         probeID: String,
@@ -1764,10 +1790,14 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             publishFailure(error)
             return
         }
+        let changeKinds = activeUnderlay?
+            .differenceKinds(comparedTo: underlay)
+            .joined(separator: ",") ?? "unknown"
         appLog(
             "Transparent Proxy underlay changed "
                 + "\(activeUnderlay?.defaultInterface.name ?? "unknown")"
-                + " -> \(underlay.defaultInterface.name); rebuilding"
+                + " -> \(underlay.defaultInterface.name) "
+                + "kinds=\(changeKinds); rebuilding"
         )
         publishRuntimeStatus("reconnecting", error: nil)
         startConnection(
@@ -2157,6 +2187,23 @@ private struct HostUnderlaySnapshot {
             && systemDNSJSON == other.systemDNSJSON
     }
 
+    func differenceKinds(
+        comparedTo other: HostUnderlaySnapshot
+    ) -> [String] {
+        var kinds: [String] = []
+        if defaultInterface.name != other.defaultInterface.name
+            || defaultInterface.index != other.defaultInterface.index {
+            kinds.append("default-interface")
+        }
+        if canonicalInterfaceKeys != other.canonicalInterfaceKeys {
+            kinds.append("interface-set")
+        }
+        if systemDNSJSON != other.systemDNSJSON {
+            kinds.append("system-dns")
+        }
+        return kinds
+    }
+
     private var canonicalInterfaceKeys: [String] {
         interfaces.map {
             "\($0.index):\($0.name):\($0.type)"
@@ -2333,12 +2380,12 @@ private final class HostUnderlayCapture {
 }
 
 /// 只观察 macOS 已经裁决完成的网络事实。它不识别接口类型或产品；
-/// 一次会话内任何连贯的 Underlay 变化，都交给宿主做完整数据面重建。
+/// 短暂不可用不等于 Underlay 已变化。只有恢复后的接口 / DNS 事实与会话
+/// 基线确实不同，才交给宿主做完整数据面重建。
 private final class HostUnderlayMonitor {
     private let monitor = NWPathMonitor()
     private let baseline: HostUnderlaySnapshot
     private let onChange: (HostUnderlaySnapshot) -> Void
-    private var sawUnavailablePath = false
     private var pendingChange: DispatchWorkItem?
     private var cancelled = false
 
@@ -2370,7 +2417,6 @@ private final class HostUnderlayMonitor {
     private func consume(_ path: Network.NWPath) {
         guard !cancelled else { return }
         guard path.status == .satisfied else {
-            sawUnavailablePath = true
             pendingChange?.cancel()
             pendingChange = nil
             return
@@ -2381,7 +2427,7 @@ private final class HostUnderlayMonitor {
         else {
             return
         }
-        guard sawUnavailablePath || !snapshot.isEquivalent(to: baseline) else {
+        guard !snapshot.isEquivalent(to: baseline) else {
             pendingChange?.cancel()
             pendingChange = nil
             return
@@ -2405,6 +2451,10 @@ private final class HostUnderlayMonitor {
                 // DNS、默认路由和 NWPath 仍处于中间态；继续等待同一轮变化
                 // 收敛，不拿旧快照启动，也不回落到任意接口。
                 self.scheduleChange()
+                return
+            }
+            guard !snapshot.isEquivalent(to: self.baseline) else {
+                self.pendingChange = nil
                 return
             }
             self.cancelled = true

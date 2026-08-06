@@ -14,9 +14,12 @@ struct InterfaceSnapshot {
     let systemDNSJSON: String
 }
 
-struct ApplicationBundleCredential: Sendable {
-    let bundlePath: String
+struct ApplicationProcessCredential: Sendable {
+    let selector: TransparentProxyProcessSelector
     let credentials: SOCKSCredentials
+    let ruleSetID: String
+    let lineID: String?
+    let subscriptionID: String?
 }
 
 final class EmbeddedSingBoxRuntime {
@@ -26,10 +29,10 @@ final class EmbeddedSingBoxRuntime {
     struct Session {
         let port: UInt16
         let credentials: SOCKSCredentials
-        /// Active App Bundle selectors in Mode binding order, each paired with
-        /// its per-session SOCKS credentials. This list is never persisted or
-        /// exposed in diagnostics.
-        let applicationBundleCredentials: [ApplicationBundleCredential]
+        /// Active Surge-style process selectors in Mode binding order, each
+        /// paired with its per-session SOCKS credentials. This list is never
+        /// persisted or exposed in diagnostics.
+        let applicationProcessCredentials: [ApplicationProcessCredential]
         let lineOutbounds: [String: String]
         let ruleSetTags: Set<String>
         let dnsCaptureDomains: [String]
@@ -37,13 +40,21 @@ final class EmbeddedSingBoxRuntime {
     }
 
     private struct SessionEnvelope: Decodable {
-        struct ApplicationPathCredential: Decodable {
-            let bundlePath: String
+        struct ApplicationProcessCredential: Decodable {
+            let kind: TransparentProxyProcessSelectorKind
+            let value: String
             let username: String
+            let ruleSetID: String
+            let lineID: String?
+            let subscriptionID: String?
 
             enum CodingKeys: String, CodingKey {
-                case bundlePath = "bundle_path"
+                case kind
+                case value
                 case username
+                case ruleSetID = "rule_set_id"
+                case lineID = "line_id"
+                case subscriptionID = "subscription_id"
             }
         }
 
@@ -80,7 +91,7 @@ final class EmbeddedSingBoxRuntime {
         let lineOutbounds: [String: String]
         let subscriptionOutbounds: [String: [String]]
         let ruleSetTags: [String]
-        let applicationPathCredentials: [ApplicationPathCredential]?
+        let applicationProcessCredentials: [ApplicationProcessCredential]?
         let anyConnect: AnyConnect?
         let tailscale: Tailscale?
 
@@ -90,7 +101,7 @@ final class EmbeddedSingBoxRuntime {
             case lineOutbounds = "line_outbounds"
             case subscriptionOutbounds = "subscription_outbounds"
             case ruleSetTags = "rule_set_tags"
-            case applicationPathCredentials = "application_path_credentials"
+            case applicationProcessCredentials = "application_process_credentials"
             case anyConnect = "anyconnect"
             case tailscale
         }
@@ -308,13 +319,21 @@ final class EmbeddedSingBoxRuntime {
             !envelope.ruleSetTags.contains(""),
             Set(envelope.ruleSetTags).count ==
                 envelope.ruleSetTags.count,
-            (envelope.applicationPathCredentials ?? []).allSatisfy({ entry in
-                TransparentProxyApplicationBundlePath(entry.bundlePath) != nil &&
+            (envelope.applicationProcessCredentials ?? []).allSatisfy({ entry in
+                TransparentProxyProcessSelector(
+                    kind: entry.kind,
+                    value: entry.value
+                ) != nil &&
                     !entry.username.isEmpty &&
-                    entry.username.utf8.count <= 255
+                    entry.username.utf8.count <= 255 &&
+                    !entry.ruleSetID.isEmpty &&
+                    ((entry.lineID?.isEmpty == false)
+                        != (entry.subscriptionID?.isEmpty == false))
             }),
-            Set((envelope.applicationPathCredentials ?? []).map(\.bundlePath))
-                .count == (envelope.applicationPathCredentials ?? []).count,
+            Set((envelope.applicationProcessCredentials ?? []).map({ entry in
+                entry.kind.rawValue + "\u{0}" + entry.value
+            })).count ==
+                (envelope.applicationProcessCredentials ?? []).count,
             envelope.tailscale.map({ tailscale in
                 !tailscale.magicDNSEnabled ||
                     !(tailscale.dnsServerTag ?? "").isEmpty
@@ -504,14 +523,20 @@ final class EmbeddedSingBoxRuntime {
             return Session(
                 port: port,
                 credentials: credentials,
-                applicationBundleCredentials:
-                    (envelope.applicationPathCredentials ?? []).map { entry in
-                        ApplicationBundleCredential(
-                            bundlePath: entry.bundlePath,
+                applicationProcessCredentials:
+                    (envelope.applicationProcessCredentials ?? []).map { entry in
+                        ApplicationProcessCredential(
+                            selector: TransparentProxyProcessSelector(
+                                kind: entry.kind,
+                                value: entry.value
+                            )!,
                             credentials: SOCKSCredentials(
                                 username: entry.username,
                                 password: credentials.password
-                            )
+                            ),
+                            ruleSetID: entry.ruleSetID,
+                            lineID: entry.lineID,
+                            subscriptionID: entry.subscriptionID
                         )
                     },
                 lineOutbounds: envelope.lineOutbounds,

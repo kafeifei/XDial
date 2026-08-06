@@ -760,7 +760,9 @@ func TestGenerateTransparentProxySessionCarriesOnlyActiveApplicationCredentials(
 				ID: "active-app", Type: config.RuleSetTypeApplication, Enabled: true,
 				Applications: []config.ApplicationMatch{{
 					Name: "Claude", Path: "/Applications/Claude.app",
+					BundleIdentifier: "com.anthropic.claudefordesktop",
 				}},
+				Processes: []string{"claude"},
 			},
 			{
 				ID: "unbound-app", Type: config.RuleSetTypeApplication, Enabled: true,
@@ -800,19 +802,48 @@ func TestGenerateTransparentProxySessionCarriesOnlyActiveApplicationCredentials(
 	if err := json.Unmarshal([]byte(sessionJSON), &session); err != nil {
 		t.Fatal(err)
 	}
-	want := []config.ApplicationSOCKSCredential{{
-		BundlePath: "/Applications/Claude.app",
-		Username: config.ApplicationSOCKSUsername(
-			"session-user", "/Applications/Claude.app",
-		),
-	}}
-	if !reflect.DeepEqual(session.ApplicationPathCredentials, want) {
-		t.Fatalf("application path credentials = %#v, want %#v", session.ApplicationPathCredentials, want)
+	want := []config.ApplicationSOCKSCredential{
+		{
+			Kind:      config.ApplicationProcessSelectorBundleID,
+			Value:     "com.anthropic.claudefordesktop",
+			RuleSetID: "active-app",
+			LineID:    "us",
+			Username: config.ApplicationSOCKSUsername(
+				"session-user", config.ApplicationProcessSelector{
+					Kind: config.ApplicationProcessSelectorBundleID, Value: "com.anthropic.claudefordesktop",
+				},
+			),
+		},
+		{
+			Kind:      config.ApplicationProcessSelectorBundlePath,
+			Value:     "/Applications/Claude.app",
+			RuleSetID: "active-app",
+			LineID:    "us",
+			Username: config.ApplicationSOCKSUsername(
+				"session-user", config.ApplicationProcessSelector{
+					Kind: config.ApplicationProcessSelectorBundlePath, Value: "/Applications/Claude.app",
+				},
+			),
+		},
+		{
+			Kind:      config.ApplicationProcessSelectorName,
+			Value:     "claude",
+			RuleSetID: "active-app",
+			LineID:    "us",
+			Username: config.ApplicationSOCKSUsername(
+				"session-user", config.ApplicationProcessSelector{
+					Kind: config.ApplicationProcessSelectorName, Value: "claude",
+				},
+			),
+		},
 	}
-	for _, credential := range session.ApplicationPathCredentials {
-		if credential.BundlePath == "/Applications/Unbound.app" ||
-			credential.BundlePath == "/Applications/Disabled.app" {
-			t.Fatalf("inactive application escaped into session credentials: %#v", session.ApplicationPathCredentials)
+	if !reflect.DeepEqual(session.ApplicationProcessCredentials, want) {
+		t.Fatalf("application process credentials = %#v, want %#v", session.ApplicationProcessCredentials, want)
+	}
+	for _, credential := range session.ApplicationProcessCredentials {
+		if credential.Value == "/Applications/Unbound.app" ||
+			credential.Value == "/Applications/Disabled.app" {
+			t.Fatalf("inactive application escaped into session credentials: %#v", session.ApplicationProcessCredentials)
 		}
 	}
 }

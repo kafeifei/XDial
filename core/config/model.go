@@ -109,12 +109,13 @@ const (
 	RuleSetMatchMixed   RuleSetMatchKind = "mixed"
 )
 
-// ApplicationMatch 是一个由用户选择的 macOS App Bundle。数据面按 Path 的
-// Bundle 前缀匹配实际发起连接的可执行文件，与 Surge Mac 的 App Bundle 模式一致。
-// 旧 Profile 里的 identities 字段由 JSON 解码器忽略，不再参与任何路由语义。
+// ApplicationMatch 是一个由用户选择的 macOS App Bundle。BundleIdentifier
+// 匹配系统直接提供的 source-app 身份；Path 对 audit-token 解析出的可执行路径
+// 做边界匹配。旧 Profile 里的 identities 字段由 JSON 解码器忽略。
 type ApplicationMatch struct {
-	Name string `json:"name,omitempty"`
-	Path string `json:"path"`
+	Name             string `json:"name,omitempty"`
+	Path             string `json:"path"`
+	BundleIdentifier string `json:"bundle_identifier,omitempty"`
 }
 
 // RuleSet 规则：匹配哪些流量
@@ -135,9 +136,12 @@ type RuleSet struct {
 	Domains []string `json:"domains,omitempty"`
 	CIDRs   []string `json:"cidrs,omitempty"`
 
-	// 应用规则。它只保存 App Bundle 路径及控制面展示元数据，不携带任何 Line 或
-	// Mode 信息；只有 active Mode 的 binding 才会把它编译为数据面规则。
+	// 应用规则。Applications 保存根 Bundle ID 与 App Bundle 前缀；Processes 保存用户显式输入的
+	// Surge PROCESS-NAME 表达式（文件名/通配符、完整路径或末尾带 / 的路径前缀）。
+	// 二者都只描述匹配内容，不携带任何 Line 或 Mode 信息；只有 active Mode 的
+	// binding 才会把它们编译为数据面规则。
 	Applications []ApplicationMatch `json:"applications,omitempty"`
+	Processes    []string           `json:"processes,omitempty"`
 
 	RuntimeMatchKind RuleSetMatchKind `json:"-"`
 }

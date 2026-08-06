@@ -154,6 +154,18 @@ final class GoEngine: ObservableObject {
     }
 
     #if DEBUG
+    func applicationAttributionSnapshot(
+        transactionID: String,
+        completion: @escaping (
+            Result<ProviderApplicationAttributionSnapshot, Error>
+        ) -> Void
+    ) {
+        transparentProxy.applicationAttributionSnapshot(
+            transactionID: transactionID,
+            completion: completion
+        )
+    }
+
     func routingProbeSnapshot(
         transactionID: String,
         probeID: String,
@@ -243,6 +255,10 @@ final class GoEngine: ObservableObject {
             pendingStatusSyncCompletions.append(completion)
         }
         transparentProxy.syncStatus()
+    }
+
+    func systemDidWake(completion: (() -> Void)? = nil) {
+        syncStatus(completion: completion)
     }
 
     func prepareTailscale(

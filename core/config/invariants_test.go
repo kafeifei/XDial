@@ -734,13 +734,13 @@ func invMatchesModeBinding(profile *Profile, rule map[string]interface{}) bool {
 		}
 		switch ruleSet.Type {
 		case RuleSetTypeApplication:
-			bundlePaths := applicationRuleSetPaths(ruleSet)
+			selectors := applicationRuleSetSelectors(ruleSet)
 			users := invStrings(rule["auth_user"])
 			// Route rules intentionally carry only derived SOCKS usernames, not
 			// Bundle paths. Match the exact active RuleSet cardinality and
 			// the fixed "." + lowercase SHA-256 suffix shape; generator tests
 			// separately prove the exact derivation.
-			if len(bundlePaths) == 0 || len(users) != len(bundlePaths) {
+			if len(selectors) == 0 || len(users) != len(selectors) {
 				continue
 			}
 			seen := map[string]bool{}

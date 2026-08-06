@@ -59,22 +59,20 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
         )
     }
 
-    func testDarkWakeAndImmediateResleepDoNotConsumeConnectionDesire() {
+    func testRepeatedWakeSignalsDoNotConsumeConnectionDesire() {
         var desired = ConnectionDesiredState()
         desired.userRequestedConnection(modeID: "work")
 
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
             activeModeID: "work",
-            systemIsSleeping: true,
             runtimeStatus: "connected",
             canConnect: false,
             networkWaitCompleted: false
-        ), .stopRuntime)
+        ), .none)
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
             activeModeID: "work",
-            systemIsSleeping: false,
             runtimeStatus: "disconnected",
             canConnect: true,
             networkWaitCompleted: false
@@ -82,23 +80,13 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
             activeModeID: "work",
-            systemIsSleeping: true,
             runtimeStatus: "disconnected",
             canConnect: false,
             networkWaitCompleted: false
-        ), .waitForWake)
-        XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
-            desired: desired,
-            activeModeID: "work",
-            systemIsSleeping: false,
-            runtimeStatus: "disconnected",
-            canConnect: true,
-            networkWaitCompleted: false
         ), .waitForNetwork)
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
             activeModeID: "work",
-            systemIsSleeping: false,
             runtimeStatus: "disconnected",
             canConnect: true,
             networkWaitCompleted: true
@@ -107,6 +95,21 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
             modeID: "work",
             runtimeOwnership: .owned
         ))
+    }
+
+    func testWakeReconcileNeverRestartsAnActiveRuntime() {
+        var desired = ConnectionDesiredState()
+        desired.userRequestedConnection(modeID: "work")
+
+        for status in ["connecting", "reconnecting", "connected"] {
+            XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
+                desired: desired,
+                activeModeID: "work",
+                runtimeStatus: status,
+                canConnect: false,
+                networkWaitCompleted: false
+            ), .none)
+        }
     }
 
     func testAdoptedRuntimeLossIsClaimedExactlyOnce() {
@@ -137,7 +140,6 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
             XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
                 desired: desired,
                 activeModeID: "work",
-                systemIsSleeping: false,
                 runtimeStatus: status,
                 canConnect: false,
                 networkWaitCompleted: false
@@ -152,7 +154,6 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
             activeModeID: "current",
-            systemIsSleeping: false,
             runtimeStatus: "disconnected",
             canConnect: true,
             networkWaitCompleted: true
@@ -191,7 +192,6 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
             activeModeID: "work",
-            systemIsSleeping: false,
             runtimeStatus: "connecting",
             canConnect: false,
             networkWaitCompleted: false

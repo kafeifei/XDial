@@ -55,16 +55,15 @@ final class AppState: ObservableObject {
     let engine = GoEngine.shared
     let installation = InstallationCoordinator.shared
     private var engineSubs = Set<AnyCancellable>()
-    private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
     private var screenWakeObserver: NSObjectProtocol?
     private var sessionActiveObserver: NSObjectProtocol?
     private var connectionDesired = ConnectionDesiredState()
     private var wakeReconnectGeneration = 0
+    private var wakeStatusSyncGeneration = 0
     private var wakeReconnectTask: Task<Void, Never>?
     @Published private(set) var wakeReconnectPhase:
         WakeReconnectPhase?
-    private var systemIsSleeping = false
     private var initialStatusSynchronized = false
     private var launchAutoConnectPending = false
     private var connectionAttempts = ConnectionAttemptGate()
@@ -436,7 +435,7 @@ final class AppState: ObservableObject {
         checkHelper()
         installation.start()
         launchAutoConnectPending = autoConnect
-        registerSleepWakeObservers()
+        registerWakeObservers()
         engine.syncStatus { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -457,9 +456,6 @@ final class AppState: ObservableObject {
     deinit {
         wakeReconnectTask?.cancel()
         let notificationCenter = NSWorkspace.shared.notificationCenter
-        if let sleepObserver {
-            notificationCenter.removeObserver(sleepObserver)
-        }
         if let wakeObserver {
             notificationCenter.removeObserver(wakeObserver)
         }
@@ -573,7 +569,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    // MARK: - Automatic connection and sleep / wake
+    // MARK: - Automatic connection and wake recovery
 
     var desiredConnectionStateForDiagnostics: String {
         switch connectionDesired.value {
@@ -596,8 +592,6 @@ final class AppState: ObservableObject {
         connectionDesired.runtimeOwnership?.rawValue ?? ""
     }
 
-    var systemIsSleepingForDiagnostics: Bool { systemIsSleeping }
-
     private func synchronizeConnectionDesiredState(
         runtimeStatus: String,
         report: ConnectionReport?
@@ -618,7 +612,7 @@ final class AppState: ObservableObject {
     }
 
     private func runLaunchAutoConnectIfNeeded() {
-        guard initialStatusSynchronized, !systemIsSleeping else { return }
+        guard initialStatusSynchronized else { return }
         synchronizeConnectionDesiredState(
             runtimeStatus: engine.status,
             report: engine.connectionReport
@@ -661,17 +655,8 @@ final class AppState: ObservableObject {
         connectAutomatically()
     }
 
-    private func registerSleepWakeObservers() {
+    private func registerWakeObservers() {
         let notificationCenter = NSWorkspace.shared.notificationCenter
-        sleepObserver = notificationCenter.addObserver(
-            forName: NSWorkspace.willSleepNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.handleWillSleep()
-            }
-        }
         wakeObserver = notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil,
@@ -701,40 +686,23 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func handleWillSleep() {
-        systemIsSleeping = true
-        cancelWakeReconnectTask()
-        synchronizeConnectionDesiredState(
-            runtimeStatus: engine.status,
-            report: engine.connectionReport
-        )
-        connectionAttempts.cancel()
-        let action = DesiredConnectionReconcilePolicy.decide(
-            desired: connectionDesired,
-            activeModeID: activeMode?.id ?? "",
-            systemIsSleeping: systemIsSleeping,
-            runtimeStatus: engine.status,
-            canConnect: canConnect,
-            networkWaitCompleted: false
-        )
-        guard action == .stopRuntime else { return }
-
-        appLog("system will sleep: stopping active connection transaction")
-        NetworkInfo.shared.clear()
-        configDirtyFlag = false
-        configurationChanges.clear()
-        reconnectGeneration += 1
-        reconnecting = false
-        engine.stop()
-    }
-
     private func handleWakeSignal(trigger: String) {
-        systemIsSleeping = false
-        synchronizeConnectionDesiredState(
-            runtimeStatus: engine.status,
-            report: engine.connectionReport
-        )
-        reconcileDesiredConnection(trigger: trigger)
+        wakeStatusSyncGeneration += 1
+        let generation = wakeStatusSyncGeneration
+        appLog("wake signal \(trigger): synchronizing runtime status")
+        engine.systemDidWake { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      generation == self.wakeStatusSyncGeneration else {
+                    return
+                }
+                self.synchronizeConnectionDesiredState(
+                    runtimeStatus: self.engine.status,
+                    report: self.engine.connectionReport
+                )
+                self.reconcileDesiredConnection(trigger: trigger)
+            }
+        }
     }
 
     private func restoreAdoptedRuntimeIfNeeded(
@@ -742,7 +710,6 @@ final class AppState: ObservableObject {
     ) {
         guard initialStatusSynchronized,
               installation.isReady,
-              !systemIsSleeping,
               runtimeStatus == "disconnected",
               connectionDesired.beginRestoringAdoptedRuntime()
         else {
@@ -759,7 +726,6 @@ final class AppState: ObservableObject {
             let action = DesiredConnectionReconcilePolicy.decide(
                 desired: connectionDesired,
                 activeModeID: activeMode?.id ?? "",
-                systemIsSleeping: systemIsSleeping,
                 runtimeStatus: engine.status,
                 canConnect: canConnect,
                 networkWaitCompleted: false
@@ -780,7 +746,6 @@ final class AppState: ObservableObject {
         let action = DesiredConnectionReconcilePolicy.decide(
             desired: connectionDesired,
             activeModeID: activeMode?.id ?? "",
-            systemIsSleeping: systemIsSleeping,
             runtimeStatus: engine.status,
             canConnect: canConnect,
             networkWaitCompleted: false
@@ -793,8 +758,6 @@ final class AppState: ObservableObject {
         case .stopRuntime:
             cancelWakeReconnectTask()
             engine.stop(userInitiated: true)
-        case .waitForWake:
-            cancelWakeReconnectTask()
         case let .modeChanged(expectedModeID, activeModeID):
             failDesiredConnectionReconcile(
                 message: tr(
@@ -841,11 +804,9 @@ final class AppState: ObservableObject {
             guard
                 disconnected,
                 generation == self.wakeReconnectGeneration,
-                !self.systemIsSleeping,
                 !Task.isCancelled
             else {
                 if generation == self.wakeReconnectGeneration,
-                   !self.systemIsSleeping,
                    !Task.isCancelled {
                     self.wakeReconnectPhase = nil
                     self.engine.lastError = self.tr(
@@ -861,7 +822,6 @@ final class AppState: ObservableObject {
                 timeout: 8
             )
             guard generation == self.wakeReconnectGeneration,
-                  !self.systemIsSleeping,
                   !Task.isCancelled else {
                 return
             }
@@ -876,7 +836,6 @@ final class AppState: ObservableObject {
             let action = DesiredConnectionReconcilePolicy.decide(
                 desired: self.connectionDesired,
                 activeModeID: self.activeMode?.id ?? "",
-                systemIsSleeping: self.systemIsSleeping,
                 runtimeStatus: self.engine.status,
                 canConnect: self.canConnect,
                 networkWaitCompleted: true
@@ -909,7 +868,7 @@ final class AppState: ObservableObject {
             case .stopRuntime:
                 self.wakeReconnectPhase = nil
                 self.engine.stop(userInitiated: true)
-            case .waitForWake, .waitForRuntime, .waitForNetwork:
+            case .waitForRuntime, .waitForNetwork:
                 self.wakeReconnectPhase = nil
             }
         }
@@ -932,7 +891,7 @@ final class AppState: ObservableObject {
         while Date() < deadline {
             if engine.status == "disconnected" { return true }
             if generation != wakeReconnectGeneration { return false }
-            if systemIsSleeping || Task.isCancelled { return false }
+            if Task.isCancelled { return false }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
         return engine.status == "disconnected"
@@ -1398,12 +1357,17 @@ final class AppState: ObservableObject {
             let cleanedApplications = RuleSet.sanitizeApplications(
                 loaded.ruleSets[i].applications
             )
+            let cleanedProcesses = RuleSet.sanitizeProcesses(
+                loaded.ruleSets[i].processes
+            )
             if cleanedDomains != loaded.ruleSets[i].domains
                 || cleanedCIDRs != loaded.ruleSets[i].cidrs
-                || cleanedApplications != loaded.ruleSets[i].applications {
+                || cleanedApplications != loaded.ruleSets[i].applications
+                || cleanedProcesses != loaded.ruleSets[i].processes {
                 loaded.ruleSets[i].domains = cleanedDomains
                 loaded.ruleSets[i].cidrs = cleanedCIDRs
                 loaded.ruleSets[i].applications = cleanedApplications
+                loaded.ruleSets[i].processes = cleanedProcesses
                 didMigrate = true
                 appLog("loadSaved: sanitized control chars in rule set \(loaded.ruleSets[i].id)")
             }

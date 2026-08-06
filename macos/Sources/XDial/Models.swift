@@ -282,23 +282,26 @@ struct TailscaleRuntimeStatus: Decodable, Hashable {
     var isRunning: Bool { backendState.lowercased() == "running" }
 }
 
-/// 一个被用户选入应用 RuleSet 的 App Bundle。数据面按规范化 Bundle 路径前缀
-/// 匹配 audit token 对应的真实可执行文件，与 Surge Mac 的 App Bundle 模式一致。
+/// 一个被用户选入应用 RuleSet 的 App Bundle。Bundle ID 用于 macOS 直接提供的
+/// source-app 归因，规范化 Bundle 路径用于 audit token 可解析时的交叉验证和兜底。
 struct ApplicationRuleApplication: Codable, Identifiable, Hashable {
     var name: String
     var path: String
+    var bundleIdentifier: String?
     private var containedLegacyIdentities = false
 
     var id: String { path }
 
-    init(name: String, path: String) {
+    init(name: String, path: String, bundleIdentifier: String? = nil) {
         self.name = name
         self.path = path
+        self.bundleIdentifier = bundleIdentifier
     }
 
     enum CodingKeys: String, CodingKey {
         case name
         case path
+        case bundleIdentifier = "bundle_identifier"
         case identities
     }
 
@@ -306,6 +309,10 @@ struct ApplicationRuleApplication: Codable, Identifiable, Hashable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         name = try values.decodeIfPresent(String.self, forKey: .name) ?? ""
         path = try values.decode(String.self, forKey: .path)
+        bundleIdentifier = try values.decodeIfPresent(
+            String.self,
+            forKey: .bundleIdentifier
+        )
         // 旧版递归持久化的 signing identities 不再参与匹配。保留这个内存标记
         // 只为让 loadSaved 的清洗迁移检测到差异并立即回写，新的编码永不输出它们。
         containedLegacyIdentities = values.contains(.identities)
@@ -315,6 +322,10 @@ struct ApplicationRuleApplication: Codable, Identifiable, Hashable {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(name, forKey: .name)
         try values.encode(path, forKey: .path)
+        try values.encodeIfPresent(
+            bundleIdentifier,
+            forKey: .bundleIdentifier
+        )
     }
 }
 
@@ -331,6 +342,10 @@ struct RuleSet: Codable, Identifiable, Hashable {
     var domains: [String] = []
     var cidrs: [String] = []
     var applications: [ApplicationRuleApplication] = []
+    /// Surge PROCESS-NAME expressions. A bare value matches the executable
+    /// filename (with `*`/`?`), an absolute path matches exactly, and an
+    /// absolute path ending in `/` matches by prefix.
+    var processes: [String] = []
 
     init(
         id: String,
@@ -342,7 +357,8 @@ struct RuleSet: Codable, Identifiable, Hashable {
         invert: Bool = false,
         domains: [String] = [],
         cidrs: [String] = [],
-        applications: [ApplicationRuleApplication] = []
+        applications: [ApplicationRuleApplication] = [],
+        processes: [String] = []
     ) {
         self.id = id
         self.name = name
@@ -354,6 +370,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
         self.domains = domains
         self.cidrs = cidrs
         self.applications = applications
+        self.processes = processes
     }
 
     enum CodingKeys: String, CodingKey {
@@ -367,6 +384,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
         case domains
         case cidrs
         case applications
+        case processes
     }
 
     init(from decoder: Decoder) throws {
@@ -402,6 +420,10 @@ struct RuleSet: Codable, Identifiable, Hashable {
             [ApplicationRuleApplication].self,
             forKey: .applications
         ) ?? []
+        processes = try values.decodeIfPresent(
+            [String].self,
+            forKey: .processes
+        ) ?? []
     }
 
     /// 清洗单条域名/CIDR 条目：剥掉所有控制与格式类字符（粘贴常混入
@@ -432,12 +454,22 @@ struct RuleSet: Codable, Identifiable, Hashable {
                     .lastPathComponent.isEmpty == false
             else { continue }
             let name = sanitizeEntry(application.name)
+            let persistedBundleIdentifier = application.bundleIdentifier
+                .map(sanitizeEntry)
+                .flatMap { Self.isValidBundleIdentifier($0) ? $0 : nil }
+            let discoveredBundleIdentifier = Bundle(
+                url: URL(fileURLWithPath: path)
+            )?.bundleIdentifier.flatMap {
+                Self.isValidBundleIdentifier($0) ? $0 : nil
+            }
             let normalized = ApplicationRuleApplication(
                 name: name.isEmpty
                     ? URL(fileURLWithPath: path).deletingPathExtension()
                         .lastPathComponent
                     : name,
-                path: path
+                path: path,
+                bundleIdentifier: persistedBundleIdentifier
+                    ?? discoveredBundleIdentifier
             )
             if applicationsByPath[path] == nil {
                 applicationsByPath[path] = normalized
@@ -446,6 +478,56 @@ struct RuleSet: Codable, Identifiable, Hashable {
         return applicationsByPath.values.sorted { lhs, rhs in
             lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
         }
+    }
+
+    static func isValidBundleIdentifier(_ value: String) -> Bool {
+        guard
+            !value.isEmpty,
+            value.utf8.count <= 255,
+            value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            scalar.value < 128
+                && !CharacterSet.controlCharacters.contains(scalar)
+                && !CharacterSet.whitespacesAndNewlines.contains(scalar)
+        }
+    }
+
+    static func sanitizeProcesses(_ processes: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for raw in processes {
+            let expression = sanitizeEntry(raw)
+            guard
+                !expression.isEmpty,
+                expression.utf8.count <= 4096
+            else { continue }
+
+            let normalized: String
+            if !expression.hasPrefix("/") {
+                guard
+                    !expression.contains("/"),
+                    expression.utf8.count <= 255
+                else { continue }
+                normalized = expression
+            } else if expression.hasSuffix("/") {
+                let prefix = String(expression.dropLast())
+                guard
+                    !prefix.isEmpty,
+                    (prefix as NSString).standardizingPath == prefix
+                else { continue }
+                normalized = prefix + "/"
+            } else {
+                guard (expression as NSString).standardizingPath == expression
+                else { continue }
+                normalized = expression
+            }
+
+            if seen.insert(normalized).inserted {
+                result.append(normalized)
+            }
+        }
+        return result
     }
 }
 

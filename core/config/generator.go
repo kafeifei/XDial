@@ -197,8 +197,8 @@ func generateSingBox(
 	if _, err := inspectModeReferences(profile, mode); err != nil {
 		return nil, err
 	}
-	activeApplicationPaths := activeApplicationRuleSetPaths(profile, mode)
-	if len(activeApplicationPaths) > 0 && !platform.isTransparentProxy() {
+	activeApplicationSelectors := activeApplicationRuleSetSelectors(profile, mode)
+	if len(activeApplicationSelectors) > 0 && !platform.isTransparentProxy() {
 		// 只有 macOS Transparent Proxy 能取得系统交付的 source app 归因。
 		// 其他入口若跳过规则会让受约束应用静默落到 Mode 默认出口，必须拒绝。
 		return nil, fmt.Errorf("active application rule sets require the macOS transparent proxy ingress")
@@ -206,7 +206,7 @@ func generateSingBox(
 	if platform.isTransparentProxy() && transparentIngress == nil {
 		return nil, fmt.Errorf("transparent proxy ingress is unavailable")
 	}
-	if len(activeApplicationPaths) > 0 &&
+	if len(activeApplicationSelectors) > 0 &&
 		len(transparentIngress.username)+1+sha256.Size*2 > 255 {
 		return nil, fmt.Errorf("transparent proxy session username is too long for application rules")
 	}
@@ -508,6 +508,7 @@ func generateSingBox(
 			systemDNS,
 			defaultTag,
 			needsProxyEndpointBootstrap,
+			transparentIngress.username,
 		)
 		if dnsErr != nil {
 			return nil, dnsErr
@@ -524,7 +525,7 @@ func generateSingBox(
 	inbound := buildTUNInbound(vpnServerIP, platform)
 	if platform.isTransparentProxy() {
 		var inboundErr error
-		inbound, inboundErr = buildTransparentProxyInbound(*transparentIngress, activeApplicationPaths)
+		inbound, inboundErr = buildTransparentProxyInbound(*transparentIngress, activeApplicationSelectors)
 		if inboundErr != nil {
 			return nil, inboundErr
 		}
@@ -547,15 +548,15 @@ func generateSingBox(
 
 func buildTransparentProxyInbound(
 	ingress transparentProxyIngress,
-	applicationBundlePaths []string,
+	applicationSelectors []ApplicationProcessSelector,
 ) (map[string]interface{}, error) {
 	users := []map[string]interface{}{{
 		"username": ingress.username,
 		"password": ingress.password,
 	}}
 	seen := map[string]bool{ingress.username: true}
-	for _, bundlePath := range applicationBundlePaths {
-		username := ApplicationSOCKSUsername(ingress.username, bundlePath)
+	for _, selector := range applicationSelectors {
+		username := ApplicationSOCKSUsername(ingress.username, selector)
 		if len(username) > 255 {
 			return nil, fmt.Errorf("transparent proxy session username is too long for application rules")
 		}
@@ -579,11 +580,11 @@ func buildTransparentProxyInbound(
 }
 
 // ApplicationSOCKSUsername derives a per-flow SOCKS username from the session
-// credential and the selected App Bundle path. The raw path never
-// enters the data-plane config, while SOCKS authentication and route matching
-// can join on this deterministic value.
-func ApplicationSOCKSUsername(baseUsername, applicationBundlePath string) string {
-	sum := sha256.Sum256([]byte(applicationBundlePath))
+// credential and one canonical Surge-style process selector. Raw paths and
+// process names never enter the sing-box route config; SOCKS authentication is
+// the narrow join between platform attribution and sing-box routing.
+func ApplicationSOCKSUsername(baseUsername string, selector ApplicationProcessSelector) string {
+	sum := sha256.Sum256([]byte(string(selector.Kind) + "\x00" + selector.Value))
 	return baseUsername + "." + hex.EncodeToString(sum[:])
 }
 
@@ -613,40 +614,45 @@ func effectiveActiveTargetIDs(profile *Profile, mode *Mode) (map[string]bool, ma
 	return lineIDs, subscriptionIDs
 }
 
-// activeApplicationRuleSetPaths returns only App Bundle paths that are both
-// enabled and bound by the active Mode. Unbound rules must create neither
+// activeApplicationRuleSetSelectors returns only process selectors that are
+// both enabled and bound by the active Mode. Unbound rules must create neither
 // route entries nor additional accepted SOCKS credentials. Order follows the
-// Mode binding list so overlapping Bundle selectors preserve visible priority.
-func activeApplicationRuleSetPaths(profile *Profile, mode *Mode) []string {
+// Mode binding list so overlapping selectors preserve visible priority.
+func activeApplicationRuleSetSelectors(profile *Profile, mode *Mode) []ApplicationProcessSelector {
 	seen := make(map[string]struct{})
-	var paths []string
+	var selectors []ApplicationProcessSelector
 	for _, binding := range mode.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
 		if ruleSet == nil || !ruleSet.Enabled || ruleSet.Type != RuleSetTypeApplication {
 			continue
 		}
-		for _, bundlePath := range applicationRuleSetPaths(ruleSet) {
-			if _, exists := seen[bundlePath]; exists {
+		for _, selector := range applicationRuleSetSelectors(ruleSet) {
+			key := selector.key()
+			if _, exists := seen[key]; exists {
 				continue
 			}
-			seen[bundlePath] = struct{}{}
-			paths = append(paths, bundlePath)
+			seen[key] = struct{}{}
+			selectors = append(selectors, selector)
 		}
 	}
-	return paths
+	return selectors
 }
 
-// ApplicationSOCKSCredential is one ordered App Bundle selector → derived
-// SOCKS username pair carried only in the macOS session envelope.
+// ApplicationSOCKSCredential is one ordered Surge-style process selector →
+// derived SOCKS username pair carried only in the macOS session envelope.
 type ApplicationSOCKSCredential struct {
-	BundlePath string `json:"bundle_path"`
-	Username   string `json:"username"`
+	Kind           ApplicationProcessSelectorKind `json:"kind"`
+	Value          string                         `json:"value"`
+	Username       string                         `json:"username"`
+	RuleSetID      string                         `json:"rule_set_id"`
+	LineID         string                         `json:"line_id,omitempty"`
+	SubscriptionID string                         `json:"subscription_id,omitempty"`
 }
 
-// ActiveApplicationSOCKSCredentials exposes the active Mode's ordered Bundle
-// path → derived SOCKS username list to the macOS session envelope. It follows the
-// exact same Mode boundary and derivation used by the generated inbound and
-// route rules, so Swift never has to reproduce the hash algorithm.
+// ActiveApplicationSOCKSCredentials exposes the active Mode's ordered process
+// selector → derived SOCKS username list to the macOS session envelope. It
+// follows the exact same Mode boundary and derivation used by the generated
+// inbound and route rules, so Swift never reproduces the hash algorithm.
 func ActiveApplicationSOCKSCredentials(profile *Profile, baseUsername string) ([]ApplicationSOCKSCredential, error) {
 	if profile == nil {
 		return nil, fmt.Errorf("profile is nil")
@@ -662,16 +668,31 @@ func ActiveApplicationSOCKSCredentials(profile *Profile, baseUsername string) ([
 	if baseUsername == "" {
 		return nil, fmt.Errorf("transparent proxy session username is invalid for application rules")
 	}
-	bundlePaths := activeApplicationRuleSetPaths(profile, mode)
-	if len(bundlePaths) > 0 && len(baseUsername)+1+sha256.Size*2 > 255 {
+	selectors := activeApplicationRuleSetSelectors(profile, mode)
+	if len(selectors) > 0 && len(baseUsername)+1+sha256.Size*2 > 255 {
 		return nil, fmt.Errorf("transparent proxy session username is too long for application rules")
 	}
-	credentials := make([]ApplicationSOCKSCredential, 0, len(bundlePaths))
-	for _, bundlePath := range bundlePaths {
-		credentials = append(credentials, ApplicationSOCKSCredential{
-			BundlePath: bundlePath,
-			Username:   ApplicationSOCKSUsername(baseUsername, bundlePath),
-		})
+	credentials := make([]ApplicationSOCKSCredential, 0, len(selectors))
+	seen := make(map[string]struct{})
+	for _, binding := range mode.Bindings {
+		ruleSet := profile.FindRuleSet(binding.RuleSetID)
+		if ruleSet == nil || !ruleSet.Enabled || ruleSet.Type != RuleSetTypeApplication {
+			continue
+		}
+		for _, selector := range applicationRuleSetSelectors(ruleSet) {
+			if _, exists := seen[selector.key()]; exists {
+				continue
+			}
+			seen[selector.key()] = struct{}{}
+			credentials = append(credentials, ApplicationSOCKSCredential{
+				Kind:           selector.Kind,
+				Value:          selector.Value,
+				Username:       ApplicationSOCKSUsername(baseUsername, selector),
+				RuleSetID:      binding.RuleSetID,
+				LineID:         binding.LineID,
+				SubscriptionID: binding.SubscriptionID,
+			})
+		}
 	}
 	return credentials, nil
 }
@@ -1041,6 +1062,7 @@ func buildTransparentProxyDNS(
 	systemDNS []string,
 	defaultOutboundTag string,
 	needsProxyEndpointBootstrap bool,
+	baseUsername string,
 ) (map[string]interface{}, error) {
 	primarySystemDNS, err := validateTransparentProxySystemDNS(systemDNS)
 	if err != nil {
@@ -1113,6 +1135,24 @@ func buildTransparentProxyDNS(
 		}
 		resolverTag := transparentProxyResolverTag(ruleSet, outTag)
 		switch ruleSet.Type {
+		case RuleSetTypeApplication:
+			selectors := applicationRuleSetSelectors(ruleSet)
+			if len(selectors) == 0 {
+				continue
+			}
+			ensureResolver(resolverTag, outTag)
+			users := make([]string, 0, len(selectors))
+			for _, selector := range selectors {
+				users = append(users, ApplicationSOCKSUsername(baseUsername, selector))
+			}
+			// DNS 包先被 route 的 hijack-dns 接入解析器，但 SOCKS
+			// auth_user 会保留在 DNS 上下文中。应用规则必须同时选择
+			// 对应 Line 的解析出口，否则应用连接虽走指定 Line，域名
+			// 查询仍可能从普通分域解析链外溢。
+			rules = append(rules, map[string]interface{}{
+				"auth_user": users,
+				"server":    resolverTag,
+			})
 		case RuleSetTypeManual:
 			if len(ruleSet.Domains) > 0 {
 				ensureResolver(resolverTag, outTag)
@@ -1323,7 +1363,7 @@ func buildNESystemRouteRules() []map[string]interface{} {
 // - 手动 IP：启动前系统 DNS → IP route；
 // - 已检查为纯域名/纯 IP 的本地规则集分别走同样两条路径；
 // - 混合或无法安全分类的规则集按用户约定走保守的系统 DNS。
-// - 应用身份：原生 SOCKS auth_user → route，不参与 DNS。
+// - 应用身份：原生 SOCKS auth_user → route；同一身份也在 DNS 规则中选择目标 Line 的解析出口。
 func buildTransparentProxyModeRouteRules(
 	profile *Profile,
 	mode *Mode,
@@ -1377,13 +1417,13 @@ func bindingOutboundTag(
 func compileTransparentProxyRuleSet(ruleSet *RuleSet, outTag, baseUsername string) []map[string]interface{} {
 	switch ruleSet.Type {
 	case RuleSetTypeApplication:
-		bundlePaths := applicationRuleSetPaths(ruleSet)
-		if len(bundlePaths) == 0 {
+		selectors := applicationRuleSetSelectors(ruleSet)
+		if len(selectors) == 0 {
 			return nil
 		}
-		users := make([]string, 0, len(bundlePaths))
-		for _, bundlePath := range bundlePaths {
-			users = append(users, ApplicationSOCKSUsername(baseUsername, bundlePath))
+		users := make([]string, 0, len(selectors))
+		for _, selector := range selectors {
+			users = append(users, ApplicationSOCKSUsername(baseUsername, selector))
 		}
 		return []map[string]interface{}{{
 			"auth_user": users,
@@ -1541,26 +1581,105 @@ func buildRouteRule(c *RuleSet, outTag string) map[string]interface{} {
 	return nil
 }
 
-// applicationRuleSetPaths flattens the user-visible App Bundle entries into
-// the sing-box match list. The order stays stable for readable generated config.
-func applicationRuleSetPaths(ruleSet *RuleSet) []string {
+type ApplicationProcessSelectorKind string
+
+const (
+	ApplicationProcessSelectorBundlePath ApplicationProcessSelectorKind = "bundle_path"
+	ApplicationProcessSelectorBundleID   ApplicationProcessSelectorKind = "bundle_identifier"
+	ApplicationProcessSelectorName       ApplicationProcessSelectorKind = "name"
+	ApplicationProcessSelectorExactPath  ApplicationProcessSelectorKind = "exact_path"
+	ApplicationProcessSelectorPathPrefix ApplicationProcessSelectorKind = "path_prefix"
+)
+
+// ApplicationProcessSelector is the canonical, platform-neutral envelope for
+// Surge PROCESS-NAME semantics. The Provider matches it against the actual
+// executable path supplied by macOS; sing-box only sees its derived username.
+type ApplicationProcessSelector struct {
+	Kind  ApplicationProcessSelectorKind `json:"kind"`
+	Value string                         `json:"value"`
+}
+
+func (s ApplicationProcessSelector) key() string {
+	return string(s.Kind) + "\x00" + s.Value
+}
+
+// applicationRuleSetSelectors flattens all user-visible App Bundle and process
+// entries into one stable list. App Bundle entries retain their dedicated kind
+// so the control plane can display them without turning them into opaque text.
+func applicationRuleSetSelectors(ruleSet *RuleSet) []ApplicationProcessSelector {
 	if ruleSet == nil {
 		return nil
 	}
 	seen := make(map[string]struct{})
-	var paths []string
+	var selectors []ApplicationProcessSelector
+	appendSelector := func(selector ApplicationProcessSelector) {
+		key := selector.key()
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		selectors = append(selectors, selector)
+	}
 	for _, application := range ruleSet.Applications {
+		if bundleIdentifier, ok := canonicalApplicationBundleIdentifier(application.BundleIdentifier); ok {
+			appendSelector(ApplicationProcessSelector{
+				Kind: ApplicationProcessSelectorBundleID, Value: bundleIdentifier,
+			})
+		}
 		bundlePath, ok := canonicalApplicationBundlePath(application.Path)
 		if !ok {
 			continue
 		}
-		if _, exists := seen[bundlePath]; exists {
+		appendSelector(ApplicationProcessSelector{
+			Kind: ApplicationProcessSelectorBundlePath, Value: bundlePath,
+		})
+	}
+	for _, expression := range ruleSet.Processes {
+		selector, ok := canonicalApplicationProcessSelector(expression)
+		if !ok {
 			continue
 		}
-		seen[bundlePath] = struct{}{}
-		paths = append(paths, bundlePath)
+		appendSelector(selector)
 	}
-	return paths
+	return selectors
+}
+
+func canonicalApplicationBundleIdentifier(raw string) (string, bool) {
+	if raw == "" || len(raw) > 255 || strings.TrimSpace(raw) != raw {
+		return "", false
+	}
+	for _, value := range raw {
+		if value > unicode.MaxASCII || unicode.IsControl(value) || unicode.IsSpace(value) {
+			return "", false
+		}
+	}
+	return raw, true
+}
+
+func canonicalApplicationProcessSelector(raw string) (ApplicationProcessSelector, bool) {
+	if raw == "" || len(raw) > 4096 || strings.TrimSpace(raw) != raw ||
+		strings.IndexFunc(raw, func(r rune) bool {
+			return unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
+		}) >= 0 {
+		return ApplicationProcessSelector{}, false
+	}
+	if !strings.HasPrefix(raw, "/") {
+		if len(raw) > 255 || strings.Contains(raw, "/") {
+			return ApplicationProcessSelector{}, false
+		}
+		return ApplicationProcessSelector{Kind: ApplicationProcessSelectorName, Value: raw}, true
+	}
+	if strings.HasSuffix(raw, "/") {
+		prefix := strings.TrimSuffix(raw, "/")
+		if prefix == "" || path.Clean(prefix) != prefix {
+			return ApplicationProcessSelector{}, false
+		}
+		return ApplicationProcessSelector{Kind: ApplicationProcessSelectorPathPrefix, Value: prefix}, true
+	}
+	if path.Clean(raw) != raw {
+		return ApplicationProcessSelector{}, false
+	}
+	return ApplicationProcessSelector{Kind: ApplicationProcessSelectorExactPath, Value: raw}, true
 }
 
 func applyURLRuleSetInvert(rule map[string]interface{}, ruleSet *RuleSet) {

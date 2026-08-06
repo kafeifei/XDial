@@ -48,10 +48,11 @@ type connectionPreparationSink func(connectionPreparationEvent)
 type transparentProxySession struct {
 	ConfigJSON string                 `json:"config_json"`
 	Plan       *config.ConnectionPlan `json:"plan"`
-	// ApplicationPathCredentials is the active Mode's ordered App Bundle path →
-	// derived SOCKS username list. It is session-only and lets the Provider pick
-	// the matching native SOCKS user without reproducing Go's derivation.
-	ApplicationPathCredentials []config.ApplicationSOCKSCredential `json:"application_path_credentials,omitempty"`
+	// ApplicationProcessCredentials is the active Mode's ordered Surge-style
+	// process selector → derived SOCKS username list. It is session-only and
+	// lets the Provider pick the matching native SOCKS user without reproducing
+	// Go's derivation.
+	ApplicationProcessCredentials []config.ApplicationSOCKSCredential `json:"application_process_credentials,omitempty"`
 	// LineOutbounds is a capability map for this exact active ConnectionPlan.
 	// It contains no endpoint or credential material and intentionally excludes
 	// enabled Lines that the active Mode did not reference.
@@ -232,15 +233,15 @@ func generateTransparentProxySession(
 	if len(data) > maxNEConfigBytes {
 		return "", fmt.Errorf("generated NetworkExtension config exceeds %d-byte limit", maxNEConfigBytes)
 	}
-	applicationPathCredentials, err := config.ActiveApplicationSOCKSCredentials(profile, socksUsername)
+	applicationProcessCredentials, err := config.ActiveApplicationSOCKSCredentials(profile, socksUsername)
 	if err != nil {
 		return "", err
 	}
 
 	session := transparentProxySession{
-		ConfigJSON:                 string(data),
-		Plan:                       plan,
-		ApplicationPathCredentials: applicationPathCredentials,
+		ConfigJSON:                    string(data),
+		Plan:                          plan,
+		ApplicationProcessCredentials: applicationProcessCredentials,
 	}
 	session.LineOutbounds, err = activeLineOutbounds(profile, plan)
 	if err != nil {
