@@ -84,6 +84,24 @@ final class ProviderDiagnosticsIPCTests: XCTestCase {
         }
     }
 
+    func testApplicationAttributionSnapshotCarriesNoTargetsInRequest() throws {
+        let request = ProviderDiagnosticsRequest(
+            cmd: .applicationAttributionSnapshot,
+            transactionID: "transaction-1"
+        )
+        XCTAssertEqual(
+            try ProviderDiagnosticsCodec.decodeRequest(
+                ProviderDiagnosticsCodec.encodeRequest(request)
+            ),
+            request
+        )
+        XCTAssertThrowsError(
+            try ProviderDiagnosticsCodec.decodeRequest(Data(
+                #"{"v":1,"cmd":"application-attribution-snapshot","transaction_id":"transaction-1","line_id":"us"}"#.utf8
+            ))
+        )
+    }
+
     func testBeginRouteProbeIsASCII443AndBoundedToFifteenSeconds() throws {
         let valid = ProviderDiagnosticsRequest(
             cmd: .beginRouteProbe,
@@ -163,6 +181,40 @@ final class ProviderDiagnosticsIPCTests: XCTestCase {
         XCTAssertFalse(raw.contains("hostname"))
         XCTAssertFalse(raw.contains("target"))
         XCTAssertFalse(raw.contains("raw_rule"))
+    }
+
+    func testApplicationAttributionResponseIsCountOnly() throws {
+        let response = ProviderDiagnosticsResponse.success(
+            transactionID: "transaction-1",
+            data: ProviderDiagnosticsData(
+                applicationAttribution:
+                    ProviderApplicationAttributionSnapshot(
+                        activeSelectorKindCounts: [
+                            "bundle_identifier": 1,
+                            "bundle_path": 1,
+                        ],
+                        matchedFlowCount: 3,
+                        matchedSelectorKindCounts: [
+                            "bundle_identifier": 3,
+                        ],
+                        matchedRuleSetIDCounts: ["claude": 3],
+                        matchedLineIDCounts: ["us": 3],
+                        matchedSubscriptionIDCounts: [:],
+                        baseFlowCount: 7,
+                        baseMissingSourceIdentityCount: 2,
+                        rejectedFlowCount: 0,
+                        rejectedUnresolvedAuditTokenCount: 0
+                    )
+            )
+        )
+        let encoded = try ProviderDiagnosticsCodec.encodeResponse(response)
+        XCTAssertEqual(
+            try ProviderDiagnosticsCodec.decodeResponse(encoded),
+            response
+        )
+        let raw = String(decoding: encoded, as: UTF8.self)
+        XCTAssertFalse(raw.contains("/Applications"))
+        XCTAssertFalse(raw.contains("com.anthropic"))
     }
 
     func testSnapshotAttributesOnlyUniqueActiveLineCapabilities() {

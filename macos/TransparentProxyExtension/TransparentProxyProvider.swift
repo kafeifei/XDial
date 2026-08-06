@@ -3,12 +3,100 @@ import Foundation
 import Network
 @preconcurrency import NetworkExtension
 import OSLog
-import Security
 
 private struct ProviderRelayEndpoint: Sendable {
     let port: UInt16
     let credentials: SOCKSCredentials
-    let applicationBundleCredentials: [ApplicationBundleCredential]
+    let applicationProcessCredentials: [ApplicationProcessCredential]
+}
+
+private final class ProviderApplicationAttributionLedger:
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var activeSelectorKindCounts: [String: Int] = [:]
+    private var matchedFlowCount = 0
+    private var matchedSelectorKindCounts: [String: Int] = [:]
+    private var matchedRuleSetIDCounts: [String: Int] = [:]
+    private var matchedLineIDCounts: [String: Int] = [:]
+    private var matchedSubscriptionIDCounts: [String: Int] = [:]
+    private var baseFlowCount = 0
+    private var baseMissingSourceIdentityCount = 0
+    private var rejectedFlowCount = 0
+    private var rejectedUnresolvedAuditTokenCount = 0
+
+    func reset(credentials: [ApplicationProcessCredential]) {
+        lock.lock()
+        activeSelectorKindCounts = Dictionary(
+            grouping: credentials,
+            by: { $0.selector.kind.rawValue }
+        ).mapValues(\.count)
+        matchedFlowCount = 0
+        matchedSelectorKindCounts = [:]
+        matchedRuleSetIDCounts = [:]
+        matchedLineIDCounts = [:]
+        matchedSubscriptionIDCounts = [:]
+        baseFlowCount = 0
+        baseMissingSourceIdentityCount = 0
+        rejectedFlowCount = 0
+        rejectedUnresolvedAuditTokenCount = 0
+        lock.unlock()
+    }
+
+    func recordMatched(_ credential: ApplicationProcessCredential) {
+        lock.lock()
+        matchedFlowCount += 1
+        matchedSelectorKindCounts[
+            credential.selector.kind.rawValue,
+            default: 0
+        ] += 1
+        matchedRuleSetIDCounts[credential.ruleSetID, default: 0] += 1
+        if let lineID = credential.lineID {
+            matchedLineIDCounts[lineID, default: 0] += 1
+        }
+        if let subscriptionID = credential.subscriptionID {
+            matchedSubscriptionIDCounts[subscriptionID, default: 0] += 1
+        }
+        lock.unlock()
+    }
+
+    func recordBase(
+        signingIdentifierPresent: Bool,
+        auditTokenPresent: Bool
+    ) {
+        lock.lock()
+        baseFlowCount += 1
+        if !signingIdentifierPresent && !auditTokenPresent {
+            baseMissingSourceIdentityCount += 1
+        }
+        lock.unlock()
+    }
+
+    func recordRejectedUnresolvedAuditToken() {
+        lock.lock()
+        rejectedFlowCount += 1
+        rejectedUnresolvedAuditTokenCount += 1
+        lock.unlock()
+    }
+
+    func snapshot() -> ProviderApplicationAttributionSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return ProviderApplicationAttributionSnapshot(
+            activeSelectorKindCounts: activeSelectorKindCounts,
+            matchedFlowCount: matchedFlowCount,
+            matchedSelectorKindCounts: matchedSelectorKindCounts,
+            matchedRuleSetIDCounts: matchedRuleSetIDCounts,
+            matchedLineIDCounts: matchedLineIDCounts,
+            matchedSubscriptionIDCounts: matchedSubscriptionIDCounts,
+            baseFlowCount: baseFlowCount,
+            baseMissingSourceIdentityCount:
+                baseMissingSourceIdentityCount,
+            rejectedFlowCount: rejectedFlowCount,
+            rejectedUnresolvedAuditTokenCount:
+                rejectedUnresolvedAuditTokenCount
+        )
+    }
 }
 
 final class TransparentProxyProvider: NETransparentProxyProvider {
@@ -39,6 +127,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         ProviderDiagnosticsOperationGate()
     private let relayRegistry =
         ProviderRelayRegistry<ProviderRelayEndpoint>()
+    private let applicationAttribution =
+        ProviderApplicationAttributionLedger()
 
     private var runtime: EmbeddedSingBoxRuntime?
     private var session: EmbeddedSingBoxRuntime.Session?
@@ -175,6 +265,12 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     reporter: reporter,
                     cancellation: cancellation
                 )
+                self.applicationAttribution.reset(
+                    credentials: session.applicationProcessCredentials
+                )
+                self.logger.notice(
+                    "application-attribution active-selectors=\(session.applicationProcessCredentials.count, privacy: .public) bundle-identifiers=\(session.applicationProcessCredentials.filter { $0.selector.kind == .bundleIdentifier }.count, privacy: .public)"
+                )
                 guard !cancellation.isCancelled else {
                     throw ProviderError.cancelledBeforeCommit
                 }
@@ -241,8 +337,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     endpoint: ProviderRelayEndpoint(
                         port: session.port,
                         credentials: session.credentials,
-                        applicationBundleCredentials:
-                            session.applicationBundleCredentials
+                        applicationProcessCredentials:
+                            session.applicationProcessCredentials
                     )
                 )
                 if replacedRelays.count > 0 {
@@ -567,6 +663,14 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
 
             let response: ProviderDiagnosticsResponse
             switch request.cmd {
+            case .applicationAttributionSnapshot:
+                response = .success(
+                    transactionID: request.transactionID,
+                    data: ProviderDiagnosticsData(
+                        applicationAttribution:
+                            self.applicationAttribution.snapshot()
+                    )
+                )
             case .routingProbeSnapshot:
                 guard let expectedProbeID = request.probeID else {
                     completionHandler(
@@ -681,7 +785,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         case .passThrough:
             return false
         }
-        guard let credentials = Self.credentials(
+        guard let credentials = credentials(
             for: flow,
             endpoint: reservation.endpoint
         ) else {
@@ -728,30 +832,52 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     }
 
     /// Resolve the real executable path from the kernel-provided audit token
-    /// and apply the first matching App Bundle selector in Mode binding order.
+    /// with the same process-path primitive used by Surge, then apply the
+    /// first matching process selector in Mode order.
     /// A raw metadata signing identifier is intentionally insufficient: it
     /// loses the path ancestry that keeps bundled helpers scoped to their app.
-    private static func credentials(
+    private func credentials(
         for flow: NEAppProxyFlow,
         endpoint: ProviderRelayEndpoint
     ) -> SOCKSCredentials? {
         let auditToken = flow.metaData.sourceAppAuditToken
         let auditTokenPresent = auditToken?.isEmpty == false
-        let executablePath = applicationExecutablePath(auditToken: auditToken)
+        let signingIdentifier = flow.metaData.sourceAppSigningIdentifier
+        let executablePath = Self.applicationExecutablePath(
+            auditToken: auditToken
+        )
         switch TransparentProxyApplicationCredentialDecision.select(
+            sourceAppSigningIdentifier: signingIdentifier,
             auditTokenPresent: auditTokenPresent,
             auditExecutablePath: executablePath,
-            activeBundlePaths: endpoint.applicationBundleCredentials.map(
-                \.bundlePath
+            activeSelectors: endpoint.applicationProcessCredentials.map(
+                \.selector
             )
         ) {
         case .base:
+            applicationAttribution.recordBase(
+                signingIdentifierPresent: !signingIdentifier.isEmpty,
+                auditTokenPresent: auditTokenPresent
+            )
             return endpoint.credentials
-        case let .application(bundlePath):
-            return endpoint.applicationBundleCredentials.first {
-                $0.bundlePath == bundlePath
-            }?.credentials
+        case let .application(selector):
+            guard let index = endpoint.applicationProcessCredentials
+                .firstIndex(where: { $0.selector == selector })
+            else { return nil }
+            let credential = endpoint.applicationProcessCredentials[index]
+            applicationAttribution.recordMatched(credential)
+            let processName = executablePath.map {
+                URL(fileURLWithPath: $0).lastPathComponent
+            } ?? ""
+            logger.debug(
+                "application-attribution result=matched selector-index=\(index, privacy: .public) kind=\(selector.kind.rawValue, privacy: .public) rule-set=\(credential.ruleSetID, privacy: .public) line=\(credential.lineID ?? "", privacy: .public) process=\(processName, privacy: .public)"
+            )
+            return credential.credentials
         case .reject:
+            applicationAttribution.recordRejectedUnresolvedAuditToken()
+            logger.error(
+                "application-attribution result=rejected reason=unresolved-audit-token"
+            )
             return nil
         }
     }
@@ -759,39 +885,36 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     private static func applicationExecutablePath(
         auditToken: Data?
     ) -> String? {
-        guard let auditToken, !auditToken.isEmpty else {
+        guard
+            let auditToken,
+            auditToken.count == MemoryLayout<audit_token_t>.size
+        else {
             return nil
         }
-        let attributes = [
-            kSecGuestAttributeAudit as String: auditToken,
-        ] as CFDictionary
-        var code: SecCode?
-        guard SecCodeCopyGuestWithAttributes(
-            nil,
-            attributes,
-            SecCSFlags(rawValue: 0),
-            &code
-        ) == errSecSuccess, let code else {
+
+        var token = audit_token_t()
+        _ = withUnsafeMutableBytes(of: &token) { destination in
+            auditToken.copyBytes(to: destination)
+        }
+
+        // Use the audit-token form directly so PID reuse cannot redirect the
+        // lookup between attribution and proc_pidpath(). Four MAXPATHLEN units
+        // matches PROC_PIDPATHINFO_MAXSIZE, whose macro Swift cannot import.
+        var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let length = proc_pidpath_audittoken(
+            &token,
+            &path,
+            UInt32(path.count)
+        )
+        guard length > 0, length < path.count else {
             return nil
         }
-        var staticCode: SecStaticCode?
-        guard SecCodeCopyStaticCode(
-            code,
-            SecCSFlags(rawValue: 0),
-            &staticCode
-        ) == errSecSuccess, let staticCode else {
+
+        let executablePath = String(cString: path)
+        guard executablePath.hasPrefix("/") else {
             return nil
         }
-        var rawPath: CFURL?
-        guard SecCodeCopyPath(
-            staticCode,
-            SecCSFlags(rawValue: 0),
-            &rawPath
-        ) == errSecSuccess,
-        let rawPath else {
-            return nil
-        }
-        return (rawPath as URL).standardizedFileURL.path
+        return (executablePath as NSString).standardizingPath
     }
 
     private static func reject(_ flow: NEAppProxyFlow) {

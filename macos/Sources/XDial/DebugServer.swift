@@ -79,7 +79,7 @@ final class DebugServer {
                     "GET  /health",
                     "GET  /state",
                     "GET  /ax[?depth=N]",
-                    "POST /action  {action: connect|disconnect|reconnect|connect-with-failure|begin-route-probe|routing-probe-snapshot|select-mode|ax-press|ax-set-value, ...}",
+                    "POST /action  {action: connect|disconnect|reconnect|connect-with-failure|application-attribution-snapshot|begin-route-probe|routing-probe-snapshot|select-mode|ax-press|ax-set-value, ...}",
                 ],
             ]))
         }
@@ -153,8 +153,6 @@ final class DebugServer {
             s.desiredConnectionModeIDForDiagnostics
         dict["desiredConnectionOwnership"] =
             s.desiredConnectionOwnershipForDiagnostics
-        dict["systemIsSleeping"] =
-            s.systemIsSleepingForDiagnostics
         dict["activeModeID"] = s.profile.activeModeID
         // 配置改了但引擎还在跑旧快照 —— 验收改动是否真正生效必须看这个
         dict["configDirty"] = s.configDirty
@@ -487,6 +485,55 @@ final class DebugServer {
                     "ok": true,
                     "transactionID": report.transactionID,
                     "probeID": begun.probeID,
+                ])
+            case let .failure(error):
+                return ok([
+                    "ok": false,
+                    "transactionID": report.transactionID,
+                    "code": providerDiagnosticsCode(error),
+                ])
+            }
+        case "application-attribution-snapshot":
+            guard
+                state.engine.status == "connected",
+                let report = state.engine.connectionReport,
+                report.state == .committed
+            else {
+                return ("409 Conflict", json([
+                    "ok": false,
+                    "code": "transparent-proxy-not-connected",
+                ]))
+            }
+            let result:
+                Result<ProviderApplicationAttributionSnapshot, Error> =
+                await withCheckedContinuation { continuation in
+                    state.engine.applicationAttributionSnapshot(
+                        transactionID: report.transactionID
+                    ) {
+                        continuation.resume(returning: $0)
+                    }
+                }
+            switch result {
+            case let .success(snapshot):
+                return ok([
+                    "ok": true,
+                    "transactionID": report.transactionID,
+                    "activeSelectorKindCounts":
+                        snapshot.activeSelectorKindCounts,
+                    "matchedFlowCount": snapshot.matchedFlowCount,
+                    "matchedSelectorKindCounts":
+                        snapshot.matchedSelectorKindCounts,
+                    "matchedRuleSetIDCounts":
+                        snapshot.matchedRuleSetIDCounts,
+                    "matchedLineIDCounts": snapshot.matchedLineIDCounts,
+                    "matchedSubscriptionIDCounts":
+                        snapshot.matchedSubscriptionIDCounts,
+                    "baseFlowCount": snapshot.baseFlowCount,
+                    "baseMissingSourceIdentityCount":
+                        snapshot.baseMissingSourceIdentityCount,
+                    "rejectedFlowCount": snapshot.rejectedFlowCount,
+                    "rejectedUnresolvedAuditTokenCount":
+                        snapshot.rejectedUnresolvedAuditTokenCount,
                 ])
             case let .failure(error):
                 return ok([

@@ -61,51 +61,140 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
     }
 
     func testApplicationCredentialDecisionUsesFirstMatchingModeBinding() {
+        let app = try! XCTUnwrap(TransparentProxyProcessSelector(
+            kind: .bundlePath,
+            value: "/Applications/Claude.app"
+        ))
+        let helper = try! XCTUnwrap(TransparentProxyProcessSelector(
+            kind: .bundlePath,
+            value: "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app"
+        ))
         XCTAssertEqual(
             TransparentProxyApplicationCredentialDecision.select(
+                sourceAppSigningIdentifier: "",
                 auditTokenPresent: true,
                 auditExecutablePath: "/Applications/Claude.app/Contents/"
                     + "Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper",
-                activeBundlePaths: [
-                    "/Applications/Claude.app",
-                    "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app",
-                ]
+                activeSelectors: [app, helper]
             ),
-            .application(bundlePath: "/Applications/Claude.app")
+            .application(selector: app)
         )
     }
 
     func testApplicationCredentialDecisionUsesBaseWithoutAuditToken() {
+        let selector = try! XCTUnwrap(TransparentProxyProcessSelector(
+            kind: .bundlePath,
+            value: "/Applications/Claude.app"
+        ))
         XCTAssertEqual(
             TransparentProxyApplicationCredentialDecision.select(
+                sourceAppSigningIdentifier: "",
                 auditTokenPresent: false,
                 auditExecutablePath: nil,
-                activeBundlePaths: ["/Applications/Claude.app"]
+                activeSelectors: [selector]
             ),
             .base
         )
     }
 
     func testApplicationCredentialDecisionRejectsUnresolvableAuditToken() {
+        let selector = try! XCTUnwrap(TransparentProxyProcessSelector(
+            kind: .bundlePath,
+            value: "/Applications/Claude.app"
+        ))
         XCTAssertEqual(
             TransparentProxyApplicationCredentialDecision.select(
+                sourceAppSigningIdentifier: "",
                 auditTokenPresent: true,
                 auditExecutablePath: nil,
-                activeBundlePaths: ["/Applications/Claude.app"]
+                activeSelectors: [selector]
             ),
             .reject
         )
     }
 
     func testApplicationCredentialDecisionUsesBaseForUnrelatedFlow() {
+        let selector = try! XCTUnwrap(TransparentProxyProcessSelector(
+            kind: .bundlePath,
+            value: "/Applications/Claude.app"
+        ))
         XCTAssertEqual(
             TransparentProxyApplicationCredentialDecision.select(
+                sourceAppSigningIdentifier: "com.apple.Safari",
                 auditTokenPresent: true,
                 auditExecutablePath: "/Applications/Safari.app/Contents/MacOS/Safari",
-                activeBundlePaths: ["/Applications/Claude.app"]
+                activeSelectors: [selector]
             ),
             .base
         )
+    }
+
+    func testApplicationCredentialDecisionUsesExactBundleIdentifierWithoutAuditToken() throws {
+        let selector = try XCTUnwrap(TransparentProxyProcessSelector(
+            kind: .bundleIdentifier,
+            value: "com.anthropic.claudefordesktop"
+        ))
+        XCTAssertEqual(
+            TransparentProxyApplicationCredentialDecision.select(
+                sourceAppSigningIdentifier:
+                    "com.anthropic.claudefordesktop",
+                auditTokenPresent: false,
+                auditExecutablePath: nil,
+                activeSelectors: [selector]
+            ),
+            .application(selector: selector)
+        )
+        XCTAssertEqual(
+            TransparentProxyApplicationCredentialDecision.select(
+                sourceAppSigningIdentifier:
+                    "com.anthropic.claudefordesktop.helper",
+                auditTokenPresent: false,
+                auditExecutablePath: nil,
+                activeSelectors: [selector]
+            ),
+            .base
+        )
+    }
+
+    func testProcessNameSelectorMatchesFilenameAndWildcards() throws {
+        let exact = try XCTUnwrap(TransparentProxyProcessSelector(
+            kind: .name,
+            value: "claude"
+        ))
+        let wildcard = try XCTUnwrap(TransparentProxyProcessSelector(
+            kind: .name,
+            value: "Claude Helper*"
+        ))
+
+        XCTAssertTrue(exact.matches(
+            executablePath: "/Users/test/Library/Application Support/Claude/"
+                + "claude-code/2.1.219/claude.app/Contents/MacOS/claude"
+        ))
+        XCTAssertTrue(wildcard.matches(
+            executablePath: "/Applications/Claude.app/Contents/Frameworks/"
+                + "Claude Helper.app/Contents/MacOS/Claude Helper (Renderer)"
+        ))
+        XCTAssertFalse(exact.matches(executablePath: "/usr/bin/other"))
+    }
+
+    func testExactAndPrefixPathSelectorsFollowSurgeSemantics() throws {
+        let exact = try XCTUnwrap(TransparentProxyProcessSelector(
+            kind: .exactPath,
+            value: "/usr/local/bin/claude"
+        ))
+        let prefix = try XCTUnwrap(TransparentProxyProcessSelector(
+            kind: .pathPrefix,
+            value: "/Applications/Claude.app"
+        ))
+
+        XCTAssertTrue(exact.matches(executablePath: "/usr/local/bin/claude"))
+        XCTAssertFalse(exact.matches(executablePath: "/opt/bin/claude"))
+        XCTAssertTrue(prefix.matches(
+            executablePath: "/Applications/Claude.app/Contents/MacOS/Claude"
+        ))
+        XCTAssertFalse(prefix.matches(
+            executablePath: "/Applications/Claude.app2/Contents/MacOS/Claude"
+        ))
     }
 
     func testEncodesIPv4EndpointWithoutReplacingHostname() throws {

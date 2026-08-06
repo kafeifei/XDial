@@ -14,13 +14,19 @@ func applicationRuleSetForTest() RuleSet {
 		Enabled: true,
 		Applications: []ApplicationMatch{
 			{
-				Name: "Claude",
-				Path: "/Applications/Claude.app",
+				Name:             "Claude",
+				Path:             "/Applications/Claude.app",
+				BundleIdentifier: "com.anthropic.claudefordesktop",
 			},
 			{
 				Name: "ChatGPT",
 				Path: "/Applications/ChatGPT.app",
 			},
+		},
+		Processes: []string{
+			"claude",
+			"/Users/test/Library/Application Support/Claude/claude",
+			"/opt/Claude/",
 		},
 	}
 }
@@ -83,7 +89,7 @@ func TestApplicationRuleSetIsModeBoundAndFailsClosedOutsideTransparentProxy(t *t
 	}
 }
 
-func TestApplicationRuleSetTransparentProxyDoesNotEmitDNSActions(t *testing.T) {
+func TestApplicationRuleSetTransparentProxyPinsRouteAndDNS(t *testing.T) {
 	profile := testProfile()
 	profile.RuleSets = append(profile.RuleSets, applicationRuleSetForTest())
 	profile.Modes[0].Bindings = append(profile.Modes[0].Bindings, RuleBinding{
@@ -124,8 +130,25 @@ func TestApplicationRuleSetTransparentProxyDoesNotEmitDNSActions(t *testing.T) {
 		t.Fatalf("application rule must not depend on DNS: %v", applicationRule)
 	}
 	wantUsers := []interface{}{
-		ApplicationSOCKSUsername("session-user", "/Applications/Claude.app"),
-		ApplicationSOCKSUsername("session-user", "/Applications/ChatGPT.app"),
+		ApplicationSOCKSUsername("session-user", ApplicationProcessSelector{
+			Kind: ApplicationProcessSelectorBundleID, Value: "com.anthropic.claudefordesktop",
+		}),
+		ApplicationSOCKSUsername("session-user", ApplicationProcessSelector{
+			Kind: ApplicationProcessSelectorBundlePath, Value: "/Applications/Claude.app",
+		}),
+		ApplicationSOCKSUsername("session-user", ApplicationProcessSelector{
+			Kind: ApplicationProcessSelectorBundlePath, Value: "/Applications/ChatGPT.app",
+		}),
+		ApplicationSOCKSUsername("session-user", ApplicationProcessSelector{
+			Kind: ApplicationProcessSelectorName, Value: "claude",
+		}),
+		ApplicationSOCKSUsername("session-user", ApplicationProcessSelector{
+			Kind:  ApplicationProcessSelectorExactPath,
+			Value: "/Users/test/Library/Application Support/Claude/claude",
+		}),
+		ApplicationSOCKSUsername("session-user", ApplicationProcessSelector{
+			Kind: ApplicationProcessSelectorPathPrefix, Value: "/opt/Claude",
+		}),
 	}
 	if got := applicationRule["auth_user"]; !reflect.DeepEqual(got, wantUsers) {
 		t.Fatalf("application route users = %#v, want %#v", got, wantUsers)
@@ -136,17 +159,57 @@ func TestApplicationRuleSetTransparentProxyDoesNotEmitDNSActions(t *testing.T) {
 		t.Fatalf("invalid generated JSON: %v", err)
 	}
 	users := config.Inbounds[0]["users"].([]interface{})
-	if len(users) != 3 { // base session user + two App Bundle selectors
-		t.Fatalf("SOCKS users = %v, want base + 2 application users", users)
+	if len(users) != 7 { // base session user + six process selectors
+		t.Fatalf("SOCKS users = %v, want base + 6 application users", users)
 	}
 	credentials, err := ActiveApplicationSOCKSCredentials(profile, "session-user")
 	if err != nil {
 		t.Fatalf("ActiveApplicationSOCKSCredentials: %v", err)
 	}
-	if len(credentials) != 2 ||
-		credentials[0].BundlePath != "/Applications/Claude.app" ||
+	if len(credentials) != 6 ||
+		credentials[0].Kind != ApplicationProcessSelectorBundleID ||
+		credentials[0].Value != "com.anthropic.claudefordesktop" ||
 		credentials[0].Username != wantUsers[0] {
 		t.Fatalf("session envelope credential drifted from route credential: %v", credentials)
+	}
+	dnsRules, ok := config.DNS["rules"].([]interface{})
+	if !ok {
+		t.Fatalf("transparent proxy DNS rules are missing: %v", config.DNS)
+	}
+	foundApplicationDNS := false
+	for _, rawRule := range dnsRules {
+		rule, ok := rawRule.(map[string]interface{})
+		if !ok || !reflect.DeepEqual(rule["auth_user"], wantUsers) {
+			continue
+		}
+		foundApplicationDNS = true
+		if rule["server"] != desktopProxyDNSTag("proxy-ss") {
+			t.Fatalf("application DNS server = %v, want selected Line resolver", rule["server"])
+		}
+	}
+	if !foundApplicationDNS {
+		t.Fatal("application identity did not pin DNS to its selected Line")
+	}
+}
+
+func TestApplicationRuleSetRejectsMalformedBundleIdentifiers(t *testing.T) {
+	for name, bundleIdentifier := range map[string]string{
+		"surrounding whitespace": " com.anthropic.claude",
+		"control character":      "com.anthropic.\nclaude",
+		"non ascii":              "com.anthropic.克劳德",
+	} {
+		t.Run(name, func(t *testing.T) {
+			ruleSet := &RuleSet{
+				ID: "app", Type: RuleSetTypeApplication, Enabled: true,
+				Applications: []ApplicationMatch{{
+					Path:             "/Applications/Claude.app",
+					BundleIdentifier: bundleIdentifier,
+				}},
+			}
+			if err := validateApplicationRuleSet(ruleSet); err == nil {
+				t.Fatal("invalid bundle identifier must reject generation")
+			}
+		})
 	}
 }
 
@@ -166,6 +229,52 @@ func TestApplicationRuleSetRejectsMalformedBundlePaths(t *testing.T) {
 			}
 			if err := validateApplicationRuleSet(ruleSet); err == nil {
 				t.Fatal("invalid App Bundle paths must reject generation")
+			}
+		})
+	}
+}
+
+func TestApplicationRuleSetAcceptsSurgeProcessSelectorModes(t *testing.T) {
+	ruleSet := &RuleSet{
+		ID: "app", Type: RuleSetTypeApplication, Enabled: true,
+		Processes: []string{
+			"claude",
+			"Claude Helper*",
+			"/usr/local/bin/claude",
+			"/Applications/Claude.app/",
+		},
+	}
+	if err := validateApplicationRuleSet(ruleSet); err != nil {
+		t.Fatalf("valid Surge process selectors rejected: %v", err)
+	}
+	selectors := applicationRuleSetSelectors(ruleSet)
+	want := []ApplicationProcessSelector{
+		{Kind: ApplicationProcessSelectorName, Value: "claude"},
+		{Kind: ApplicationProcessSelectorName, Value: "Claude Helper*"},
+		{Kind: ApplicationProcessSelectorExactPath, Value: "/usr/local/bin/claude"},
+		{Kind: ApplicationProcessSelectorPathPrefix, Value: "/Applications/Claude.app"},
+	}
+	if !reflect.DeepEqual(selectors, want) {
+		t.Fatalf("selectors = %#v, want %#v", selectors, want)
+	}
+}
+
+func TestApplicationRuleSetRejectsMalformedProcessSelectors(t *testing.T) {
+	for name, process := range map[string]string{
+		"empty":                  "",
+		"relative path":          "bin/claude",
+		"unclean exact path":     "/usr/local/../bin/claude",
+		"unclean prefix path":    "/Applications/Other/../Claude.app/",
+		"surrounding whitespace": " claude",
+		"format character":       "cl\u200baude",
+	} {
+		t.Run(name, func(t *testing.T) {
+			ruleSet := &RuleSet{
+				ID: "app", Type: RuleSetTypeApplication, Enabled: true,
+				Processes: []string{process},
+			}
+			if err := validateApplicationRuleSet(ruleSet); err == nil {
+				t.Fatal("invalid process selector must reject generation")
 			}
 		})
 	}

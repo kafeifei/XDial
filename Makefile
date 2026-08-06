@@ -96,6 +96,7 @@ test: $(PATCHED_WORKFILE) test-patched-tailscale test-patched-sing-box test-patc
 
 test-macos-transaction:
 	@! rg -n 'probeNetwork|127\.0\.0\.1:9090|test-out' macos/Sources/XDial
+	@! rg -n 'willSleepNotification|screensDidSleepNotification|systemIsSleeping|sawUnavailablePath' macos/Sources/XDial macos/Shared
 	@! rg -n 'URLSession|ip-api\.com' macos/Sources/XDial/NetworkInfo.swift
 	@! rg -U -n '\.on(Appear|Disappear)[[:space:]]*\{[^}]{0,500}(probeNetwork|prepareTailscale|closeTailscaleSetup|URLSession|127\.0\.0\.1:9090)' macos/Sources/XDial/SettingsView.swift
 	@test "$$(rg -U -o 'AXUIElementCopyAttributeValue\([^)]*kAXValueAttribute' macos/Sources/XDial/DebugServer.swift | wc -l | tr -d ' ')" -eq 1

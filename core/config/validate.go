@@ -261,12 +261,22 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 }
 
 func validateApplicationRuleSet(ruleSet *RuleSet) error {
-	if len(ruleSet.Applications) == 0 {
-		return fmt.Errorf("applications is empty")
+	if len(ruleSet.Applications) == 0 && len(ruleSet.Processes) == 0 {
+		return fmt.Errorf("application process selectors are empty")
 	}
 	for applicationIndex, application := range ruleSet.Applications {
 		if _, ok := canonicalApplicationBundlePath(application.Path); !ok {
 			return fmt.Errorf("application #%d bundle path is invalid", applicationIndex+1)
+		}
+		if application.BundleIdentifier != "" {
+			if _, ok := canonicalApplicationBundleIdentifier(application.BundleIdentifier); !ok {
+				return fmt.Errorf("application #%d bundle identifier is invalid", applicationIndex+1)
+			}
+		}
+	}
+	for processIndex, process := range ruleSet.Processes {
+		if _, ok := canonicalApplicationProcessSelector(process); !ok {
+			return fmt.Errorf("process #%d selector is invalid", processIndex+1)
 		}
 	}
 	return nil
