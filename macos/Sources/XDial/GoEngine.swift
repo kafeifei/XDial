@@ -153,6 +153,18 @@ final class GoEngine: ObservableObject {
         )
     }
 
+    func trafficSnapshot(
+        transactionID: String,
+        completion: @escaping (
+            Result<ProviderTrafficSnapshot, Error>
+        ) -> Void
+    ) {
+        transparentProxy.trafficSnapshot(
+            transactionID: transactionID,
+            completion: completion
+        )
+    }
+
     #if DEBUG
     func applicationAttributionSnapshot(
         transactionID: String,

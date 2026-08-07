@@ -2,6 +2,23 @@ import Foundation
 import XCTest
 
 final class ApplicationRuleSetModelTests: XCTestCase {
+    func testLegacyURLRuleDefaultsFetchLineToDirect() throws {
+        let data = try XCTUnwrap("""
+        {
+          "id": "remote",
+          "name": "Remote",
+          "type": "url",
+          "enabled": true,
+          "url": "https://rules.example.com/list.srs",
+          "format": "srs"
+        }
+        """.data(using: .utf8))
+
+        let decoded = try JSONDecoder().decode(RuleSet.self, from: data)
+
+        XCTAssertEqual(decoded.fetchLineID, "direct")
+    }
+
     func testApplicationRulePersistsRootBundleIdentityAndPath() throws {
         let source = RuleSet(
             id: "claude",

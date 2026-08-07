@@ -67,6 +67,46 @@ type transparentProxySession struct {
 	Tailscale             *transparentProxyTailscale  `json:"tailscale,omitempty"`
 }
 
+type transparentProxyRuleSetRefresh struct {
+	RuleSetID    string `json:"rule_set_id"`
+	URL          string `json:"url"`
+	LocalPath    string `json:"local_path"`
+	InputFormat  string `json:"input_format"`
+	StoredFormat string `json:"stored_format"`
+	OutboundTag  string `json:"outbound_tag"`
+	ResolverTag  string `json:"resolver_tag"`
+}
+
+type pendingNERuleSetRefresh struct {
+	RuleSetID    string
+	URL          string
+	LocalPath    string
+	InputFormat  string
+	StoredFormat string
+	FetchLineID  string
+}
+
+type transparentProxyRuleSetBootstrap struct {
+	PreflightSessions  []transparentProxyRuleSetBootstrapSession `json:"preflight_sessions,omitempty"`
+	BackgroundSessions []transparentProxyRuleSetBootstrapSession `json:"background_sessions,omitempty"`
+}
+
+type transparentProxyRuleSetBootstrapSession struct {
+	ConfigJSON  string                           `json:"config_json"`
+	LineID      string                           `json:"line_id"`
+	OutboundTag string                           `json:"outbound_tag"`
+	Refreshes   []transparentProxyRuleSetRefresh `json:"refreshes"`
+	ReuseActive bool                             `json:"reuse_active"`
+	AnyConnect  *transparentProxyAnyConnect      `json:"anyconnect,omitempty"`
+	Tailscale   *transparentProxyTailscale       `json:"tailscale,omitempty"`
+}
+
+type transparentProxyRuleSetBootstrapGroup struct {
+	LineID    string
+	Preflight bool
+	Refreshes []pendingNERuleSetRefresh
+}
+
 type transparentProxyAnyConnect struct {
 	Server        string `json:"server"`
 	Username      string `json:"username"`
@@ -175,6 +215,227 @@ func GenerateTransparentProxySessionWithCallback(
 	)
 }
 
+// GenerateTransparentProxyRuleSetBootstrap returns isolated acquisition
+// sessions for active URL RuleSets. Missing caches are fetched before system
+// takeover; stale validated caches are refreshed only after the formal traffic
+// session commits. A session carries no Mode bindings, so its Line can never
+// become a user-traffic policy by accident.
+func GenerateTransparentProxyRuleSetBootstrap(
+	profileJSON string,
+	basePath string,
+	listenPort int,
+	socksUsername string,
+	socksPassword string,
+	underlayInterface string,
+	systemDNSJSON string,
+) (string, error) {
+	profile, err := config.ParseProfile([]byte(profileJSON))
+	if err != nil {
+		return "", err
+	}
+	mode := profile.ActiveMode()
+	if mode == nil {
+		return "", fmt.Errorf("no active mode")
+	}
+	trafficPlan, err := config.BuildConnectionPlan(profile)
+	if err != nil {
+		return "", err
+	}
+	trafficLineOutbounds, err := activeLineOutbounds(profile, trafficPlan)
+	if err != nil {
+		return "", err
+	}
+	ruleDir, err := prepareNERuleSetDirectory(basePath)
+	if err != nil {
+		return "", err
+	}
+	var systemDNS []string
+	if err := json.Unmarshal([]byte(systemDNSJSON), &systemDNS); err != nil {
+		return "", fmt.Errorf("decode system DNS snapshot: %w", err)
+	}
+
+	groups := make(map[string]*transparentProxyRuleSetBootstrapGroup)
+	var groupOrder []string
+	seenRules := make(map[string]bool)
+	for _, binding := range mode.Bindings {
+		rule := profile.FindRuleSet(binding.RuleSetID)
+		if rule == nil || !rule.Enabled || rule.Type != config.RuleSetTypeURL || seenRules[rule.ID] {
+			continue
+		}
+		seenRules[rule.ID] = true
+		inputFormat := neRuleSetFormat(rule)
+		storedFormat := inputFormat
+		if storedFormat == "text" {
+			storedFormat = "source"
+		}
+		localPath := neRuleSetCachePath(
+			ruleDir,
+			"profile",
+			rule.ID,
+			rule.URL,
+			inputFormat,
+			storedFormat,
+		)
+		_, _, cacheInfo, cacheErr := readValidatedNERuleSet(
+			localPath,
+			storedFormat,
+			maxNERuleSetBytes,
+		)
+		if cacheErr == nil && time.Since(cacheInfo.ModTime()) <= neRuleSetCacheFreshFor {
+			continue
+		}
+		lineID := rule.EffectiveFetchLineID()
+		preflight := cacheErr != nil
+		key := fmt.Sprintf("%t\x00%s", preflight, lineID)
+		group := groups[key]
+		if group == nil {
+			group = &transparentProxyRuleSetBootstrapGroup{
+				LineID:    lineID,
+				Preflight: preflight,
+			}
+			groups[key] = group
+			groupOrder = append(groupOrder, key)
+		}
+		group.Refreshes = append(group.Refreshes, pendingNERuleSetRefresh{
+			RuleSetID:    rule.ID,
+			URL:          rule.URL,
+			LocalPath:    localPath,
+			InputFormat:  inputFormat,
+			StoredFormat: storedFormat,
+			FetchLineID:  lineID,
+		})
+	}
+
+	bootstrap := transparentProxyRuleSetBootstrap{}
+	for _, key := range groupOrder {
+		group := groups[key]
+		lineID := group.LineID
+		encodedProfile, err := json.Marshal(profile)
+		if err != nil {
+			return "", fmt.Errorf("encode RuleSet bootstrap profile: %w", err)
+		}
+		var isolated config.Profile
+		if err := json.Unmarshal(encodedProfile, &isolated); err != nil {
+			return "", fmt.Errorf("clone RuleSet bootstrap profile: %w", err)
+		}
+		isolatedMode := isolated.ActiveMode()
+		if isolatedMode == nil {
+			return "", fmt.Errorf("RuleSet bootstrap mode is unavailable")
+		}
+		isolatedMode.Bindings = nil
+		isolatedMode.DefaultLineID = lineID
+		isolatedMode.DefaultSubscriptionID = ""
+		isolated.RuleSets = nil
+		isolated.Subscriptions = nil
+		plan, err := config.BuildConnectionPlan(&isolated)
+		if err != nil {
+			return "", err
+		}
+		data, err := config.GenerateSingBoxTransparentProxy(
+			&isolated,
+			listenPort,
+			socksUsername,
+			socksPassword,
+			basePath,
+			underlayInterface,
+			systemDNS,
+		)
+		if err != nil {
+			return "", err
+		}
+		data, err = removeTransparentProxyBootstrapIngress(data)
+		if err != nil {
+			return "", err
+		}
+		lineOutbounds, err := activeLineOutbounds(&isolated, plan)
+		if err != nil {
+			return "", err
+		}
+		outboundTag := lineOutbounds[lineID]
+		if outboundTag == "" {
+			return "", fmt.Errorf("RuleSet bootstrap Line has no runtime outbound")
+		}
+		refreshes, err := transparentProxyRuleSetRefreshes(group.Refreshes, lineOutbounds)
+		if err != nil {
+			return "", err
+		}
+		session := transparentProxyRuleSetBootstrapSession{
+			ConfigJSON:  string(data),
+			LineID:      lineID,
+			OutboundTag: outboundTag,
+			Refreshes:   refreshes,
+			ReuseActive: lineID == "direct" ||
+				trafficLineOutbounds[lineID] == outboundTag,
+		}
+		if line := isolated.ActiveVPNLine(); line != nil {
+			if strings.TrimSpace(line.VPNServer) == "" ||
+				strings.TrimSpace(line.VPNUsername) == "" ||
+				line.VPNPassword == "" {
+				return "", fmt.Errorf("RuleSet acquisition AnyConnect credentials are missing")
+			}
+			session.AnyConnect = &transparentProxyAnyConnect{
+				Server:        line.VPNServer,
+				Username:      line.VPNUsername,
+				Password:      line.VPNPassword,
+				AllowInsecure: line.AllowInsecure,
+			}
+		}
+		tailscaleLine, err := config.ActiveTailscaleLine(&isolated)
+		if err != nil {
+			return "", err
+		}
+		if tailscaleLine != nil {
+			exitNode := strings.TrimSpace(tailscaleLine.TailscaleExitNode)
+			if exitNode == "" {
+				return "", fmt.Errorf("RuleSet acquisition Tailscale exit node is missing")
+			}
+			endpointTag := ""
+			for _, member := range config.BuildLineRuntimeCatalog(&isolated).Lines {
+				if member.ID == tailscaleLine.ID {
+					endpointTag = member.Tag
+					break
+				}
+			}
+			if endpointTag == "" {
+				return "", fmt.Errorf("RuleSet acquisition Tailscale endpoint is missing")
+			}
+			dnsServerTag := ""
+			if tailscaleLine.TailscaleMagicDNS {
+				dnsServerTag = config.TailscaleMagicDNSDNSServerTag(endpointTag)
+			}
+			session.Tailscale = &transparentProxyTailscale{
+				EndpointTag:     endpointTag,
+				ExitNode:        exitNode,
+				MagicDNSEnabled: tailscaleLine.TailscaleMagicDNS,
+				DNSServerTag:    dnsServerTag,
+			}
+		}
+		if group.Preflight {
+			bootstrap.PreflightSessions = append(bootstrap.PreflightSessions, session)
+		} else {
+			bootstrap.BackgroundSessions = append(bootstrap.BackgroundSessions, session)
+		}
+	}
+	encoded, err := json.Marshal(bootstrap)
+	if err != nil {
+		return "", fmt.Errorf("encode RuleSet bootstrap sessions: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func removeTransparentProxyBootstrapIngress(data []byte) ([]byte, error) {
+	var document map[string]interface{}
+	if err := json.Unmarshal(data, &document); err != nil {
+		return nil, fmt.Errorf("decode RuleSet acquisition config: %w", err)
+	}
+	document["inbounds"] = []interface{}{}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode RuleSet acquisition config: %w", err)
+	}
+	return encoded, nil
+}
+
 func generateTransparentProxySession(
 	profileJSON string,
 	basePath string,
@@ -197,12 +458,13 @@ func generateTransparentProxySession(
 	if err != nil {
 		return "", err
 	}
-	if err := materializeNERuleSetsWithEvents(
+	_, err = materializeNERuleSetsWithRefreshEvents(
 		profile,
 		basePath,
-		subscription.FetchStrictBytes,
+		nil,
 		progress,
-	); err != nil {
+	)
+	if err != nil {
 		return "", err
 	}
 	var systemDNS []string
@@ -339,6 +601,36 @@ func activeLineOutbounds(
 		active[lineID] = tag
 	}
 	return active, nil
+}
+
+func transparentProxyRuleSetRefreshes(
+	pending []pendingNERuleSetRefresh,
+	lineOutbounds map[string]string,
+) ([]transparentProxyRuleSetRefresh, error) {
+	refreshes := make([]transparentProxyRuleSetRefresh, 0, len(pending))
+	for _, item := range pending {
+		outboundTag := lineOutbounds[item.FetchLineID]
+		if outboundTag == "" {
+			return nil, fmt.Errorf(
+				"rule set %q update Line has no runtime outbound",
+				item.RuleSetID,
+			)
+		}
+		resolverTag := "proxy-dns-" + outboundTag
+		if outboundTag == "direct" {
+			resolverTag = "xdial-system-dns"
+		}
+		refreshes = append(refreshes, transparentProxyRuleSetRefresh{
+			RuleSetID:    item.RuleSetID,
+			URL:          item.URL,
+			LocalPath:    item.LocalPath,
+			InputFormat:  item.InputFormat,
+			StoredFormat: item.StoredFormat,
+			OutboundTag:  outboundTag,
+			ResolverTag:  resolverTag,
+		})
+	}
+	return refreshes, nil
 }
 
 func activeSubscriptionOutbounds(
@@ -556,7 +848,8 @@ func prepareNERuleSetDirectory(basePath string) (string, error) {
 // 远程规则并写入 App Group。扩展只读本地文件，不再让 sing-box 自行跟随未校验的
 // URL/重定向，从而封住 localhost、内网地址和 DNS rebinding 通道。
 func materializeNERuleSets(profile *config.Profile, basePath string, fetch neRuleSetFetcher) error {
-	return materializeNERuleSetsWithEvents(profile, basePath, fetch, nil)
+	_, err := materializeNERuleSetsWithRefreshEvents(profile, basePath, fetch, nil)
+	return err
 }
 
 func materializeNERuleSetsWithEvents(
@@ -565,12 +858,26 @@ func materializeNERuleSetsWithEvents(
 	fetch neRuleSetFetcher,
 	progress connectionPreparationSink,
 ) error {
+	_, err := materializeNERuleSetsWithRefreshEvents(profile, basePath, fetch, progress)
+	return err
+}
+
+func materializeNERuleSetsWithRefreshEvents(
+	profile *config.Profile,
+	basePath string,
+	fetch neRuleSetFetcher,
+	progress connectionPreparationSink,
+) ([]pendingNERuleSetRefresh, error) {
 	mode := profile.ActiveMode()
 	if mode == nil {
-		return fmt.Errorf("no active mode")
+		return nil, fmt.Errorf("no active mode")
 	}
 
-	var rules []*config.RuleSet
+	type activeRuleSet struct {
+		rule    *config.RuleSet
+		binding config.RuleBinding
+	}
+	var rules []activeRuleSet
 	seen := make(map[string]bool)
 	for _, binding := range mode.Bindings {
 		rule := profile.FindRuleSet(binding.RuleSetID)
@@ -578,22 +885,24 @@ func materializeNERuleSetsWithEvents(
 			continue
 		}
 		seen[rule.ID] = true
-		rules = append(rules, rule)
+		rules = append(rules, activeRuleSet{rule: rule, binding: binding})
 	}
 	if len(rules) == 0 {
-		return nil
+		return nil, nil
 	}
 	if basePath == "" || !filepath.IsAbs(basePath) {
-		return fmt.Errorf("shared rule-set directory is unavailable")
+		return nil, fmt.Errorf("shared rule-set directory is unavailable")
 	}
 
 	ruleDir := filepath.Join(basePath, "xdial-rule-sets")
 	if err := os.MkdirAll(ruleDir, 0o700); err != nil {
-		return fmt.Errorf("prepare local rule-set directory: %w", err)
+		return nil, fmt.Errorf("prepare local rule-set directory: %w", err)
 	}
 
 	remaining := maxNERuleSetBytes
-	for _, rule := range rules {
+	var pendingRefreshes []pendingNERuleSetRefresh
+	for _, active := range rules {
+		rule := active.rule
 		taskID := "rule-set:" + rule.ID
 		emitConnectionPreparation(
 			progress,
@@ -608,7 +917,7 @@ func materializeNERuleSetsWithEvents(
 				taskID,
 				"rule-set-address-missing",
 			)
-			return fmt.Errorf("remote rule set is missing an address")
+			return nil, fmt.Errorf("remote rule set is missing an address")
 		}
 		originalURL := rule.URL
 		originalFormat := neRuleSetFormat(rule)
@@ -624,32 +933,69 @@ func materializeNERuleSetsWithEvents(
 			originalFormat,
 			storedFormat,
 		)
-		content, matchKind, err := loadOrFetchNERuleSet(
+		content, matchKind, cachedInfo, cachedErr := readValidatedNERuleSet(
 			localPath,
 			storedFormat,
 			remaining,
-			func(limit int64) ([]byte, error) {
-				fetched, fetchErr := fetch(originalURL, limit)
-				if fetchErr != nil {
-					return nil, fetchErr
-				}
-				if originalFormat == "text" {
-					converted, convertErr := convertTextRuleSet(fetched)
-					if convertErr != nil {
-						return nil, fmt.Errorf("remote text rule set is invalid")
-					}
-					return converted, nil
-				}
-				return fetched, nil
-			},
 		)
-		if err != nil {
+		if cachedErr == nil && time.Since(cachedInfo.ModTime()) > neRuleSetCacheFreshFor {
+			pendingRefreshes = append(pendingRefreshes, pendingNERuleSetRefresh{
+				RuleSetID:    rule.ID,
+				URL:          originalURL,
+				LocalPath:    localPath,
+				InputFormat:  originalFormat,
+				StoredFormat: storedFormat,
+				FetchLineID:  rule.EffectiveFetchLineID(),
+			})
+		}
+		if cachedErr != nil {
+			if fetch == nil {
+				emitConnectionPreparationFailure(
+					progress,
+					taskID,
+					"rule-set-unavailable",
+				)
+				return nil, fmt.Errorf(
+					"rule set %q is unavailable and has no valid local copy",
+					rule.ID,
+				)
+			}
+			var fetchErr error
+			content, matchKind, fetchErr = loadOrFetchNERuleSet(
+				localPath,
+				storedFormat,
+				remaining,
+				func(limit int64) ([]byte, error) {
+					fetched, fetchErr := fetch(originalURL, limit)
+					if fetchErr != nil {
+						return nil, fetchErr
+					}
+					if originalFormat == "text" {
+						converted, convertErr := convertTextRuleSet(fetched)
+						if convertErr != nil {
+							return nil, fmt.Errorf("remote text rule set is invalid")
+						}
+						return converted, nil
+					}
+					return fetched, nil
+				},
+			)
+			if fetchErr != nil {
+				emitConnectionPreparationFailure(
+					progress,
+					taskID,
+					"rule-set-unavailable",
+				)
+				return nil, fmt.Errorf("rule set %q is unavailable and has no valid local copy", rule.ID)
+			}
+		}
+		if cachedErr != nil && len(content) == 0 {
 			emitConnectionPreparationFailure(
 				progress,
 				taskID,
 				"rule-set-unavailable",
 			)
-			return fmt.Errorf("rule set %q is unavailable and has no valid local copy", rule.ID)
+			return nil, fmt.Errorf("rule set %q is unavailable and has no valid local copy", rule.ID)
 		}
 		remaining -= int64(len(content))
 		rule.URL = "file://" + localPath
@@ -663,22 +1009,19 @@ func materializeNERuleSetsWithEvents(
 			},
 		)
 	}
-	return nil
+	return pendingRefreshes, nil
 }
 
-// loadOrFetchNERuleSet keeps connection startup cache-first. A fresh, validated copy is
-// immediately reusable, so a routine reconnect or an Underlay rebuild never depends on
-// the rule host being reachable in the short interval before XDial is active. Once the
-// copy ages out, a successful fetch atomically replaces it; a failed refresh keeps using
-// the last validated copy.
+// loadOrFetchNERuleSet is the cold-cache primitive. Warm-cache startup is handled
+// before this function so even an expired validated copy never blocks connection.
 func loadOrFetchNERuleSet(
 	localPath string,
 	format string,
 	limit int64,
 	fetch func(int64) ([]byte, error),
 ) ([]byte, config.RuleSetMatchKind, error) {
-	cached, cachedKind, cachedInfo, cachedErr := readValidatedNERuleSet(localPath, format, limit)
-	if cachedErr == nil && time.Since(cachedInfo.ModTime()) <= neRuleSetCacheFreshFor {
+	cached, cachedKind, _, cachedErr := readValidatedNERuleSet(localPath, format, limit)
+	if cachedErr == nil {
 		return cached, cachedKind, nil
 	}
 
@@ -694,9 +1037,6 @@ func loadOrFetchNERuleSet(
 		fetchErr = validateErr
 	}
 
-	if cachedErr == nil {
-		return cached, cachedKind, nil
-	}
 	return nil, config.RuleSetMatchUnknown, fetchErr
 }
 

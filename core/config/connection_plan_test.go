@@ -101,6 +101,36 @@ func TestBuildConnectionPlanIncludesDynamicTailscaleAndGeneratedSubscriptionRule
 	}
 }
 
+func TestBuildConnectionPlanKeepsRuleSetFetchLineOutOfTrafficTasks(t *testing.T) {
+	profile := invBaseProfile()
+	profile.Lines = append(profile.Lines, invUnusedTrojanLine())
+	profile.RuleSets[1].FetchLineID = "ghost"
+
+	plan, err := BuildConnectionPlan(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ruleTask *ConnectionPlanTask
+	for index := range plan.Tasks {
+		if plan.Tasks[index].ID == "rule-set:remote" {
+			ruleTask = &plan.Tasks[index]
+			break
+		}
+	}
+	if ruleTask == nil {
+		t.Fatal("rule-set task is missing")
+	}
+	if containsString(ruleTask.Dependencies, "line:ghost") {
+		t.Fatalf("background fetch Line leaked into traffic dependencies: %+v", ruleTask.Dependencies)
+	}
+	if containsString(connectionPlanTaskIDs(plan), "line:ghost") {
+		t.Fatalf("background fetch Line leaked into traffic tasks: %+v", plan.Tasks)
+	}
+	if ruleTask.Detail != "远程规则；经校验缓存立即启动，连接后更新 → 海外中转" {
+		t.Fatalf("RuleSet fetch source polluted traffic policy: %q", ruleTask.Detail)
+	}
+}
+
 func TestBuildConnectionPlanRejectsBrokenReferencesBeforeSideEffects(t *testing.T) {
 	profile := invBaseProfile()
 	profile.Modes[0].Bindings[0].LineID = "missing"

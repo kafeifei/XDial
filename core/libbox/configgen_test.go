@@ -431,7 +431,7 @@ func TestMaterializeNERuleSetsReusesValidatedCacheAcrossStarts(t *testing.T) {
 	}
 }
 
-func TestMaterializeNERuleSetsFallsBackToStaleValidatedCache(t *testing.T) {
+func TestMaterializeNERuleSetsStartsImmediatelyFromStaleValidatedCache(t *testing.T) {
 	basePath := t.TempDir()
 	profile := &config.Profile{
 		Lines: []config.Line{{ID: "direct", Type: config.LineTypeDirect, Enabled: true}},
@@ -470,17 +470,165 @@ func TestMaterializeNERuleSetsFallsBackToStaleValidatedCache(t *testing.T) {
 		ActiveModeID: "mode",
 	}
 	fetchCalls := 0
-	if err := materializeNERuleSets(reconnect, basePath, func(string, int64) ([]byte, error) {
+	pending, err := materializeNERuleSetsWithRefreshEvents(reconnect, basePath, func(string, int64) ([]byte, error) {
 		fetchCalls++
 		return nil, fmt.Errorf("network unavailable")
-	}); err != nil {
+	}, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if fetchCalls != 1 {
-		t.Fatalf("stale cache should attempt one refresh, fetch calls = %d", fetchCalls)
+	if fetchCalls != 0 {
+		t.Fatalf("stale cache must not block startup, fetch calls = %d", fetchCalls)
 	}
 	if reconnect.RuleSets[0].URL != "file://"+localPath {
 		t.Fatalf("stale validated cache was not retained: %q", reconnect.RuleSets[0].URL)
+	}
+	if len(pending) != 1 || pending[0].RuleSetID != "cnip" ||
+		pending[0].FetchLineID != "direct" || pending[0].LocalPath != localPath {
+		t.Fatalf("background refresh was not scheduled: %+v", pending)
+	}
+}
+
+func TestGenerateTransparentProxyRuleSetBootstrapSeparatesColdAndWarmRefresh(t *testing.T) {
+	basePath := t.TempDir()
+	newProfile := func(fetchLineID string) config.Profile {
+		return config.Profile{
+			Lines: []config.Line{
+				{ID: "direct", Type: config.LineTypeDirect, Enabled: true},
+				{
+					ID: "source", Name: "Source", Type: config.LineTypeTrojan, Enabled: true,
+					TrojanServer: "source.example.com", TrojanPort: 443,
+					TrojanPassword: "secret", TrojanSNI: "source.example.com",
+				},
+			},
+			RuleSets: []config.RuleSet{{
+				ID: "remote", Type: config.RuleSetTypeURL, Enabled: true,
+				URL: "https://rules.example.com/list.json", Format: "json",
+				FetchLineID: fetchLineID,
+			}},
+			Modes: []config.Mode{{
+				ID:            "mode",
+				Bindings:      []config.RuleBinding{{RuleSetID: "remote", LineID: "direct"}},
+				DefaultLineID: "direct",
+			}},
+			ActiveModeID: "mode",
+		}
+	}
+	generate := func(profile config.Profile) transparentProxyRuleSetBootstrap {
+		t.Helper()
+		profileJSON, err := json.Marshal(profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := GenerateTransparentProxyRuleSetBootstrap(
+			string(profileJSON), basePath, 29877, "user", "password",
+			"utun-underlay", `["100.100.100.100"]`,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var bootstrap transparentProxyRuleSetBootstrap
+		if err := json.Unmarshal([]byte(raw), &bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		return bootstrap
+	}
+
+	cold := generate(newProfile("source"))
+	if len(cold.PreflightSessions) != 1 || len(cold.BackgroundSessions) != 0 {
+		t.Fatalf("cold cache must create one preflight session: %+v", cold)
+	}
+	session := cold.PreflightSessions[0]
+	if session.LineID != "source" || session.OutboundTag != "proxy-source" ||
+		session.ReuseActive || len(session.Refreshes) != 1 {
+		t.Fatalf("fetch-only Line leaked or was not isolated: %+v", session)
+	}
+	if session.Refreshes[0].ResolverTag != "proxy-dns-proxy-source" {
+		t.Fatalf("fetch DNS did not follow the source Line: %+v", session.Refreshes[0])
+	}
+	if strings.Contains(session.ConfigJSON, `"ruleset-remote"`) {
+		t.Fatalf("bootstrap config is not an isolated source session: %s", session.ConfigJSON)
+	}
+	var bootstrapConfig map[string]interface{}
+	if err := json.Unmarshal([]byte(session.ConfigJSON), &bootstrapConfig); err != nil {
+		t.Fatal(err)
+	}
+	if inbounds, ok := bootstrapConfig["inbounds"].([]interface{}); !ok || len(inbounds) != 0 {
+		t.Fatalf("RuleSet acquisition session must not expose an ingress: %v", bootstrapConfig["inbounds"])
+	}
+	foundSource := false
+	for _, rawOutbound := range bootstrapConfig["outbounds"].([]interface{}) {
+		outbound := rawOutbound.(map[string]interface{})
+		foundSource = foundSource || outbound["tag"] == "proxy-source"
+	}
+	if !foundSource {
+		t.Fatalf("RuleSet acquisition session omitted its source Line: %v", bootstrapConfig["outbounds"])
+	}
+
+	ruleDir, err := prepareNERuleSetDirectory(basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localPath := neRuleSetCachePath(
+		ruleDir, "profile", "remote",
+		"https://rules.example.com/list.json", "source", "source",
+	)
+	content := []byte(`{"version":1,"rules":[{"domain_suffix":["example.com"]}]}`)
+	if err := writeNERuleSetCache(localPath, content); err != nil {
+		t.Fatal(err)
+	}
+	fresh := generate(newProfile("source"))
+	if len(fresh.PreflightSessions) != 0 || len(fresh.BackgroundSessions) != 0 {
+		t.Fatalf("fresh cache must not schedule network work: %+v", fresh)
+	}
+	staleTime := time.Now().Add(-neRuleSetCacheFreshFor - time.Hour)
+	if err := os.Chtimes(localPath, staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+	warm := generate(newProfile("source"))
+	if len(warm.PreflightSessions) != 0 || len(warm.BackgroundSessions) != 1 {
+		t.Fatalf("stale cache must refresh only after commit: %+v", warm)
+	}
+}
+
+func TestGenerateTransparentProxyRuleSetBootstrapDefaultsToDirect(t *testing.T) {
+	basePath := t.TempDir()
+	profile := config.Profile{
+		Lines: []config.Line{{ID: "proxy", Type: config.LineTypeTrojan, Enabled: true,
+			TrojanServer: "proxy.example.com", TrojanPort: 443, TrojanPassword: "secret"}},
+		RuleSets: []config.RuleSet{{
+			ID: "remote", Type: config.RuleSetTypeURL, Enabled: true,
+			URL: "https://rules.example.com/list.srs", Format: "srs",
+		}},
+		Modes: []config.Mode{{
+			ID:            "mode",
+			Bindings:      []config.RuleBinding{{RuleSetID: "remote", LineID: "proxy"}},
+			DefaultLineID: "proxy",
+		}},
+		ActiveModeID: "mode",
+	}
+	profileJSON, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := GenerateTransparentProxyRuleSetBootstrap(
+		string(profileJSON), basePath, 29877, "user", "password",
+		"utun-underlay", `["100.100.100.100"]`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bootstrap transparentProxyRuleSetBootstrap
+	if err := json.Unmarshal([]byte(raw), &bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	if len(bootstrap.PreflightSessions) != 1 {
+		t.Fatalf("missing Direct preflight session: %+v", bootstrap)
+	}
+	session := bootstrap.PreflightSessions[0]
+	if session.LineID != "direct" || session.OutboundTag != "direct" ||
+		session.Refreshes[0].ResolverTag != "xdial-system-dns" {
+		t.Fatalf("unspecified fetch Line must be Direct: %+v", session)
 	}
 }
 

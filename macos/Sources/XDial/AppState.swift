@@ -67,6 +67,9 @@ final class AppState: ObservableObject {
     private var initialStatusSynchronized = false
     private var launchAutoConnectPending = false
     private var connectionAttempts = ConnectionAttemptGate()
+    @Published private(set) var modeSwitchTargetID: String?
+    private var modeSwitchGeneration = 0
+    private var modeSwitchTask: Task<Void, Never>?
 
     private let profileKey = "xdial.profile"
     private let keychainPrefix = "xdial-line-"
@@ -247,16 +250,20 @@ final class AppState: ObservableObject {
         // 真正阻止新事务的只能是引擎自身的连接/断开状态。
         guard !engine.isBusy else { return false }
         guard installation.isReady else { return false }
-        guard let s = activeMode else { return false }
+        guard let mode = activeMode else { return false }
+        return hasRequiredCredentials(for: mode)
+    }
+
+    private func hasRequiredCredentials(for mode: Mode) -> Bool {
         // 必须有效的 VPN 凭据（如果模式用到 VPN）
-        for binding in s.bindings {
+        for binding in mode.bindings {
             if let line = profile.lines.first(where: { $0.id == binding.lineID }),
                line.type == "vpn",
                (line.vpnServer.isEmpty || line.vpnUsername.isEmpty || line.vpnPassword.isEmpty) {
                 return false
             }
         }
-        if let line = profile.lines.first(where: { $0.id == s.defaultLineID }),
+        if let line = profile.lines.first(where: { $0.id == mode.defaultLineID }),
            line.type == "vpn",
            (line.vpnServer.isEmpty || line.vpnUsername.isEmpty || line.vpnPassword.isEmpty) {
             return false
@@ -265,6 +272,15 @@ final class AppState: ObservableObject {
     }
 
     var statusText: String {
+        if let modeSwitchTargetID,
+           let mode = profile.modes.first(where: {
+               $0.id == modeSwitchTargetID
+           }) {
+            return tr(
+                "正在切换至 \(mode.name)…",
+                "Switching to \(mode.name)…"
+            )
+        }
         if let wakeReconnectPhase {
             return tr(
                 wakeReconnectPhase.zhStatusText,
@@ -1057,57 +1073,99 @@ final class AppState: ObservableObject {
         launchAutoConnectPending = false
         connectionAttempts.cancel()
         cancelWakeReconnectTask()
+        cancelModeSwitch()
         NetworkInfo.shared.clear()
         // 引擎不再攥着旧快照，残留提示没有意义
         configDirtyFlag = false
         configurationChanges.clear()
-        // 作废进行中的重连，免得它在用户明确要求断开之后又把连接拉起来
-        reconnectGeneration += 1
-        reconnecting = false
         engine.stop(userInitiated: true)
     }
 
-    /// 每发起一次重连就 +1。进行中的等待循环每轮比对，代次对不上就自行退场 ——
-    /// 比 Task.cancel 更严实：不会出现旧任务醒来后覆盖新任务状态。
-    private var reconnectGeneration = 0
-    private var reconnecting = false
-
     /// 一键重连：把当前配置重新下发给引擎。
-    ///
-    /// Go 侧 Engine.Start 在 connected/connecting/reconnecting 时直接报 "already ..."，
-    /// 所以必须先 stop、等它真的落到 disconnected 再 start。等待有上限（10s），
-    /// 超时就报错而不是无限等下去。
     func reconnect() {
-        guard canConnect, !reconnecting else { return }
-        if !engineHoldsSnapshot {
-            // 引擎手里本来就没有快照（自己掉线了），直接连即可
-            connect()
-            return
+        guard let activeMode else { return }
+        switchMode(to: activeMode.id)
+    }
+
+    /// 切换模式是一个保持“仍需连接”意图的独立操作，不能借用
+    /// `disconnect()`；后者会把用户意图改成明确断开。新点击通过 generation
+    /// 覆盖旧点击，且只有旧事务完整落到 disconnected 后才会启动新事务。
+    @discardableResult
+    func switchMode(to id: String) -> Bool {
+        guard let mode = profile.modes.first(where: { $0.id == id }) else {
+            return false
         }
+        guard hasRequiredCredentials(for: mode) else { return false }
+        guard activateMode(id) else { return false }
+
+        connectionDesired.userRequestedConnection(modeID: id)
+        launchAutoConnectPending = false
         connectionAttempts.cancel()
-        save(markDirty: false)
-        reconnectGeneration += 1
-        let gen = reconnectGeneration
-        reconnecting = true
+        cancelWakeReconnectTask()
+        cancelModeSwitch()
+        NetworkInfo.shared.clear()
+
+        modeSwitchGeneration += 1
+        let generation = modeSwitchGeneration
+        modeSwitchTargetID = id
+
+        if engine.status == "disconnected" {
+            finishModeSwitch(generation: generation, targetModeID: id)
+            return true
+        }
+
         engine.stop()
-        Task { [weak self] in
-            for _ in 0..<100 {
-                try? await Task.sleep(nanoseconds: 100_000_000)
-                guard let self, gen == self.reconnectGeneration else { return }
-                // 必须等到 disconnected 本身：disconnecting 期间 canConnect 为 false，
-                // 这时 connect() 会静默返回，重连就悄悄失败了。
-                if self.engine.status == "disconnected" {
-                    self.reconnecting = false
-                    self.connect()
+        modeSwitchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                guard generation == self.modeSwitchGeneration,
+                      !Task.isCancelled else {
                     return
                 }
+                if self.engine.status == "disconnected" {
+                    self.finishModeSwitch(
+                        generation: generation,
+                        targetModeID: id
+                    )
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
             }
-            guard let self, gen == self.reconnectGeneration else { return }
-            self.reconnecting = false
+            guard generation == self.modeSwitchGeneration,
+                  !Task.isCancelled else {
+                return
+            }
+            self.modeSwitchTask = nil
+            self.modeSwitchTargetID = nil
             self.engine.lastError = self.tr(
-                "重连超时：引擎未能在 10 秒内断开，请手动断开后再连接",
-                "Reconnect timed out: engine did not stop within 10s — disconnect manually and retry")
+                "切换超时：当前连接未能在 10 秒内完成断开",
+                "Switch timed out: the current connection did not finish disconnecting within 10s"
+            )
         }
+        return true
+    }
+
+    private func finishModeSwitch(
+        generation: Int,
+        targetModeID: String
+    ) {
+        guard generation == modeSwitchGeneration,
+              modeSwitchTargetID == targetModeID,
+              profile.activeModeID == targetModeID,
+              connectionDesired.modeID == targetModeID else {
+            return
+        }
+        modeSwitchTask = nil
+        modeSwitchTargetID = nil
+        connect()
+    }
+
+    private func cancelModeSwitch() {
+        modeSwitchGeneration += 1
+        modeSwitchTask?.cancel()
+        modeSwitchTask = nil
+        modeSwitchTargetID = nil
     }
 
     // MARK: - Intents（UI 与 DebugServer 共用的唯一入口）

@@ -1551,6 +1551,19 @@ struct RuleSetRow: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
                     .onChange(of: rule.url) { _, _ in state.save() }
+                Picker("", selection: $rule.fetchLineID) {
+                    Text(state.tr("直连", "Direct")).tag("direct")
+                    ForEach(state.profile.lines.filter {
+                        $0.enabled && $0.id != "direct"
+                    }) { line in
+                        Text(line.name).tag(line.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(width: 120)
+                .help(state.tr("选择获取线路", "Select fetch line"))
+                .onChange(of: rule.fetchLineID) { _, _ in state.save() }
             }
             HStack {
                 Text("格式").font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
@@ -1907,6 +1920,7 @@ struct ModeRow: View {
         .labelsHidden()
         .onChange(of: selectedID.wrappedValue) { _, _ in state.save() }
     }
+
 }
 
 // MARK: - 订阅行

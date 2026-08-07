@@ -22,6 +22,7 @@ enum TCPFlowSOCKSRelay {
         socksPort: UInt16,
         credentials: SOCKSCredentials? = nil,
         trialID: String,
+        traffic: ProviderTrafficLedger,
         logger: Logger
     ) -> ProviderRelayHandle {
         let connection = NWConnection(
@@ -64,7 +65,8 @@ enum TCPFlowSOCKSRelay {
                             flow: flow,
                             connection: connection,
                             resources: resources,
-                            shutdown: shutdown
+                            shutdown: shutdown,
+                            traffic: traffic
                         )
                         logger.debug(
                             "relay-finished trial=\(trialID, privacy: .public)"
@@ -287,7 +289,8 @@ enum TCPFlowSOCKSRelay {
         flow: NEAppProxyTCPFlow,
         connection: NWConnection,
         resources: TCPRelayResources,
-        shutdown: RelayTaskShutdown
+        shutdown: RelayTaskShutdown,
+        traffic: ProviderTrafficLedger
     ) async throws {
         try await RelayTaskPair.run(
             first: {
@@ -299,6 +302,7 @@ enum TCPFlowSOCKSRelay {
                         return
                     }
                     try await send(data, to: connection)
+                    traffic.recordUpload(data.count)
                 }
             },
             second: {
@@ -306,6 +310,7 @@ enum TCPFlowSOCKSRelay {
                     let result = try await receive(from: connection)
                     if !result.data.isEmpty {
                         try await write(result.data, to: flow)
+                        traffic.recordDownload(result.data.count)
                     }
                     if let error = result.error {
                         throw error

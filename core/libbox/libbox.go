@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +48,7 @@ import (
 	"sslcon/session"
 
 	"github.com/kafeifei/xdial/core/engine"
+	"github.com/kafeifei/xdial/core/subscription"
 )
 
 // Callback 镜像 core/engine.StatusCallback 的形状,保持 gomobile 可绑定
@@ -400,6 +402,109 @@ func (l *Libbox) ProbeOutboundIP(outboundTag string, timeoutMS int) (string, err
 		return "", fmt.Errorf("connection changed during outbound address probe")
 	}
 	return "", fmt.Errorf("outbound address probe failed: %s", strings.Join(probeErrors, "; "))
+}
+
+// RefreshRuleSet downloads and atomically replaces one validated cache entry
+// through the exact outbound and DNS transport compiled for this session. The
+// running router keeps using its already-loaded snapshot; the new copy becomes
+// active on the next connection transaction.
+func (l *Libbox) RefreshRuleSet(refreshJSON string) error {
+	var refresh transparentProxyRuleSetRefresh
+	if err := stdjson.Unmarshal([]byte(refreshJSON), &refresh); err != nil {
+		return fmt.Errorf("rule-set refresh request is invalid")
+	}
+	if refresh.RuleSetID == "" || refresh.URL == "" ||
+		refresh.OutboundTag == "" || refresh.ResolverTag == "" {
+		return fmt.Errorf("rule-set refresh request is incomplete")
+	}
+	if refresh.InputFormat != "text" && refresh.InputFormat != "source" &&
+		refresh.InputFormat != "binary" {
+		return fmt.Errorf("rule-set refresh input format is invalid")
+	}
+	if refresh.StoredFormat != "source" && refresh.StoredFormat != "binary" {
+		return fmt.Errorf("rule-set refresh storage format is invalid")
+	}
+	cleanPath := filepath.Clean(refresh.LocalPath)
+	if !filepath.IsAbs(cleanPath) ||
+		filepath.Base(filepath.Dir(cleanPath)) != "xdial-rule-sets" ||
+		filepath.Base(cleanPath) == "." {
+		return fmt.Errorf("rule-set refresh cache path is invalid")
+	}
+
+	l.mu.Lock()
+	if !l.running || l.box == nil || l.runtimeCtx == nil {
+		l.mu.Unlock()
+		return fmt.Errorf("connection is not running")
+	}
+	outbound, loaded := l.box.Outbound().Outbound(refresh.OutboundTag)
+	if !loaded {
+		l.mu.Unlock()
+		return fmt.Errorf("rule-set refresh outbound is unavailable")
+	}
+	dnsRouter := service.FromContext[adapter.DNSRouter](l.runtimeCtx)
+	dnsTransports := service.FromContext[adapter.DNSTransportManager](l.runtimeCtx)
+	if dnsRouter == nil || dnsTransports == nil {
+		l.mu.Unlock()
+		return fmt.Errorf("rule-set refresh resolver is unavailable")
+	}
+	dnsTransport, loaded := dnsTransports.Transport(refresh.ResolverTag)
+	if !loaded {
+		l.mu.Unlock()
+		return fmt.Errorf("rule-set refresh resolver is unavailable")
+	}
+	runtimeCtx := l.runtimeCtx
+	generation := l.generation
+	l.runtimeUsers.Add(1)
+	l.mu.Unlock()
+	defer l.runtimeUsers.Done()
+
+	lookup := func(ctx context.Context, _, host string) ([]netip.Addr, error) {
+		return dnsRouter.Lookup(ctx, host, adapter.DNSQueryOptions{
+			Transport:    dnsTransport,
+			DisableCache: true,
+		})
+	}
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, rawPort, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("remote address is invalid")
+		}
+		ip, err := netip.ParseAddr(host)
+		if err != nil {
+			return nil, fmt.Errorf("remote address is invalid")
+		}
+		port, err := strconv.ParseUint(rawPort, 10, 16)
+		if err != nil || port == 0 {
+			return nil, fmt.Errorf("remote address is invalid")
+		}
+		return outbound.DialContext(ctx, network, M.SocksaddrFrom(ip.Unmap(), uint16(port)))
+	}
+	content, err := subscription.FetchStrictBytesWithNetworkContext(
+		runtimeCtx,
+		refresh.URL,
+		maxNERuleSetBytes,
+		lookup,
+		dial,
+	)
+	if err != nil {
+		return fmt.Errorf("rule-set refresh failed")
+	}
+	if refresh.InputFormat == "text" {
+		content, err = convertTextRuleSet(content)
+		if err != nil {
+			return fmt.Errorf("rule-set refresh content is invalid")
+		}
+	}
+	if _, err := validateNERuleSet(content, refresh.StoredFormat, maxNERuleSetBytes); err != nil {
+		return fmt.Errorf("rule-set refresh content is invalid")
+	}
+	if !l.probeGenerationIsCurrent(generation) {
+		return fmt.Errorf("connection changed during rule-set refresh")
+	}
+	if err := writeNERuleSetCache(cleanPath, content); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (l *Libbox) probeGenerationIsCurrent(generation uint64) bool {

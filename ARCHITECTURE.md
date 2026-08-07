@@ -71,15 +71,18 @@ Codex / Cursor）和人类贡献者在改动本仓库前必须先读完本文，
 
 ### 定律二：内部正交律
 
-> **Ingress / Line / RuleSet / Mode 四个维度互不知道对方存在。Mode 是唯一的连接点。**
+> **Ingress / Line / RuleSet / Mode 的流量语义互相正交。Mode 是用户流量裁决的唯一连接点。**
 
 正面定义：
 
-- 四个维度各自只掌握自己那一层的信息，不持有、不查询、不推断其他维度的对象。
+- 四个维度各自只掌握自己那一层的信息，不持有、不查询、不推断其他维度的流量语义。
 - 只有 Mode 同时看得见 RuleSet 和 Line，并负责把它们绑定起来。
 - **声明 ≠ 生效。** 一个对象存在于 Profile 里，只表示"用户配置过它"。它是否对本机
   流量产生任何影响，唯一取决于 active Mode 是否引用它。未被引用的对象不得进入数据
   面配置，也不得持有影响本机流量的活会话。
+- D38 允许 URL RuleSet 额外选择一条 `fetch_line_id`，但它只表达远程资源的获取路径，
+  不表达任何用户流量出口。只有 active Mode 引用该 RuleSet 时，连接事务才可建立限时、
+  无系统 Ingress 的获取会话；它不能进入 Mode binding、route、普通 DNS 分域或默认出口。
 
 反面案例（真实历史）：
 
@@ -99,13 +102,14 @@ Codex / Cursor）和人类贡献者在改动本仓库前必须先读完本文，
 |---|---|---|---|
 | **Ingress**（入口）<br>tun / 系统代理 | 流量如何进盒；把包归因到源（进程、接口、地址族）；声明盒子占用的地址段 | **绝不参与路由裁决**。不决定任何流量走哪个出口，不携带任何域名/规则知识 | 在 `buildTUNInbound` 里按线路类型改 `route_exclude_address`（VPN 服务端地址例外是密封性要求——不排除就会自环——不是裁决）；在 inbound 上挂 `outbound` 字段；按"当前模式"改 tun 地址段 |
 | **Line**（出口） | 声明"怎么到达一个出口"：协议参数、凭据、传输选项、**能力**（能解析哪些后缀、是否自带 resolver、是否自带路由供给） | **绝不自行生效**。未被 active Mode 引用时，不得对本机流量决策产生任何影响；不得注册全局路由；不得抢占默认出口；不得改写系统状态 | Line 未被 active Mode 引用或用户未打开可见能力开关，就往 `route.rules` / `dns.rules` 插入 `preferred_by`；线路自己改写 `final`；线路 enabled 就发起出网连接 / 持有活跃会话 |
-| **RuleSet**（匹配） | 只管**匹配流量**：域名、后缀、CIDR、远程规则集资源 | **不知道任何 Line 存在**。`RuleSet` 结构体里绝不能出现 `line_id`、`outbound`、`server` 之类字段 | 在 `RuleSet` 上加 `DefaultLineID`；在 `buildRouteRule` 里根据规则集内容猜出口；订阅规则表直接携带出口名并绕过 Mode |
+| **RuleSet**（匹配） | 管理匹配内容：域名、后缀、CIDR、远程规则集资源；URL 类型可按 D38 选择一条仅用于资源获取的 `fetch_line_id` | **绝不借获取线路裁决用户流量**。不得携带 traffic `outbound`、默认出口或 DNS 分域规则 | 在 `RuleSet` 上加 `DefaultLineID`；在 `buildRouteRule` 里从 `fetch_line_id` 猜流量出口；订阅规则表直接携带出口名并绕过 Mode |
 | **Mode**（裁决） | 唯一裁决者：绑定 RuleSet→Line、指定默认出口、裁决 DNS 分域归属。route 规则和 DNS 规则**必须从同一份 Mode binding 编译** | 不定义匹配内容（那是 RuleSet），不定义出口参数（那是 Line），不定义流量如何进盒（那是 Ingress） | Mode 里内联域名列表；Mode 里内联服务器地址；route 规则从 Mode 编译而 DNS 规则从别处编译（两者必然漂移） |
 
-**依赖方向是单向的**：`Mode → {RuleSet, Line}`。RuleSet 不指向 Line，Line 不指向 RuleSet，二者都不指向 Mode。Ingress 谁也不指向。任何引入反向或横向依赖的改动都是越界。
-
-数据模型必须直接体现这条依赖方向。**给 `Line` 或 `RuleSet` 增加一个指向对方或
-Mode 的字段，就是越界的最短路径。**
+**用户流量的依赖方向仍是单向的**：`Mode → {RuleSet, Line}`。Line 不指向 RuleSet，
+二者都不指向 Mode，Ingress 谁也不指向。D38 唯一新增的是
+`URL RuleSet → fetch Line` 的资源供应引用；它必须由独立的获取编译路径消费，不能被
+traffic generator 当成 active Line。除这个有字段、生命周期和副作用门禁的例外外，
+任何反向或横向依赖仍是越界。
 
 ---
 
@@ -520,6 +524,8 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   计划只包含本次实际引用的 RuleSet、Line、Subscription，以及由同一份 Mode 推导出的
   DNS、sing-box 数据面和系统 Ingress；顺序和依赖关系也是计划的一部分。对象仅仅存在或
   `enabled` 不得进入计划，Swift 也不得另写一份“VPN → Tailscale → 规则”的固定流程。
+  D38 的 `fetch_line_id` 是 RuleSet 任务内部的资源供应能力，不得伪装成 Mode 的 Line
+  任务或改变 traffic plan。
 - **状态机**：一笔连接事务只有
   `planning → preparing → readyToCommit → committing → committed` 这一条成功路径；
   任一步失败或被取消都必须进入
@@ -583,6 +589,28 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   `InstallationReport`，禁止解析日志推动流程。每个步骤必须幂等；进程中断后从当前
   macOS 结构化状态重新执行。安装包替换失败恢复旧 app，helper 或扩展失败则保留原
   Underlay，并停在失败项供重试。
+
+### D38 — URL RuleSet 的获取线路与流量策略分离
+
+- **可见模型**：URL RuleSet 可以选择 `fetch_line_id`，默认值是内建 Direct。选择器属于
+  Rules 页面并紧跟 URL；它不是 `Mode.Binding`，也不得出现在“规则 → 线路”的流量策略
+  列表里。旧 Profile 缺少该字段时按 Direct 迁移。
+- **作用域**：获取线路只负责该远程资源的 DNS、HTTPS 连接、重定向和内容下载。目标
+  域名必须通过该线路对应的盒内 resolver 求值，连接必须经同一条精确 outbound 发出；
+  两个视角不得拆开。它不能生成用户流量 route、普通分域 DNS、默认出口或系统网络设置。
+- **缓存优先**：连接事务先校验按 RuleSet 身份、URL 和格式寻址的 last-known-good 缓存。
+  有有效缓存时立即生成并启动正式数据面；缓存过期只在系统 Commit 成功后后台刷新，
+  本次运行继续使用启动时已装载的快照，新副本下次连接生效。新鲜缓存不发起网络请求。
+- **冷启动**：没有有效缓存时，Provider 在系统 Commit 之前建立一条限时、无用户流量
+  Ingress、没有 Mode bindings 的隔离会话，只包含所选获取 Line。它完成精确出口就绪
+  验证、经该 Line 的 DNS 获取、严格 HTTPS/重定向/全地址 SSRF 校验、内容语义校验和
+  原子落盘后立即停止；任一步失败都归因到对应 RuleSet 任务并阻止 Commit，不得静默
+  改走 Direct。
+- **后台刷新**：正式数据面已包含同一获取 Line 时，刷新复用该运行实例；未包含时可在
+  Commit 后建立同样的隔离会话，刷新结束即停止。AnyConnect 和 Tailscale 等进程级单例
+  不得与正式数据面的另一实例并发；冲突时保留有效缓存并延后刷新，不能破坏已提交会话。
+- **激活门禁**：只有 active Mode 实际引用该 URL RuleSet 时，`fetch_line_id` 才能触发
+  会话或请求。未绑定、禁用或仅存在于 Profile 的 RuleSet 与 Line 必须保持零副作用。
 
 ### D-DNS — DNS 分域归属由 Mode 裁决
 
@@ -658,11 +686,11 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
 
 1. **不许让任何 Line 在未被 active Mode 引用时影响本机流量决策。** 包括但不限于：注册路由、抢占默认出口、注入 DNS 规则、修改系统状态。
 2. **不许在生成器里注入用户不可见的路由规则。** 生成的 `route.rules` 每一条都必须能追溯到某个 Mode binding、一份**显式列举**的系统白名单（`sniff` / `hijack-dns` / 桌面诊断 selector），或 D33 中“active Mode 引用 + Line 可见勾选项”共同启用的动态 MagicDNS 能力。白名单本身不得在未更新本文档的情况下扩充；MagicDNS 不得硬编码匹配范围。
-3. **不许让任何 Line 在未被引用时自动持有活会话或发起出网请求**（含探测、健康检查、订阅刷新、控制面登录）。"enabled 就去连一下试试"是副作用面泄漏——它产生用户不知道的网络指纹，也会在断网时产生莫名其妙的错误。唯一例外是 D33 定义的用户显式、限时、无系统网络副作用的配置会话；它不得混入完整数据面生命周期。
+3. **不许让任何 Line 在未被引用时自动持有活会话或发起出网请求**（含探测、健康检查、订阅刷新、控制面登录）。"enabled 就去连一下试试"是副作用面泄漏——它产生用户不知道的网络指纹，也会在断网时产生莫名其妙的错误。窄例外只有 D33 的显式配置会话，以及 D38 中被 active Mode 引用的 URL RuleSet 明确选择的限时获取会话；二者都不得接管系统网络或混入用户流量裁决。
 4. **不许让 Swift 复刻 Go 的 tag / slug / schema 规则。** `macos/Sources/XDial/NetworkInfo.swift` 的 `slugify` 是一份存量违规复刻——它的注释里自认"必须与 Go 端 `core/config/generator.go` 的 `slugify` 完全一致"，这句话本身就是 bug 的定义（两份实现，一份契约，无人守护）。正确做法是 Go 侧导出运行时目录、Swift 侧只消费，参考 `RuntimeSubscriptionCatalog`。新代码一律走导出，存量复刻应逐步迁移。
 5. **不许静默回落 direct**，也不许静默回落到公共 DNS，不许静默跳过一条无法生成的规则而不告知用户。**引用悬空必须报错**（见 INV6a），不得 `continue` 了事。
 6. **不许用日志抓取做控制流。** 解析 sing-box / sslcon 的日志文本来判断状态，然后据此决策——日志格式不是契约，上游改一个字就静默失效，且失效方式是"永远走 else 分支"，没有任何报错。状态判断必须走结构化接口（Clash API、进程退出码、显式回调）。
-7. **不许把 DNS 规则和 route 规则从不同来源编译。** 普通分域的唯一输入源是 `mode.Bindings`；D33 MagicDNS 的 DNS 与 route 必须共同来自同一条 active Tailscale Line 的同一个可见开关，并保持成对启停。macOS Transparent Proxy 中的 DNS 优先级最高用于保持 Tailnet 权威语义，不得类推到 route 或其他 Line。
+7. **不许把 DNS 规则和 route 规则从不同来源编译。** 普通用户流量分域的唯一输入源是 `mode.Bindings`；D33 MagicDNS 的 DNS 与 route 必须共同来自同一条 active Tailscale Line 的同一个可见开关，并保持成对启停。D38 的 resolver 只服务一笔 RuleSet 资源获取，不得生成用户流量 DNS 规则。macOS Transparent Proxy 中的 DNS 优先级最高用于保持 Tailnet 权威语义，不得类推到 route 或其他 Line。
 8. **不许在 XDial 里选择或重排 Underlay。** 不得按产品名、接口名称前缀或物理/虚拟
    分类删除候选，不得生成 outbound `bind_interface`，也不得为了"兼容某个 VPN"增加
    产品级 DNS/路由分支。旧原生 TUN 的 `route.default_interface` 唯一合法来源是
@@ -689,6 +717,8 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
 读取，不在本文维护一份容易漂移的镜像清单。它至少必须守住：
 
 - 未被 active Mode 引用的对象产生零数据面副作用；
+- URL RuleSet 缺省经 Direct 获取；显式获取 Line 不进入 traffic plan、route 或普通 DNS
+  分域，只有 active Mode 引用该 RuleSet 时才允许预取或后台刷新；
 - DNS 与路由同源、无隐藏规则、无静默 direct 或公共 DNS 回落；
 - 悬空引用报错，用户主动禁用产生可见 warning；
 - 桌面只允许一条 active AnyConnect；
@@ -728,6 +758,8 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
    可观察、逆序、幂等且有界的 Rollback，并证明系统接管已经移除？
 10. Tailscale DNS 快照是否只在本次 Provider 内存中存在，解析和 route resolve
     是否均禁用缓存，日志和跨语言接口是否没有暴露成员 IP，断开是否主动清空？
-11. `go build ./...` 和相关包的 `go test` 过了吗？`gofmt` 过了吗？
+11. URL RuleSet 的获取 Line 是否仍只存在于隔离资源会话，DNS 与 HTTPS 是否经同一
+    精确 Line，且它没有泄漏进 Mode 的用户流量任务或生成规则？
+12. `go build ./...` 和相关包的 `go test` 过了吗？`gofmt` 过了吗？
 
 任何一条答不上来，先停下来问，不要提交。

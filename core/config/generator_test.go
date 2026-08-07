@@ -1626,9 +1626,8 @@ func TestGenerateDesktopTUNCapturesIPv6(t *testing.T) {
 	}
 }
 
-// 规则集要从它自己所描述的路径上下载，硬编码 direct 就是从受限网络路径链路取 remotePolicy；
-// 首次下载失败是硬失败（sing-box router 启动即 FATAL），不是降级。
-func TestGenerateRuleSetDownloadDetourFollowsBinding(t *testing.T) {
+// RuleSet 获取线路不再从流量 binding 推断；未选择时默认直连。
+func TestGenerateRuleSetDownloadDetourDefaultsToDirect(t *testing.T) {
 	p := testProfile()
 	p.ActiveModeID = "domestic-ss"
 
@@ -1645,8 +1644,30 @@ func TestGenerateRuleSetDownloadDetourFollowsBinding(t *testing.T) {
 		t.Fatalf("expected the remote rule set only, got %v", sets)
 	}
 	set := sets[0].(map[string]interface{})
-	if set["tag"] != "ruleset-remote" || set["download_detour"] != "proxy-ss" {
-		t.Fatalf("rule set must download through its bound line: %v", set)
+	if set["tag"] != "ruleset-remote" || set["download_detour"] != "direct" {
+		t.Fatalf("rule set must default to direct acquisition: %v", set)
+	}
+}
+
+func TestGenerateRuleSetDownloadDetourFollowsExplicitUpdateLine(t *testing.T) {
+	p := splitProfileWithProxy()
+	p.Modes[0].Bindings = []RuleBinding{{
+		RuleSetID: "remote",
+		LineID:    "px",
+	}}
+	p.RuleSets[1].FetchLineID = "px"
+
+	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	set := cfg.Route["rule_set"].([]interface{})[0].(map[string]interface{})
+	if set["download_detour"] != "proxy-px" {
+		t.Fatalf("explicit update Line was ignored: %v", set)
 	}
 }
 

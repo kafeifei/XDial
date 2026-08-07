@@ -55,9 +55,58 @@ func fetchStrictWithContextLimit(ctx context.Context, rawURL string, maxBytes in
 // 数值地址固定拨号边界。string 在 Go 中可无损承载任意字节，这里再转回 []byte，
 // 因而同时适用于 JSON 与二进制 SRS。
 func FetchStrictBytes(rawURL string, maxBytes int64) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return FetchStrictBytesWithNetwork(
+		rawURL,
+		maxBytes,
+		net.DefaultResolver.LookupNetIP,
+		(&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	)
+}
+
+// FetchStrictBytesWithNetwork keeps the strict URL, redirect and all-address
+// validation boundary while letting a running data plane provide one exact DNS
+// view and one exact outbound dialer. DNS and egress therefore cannot silently
+// split across different Lines.
+func FetchStrictBytesWithNetwork(
+	rawURL string,
+	maxBytes int64,
+	lookup func(context.Context, string, string) ([]netip.Addr, error),
+	dial func(context.Context, string, string) (net.Conn, error),
+) ([]byte, error) {
+	return FetchStrictBytesWithNetworkContext(
+		context.Background(), rawURL, maxBytes, lookup, dial,
+	)
+}
+
+// FetchStrictBytesWithNetworkContext is the cancellable form used by a running
+// data-plane lease. Cancelling the session cancels DNS, dial and response reads.
+func FetchStrictBytesWithNetworkContext(
+	parent context.Context,
+	rawURL string,
+	maxBytes int64,
+	lookup func(context.Context, string, string) ([]netip.Addr, error),
+	dial func(context.Context, string, string) (net.Conn, error),
+) ([]byte, error) {
+	if lookup == nil || dial == nil {
+		return nil, fmt.Errorf("remote network path is unavailable")
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = newStrictDialContext(lookup, dial)
+	client := &http.Client{
+		Transport:     transport,
+		Timeout:       30 * time.Second,
+		CheckRedirect: strictRedirectPolicy,
+	}
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
-	content, err := fetchStrictWithContextLimit(ctx, rawURL, maxBytes)
+	if err := validateStrictRemoteURL(rawURL); err != nil {
+		return nil, err
+	}
+	content, err := fetchWithClientLimit(ctx, rawURL, client, maxBytes)
 	if err != nil {
 		return nil, err
 	}
