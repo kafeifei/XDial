@@ -126,8 +126,9 @@ type RuleSet struct {
 	Enabled bool        `json:"enabled"`
 
 	// URL 规则（远程规则集）
-	URL    string `json:"url,omitempty"`
-	Format string `json:"format,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Format      string `json:"format,omitempty"`
+	FetchLineID string `json:"fetch_line_id,omitempty"`
 	// Invert 只作用于 URL RuleSet 的匹配条件。它让“海外 IP”可以复用
 	// 国内 IP 列表并取反，避免维护一份庞大且容易漂移的补集。
 	Invert bool `json:"invert,omitempty"`
@@ -144,6 +145,15 @@ type RuleSet struct {
 	Processes    []string           `json:"processes,omitempty"`
 
 	RuntimeMatchKind RuleSetMatchKind `json:"-"`
+}
+
+// EffectiveFetchLineID returns the explicitly selected source Line. Legacy
+// RuleSets without the field retain Direct as their acquisition path.
+func (r RuleSet) EffectiveFetchLineID() string {
+	if r.FetchLineID != "" {
+		return r.FetchLineID
+	}
+	return builtinDirectLineID
 }
 
 // RuleBinding 模式中的一条绑定：规则→线路（或订阅）

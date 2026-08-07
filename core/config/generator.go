@@ -1186,6 +1186,33 @@ func buildTransparentProxyDNS(
 		}
 	}
 
+	// RuleSet 的获取线路只描述规则资源的供应路径，不参与上面的用户流量
+	// DNS/route 裁决。如果该线路本来就在当前 Mode 的正式数据面中，仍要把它的
+	// 专用 resolver 注册进来，供提交后的缓存刷新复用同一个运行实例。未进入
+	// validTags 的获取线路不会因此被带进正式数据面；它由独立的无策略会话刷新。
+	seenRuleSetSource := make(map[string]bool)
+	for index := range mode.Bindings {
+		ruleSet := profile.FindRuleSet(mode.Bindings[index].RuleSetID)
+		if ruleSet == nil || !ruleSet.Enabled ||
+			ruleSet.Type != RuleSetTypeURL || seenRuleSetSource[ruleSet.ID] {
+			continue
+		}
+		seenRuleSetSource[ruleSet.ID] = true
+		fetchLineID := ruleSet.EffectiveFetchLineID()
+		if fetchLineID == builtinDirectLineID {
+			continue
+		}
+		line := profile.FindLine(fetchLineID)
+		if line == nil || !line.Enabled {
+			continue
+		}
+		outTag := resolveOutboundTag(line)
+		if outTag == "" || !validTags[outTag] {
+			continue
+		}
+		ensureResolver(transparentProxyResolverForOutbound(outTag), outTag)
+	}
+
 	for _, sub := range profile.Subscriptions {
 		groupTags := subGroupTagMap[sub.ID]
 		if groupTags == nil {
@@ -1729,7 +1756,7 @@ func sbCollectRuleSets(
 				"tag":             tag,
 				"format":          format,
 				"url":             c.URL,
-				"download_detour": sbDownloadDetour(profile, &binding, subTagMap, validTags),
+				"download_detour": sbDownloadDetour(profile, c, validTags),
 			})
 		}
 	}
@@ -1755,20 +1782,19 @@ func sbCollectRuleSets(
 // 主要覆盖移动端和测试调用方。
 func sbDownloadDetour(
 	profile *Profile,
-	binding *RuleBinding,
-	subTagMap map[string]string,
+	ruleSet *RuleSet,
 	validTags map[string]bool,
 ) string {
 	var tag string
-	if binding.SubscriptionID != "" {
-		tag = subTagMap[binding.SubscriptionID]
-	} else {
-		line := profile.FindLine(binding.LineID)
-		if line == nil || !line.Enabled || line.Type == LineTypeTailscale {
-			return "direct"
-		}
-		tag = resolveOutboundTag(line)
+	fetchLineID := ruleSet.EffectiveFetchLineID()
+	if fetchLineID == builtinDirectLineID {
+		return "direct"
 	}
+	line := profile.FindLine(fetchLineID)
+	if line == nil || !line.Enabled || line.Type == LineTypeTailscale {
+		return "direct"
+	}
+	tag = resolveOutboundTag(line)
 	if tag == "" || tag == "direct" || tag == "vpn" || !validTags[tag] {
 		return "direct"
 	}

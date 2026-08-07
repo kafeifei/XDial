@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 
 struct InstallationView: View {
+    @Environment(\.dismissWindow) private var dismissWindow
     @ObservedObject var coordinator: InstallationCoordinator
 
     var body: some View {
@@ -78,9 +79,10 @@ struct InstallationView: View {
                     .buttonStyle(.borderedProminent)
                 } else if coordinator.isReady {
                     Button("完成") {
-                        NSApp.keyWindow?.close()
+                        closeWindow()
                     }
                     .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
                 }
             }
         }
@@ -89,6 +91,13 @@ struct InstallationView: View {
         .onAppear {
             coordinator.start()
         }
+        .onExitCommand {
+            closeWindow()
+        }
+    }
+
+    private func closeWindow() {
+        dismissWindow(id: "installation")
     }
 
     private var headerTitle: String {

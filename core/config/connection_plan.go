@@ -83,7 +83,7 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 		seen[task.ID] = true
 		plan.Tasks = append(plan.Tasks, task)
 	}
-	addRuleSet := func(ruleSet *RuleSet, targetTaskID, targetName string) {
+	addRuleSet := func(ruleSet *RuleSet, targetName string) {
 		if ruleSet == nil || !ruleSet.Enabled {
 			return
 		}
@@ -92,16 +92,10 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 		detail := "本地规则"
 		if ruleSet.Type == RuleSetTypeURL {
 			preparation = "cache-or-download"
-			detail = "远程规则；优先使用经校验缓存，必要时下载"
+			detail = "远程规则；经校验缓存立即启动，连接后更新"
 		}
 		if targetName != "" {
 			detail += " → " + targetName
-		}
-		dependencies := []string{"underlay:system"}
-		if targetTaskID != "" {
-			// The edge is represented in Detail for the UI. A RuleSet can be
-			// downloaded concurrently with its Line, so it does not depend on it.
-			_ = targetTaskID
 		}
 		add(ConnectionPlanTask{
 			ID:           taskID,
@@ -109,7 +103,7 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 			Name:         ruleSetLabel(ruleSet),
 			Detail:       detail,
 			Preparation:  preparation,
-			Dependencies: dependencies,
+			Dependencies: []string{"underlay:system"},
 			ResourceID:   ruleSet.ID,
 			ResourceType: string(ruleSet.Type),
 		})
@@ -206,7 +200,8 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 		if !effective {
 			continue
 		}
-		addRuleSet(ruleSet, targetTaskID, targetName)
+		_ = targetTaskID
+		addRuleSet(ruleSet, targetName)
 	}
 
 	if _, _, effective := resolveTarget(

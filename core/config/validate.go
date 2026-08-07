@@ -155,6 +155,27 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 			})
 			continue
 		}
+		if ruleSet.Type == RuleSetTypeURL && ruleSet.FetchLineID != "" {
+			if ruleSet.FetchLineID != builtinDirectLineID {
+				fetchLine := profile.FindLine(ruleSet.FetchLineID)
+				if fetchLine == nil {
+					return nil, fmt.Errorf(
+						"mode %q updates rule set %q through missing line %q",
+						mode.ID,
+						ruleSet.ID,
+						ruleSet.FetchLineID,
+					)
+				}
+				if !fetchLine.Enabled || !lineHasUsableOutbound(fetchLine) {
+					return nil, fmt.Errorf(
+						"mode %q updates rule set %q through unavailable line %q",
+						mode.ID,
+						ruleSet.ID,
+						ruleSet.FetchLineID,
+					)
+				}
+			}
+		}
 		if ruleSet.Type == RuleSetTypeApplication {
 			if err := validateApplicationRuleSet(ruleSet); err != nil {
 				return nil, fmt.Errorf("mode %q references invalid application rule set %q: %w",

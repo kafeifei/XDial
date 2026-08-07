@@ -274,6 +274,32 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
     }
 
+    func trafficSnapshot(
+        transactionID: String,
+        completion: @escaping (
+            Result<ProviderTrafficSnapshot, Error>
+        ) -> Void
+    ) {
+        let request = ProviderDiagnosticsRequest(
+            cmd: .trafficSnapshot,
+            transactionID: transactionID
+        )
+        sendProviderDiagnostics(request, timeout: 3) { result in
+            switch result {
+            case let .failure(error):
+                completion(.failure(error))
+            case let .success(data):
+                guard let snapshot = data.traffic else {
+                    completion(.failure(
+                        ProviderDiagnosticsHostError.payloadMismatch
+                    ))
+                    return
+                }
+                completion(.success(snapshot))
+            }
+        }
+    }
+
     #if DEBUG
     func applicationAttributionSnapshot(
         transactionID: String,

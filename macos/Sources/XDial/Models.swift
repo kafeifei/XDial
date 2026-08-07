@@ -336,6 +336,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
     var enabled: Bool = true
     var url: String = ""
     var format: String = "auto"
+    var fetchLineID: String = "direct"
     /// 仅用于 URL RuleSet。true 表示匹配远程列表之外的目标，例如
     /// “海外 IP”复用国内 IP 列表并取反，不需要维护一份容易漂移的世界 CIDR 副本。
     var invert: Bool = false
@@ -354,6 +355,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
         enabled: Bool = true,
         url: String = "",
         format: String = "auto",
+        fetchLineID: String = "direct",
         invert: Bool = false,
         domains: [String] = [],
         cidrs: [String] = [],
@@ -366,6 +368,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
         self.enabled = enabled
         self.url = url
         self.format = format
+        self.fetchLineID = fetchLineID
         self.invert = invert
         self.domains = domains
         self.cidrs = cidrs
@@ -380,6 +383,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
         case enabled
         case url
         case format
+        case fetchLineID = "fetch_line_id"
         case invert
         case domains
         case cidrs
@@ -404,6 +408,10 @@ struct RuleSet: Codable, Identifiable, Hashable {
             String.self,
             forKey: .format
         ) ?? "auto"
+        fetchLineID = try values.decodeIfPresent(
+            String.self,
+            forKey: .fetchLineID
+        ) ?? "direct"
         invert = try values.decodeIfPresent(
             Bool.self,
             forKey: .invert
@@ -556,7 +564,11 @@ struct RuleBinding: Codable, Hashable, Identifiable {
         case subscriptionID = "subscription_id"
     }
 
-    init(ruleSetID: String, lineID: String = "", subscriptionID: String = "") {
+    init(
+        ruleSetID: String,
+        lineID: String = "",
+        subscriptionID: String = ""
+    ) {
         self.ruleSetID = ruleSetID
         self.lineID = lineID
         self.subscriptionID = subscriptionID

@@ -5,6 +5,7 @@ enum ProviderDiagnosticsCommand: String, Codable {
     case routingProbeSnapshot = "routing-probe-snapshot"
     case beginRouteProbe = "begin-route-probe"
     case applicationAttributionSnapshot = "application-attribution-snapshot"
+    case trafficSnapshot = "traffic-snapshot"
 }
 
 struct ProviderDiagnosticsRequest: Codable, Equatable {
@@ -197,18 +198,34 @@ struct ProviderApplicationAttributionSnapshot: Codable, Equatable {
     }
 }
 
+/// 当前已提交 Provider 事务转发给应用层的净荷字节累计值。
+///
+/// 这里只统计 Transparent Proxy relay 实际完成转发的 TCP/UDP payload；不把
+/// Underlay 接口、SOCKS framing 或其他进程流量混进来。
+struct ProviderTrafficSnapshot: Codable, Equatable {
+    let downloadBytes: UInt64
+    let uploadBytes: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case downloadBytes = "download_bytes"
+        case uploadBytes = "upload_bytes"
+    }
+}
+
 struct ProviderDiagnosticsData: Codable, Equatable {
     let routingProbe: ProviderRoutingProbeSnapshot?
     let lineOutboundAddress: ProviderLineOutboundAddress?
     let begunRouteProbe: ProviderBegunRouteProbe?
     let applicationAttribution:
         ProviderApplicationAttributionSnapshot?
+    let traffic: ProviderTrafficSnapshot?
 
     enum CodingKeys: String, CodingKey {
         case routingProbe = "routing_probe"
         case lineOutboundAddress = "line_outbound_address"
         case begunRouteProbe = "begun_route_probe"
         case applicationAttribution = "application_attribution"
+        case traffic
     }
 
     init(
@@ -216,12 +233,14 @@ struct ProviderDiagnosticsData: Codable, Equatable {
         lineOutboundAddress: ProviderLineOutboundAddress? = nil,
         begunRouteProbe: ProviderBegunRouteProbe? = nil,
         applicationAttribution:
-            ProviderApplicationAttributionSnapshot? = nil
+            ProviderApplicationAttributionSnapshot? = nil,
+        traffic: ProviderTrafficSnapshot? = nil
     ) {
         self.routingProbe = routingProbe
         self.lineOutboundAddress = lineOutboundAddress
         self.begunRouteProbe = begunRouteProbe
         self.applicationAttribution = applicationAttribution
+        self.traffic = traffic
     }
 }
 
@@ -456,7 +475,7 @@ enum ProviderDiagnosticsCodec {
 
         var allowedKeys = baseKeys
         switch command {
-        case .applicationAttributionSnapshot:
+        case .applicationAttributionSnapshot, .trafficSnapshot:
             break
         case .routingProbeSnapshot:
             allowedKeys.insert("probe_id")
@@ -480,7 +499,7 @@ enum ProviderDiagnosticsCodec {
             throw ProviderDiagnosticsCodecError.invalidRequest
         }
         switch request.cmd {
-        case .applicationAttributionSnapshot:
+        case .applicationAttributionSnapshot, .trafficSnapshot:
             break
         case .routingProbeSnapshot:
             guard

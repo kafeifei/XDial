@@ -345,6 +345,70 @@ final class ProviderDiagnosticsIPCTests: XCTestCase {
                 debugCommandsEnabled: false
             )
         )
+        XCTAssertNil(
+            ProviderDiagnosticsGate.commandRejectionCode(
+                .trafficSnapshot,
+                debugCommandsEnabled: false
+            )
+        )
+    }
+
+    func testTrafficSnapshotHasNoCallerSelectedScope() throws {
+        let request = ProviderDiagnosticsRequest(
+            cmd: .trafficSnapshot,
+            transactionID: "transaction-1"
+        )
+        XCTAssertEqual(
+            try ProviderDiagnosticsCodec.decodeRequest(
+                ProviderDiagnosticsCodec.encodeRequest(request)
+            ),
+            request
+        )
+        XCTAssertThrowsError(
+            try ProviderDiagnosticsCodec.decodeRequest(Data(
+                #"{"v":1,"cmd":"traffic-snapshot","transaction_id":"transaction-1","line_id":"company"}"#.utf8
+            ))
+        )
+
+        let response = ProviderDiagnosticsResponse.success(
+            transactionID: "transaction-1",
+            data: ProviderDiagnosticsData(
+                traffic: ProviderTrafficSnapshot(
+                    downloadBytes: 4_096,
+                    uploadBytes: 1_024
+                )
+            )
+        )
+        XCTAssertEqual(
+            try ProviderDiagnosticsCodec.decodeResponse(
+                ProviderDiagnosticsCodec.encodeResponse(response)
+            ),
+            response
+        )
+    }
+
+    func testTrafficLedgerIsBoundToCurrentTransaction() {
+        let ledger = ProviderTrafficLedger()
+        ledger.reset(transactionID: "transaction-1")
+        ledger.recordDownload(2_048)
+        ledger.recordUpload(512)
+        XCTAssertEqual(
+            ledger.snapshot(transactionID: "transaction-1"),
+            ProviderTrafficSnapshot(
+                downloadBytes: 2_048,
+                uploadBytes: 512
+            )
+        )
+        XCTAssertNil(ledger.snapshot(transactionID: "old"))
+
+        ledger.reset(transactionID: "transaction-2")
+        XCTAssertEqual(
+            ledger.snapshot(transactionID: "transaction-2"),
+            ProviderTrafficSnapshot(
+                downloadBytes: 0,
+                uploadBytes: 0
+            )
+        )
     }
 
     func testSnapshotMustMatchExpectedCurrentProbeID() {

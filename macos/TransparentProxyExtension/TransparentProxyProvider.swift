@@ -129,6 +129,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         ProviderRelayRegistry<ProviderRelayEndpoint>()
     private let applicationAttribution =
         ProviderApplicationAttributionLedger()
+    private let traffic = ProviderTrafficLedger()
 
     private var runtime: EmbeddedSingBoxRuntime?
     private var session: EmbeddedSingBoxRuntime.Session?
@@ -206,6 +207,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         cancellationLock.unlock()
         outboundProbeGate.invalidate()
         generation = transactionID
+        traffic.reset(transactionID: transactionID)
         let generation = generation
         engineQueue.async { [weak self] in
             guard let self else {
@@ -460,6 +462,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                             }
                             return
                         }
+                        runtime.beginRuleSetRefreshes()
                         self.logger.notice(
                             "started generation=\(generation, privacy: .public)"
                         )
@@ -663,6 +666,20 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
 
             let response: ProviderDiagnosticsResponse
             switch request.cmd {
+            case .trafficSnapshot:
+                guard let snapshot = self.traffic.snapshot(
+                    transactionID: request.transactionID
+                ) else {
+                    response = .failure(
+                        transactionID: request.transactionID,
+                        code: "stale-session"
+                    )
+                    break
+                }
+                response = .success(
+                    transactionID: request.transactionID,
+                    data: ProviderDiagnosticsData(traffic: snapshot)
+                )
             case .applicationAttributionSnapshot:
                 response = .success(
                     transactionID: request.transactionID,
@@ -800,6 +817,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 socksPort: reservation.endpoint.port,
                 credentials: credentials,
                 trialID: reservation.generation,
+                traffic: traffic,
                 logger: logger
             )
         } else if let udpFlow = flow as? NEAppProxyUDPFlow {
@@ -808,6 +826,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 socksPort: reservation.endpoint.port,
                 credentials: credentials,
                 trialID: reservation.generation,
+                traffic: traffic,
                 logger: logger
             )
         } else {

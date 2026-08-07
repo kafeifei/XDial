@@ -154,12 +154,11 @@ release: libbox-macos-xcframework
 	ditto "$(BUILD_DIR)/macos-xcode-release/Build/Products/Release/XDial.app" "$(RELEASE_BUNDLE)"
 	@echo "release bundle: $(RELEASE_BUNDLE) (version $(PLIST_VERSION))"
 
-# 一键重启:先让旧实例完成网络回滚→重编→由应用安装事务替换 /Applications
-# 中的旧版→等 debug server 上线。这里不能把 app 写成 prerequisite：Make 会先
-# 执行 prerequisite，导致仍在运行的旧宿主无法使用刚编译的正常退出实现。
-# 不要在 build/ 留旧 App 容器，否则 macOS 会继续把它关联的 System Extension
-# 显示为已安装。
+# 一键重启：先完整构建并签名新版本，成功后才让旧实例完成网络回滚并退出，
+# 最后启动新版本、由应用安装事务替换 /Applications 中的旧版，并等待 Debug
+# Server 上线。构建失败不得影响正在运行的旧实例。
 restart:
+	@$(MAKE) app DEBUG_BUILD_VERSION=$(DEBUG_BUILD_VERSION)
 	@if curl -s -m 1 http://127.0.0.1:19876/health >/dev/null 2>&1; then \
 		curl -s -m 2 -X POST http://127.0.0.1:19876/action \
 			-d '{"action":"quit"}' >/dev/null 2>&1 || true; \
@@ -171,7 +170,6 @@ restart:
 		echo "! graceful XDial shutdown timed out; forcing host exit"; \
 		pkill -x XDial 2>/dev/null || true; \
 	fi
-	@$(MAKE) app DEBUG_BUILD_VERSION=$(DEBUG_BUILD_VERSION)
 	@rm -rf "$(BUILD_DIR)/XDial.previous.app"
 	@open "$(APP_BUNDLE)"
 	@for i in $$(seq 1 30); do \

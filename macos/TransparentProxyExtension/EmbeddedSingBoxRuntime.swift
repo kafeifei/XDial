@@ -58,7 +58,7 @@ final class EmbeddedSingBoxRuntime {
             }
         }
 
-        struct AnyConnect: Decodable {
+        struct AnyConnect: Codable {
             let server: String
             let username: String
             let password: String
@@ -72,7 +72,7 @@ final class EmbeddedSingBoxRuntime {
             }
         }
 
-        struct Tailscale: Decodable {
+        struct Tailscale: Codable {
             let endpointTag: String
             let exitNode: String
             let magicDNSEnabled: Bool
@@ -104,6 +104,56 @@ final class EmbeddedSingBoxRuntime {
             case applicationProcessCredentials = "application_process_credentials"
             case anyConnect = "anyconnect"
             case tailscale
+        }
+    }
+
+    private struct RuleSetBootstrapEnvelope: Decodable {
+        struct Refresh: Codable {
+            let ruleSetID: String
+            let url: String
+            let localPath: String
+            let inputFormat: String
+            let storedFormat: String
+            let outboundTag: String
+            let resolverTag: String
+
+            enum CodingKeys: String, CodingKey {
+                case ruleSetID = "rule_set_id"
+                case url
+                case localPath = "local_path"
+                case inputFormat = "input_format"
+                case storedFormat = "stored_format"
+                case outboundTag = "outbound_tag"
+                case resolverTag = "resolver_tag"
+            }
+        }
+
+        struct BootstrapSession: Decodable {
+            let configJSON: String
+            let lineID: String
+            let outboundTag: String
+            let refreshes: [Refresh]
+            let reuseActive: Bool
+            let anyConnect: SessionEnvelope.AnyConnect?
+            let tailscale: SessionEnvelope.Tailscale?
+
+            enum CodingKeys: String, CodingKey {
+                case configJSON = "config_json"
+                case lineID = "line_id"
+                case outboundTag = "outbound_tag"
+                case refreshes
+                case reuseActive = "reuse_active"
+                case anyConnect = "anyconnect"
+                case tailscale
+            }
+        }
+
+        let preflightSessions: [BootstrapSession]?
+        let backgroundSessions: [BootstrapSession]?
+
+        enum CodingKeys: String, CodingKey {
+            case preflightSessions = "preflight_sessions"
+            case backgroundSessions = "background_sessions"
         }
     }
 
@@ -231,6 +281,11 @@ final class EmbeddedSingBoxRuntime {
     private let callback: EngineCallback
     private let engineLock = NSLock()
     private var engine: LibboxLibbox?
+    private var backgroundRuleSetSessions:
+        [RuleSetBootstrapEnvelope.BootstrapSession] = []
+    private var backgroundNetworkSnapshot: InterfaceSnapshot?
+    private var backgroundCancellation: ConnectionCancellation?
+    private var acquisitionEngine: LibboxLibbox?
 
     init(
         logger: Logger,
@@ -264,7 +319,48 @@ final class EmbeddedSingBoxRuntime {
 
         try checkCancellation(cancellation)
         reporter.setState(.preparing)
-        reporter.setTask(id: "dns:mode", state: .running)
+        var bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
+        while bootstrapPort == port {
+            bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
+        }
+        var bootstrapGenerationError: NSError?
+        let bootstrapJSON =
+            LibboxGenerateTransparentProxyRuleSetBootstrap(
+                profileJSON,
+                basePath.path,
+                Int(bootstrapPort),
+                UUID().uuidString,
+                UUID().uuidString + UUID().uuidString,
+                networkSnapshot.defaultInterface.name,
+                networkSnapshot.systemDNSJSON,
+                &bootstrapGenerationError
+            )
+        if let bootstrapGenerationError {
+            throw bootstrapGenerationError
+        }
+        guard
+            let bootstrapData = bootstrapJSON.data(using: .utf8),
+            let bootstrap = try? JSONDecoder().decode(
+                RuleSetBootstrapEnvelope.self,
+                from: bootstrapData
+            ),
+            (bootstrap.preflightSessions ?? []).allSatisfy(
+                isValidRuleSetBootstrapSession
+            ),
+            (bootstrap.backgroundSessions ?? []).allSatisfy(
+                isValidRuleSetBootstrapSession
+            )
+        else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        for bootstrapSession in bootstrap.preflightSessions ?? [] {
+            try runRuleSetAcquisitionSession(
+                bootstrapSession,
+                networkSnapshot: networkSnapshot,
+                reporter: reporter,
+                cancellation: cancellation
+            )
+        }
         let preparationCallback = PreparationCallback(
             reporter: reporter
         )
@@ -345,6 +441,7 @@ final class EmbeddedSingBoxRuntime {
         reporter.setPendingTasks(kind: "rule_set", state: .ready)
         reporter.setTasks(kind: "line", state: .running)
         reporter.setTasks(kind: "subscription", state: .running)
+        reporter.setTask(id: "dns:mode", state: .running)
         reporter.setTask(id: "data-plane:sing-box", state: .running)
         try checkCancellation(cancellation)
         guard let instance = LibboxNew(callback) else {
@@ -512,8 +609,27 @@ final class EmbeddedSingBoxRuntime {
             }
             reporter.setTask(id: "dns:mode", state: .ready)
             try checkCancellation(cancellation)
+            let safeBackgroundSessions =
+                (bootstrap.backgroundSessions ?? []).filter { candidate in
+                    let conflictsWithActiveSingleton =
+                        !candidate.reuseActive &&
+                        ((candidate.anyConnect != nil &&
+                            envelope.anyConnect != nil) ||
+                            (candidate.tailscale != nil &&
+                                envelope.tailscale != nil))
+                    if conflictsWithActiveSingleton {
+                        logger.warning(
+                            "rule-set-refresh-deferred reason=active-singleton-conflict line=\(candidate.lineID, privacy: .public)"
+                        )
+                    }
+                    return !conflictsWithActiveSingleton
+                }
             engineLock.lock()
             engine = instance
+            backgroundRuleSetSessions =
+                safeBackgroundSessions
+            backgroundNetworkSnapshot = networkSnapshot
+            backgroundCancellation = cancellation
             engineLock.unlock()
             reporter.setTask(
                 id: "data-plane:sing-box",
@@ -550,6 +666,227 @@ final class EmbeddedSingBoxRuntime {
             callback.markStopped()
             try? instance.stop()
             throw error
+        }
+    }
+
+    private func isValidRuleSetBootstrapSession(
+        _ session: RuleSetBootstrapEnvelope.BootstrapSession
+    ) -> Bool {
+        !session.configJSON.isEmpty &&
+            !session.lineID.isEmpty &&
+            !session.outboundTag.isEmpty &&
+            !session.refreshes.isEmpty &&
+            session.refreshes.allSatisfy { refresh in
+                !refresh.ruleSetID.isEmpty &&
+                    !refresh.url.isEmpty &&
+                    !refresh.localPath.isEmpty &&
+                    !refresh.inputFormat.isEmpty &&
+                    !refresh.storedFormat.isEmpty &&
+                    !refresh.outboundTag.isEmpty &&
+                    !refresh.resolverTag.isEmpty
+            } &&
+            (session.tailscale.map { tailscale in
+                !tailscale.endpointTag.isEmpty &&
+                    !tailscale.exitNode.isEmpty &&
+                    (!tailscale.magicDNSEnabled ||
+                        !(tailscale.dnsServerTag ?? "").isEmpty)
+            } ?? true)
+    }
+
+    private func encodedRuleSetRefreshRequest(
+        _ refresh: RuleSetBootstrapEnvelope.Refresh
+    ) throws -> String {
+        let data = try JSONEncoder().encode(refresh)
+        guard let request = String(data: data, encoding: .utf8) else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        return request
+    }
+
+    private func configureBootstrapInstance(
+        _ instance: LibboxLibbox,
+        networkSnapshot: InterfaceSnapshot
+    ) throws {
+        instance.setUnderlayInterfaceBinding(true)
+        try instance.setNetworkInterfaces(networkSnapshot.interfacesJSON)
+        instance.setDefaultInterface(
+            networkSnapshot.defaultInterface.name,
+            index: networkSnapshot.defaultInterface.index
+        )
+    }
+
+    private func startBootstrapInstance(
+        _ instance: LibboxLibbox,
+        session: RuleSetBootstrapEnvelope.BootstrapSession,
+        cancellation: ConnectionCancellation
+    ) throws {
+        try checkCancellation(cancellation)
+        if let anyConnect = session.anyConnect {
+            var resolveError: NSError?
+            let dialAddress = LibboxResolveServerIPv4(
+                anyConnect.server,
+                &resolveError
+            )
+            if let resolveError {
+                throw resolveError
+            }
+            try instance.startResolved(
+                withInsecure: anyConnect.server,
+                dialAddress: dialAddress,
+                username: anyConnect.username,
+                password: anyConnect.password,
+                allowInsecure: anyConnect.allowInsecure,
+                configJSON: session.configJSON
+            )
+            try waitForAnyConnectRecovery(
+                instance,
+                cancellation: cancellation
+            )
+        } else {
+            try instance.startStandalone(session.configJSON)
+        }
+    }
+
+    private func runRuleSetAcquisitionSession(
+        _ session: RuleSetBootstrapEnvelope.BootstrapSession,
+        networkSnapshot: InterfaceSnapshot,
+        reporter: ConnectionTransactionReporter?,
+        cancellation: ConnectionCancellation,
+        continueAfterRefreshFailure: Bool = false
+    ) throws {
+        let bootstrapCallback = BootstrapEngineCallback(logger: logger)
+        guard let instance = LibboxNew(bootstrapCallback) else {
+            throw RuntimeError.unavailable
+        }
+        engineLock.lock()
+        acquisitionEngine = instance
+        engineLock.unlock()
+        defer {
+            engineLock.lock()
+            if acquisitionEngine === instance {
+                acquisitionEngine = nil
+            }
+            engineLock.unlock()
+        }
+        do {
+            try configureBootstrapInstance(
+                instance,
+                networkSnapshot: networkSnapshot
+            )
+            try startBootstrapInstance(
+                instance,
+                session: session,
+                cancellation: cancellation
+            )
+            if let tailscale = session.tailscale {
+                _ = try waitForTailscale(
+                    instance,
+                    target: tailscale,
+                    reporter: reporter,
+                    taskID: "rule-set:" +
+                        (session.refreshes.first?.ruleSetID ?? ""),
+                    cancellation: cancellation
+                )
+            } else if session.anyConnect == nil {
+                try checkCancellation(cancellation)
+                var probeError: NSError?
+                let address = instance.probeOutboundIP(
+                    session.outboundTag,
+                    timeoutMS: 8_000,
+                    error: &probeError
+                )
+                guard probeError == nil, !address.isEmpty else {
+                    throw probeError ?? RuntimeError.lineCapabilityUnavailable
+                }
+            }
+            for (index, refresh) in session.refreshes.enumerated() {
+                try checkCancellation(cancellation)
+                let taskID = "rule-set:" + refresh.ruleSetID
+                reporter?.setTask(id: taskID, state: .running)
+                let request = try encodedRuleSetRefreshRequest(refresh)
+                do {
+                    try instance.refreshRuleSet(request)
+                } catch {
+                    reporter?.fail(
+                        error,
+                        code: "rule-set-refresh-failed",
+                        taskID: taskID
+                    )
+                    if !continueAfterRefreshFailure {
+                        throw error
+                    }
+                    logger.warning(
+                        "rule-set-refresh-failed phase=isolated index=\(index, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                    )
+                    continue
+                }
+                reporter?.setTask(id: taskID, state: .ready)
+                logger.notice(
+                    "rule-set-refresh-ready phase=isolated index=\(index, privacy: .public)"
+                )
+            }
+        } catch {
+            try? instance.stop()
+            throw error
+        }
+        try instance.stop()
+    }
+
+    func beginRuleSetRefreshes() {
+        engineLock.lock()
+        let sessions = backgroundRuleSetSessions
+        let networkSnapshot = backgroundNetworkSnapshot
+        let cancellation = backgroundCancellation
+        backgroundRuleSetSessions = []
+        engineLock.unlock()
+        guard
+            !sessions.isEmpty,
+            let networkSnapshot,
+            let cancellation
+        else {
+            return
+        }
+        DispatchQueue.global(qos: .utility).async {
+            for (sessionIndex, session) in sessions.enumerated() {
+                if cancellation.isCancelled {
+                    return
+                }
+                do {
+                    if session.reuseActive {
+                        guard let instance = self.currentEngine() else {
+                            return
+                        }
+                        for (refreshIndex, refresh) in
+                            session.refreshes.enumerated()
+                        {
+                            do {
+                                let request = try
+                                    self.encodedRuleSetRefreshRequest(refresh)
+                                try instance.refreshRuleSet(request)
+                                self.logger.notice(
+                                    "rule-set-refresh-ready phase=active session=\(sessionIndex, privacy: .public) index=\(refreshIndex, privacy: .public)"
+                                )
+                            } catch {
+                                self.logger.warning(
+                                    "rule-set-refresh-failed phase=active session=\(sessionIndex, privacy: .public) index=\(refreshIndex, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                                )
+                            }
+                        }
+                    } else {
+                        try self.runRuleSetAcquisitionSession(
+                            session,
+                            networkSnapshot: networkSnapshot,
+                            reporter: nil,
+                            cancellation: cancellation,
+                            continueAfterRefreshFailure: true
+                        )
+                    }
+                } catch {
+                    self.logger.warning(
+                        "rule-set-refresh-failed phase=background session=\(sessionIndex, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
         }
     }
 
@@ -621,8 +958,14 @@ final class EmbeddedSingBoxRuntime {
         callback.markStopped()
         engineLock.lock()
         let current = engine
+        let currentAcquisition = acquisitionEngine
         engine = nil
+        acquisitionEngine = nil
+        backgroundRuleSetSessions = []
+        backgroundNetworkSnapshot = nil
+        backgroundCancellation = nil
         engineLock.unlock()
+        try? currentAcquisition?.stop()
         guard let current else {
             return
         }
@@ -662,7 +1005,7 @@ final class EmbeddedSingBoxRuntime {
     private func waitForTailscale(
         _ instance: LibboxLibbox,
         target: SessionEnvelope.Tailscale,
-        reporter: ConnectionTransactionReporter,
+        reporter: ConnectionTransactionReporter?,
         taskID: String,
         cancellation: ConnectionCancellation
     ) throws -> TransparentProxyPreparedTailscaleDNS? {
@@ -993,7 +1336,7 @@ final class EmbeddedSingBoxRuntime {
                     )
                 facts["final_path_candidate_relay"] =
                     node.pathCandidate == "relay"
-                reporter.note(
+                reporter?.note(
                     code: "tailscale-peer-derp-path-observation",
                     message:
                         "DERP 路径首尾观察：\(comparison.logSummary)",
@@ -1069,6 +1412,29 @@ final class EmbeddedSingBoxRuntime {
         }
     }
 
+}
+
+private final class BootstrapEngineCallback:
+    NSObject,
+    LibboxCallbackProtocol
+{
+    private let logger: Logger
+
+    init(logger: Logger) {
+        self.logger = logger
+    }
+
+    func onStatusChanged(_ statusJSON: String?) {
+        logger.debug(
+            "rule-set-bootstrap-status value=\(statusJSON ?? "-", privacy: .private)"
+        )
+    }
+
+    func onError(_ code: Int, message: String?) {
+        logger.warning(
+            "rule-set-bootstrap-error code=\(code, privacy: .public) message=\(message ?? "-", privacy: .private)"
+        )
+    }
 }
 
 private final class PreparationCallback:
