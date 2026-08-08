@@ -57,7 +57,6 @@ struct XDialApp: App {
             MainPopover()
                 .environmentObject(state)
                 .tint(XDialPalette.accent)
-                .preferredColorScheme(state.appearance.colorScheme)
         } label: {
             MenuBarLabel(connected: state.isConnected)
         }
@@ -67,7 +66,6 @@ struct XDialApp: App {
             SettingsView()
                 .environmentObject(state)
                 .tint(XDialPalette.accent)
-                .preferredColorScheme(state.appearance.colorScheme)
         }
         .defaultSize(width: 540, height: 540)
         .windowResizability(.contentSize)
@@ -78,7 +76,6 @@ struct XDialApp: App {
             )
             .environmentObject(state)
             .tint(XDialPalette.accent)
-            .preferredColorScheme(state.appearance.colorScheme)
         }
         .defaultSize(width: 480, height: 420)
         .windowResizability(.contentSize)
@@ -90,6 +87,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminationApproved = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        XDialWindowAppearanceController.applyToApplication(
+            AppAppearance.persisted(in: xdialDefaults)
+        )
         AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
 
         // 设置窗口：不随失焦隐藏 + 出现在 Cmd+Tab

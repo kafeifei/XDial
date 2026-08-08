@@ -198,6 +198,7 @@ targets:
       - Tests
       - Shared
       - Sources/XDial/Models.swift
+      - Sources/XDial/Localization.swift
       - Sources/XDial/ScenarioIconCatalog.swift
       - Sources/XDial/ScenarioGridLayout.swift
       - TransparentProxyExtension/ConnectionTransactionReporter.swift
