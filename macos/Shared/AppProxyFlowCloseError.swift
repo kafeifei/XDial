@@ -45,8 +45,12 @@ enum AppProxyFlowCloseError {
             return self.code(for: code)
         case .dns:
             return .hostUnreachable
-        case .tls, .wifiAware:
+        case .tls:
             return .internal
+#if compiler(>=6.2)
+        case .wifiAware:
+            return .internal
+#endif
         @unknown default:
             return .internal
         }
