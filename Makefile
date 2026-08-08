@@ -24,12 +24,23 @@ PATCHED_GO_INPUTS_CURRENT := $(shell bash $(PATCHED_GO_SCRIPT) --check >/dev/nul
 # preserved, so it is the authoritative mapping to the patched Tailscale module.
 PATCHED_GO_ENV = GOWORK='$(PATCHED_WORKFILE)' GOFLAGS=
 SING_BOX_TEST_BINARY := $(abspath $(BUILD_DIR)/tools/sing-box)
+MACOS_ICON_GENERATOR := scripts/generate-macos-app-icon/main.swift
+MACOS_ICON_SOURCE := macos/Sources/XDial/AppIcon.swift
 # SMAppService 要求签名身份跨构建稳定：ad-hoc 签名每次构建身份都变，
 # 系统会把重编后的 daemon 当新程序、要求重新批准。默认用开发者证书
 # （partial match，本机唯一），无证书环境可 SIGN_IDENTITY=- 回落 ad-hoc。
 SIGN_IDENTITY ?= Apple Development
 
 .PHONY: all cli app release restart inspector clean prepare-patched-go go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
+
+macos/AppIcon.icns: $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
+	@rm -rf "$(BUILD_DIR)/AppIcon.iconset" "$(BUILD_DIR)/generate-app-icon"
+	@mkdir -p "$(BUILD_DIR)/AppIcon.iconset"
+	xcrun swiftc $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR) \
+		-o "$(BUILD_DIR)/generate-app-icon"
+	"$(BUILD_DIR)/generate-app-icon" "$(BUILD_DIR)/AppIcon.iconset"
+	iconutil -c icns "$(BUILD_DIR)/AppIcon.iconset" \
+		-o macos/AppIcon.icns
 
 # 组装 .app bundle。$(1)=swift 产物目录(debug/release) $(2)=bundle 路径
 define assemble_app
@@ -121,7 +132,7 @@ cli: $(PATCHED_WORKFILE)
 	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS)" -o $(BUILD_DIR)/xdial ./cmd/xdial/
 
 # debug 构建(含 DebugServer,仅本地开发用,不得分发)
-app: cli libbox-macos-xcframework
+app: cli libbox-macos-xcframework macos/AppIcon.icns
 	cd macos && xcodegen generate
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Debug \
 		-destination 'platform=macOS,arch=arm64' \
@@ -138,7 +149,7 @@ app: cli libbox-macos-xcframework
 
 # release 构建:swift -c release 使 #if DEBUG 的 DebugServer 整体排除,
 # go -trimpath -s -w 去符号并注入版本。分发一律用这个产物。
-release: libbox-macos-xcframework
+release: libbox-macos-xcframework macos/AppIcon.icns
 	@mkdir -p $(BUILD_DIR)
 	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -trimpath -ldflags "$(GO_LDFLAGS) -s -w" -o $(BUILD_DIR)/xdial ./cmd/xdial/
 	cd macos && xcodegen generate

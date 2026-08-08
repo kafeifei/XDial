@@ -76,10 +76,6 @@ targets:
       - Shared
       - path: AppIcon.icns
         buildPhase: resources
-      - path: Resources/AppIconDisconnected.png
-        buildPhase: resources
-      - path: Resources/AppIconConnected.png
-        buildPhase: resources
     info:
       path: Info.plist
       properties:
