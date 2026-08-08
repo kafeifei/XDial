@@ -1161,6 +1161,17 @@ final class AppState: ObservableObject {
         )
     }
 
+    /// 用户从断开态点击场景球时表达的是“用这个场景连接”，不是只选择场景。
+    /// SSID / 设置页的激活仍走 `switchScenario`，因此 D39 的显式断开门禁不变。
+    @discardableResult
+    func connectScenario(_ id: String) -> Bool {
+        cancelNetworkEpochQuietWindow()
+        return enqueueScenarioSwitch(
+            to: id,
+            requiresUnderlayRefresh: false
+        )
+    }
+
     /// 切换场景是一个保持“仍需连接”意图的一等操作。已提交会话通过
     /// Provider 的 staged Switch 保留旧事务，绝不先 `stopVPNTunnel`；新点击只
     /// 覆盖待切目标，控制面始终 single-flight。

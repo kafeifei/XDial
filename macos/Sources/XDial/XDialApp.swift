@@ -14,10 +14,17 @@ extension Notification.Name {
 /// openWindow 环境值的地方（popover 的内容只在展开时才存在）。
 private struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
+    let connected: Bool
 
     var body: some View {
-        Image(nsImage: AppIcon.menuBar())
+        Image(nsImage: AppIcon.menuBar(connected: connected))
             .accessibilityLabel("XDial")
+            .onAppear {
+                AppIcon.applyDockState(connected: connected)
+            }
+            .onChange(of: connected) { _, isConnected in
+                AppIcon.applyDockState(connected: isConnected)
+            }
             .onReceive(
                 NotificationCenter.default.publisher(
                     for: .xdialOpenInstallation
@@ -46,7 +53,7 @@ struct XDialApp: App {
                 .tint(XDialPalette.accent)
                 .preferredColorScheme(state.appearance.colorScheme)
         } label: {
-            MenuBarLabel()
+            MenuBarLabel(connected: state.isConnected)
         }
         .menuBarExtraStyle(.window)
 
@@ -77,6 +84,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminationApproved = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
+
         // 设置窗口：不随失焦隐藏 + 出现在 Cmd+Tab
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { n in
             guard let w = n.object as? NSWindow,
@@ -85,7 +94,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     || w.title.contains("安装")
                     || w.title.contains("Installation") else { return }
             w.hidesOnDeactivate = false
-            NSApp.applicationIconImage = AppIcon.dock(size: 256)
+            AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
             NSApp.setActivationPolicy(.regular)
         }
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { n in

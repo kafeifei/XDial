@@ -1003,6 +1003,11 @@ struct MainPopover: View {
             return
         }
 
+        if !state.isConnected && !state.isBusy {
+            state.connectScenario(scenario.id)
+            return
+        }
+
         if scenario.id != currentRuntimeScenarioID {
             state.switchScenario(to: scenario.id)
             return
