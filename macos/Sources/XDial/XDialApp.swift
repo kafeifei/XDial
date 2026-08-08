@@ -18,6 +18,12 @@ private struct MenuBarLabel: View {
 
     var body: some View {
         Image(nsImage: AppIcon.menuBar(connected: connected))
+            .resizable()
+            .interpolation(.high)
+            .frame(width: 18, height: 18)
+            // 系统 status item 还会增加自身左右 inset；缩窄
+            // label 布局宽度，但不裁剪 18pt 的月球。
+            .frame(width: 13, height: 18)
             .accessibilityLabel("XDial")
             .onAppear {
                 AppIcon.applyDockState(connected: connected)
@@ -88,14 +94,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 设置窗口：不随失焦隐藏 + 出现在 Cmd+Tab
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { n in
-            guard let w = n.object as? NSWindow,
-                  w.title.contains("设置")
-                    || w.title.contains("Settings")
-                    || w.title.contains("安装")
-                    || w.title.contains("Installation") else { return }
-            w.hidesOnDeactivate = false
-            AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
-            NSApp.setActivationPolicy(.regular)
+            MainActor.assumeIsolated {
+                guard let w = n.object as? NSWindow,
+                      w.title.contains("设置")
+                        || w.title.contains("Settings")
+                        || w.title.contains("安装")
+                        || w.title.contains("Installation") else { return }
+                w.hidesOnDeactivate = false
+                AppIcon.applyDockState(
+                    connected: GoEngine.shared.isConnected
+                )
+                NSApp.setActivationPolicy(.regular)
+            }
         }
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { n in
             guard let w = n.object as? NSWindow,
