@@ -20,6 +20,7 @@ struct MainPopover: View {
     @StateObject private var trafficInfo = TrafficInfo()
     @State private var hoveredScenarioID: String?
     @State private var showsConnectionDetails = true
+    @State private var dismissedScenarioSwitchFailureID: String?
 
     private let minimumPopoverWidth: CGFloat = 340
     private let maximumScenariosPerRow = 4
@@ -38,13 +39,14 @@ struct MainPopover: View {
             header
             Divider()
             scenarioCarousel
-            if showsStatusBand {
+            if let failure = scenarioSwitchFailureProjection {
+                Divider()
+                scenarioSwitchFailureBand(failure)
+            } else if showsStatusBand {
                 Divider()
                 statusBand
                 if showsConnectionDetails,
-                   state.isBusy,
-                   state.scenarioSwitchTargetID == nil,
-                   let report = state.presentedConnectionReport,
+                   let report = connectionProgressReport,
                    !report.tasks.isEmpty {
                     Divider()
                         .padding(.horizontal, 20)
@@ -350,7 +352,7 @@ struct MainPopover: View {
                     .font(.system(size: 12))
                     .lineLimit(1)
                 Spacer()
-                if let report = state.presentedConnectionReport,
+                if let report = connectionProgressReport,
                    !report.tasks.isEmpty {
                     Button {
                         withAnimation(.easeInOut(duration: 0.18)) {
@@ -360,8 +362,12 @@ struct MainPopover: View {
                         HStack(spacing: 5) {
                             Text(
                                 state.tr(
-                                    "连接进度",
-                                    "Connection progress"
+                                    state.scenarioSwitchTargetID == nil
+                                        ? "连接进度"
+                                        : "切换进度",
+                                    state.scenarioSwitchTargetID == nil
+                                        ? "Connection progress"
+                                        : "Switch progress"
                                 )
                             )
                             Text(
@@ -466,6 +472,87 @@ struct MainPopover: View {
         .contentShape(Rectangle())
     }
 
+    private func scenarioSwitchFailureBand(
+        _ projection: HostScenarioSwitchProjection
+    ) -> some View {
+        let sourceName = state.presentedConnectionReport?.scenario.name
+            ?? scenarioName(for: projection.fromScenarioID)
+        let targetName = projection.candidateReport.scenario.name.isEmpty
+            ? scenarioName(for: projection.toScenarioID)
+            : projection.candidateReport.scenario.name
+        let detail = scenarioSwitchFailureDetail(projection)
+        return HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(dangerColor)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(
+                    state.tr(
+                        "切换到“\(targetName)”失败，仍在使用“\(sourceName)”",
+                        "Couldn’t switch to “\(targetName)”; still using “\(sourceName)”"
+                    )
+                )
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.primary.opacity(0.88))
+                .fixedSize(horizontal: false, vertical: true)
+                Text(detail)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 6)
+            Button {
+                dismissedScenarioSwitchFailureID =
+                    projection.candidateTransactionID
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help(state.tr("关闭切换错误", "Dismiss switch error"))
+            .accessibilityLabel(
+                state.tr("关闭切换错误", "Dismiss switch error")
+            )
+        }
+        .padding(.leading, 20)
+        .padding(.trailing, 14)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            LinearGradient(
+                colors: [
+                    dangerColor.opacity(0.075),
+                    dangerColor.opacity(0.025),
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        }
+    }
+
+    private func scenarioSwitchFailureDetail(
+        _ projection: HostScenarioSwitchProjection
+    ) -> String {
+        if let message = projection.message,
+           !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return message
+        }
+        if let message = projection.candidateReport.error?.message,
+           !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return message
+        }
+        return state.tr("场景切换失败", "Scenario switch failed")
+    }
+
+    private func scenarioName(for id: String) -> String {
+        state.profile.scenarios.first(where: { $0.id == id })?.name ?? id
+    }
+
     private var dirtyConfigurationBlocker: String {
         if !state.installation.isReady {
             return state.tr("请先完成安装", "Complete setup first")
@@ -513,6 +600,30 @@ struct MainPopover: View {
 
     private var showsStatusBand: Bool {
         state.isBusy || (state.configDirty && state.isConnected)
+    }
+
+    private var scenarioSwitchFailureProjection:
+        HostScenarioSwitchProjection? {
+        guard
+            let projection = state.engine.scenarioSwitchProjection,
+            !projection.inFlight,
+            projection.status == "failed"
+                || projection.status == "timed-out",
+            projection.candidateTransactionID
+                != dismissedScenarioSwitchFailureID,
+            state.isConnected,
+            let report = state.presentedConnectionReport,
+            report.state == .committed,
+            !report.systemTakeoverRemoved,
+            report.transactionID
+                == projection.sourceCommittedTransactionID,
+            report.transactionID
+                == projection.activeCommittedTransactionID,
+            report.scenario.id == projection.fromScenarioID
+        else {
+            return nil
+        }
+        return projection
     }
 
     private var connectionDetailsSymbol: String {
@@ -853,7 +964,8 @@ struct MainPopover: View {
         guard let report = state.presentedConnectionReport else {
             return nil
         }
-        if state.isConnected && report.state == .committed {
+        if state.isConnected && !state.isBusy &&
+            report.state == .committed {
             return report
         }
         if report.error != nil || report.state == .failed {
@@ -862,11 +974,25 @@ struct MainPopover: View {
         return nil
     }
 
+    private var connectionProgressReport: ConnectionReport? {
+        if
+            let targetScenarioID = state.scenarioSwitchTargetID,
+            let projection = state.engine.scenarioSwitchProjection,
+            projection.inFlight,
+            projection.toScenarioID == targetScenarioID,
+            projection.candidateReport.scenario.id == targetScenarioID
+        {
+            return projection.candidateReport
+        }
+        guard state.isBusy,
+              state.scenarioSwitchTargetID == nil else {
+            return nil
+        }
+        return state.presentedConnectionReport
+    }
+
     private var connectionProgress: Double {
-        // During a staged Switch the committed report still describes the
-        // source generation. It must never be presented as candidate progress.
-        guard state.scenarioSwitchTargetID == nil else { return 0 }
-        guard let report = state.presentedConnectionReport,
+        guard let report = connectionProgressReport,
               !report.tasks.isEmpty else {
             return 0
         }
