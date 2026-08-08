@@ -242,7 +242,10 @@ enum UDPFlowSOCKSRelay {
                                 "udp-send trial=\(trialID, privacy: .public) bytes=\(payload.count)"
                             )
                             try await send(packet, to: connection)
-                            traffic.recordUpload(payload.count)
+                            traffic.recordUpload(
+                                payload.count,
+                                transactionID: trialID
+                            )
                         }
                     }
                 },
@@ -261,7 +264,10 @@ enum UDPFlowSOCKSRelay {
                             [(decoded.payload, decoded.endpoint)],
                             to: flow
                         )
-                        traffic.recordDownload(decoded.payload.count)
+                        traffic.recordDownload(
+                            decoded.payload.count,
+                            transactionID: trialID
+                        )
                     }
                 },
                 {

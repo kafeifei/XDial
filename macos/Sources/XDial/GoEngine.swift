@@ -35,6 +35,7 @@ final class GoEngine: ObservableObject {
     private var requestSeq: UInt64 = 0
     private var pendingCallbacks: [String: (DaemonResponse) -> Void] = [:]
     private var transparentProxySystemStatus = "disconnected"
+    var underlayChangeHandler: ((String) -> Void)?
 
     @Published private(set) var status: String = "disconnected"
     @Published var lastError: String?
@@ -53,6 +54,10 @@ final class GoEngine: ObservableObject {
             explicitlyStoppedTransactionID:
                 explicitlyStoppedTransactionID
         )
+    }
+
+    var scenarioSwitchProjection: HostScenarioSwitchProjection? {
+        transparentProxy.scenarioSwitchProjection
     }
 
     struct ParseResult: Decodable {
@@ -94,6 +99,11 @@ final class GoEngine: ObservableObject {
                 self?.applyConnectionReport(report)
             }
         }
+        transparentProxy.underlayChangeHandler = { [weak self] fingerprint in
+            Task { @MainActor in
+                self?.underlayChangeHandler?(fingerprint)
+            }
+        }
     }
 
     // MARK: - Public API
@@ -113,6 +123,51 @@ final class GoEngine: ObservableObject {
         transparentProxy.start(
             profileJSON: profileJSON,
             automaticRetryTrigger: automaticRetryTrigger
+        )
+    }
+
+    /// Replace the committed Scenario inside the current Provider session.
+    /// The source report and `connected` status stay live until the Provider
+    /// atomically commits the target transaction.
+    func switchScenario(
+        profileJSON: String,
+        completion: @escaping (Result<ConnectionReport, Error>) -> Void
+    ) {
+        lastError = nil
+        transparentProxy.switchScenario(
+            profileJSON: profileJSON
+        ) { [weak self] result in
+            Task { @MainActor [weak self] in
+                switch result {
+                case let .success(report):
+                    self?.applyConnectionReport(report)
+                case let .failure(error):
+                    self?.lastError = error.localizedDescription
+                }
+                completion(result)
+            }
+        }
+    }
+
+    func cancelScenarioSwitch() {
+        transparentProxy.cancelScenarioSwitch()
+    }
+
+    func captureCurrentUnderlayFingerprint(
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        transparentProxy.captureCurrentUnderlayFingerprint { result in
+            Task { @MainActor in
+                completion(result)
+            }
+        }
+    }
+
+    func runtimeConfigurationFingerprint(
+        profileJSON: String
+    ) -> Result<String, Error> {
+        transparentProxy.runtimeConfigurationFingerprint(
+            profileJSON: profileJSON
         )
     }
 
@@ -699,12 +754,21 @@ private struct DaemonResponse: Decodable {
 
 struct EngineStatus: Decodable {
     let status: String
-    let mode: String?
+    let scenarioID: String?
     let connectedAt: Int?
     let error: String?
 
     enum CodingKeys: String, CodingKey {
-        case status, mode, error
+        case status, error
+        case scenarioID = "scenario_id"
         case connectedAt = "connected_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        status = try values.decode(String.self, forKey: .status)
+        scenarioID = try values.decodeIfPresent(String.self, forKey: .scenarioID)
+        connectedAt = try values.decodeIfPresent(Int.self, forKey: .connectedAt)
+        error = try values.decodeIfPresent(String.self, forKey: .error)
     }
 }

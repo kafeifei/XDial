@@ -303,7 +303,7 @@ struct ConfigurationView: View {
         default:
             app.tr("手工规则", "Manual rule")
         }
-        Button(label) {
+        return Button(label) {
             guard !app.hasActiveTunnel, !app.isBusy else { return }
             let id = "rule-" + String(UUID().uuidString.prefix(8)).lowercased()
             let name: String = switch type {
@@ -320,15 +320,15 @@ struct ConfigurationView: View {
     private func deleteLine(_ line: Line) {
         guard !app.hasActiveTunnel, !app.isBusy, line.type != "direct" else { return }
         app.profile.lines.removeAll { $0.id == line.id }
-        // 保留模式里的悬空引用；连接前校验会阻止启动并要求用户明确选择替代目标。
+        // 保留场景里的悬空引用；连接前校验会阻止启动并要求用户明确选择替代目标。
         app.save()
     }
 
     private func deleteRule(_ ruleSet: RuleSet) {
         guard !app.hasActiveTunnel, !app.isBusy else { return }
         app.profile.ruleSets.removeAll { $0.id == ruleSet.id }
-        for index in app.profile.modes.indices {
-            app.profile.modes[index].bindings.removeAll { $0.ruleSetID == ruleSet.id }
+        for index in app.profile.scenarios.indices {
+            app.profile.scenarios[index].bindings.removeAll { $0.ruleSetID == ruleSet.id }
         }
         app.save()
     }
@@ -604,8 +604,8 @@ private struct LineEditorView: View {
                 Text("Tailscale")
             } footer: {
                 Text(app.tr(
-                    "勾选后可解析并访问 Tailnet 节点；只有当前 Mode 使用这条线路时才生效，Mode 中已有的显式域名规则优先。",
-                    "When enabled, Tailnet peers can be resolved and reached only while the current Mode uses this line. Explicit domain rules in the Mode take priority."
+                    "勾选后可解析并访问 Tailnet 节点；只有当前 Scenario 使用这条线路时才生效，Scenario 中已有的显式域名规则优先。",
+                    "When enabled, Tailnet peers can be resolved and reached only while the current Scenario uses this line. Explicit domain rules in the Scenario take priority."
                 ))
             }
             .disabled(app.hasActiveTunnel)
@@ -1101,7 +1101,7 @@ private struct LineEditorView: View {
         guard app.canMutateConfiguration,
               let index = lineIndex, app.profile.lines[index].type != "direct" else { return }
         app.profile.lines.remove(at: index)
-        // 模式引用故意保留，避免静默改变路由语义。
+        // 场景引用故意保留，避免静默改变路由语义。
         app.save()
         dismiss()
     }
@@ -1163,7 +1163,7 @@ private struct RuleEditorView: View {
                 if isConnectivityTestRule {
                     Section {
                         Label(
-                            app.tr("分别验证 Direct 与当前模式选中的非 Direct 出口绑定。", "Verifies the Direct route and the selected non-Direct route independently."),
+                            app.tr("分别验证 Direct 与当前场景选中的非 Direct 出口绑定。", "Verifies the Direct route and the selected non-Direct route independently."),
                             systemImage: "checkmark.shield"
                         )
                     } footer: {
@@ -1318,8 +1318,8 @@ private struct RuleEditorView: View {
         pendingSaveTask = nil
         let id = app.profile.ruleSets[index].id
         app.profile.ruleSets.remove(at: index)
-        for modeIndex in app.profile.modes.indices {
-            app.profile.modes[modeIndex].bindings.removeAll { $0.ruleSetID == id }
+        for scenarioIndex in app.profile.scenarios.indices {
+            app.profile.scenarios[scenarioIndex].bindings.removeAll { $0.ruleSetID == id }
         }
         app.save()
         dismiss()

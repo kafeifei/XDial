@@ -23,7 +23,7 @@
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSSystemExtensionUsageDescription</key>
-	<string>XDial 使用网络扩展将线路、规则和模式交给 sing-box 统一执行。</string>
+	<string>XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。</string>
 	<key>NetworkExtension</key>
 	<dict>
 		<key>NEProviderClasses</key>

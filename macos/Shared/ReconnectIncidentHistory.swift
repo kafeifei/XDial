@@ -27,8 +27,8 @@ struct ReconnectIncident: Codable, Equatable, Identifiable {
     let disconnectedAt: Date
     let trigger: AutomaticReconnectTrigger
     let originalTransactionID: String
-    let modeID: String
-    let modeName: String
+    let scenarioID: String
+    let scenarioName: String
     var reasonCode: String
     var reasonMessage: String
     var evidence: ConnectionFailureEvidence?
@@ -42,8 +42,8 @@ struct ReconnectIncident: Codable, Equatable, Identifiable {
         case disconnectedAt = "disconnected_at"
         case trigger
         case originalTransactionID = "original_transaction_id"
-        case modeID = "mode_id"
-        case modeName = "mode_name"
+        case scenarioID = "scenario_id"
+        case scenarioName = "scenario_name"
         case reasonCode = "reason_code"
         case reasonMessage = "reason_message"
         case evidence
@@ -51,6 +51,59 @@ struct ReconnectIncident: Codable, Equatable, Identifiable {
         case systemDisconnectMessage = "system_disconnect_message"
         case outcome
         case events
+    }
+
+    init(
+        id: String,
+        disconnectedAt: Date,
+        trigger: AutomaticReconnectTrigger,
+        originalTransactionID: String,
+        scenarioID: String,
+        scenarioName: String,
+        reasonCode: String,
+        reasonMessage: String,
+        evidence: ConnectionFailureEvidence?,
+        systemDisconnectCode: String?,
+        systemDisconnectMessage: String?,
+        outcome: String,
+        events: [ReconnectIncidentEvent]
+    ) {
+        self.id = id
+        self.disconnectedAt = disconnectedAt
+        self.trigger = trigger
+        self.originalTransactionID = originalTransactionID
+        self.scenarioID = scenarioID
+        self.scenarioName = scenarioName
+        self.reasonCode = reasonCode
+        self.reasonMessage = reasonMessage
+        self.evidence = evidence
+        self.systemDisconnectCode = systemDisconnectCode
+        self.systemDisconnectMessage = systemDisconnectMessage
+        self.outcome = outcome
+        self.events = events
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        disconnectedAt = try values.decode(Date.self, forKey: .disconnectedAt)
+        trigger = try values.decode(AutomaticReconnectTrigger.self, forKey: .trigger)
+        originalTransactionID = try values.decode(String.self, forKey: .originalTransactionID)
+        scenarioID = try values.decodeIfPresent(
+            String.self,
+            forKey: .scenarioID
+        ) ?? ""
+        scenarioName = try values.decodeIfPresent(
+            String.self,
+            forKey: .scenarioName
+        ) ?? ""
+        reasonCode = try values.decode(String.self, forKey: .reasonCode)
+        reasonMessage = try values.decode(String.self, forKey: .reasonMessage)
+        evidence = try values.decodeIfPresent(ConnectionFailureEvidence.self, forKey: .evidence)
+        systemDisconnectCode = try values.decodeIfPresent(String.self, forKey: .systemDisconnectCode)
+        systemDisconnectMessage = try values.decodeIfPresent(String.self, forKey: .systemDisconnectMessage)
+        outcome = try values.decode(String.self, forKey: .outcome)
+        events = try values.decode([ReconnectIncidentEvent].self, forKey: .events)
     }
 
     mutating func append(
@@ -96,8 +149,8 @@ struct ReconnectIncidentHistory: Codable, Equatable {
             disconnectedAt: timestamp,
             trigger: trigger,
             originalTransactionID: report?.transactionID ?? "",
-            modeID: report?.mode.id ?? "",
-            modeName: report?.mode.name ?? "",
+            scenarioID: report?.scenario.id ?? "",
+            scenarioName: report?.scenario.name ?? "",
             reasonCode: reasonCode,
             reasonMessage: reasonMessage,
             evidence: report?.error?.evidence,

@@ -60,7 +60,7 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
         )
     }
 
-    func testApplicationCredentialDecisionUsesFirstMatchingModeBinding() {
+    func testApplicationCredentialDecisionUsesFirstMatchingScenarioBinding() {
         let app = try! XCTUnwrap(TransparentProxyProcessSelector(
             kind: .bundlePath,
             value: "/Applications/Claude.app"

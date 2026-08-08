@@ -65,7 +65,7 @@ func applicationRuleIndexForTest(rules []map[string]interface{}) int {
 	return -1
 }
 
-func TestApplicationRuleSetIsModeBoundAndFailsClosedOutsideTransparentProxy(t *testing.T) {
+func TestApplicationRuleSetIsScenarioBoundAndFailsClosedOutsideTransparentProxy(t *testing.T) {
 	profile := testProfile()
 	profile.RuleSets = append(profile.RuleSets, applicationRuleSetForTest())
 
@@ -79,7 +79,7 @@ func TestApplicationRuleSetIsModeBoundAndFailsClosedOutsideTransparentProxy(t *t
 		t.Fatalf("unbound application rule leaked into route rule #%d", index)
 	}
 
-	profile.Modes[0].Bindings = append(profile.Modes[0].Bindings, RuleBinding{
+	profile.Scenarios[0].Bindings = append(profile.Scenarios[0].Bindings, RuleBinding{
 		RuleSetID: "claude-app",
 		LineID:    "ss",
 	})
@@ -92,7 +92,7 @@ func TestApplicationRuleSetIsModeBoundAndFailsClosedOutsideTransparentProxy(t *t
 func TestApplicationRuleSetTransparentProxyPinsRouteAndDNS(t *testing.T) {
 	profile := testProfile()
 	profile.RuleSets = append(profile.RuleSets, applicationRuleSetForTest())
-	profile.Modes[0].Bindings = append(profile.Modes[0].Bindings, RuleBinding{
+	profile.Scenarios[0].Bindings = append(profile.Scenarios[0].Bindings, RuleBinding{
 		RuleSetID: "claude-app",
 		LineID:    "ss",
 	})
@@ -120,7 +120,7 @@ func TestApplicationRuleSetTransparentProxyPinsRouteAndDNS(t *testing.T) {
 		}
 	}
 	if manualRouteIndex < 0 || manualRouteIndex >= applicationIndex {
-		t.Fatalf("application route must follow its Mode binding position: manual=%d app=%d", manualRouteIndex, applicationIndex)
+		t.Fatalf("application route must follow its Scenario binding position: manual=%d app=%d", manualRouteIndex, applicationIndex)
 	}
 	applicationRule := rules[applicationIndex]
 	if applicationRule["outbound"] != "proxy-ss" {
@@ -189,6 +189,48 @@ func TestApplicationRuleSetTransparentProxyPinsRouteAndDNS(t *testing.T) {
 	}
 	if !foundApplicationDNS {
 		t.Fatal("application identity did not pin DNS to its selected Line")
+	}
+}
+
+func TestInvertedApplicationRuleSetInvertsRouteAndDNSTogether(t *testing.T) {
+	profile := testProfile()
+	ruleSet := applicationRuleSetForTest()
+	ruleSet.Invert = true
+	profile.RuleSets = append(profile.RuleSets, ruleSet)
+	profile.Scenarios[0].Bindings = append(profile.Scenarios[0].Bindings, RuleBinding{
+		RuleSetID: ruleSet.ID,
+		LineID:    "ss",
+	})
+
+	raw, err := GenerateSingBoxTransparentProxy(
+		profile, 11080, "session-user", "session-password", t.TempDir(), "en0", []string{"1.1.1.1"},
+	)
+	if err != nil {
+		t.Fatalf("GenerateSingBoxTransparentProxy: %v", err)
+	}
+	rules := applicationRouteRulesForTest(t, raw)
+	applicationIndex := applicationRuleIndexForTest(rules)
+	if applicationIndex < 0 || rules[applicationIndex]["invert"] != true {
+		t.Fatalf("inverted application route rule is missing: %v", rules)
+	}
+
+	var config SingBoxConfig
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatalf("invalid generated JSON: %v", err)
+	}
+	found := false
+	for _, rawRule := range config.DNS["rules"].([]interface{}) {
+		dnsRule := rawRule.(map[string]interface{})
+		if _, ok := dnsRule["auth_user"]; !ok {
+			continue
+		}
+		found = true
+		if dnsRule["invert"] != true {
+			t.Fatalf("application DNS rule was not inverted with its route: %v", dnsRule)
+		}
+	}
+	if !found {
+		t.Fatal("inverted application RuleSet did not compile a DNS rule")
 	}
 }
 

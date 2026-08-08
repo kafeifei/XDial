@@ -690,9 +690,13 @@ struct Subscription: Codable, Identifiable, Hashable {
     }
 }
 
-struct Mode: Codable, Identifiable, Hashable {
+struct Scenario: Codable, Identifiable, Hashable {
     var id: String
     var name: String
+    /// 稳定的语义图标 Key；nil 表示根据名称与已保存 SSID 自动选择。
+    /// 这里不保存 SF Symbol 名，避免把平台绘制细节写进配置契约。
+    var iconOverride: String?
+    var matchSSIDs: [String] = []
     var bindings: [RuleBinding] = []
     var defaultLineID: String = ""
     var defaultSubscriptionID: String = ""
@@ -711,12 +715,16 @@ struct Mode: Codable, Identifiable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, bindings
+        case iconOverride = "icon"
+        case matchSSIDs = "match_ssids"
         case defaultLineID = "default_line_id"
         case defaultSubscriptionID = "default_subscription_id"
     }
 
-    init(id: String, name: String, bindings: [RuleBinding] = [], defaultLineID: String = "", defaultSubscriptionID: String = "") {
-        self.id = id; self.name = name; self.bindings = bindings
+    init(id: String, name: String, matchSSIDs: [String] = [], bindings: [RuleBinding] = [], defaultLineID: String = "", defaultSubscriptionID: String = "", iconOverride: String? = nil) {
+        self.id = id; self.name = name; self.iconOverride = iconOverride
+        self.matchSSIDs = matchSSIDs
+        self.bindings = bindings
         self.defaultLineID = defaultLineID; self.defaultSubscriptionID = defaultSubscriptionID
     }
 
@@ -724,6 +732,12 @@ struct Mode: Codable, Identifiable, Hashable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
+        iconOverride = try c.decodeIfPresent(String.self, forKey: .iconOverride)
+        if iconOverride?.isEmpty == true { iconOverride = nil }
+        matchSSIDs = try c.decodeIfPresent(
+            [String].self,
+            forKey: .matchSSIDs
+        ) ?? []
         bindings = try c.decodeIfPresent([RuleBinding].self, forKey: .bindings) ?? []
         defaultLineID = try c.decodeIfPresent(String.self, forKey: .defaultLineID) ?? ""
         defaultSubscriptionID = try c.decodeIfPresent(String.self, forKey: .defaultSubscriptionID) ?? ""
@@ -733,17 +747,17 @@ struct Mode: Codable, Identifiable, Hashable {
 struct Profile: Codable, Hashable {
     var lines: [Line] = []
     var ruleSets: [RuleSet] = []
-    var modes: [Mode] = []
+    var scenarios: [Scenario] = []
     var subscriptions: [Subscription] = []
-    var activeModeID: String = ""
+    var activeScenarioID: String = ""
     var tailscale = TailscaleIdentity()
 
     enum CodingKeys: String, CodingKey {
         case lines = "lines"
         case ruleSets = "rule_sets"
-        case modes = "modes"
+        case scenarios = "scenarios"
         case subscriptions
-        case activeModeID = "active_mode_id"
+        case activeScenarioID = "active_scenario_id"
         case tailscale
     }
 
@@ -753,14 +767,34 @@ struct Profile: Codable, Hashable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         lines = try c.decodeIfPresent([Line].self, forKey: .lines) ?? []
         ruleSets = try c.decodeIfPresent([RuleSet].self, forKey: .ruleSets) ?? []
-        modes = try c.decodeIfPresent([Mode].self, forKey: .modes) ?? []
+        scenarios = try c.decodeIfPresent(
+            [Scenario].self,
+            forKey: .scenarios
+        ) ?? []
         subscriptions = try c.decodeIfPresent([Subscription].self, forKey: .subscriptions) ?? []
-        activeModeID = try c.decodeIfPresent(String.self, forKey: .activeModeID) ?? ""
+        activeScenarioID = try c.decodeIfPresent(
+            String.self,
+            forKey: .activeScenarioID
+        ) ?? ""
         tailscale = try c.decodeIfPresent(TailscaleIdentity.self, forKey: .tailscale) ?? TailscaleIdentity()
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(lines, forKey: .lines)
+        try c.encode(ruleSets, forKey: .ruleSets)
+        try c.encode(scenarios, forKey: .scenarios)
+        try c.encode(subscriptions, forKey: .subscriptions)
+        try c.encode(activeScenarioID, forKey: .activeScenarioID)
+        try c.encode(tailscale, forKey: .tailscale)
     }
 }
 
 extension Profile {
+    func scenario(matchingSSID ssid: String) -> Scenario? {
+        scenarios.first { $0.matchSSIDs.contains(ssid) }
+    }
+
     static func bootstrap() -> Profile {
         var p = Profile()
         p.lines = [
@@ -781,8 +815,8 @@ extension Profile {
         return p
     }
 
-    static func templateOverseas(ruleSetIDs: [String], vpnLineID: String, directLineID: String) -> Mode {
-        Mode(
+    static func templateOverseas(ruleSetIDs: [String], vpnLineID: String, directLineID: String) -> Scenario {
+        Scenario(
             id: UUID().uuidString,
             name: "海外",
             bindings: ruleSetIDs.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) },
@@ -790,12 +824,12 @@ extension Profile {
         )
     }
 
-    static func templateDomestic(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, directLineID: String) -> Mode {
+    static func templateDomestic(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, directLineID: String) -> Scenario {
         var bindings = ruleSetIDs.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) }
         if !gfwRuleSetID.isEmpty {
             bindings.append(RuleBinding(ruleSetID: gfwRuleSetID, lineID: vpnLineID))
         }
-        return Mode(
+        return Scenario(
             id: UUID().uuidString,
             name: "国内",
             bindings: bindings,
@@ -803,12 +837,12 @@ extension Profile {
         )
     }
 
-    static func templateDomesticSS(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, ssLineID: String, directLineID: String) -> Mode {
+    static func templateDomesticSS(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, ssLineID: String, directLineID: String) -> Scenario {
         var bindings = ruleSetIDs.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) }
         if !gfwRuleSetID.isEmpty {
             bindings.append(RuleBinding(ruleSetID: gfwRuleSetID, lineID: ssLineID))
         }
-        return Mode(
+        return Scenario(
             id: UUID().uuidString,
             name: "国内+SS",
             bindings: bindings,

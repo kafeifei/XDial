@@ -35,7 +35,7 @@ targets:
         NetworkExtension:
           NEProviderClasses:
             com.apple.networkextension.app-proxy: "$(PRODUCT_MODULE_NAME).TransparentProxyProvider"
-        NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和模式交给 sing-box 统一执行。
+        NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。
     settings:
       base:
         # Apple requires a Network Extension system extension's filename to
@@ -87,7 +87,8 @@ targets:
         LSUIElement: true
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-        NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和模式交给 sing-box 统一执行。
+        NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。
+        NSLocationWhenInUseUsageDescription: XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。
         XDialTransparentProxyBundleIdentifier: "$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)"
     settings:
       base:
@@ -118,6 +119,8 @@ targets:
       - sdk: NetworkExtension.framework
       - sdk: SystemExtensions.framework
       - sdk: SystemConfiguration.framework
+      - sdk: CoreLocation.framework
+      - sdk: CoreWLAN.framework
     postBuildScripts:
       - name: Embed private RuleSet presets
         script: |
@@ -190,6 +193,9 @@ targets:
       - Tests
       - Shared
       - Sources/XDial/Models.swift
+      - Sources/XDial/ScenarioIconCatalog.swift
+      - Sources/XDial/ScenarioGridLayout.swift
+      - TransparentProxyExtension/ConnectionTransactionReporter.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.tests

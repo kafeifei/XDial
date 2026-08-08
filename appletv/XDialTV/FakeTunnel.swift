@@ -8,7 +8,7 @@ import Foundation
 // `#if targetEnvironment(simulator)` 包裹，真机 / Release 构建不包含）。
 //
 // 目的：让 app 在没有 NetworkExtension entitlement、没有真机的情况下，也能在
-// Simulator 里完整走通 UI 交互——连接 / 断开 / 状态转换 / 模式切换——而不真正拨号。
+// Simulator 里完整走通 UI 交互——连接 / 断开 / 状态转换 / 场景切换——而不真正拨号。
 //
 // 它替换的两个真实实现：
 //   - GoEngine（走 NEVPNConnection.sendProviderMessage，Simulator 没有隧道会话）
@@ -401,10 +401,10 @@ extension AppState {
 
     /// 在 Simulator 分支下补齐演示数据，让 app 一进来就处于「可连接」且有内容可切换的状态：
     ///   1. VPN 类型 Line 凭据为空则填入演示值。
-    ///   2. 没有模式则种入 2 条（海外 / 国内），并设一个为 active。
+    ///   2. 没有场景则种入 2 条（海外 / 国内），并设一个为 active。
     ///
     /// 只在 RootView 的 Simulator 分支调用，不污染真实路径的 AppState 逻辑。
-    /// 幂等：已填过凭据 / 已有模式就不重复写，避免每次启动都改动。
+    /// 幂等：已填过凭据 / 已有场景就不重复写，避免每次启动都改动。
     func seedDemoDataForSimulator() {
         var changed = false
 
@@ -424,8 +424,8 @@ extension AppState {
             }
         }
 
-        // 2. 种模式（至少 2 条，ModePickerView 才有东西可选）
-        if profile.modes.isEmpty {
+        // 2. 种场景（至少 2 条，ScenarioPickerView 才有东西可选）
+        if profile.scenarios.isEmpty {
             let directID = profile.lines.first(where: { $0.type == "direct" })?.id ?? "direct"
             let vpnID = profile.lines.first(where: { $0.type == "vpn" })?.id ?? "vpn"
             let manualRuleSetIDs = profile.ruleSets
@@ -445,16 +445,16 @@ extension AppState {
                 vpnLineID: vpnID,
                 directLineID: directID
             )
-            profile.modes = [overseas, domestic]
-            profile.activeModeID = overseas.id
+            profile.scenarios = [overseas, domestic]
+            profile.activeScenarioID = overseas.id
             changed = true
-        } else if profile.activeModeID.isEmpty {
-            profile.activeModeID = profile.modes.first?.id ?? ""
+        } else if profile.activeScenarioID.isEmpty {
+            profile.activeScenarioID = profile.scenarios.first?.id ?? ""
             changed = true
         }
 
         if ProcessInfo.processInfo.arguments.contains("-XDialUITestingIncompleteLine"),
-           let modeIndex = profile.modes.firstIndex(where: { $0.id == profile.activeModeID }) {
+           let scenarioIndex = profile.scenarios.firstIndex(where: { $0.id == profile.activeScenarioID }) {
             let lineID = "incomplete-ui-line"
             if !profile.lines.contains(where: { $0.id == lineID }) {
                 profile.lines.append(Line(
@@ -463,8 +463,8 @@ extension AppState {
                     type: "vpn"
                 ))
             }
-            profile.modes[modeIndex].defaultLineID = lineID
-            profile.modes[modeIndex].defaultSubscriptionID = ""
+            profile.scenarios[scenarioIndex].defaultLineID = lineID
+            profile.scenarios[scenarioIndex].defaultSubscriptionID = ""
             changed = true
         }
 
@@ -498,12 +498,12 @@ extension AppState {
                 type: "tailscale",
                 enabled: true
             ))
-            profile.modes = [Mode(
-                id: "tailscale-offline-mode",
+            profile.scenarios = [Scenario(
+                id: "tailscale-offline-scenario",
                 name: "Tailscale 首次设置",
                 defaultLineID: "tailscale-offline-setup"
             )]
-            profile.activeModeID = "tailscale-offline-mode"
+            profile.activeScenarioID = "tailscale-offline-scenario"
             profile.ensureConnectivityTestConfiguration()
             changed = true
         }
@@ -518,7 +518,7 @@ extension AppState {
             changed = true
         }
         if ProcessInfo.processInfo.arguments.contains("-XDialUITestingTailscaleActionRequired"),
-           let modeIndex = profile.modes.firstIndex(where: { $0.id == profile.activeModeID }) {
+           let scenarioIndex = profile.scenarios.firstIndex(where: { $0.id == profile.activeScenarioID }) {
             let ruleID = "tailscale-ui-login-rule"
             if !profile.ruleSets.contains(where: { $0.id == ruleID }) {
                 profile.ruleSets.append(RuleSet(
@@ -529,10 +529,10 @@ extension AppState {
                 ))
                 changed = true
             }
-            if !profile.modes[modeIndex].bindings.contains(where: {
+            if !profile.scenarios[scenarioIndex].bindings.contains(where: {
                 $0.ruleSetID == ruleID
             }) {
-                profile.modes[modeIndex].bindings.append(RuleBinding(
+                profile.scenarios[scenarioIndex].bindings.append(RuleBinding(
                     ruleSetID: ruleID,
                     lineID: "tailscale-ui-demo"
                 ))
@@ -567,9 +567,9 @@ extension AppState {
             changed = true
         }
         if ProcessInfo.processInfo.arguments.contains("-XDialUITestingSubscriptionSummary"),
-           let modeIndex = profile.modes.firstIndex(where: { $0.id == profile.activeModeID }) {
-            profile.modes[modeIndex].defaultLineID = ""
-            profile.modes[modeIndex].defaultSubscriptionID = "sub-ui-demo"
+           let scenarioIndex = profile.scenarios.firstIndex(where: { $0.id == profile.activeScenarioID }) {
+            profile.scenarios[scenarioIndex].defaultLineID = ""
+            profile.scenarios[scenarioIndex].defaultSubscriptionID = "sub-ui-demo"
             changed = true
         }
 

@@ -54,8 +54,8 @@ struct SettingsView: View {
                     : app.tr("未安装", "Not installed")
             )
             infoRow(
-                label: app.tr("模式数量", "Modes"),
-                value: "\(app.profile.modes.count)"
+                label: app.tr("场景数量", "Scenarios"),
+                value: "\(app.profile.scenarios.count)"
             )
             infoRow(
                 label: app.tr("线路数量", "Lines"),

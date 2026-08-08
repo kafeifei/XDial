@@ -2,6 +2,38 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+private extension UTType {
+    static let xdialSettingsEntry = UTType(
+        exportedAs: "com.kafeifei.xdial.settings-entry"
+    )
+}
+
+private struct SettingsReorderItem: Codable, Transferable {
+    let kind: String
+    let id: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        CodableRepresentation(contentType: .xdialSettingsEntry)
+    }
+}
+
+@discardableResult
+private func reorder<Item>(
+    _ items: inout [Item],
+    draggedID: String,
+    targetID: String,
+    id: (Item) -> String
+) -> Bool {
+    guard draggedID != targetID,
+          let sourceIndex = items.firstIndex(where: { id($0) == draggedID }),
+          let targetIndex = items.firstIndex(where: { id($0) == targetID }) else {
+        return false
+    }
+    let item = items.remove(at: sourceIndex)
+    items.insert(item, at: min(targetIndex, items.endIndex))
+    return true
+}
+
 struct SettingsView: View {
     @EnvironmentObject var state: AppState
     @State private var tab = 0
@@ -9,35 +41,67 @@ struct SettingsView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Picker("", selection: $tab) {
-                    Text("📡 \(state.tr("线路", "Lines"))").tag(0)
-                    Text("📋 \(state.tr("规则", "Rules"))").tag(1)
-                    Text("🔀 \(state.tr("模式", "Modes"))").tag(2)
+                HStack {
+                    Spacer(minLength: 0)
+                    HStack(spacing: 4) {
+                        settingsTab(
+                            0,
+                            title: state.tr("线路", "Lines"),
+                            symbol: "point.3.connected.trianglepath.dotted"
+                        )
+                        settingsTab(
+                            1,
+                            title: state.tr("规则", "Rules"),
+                            symbol: "list.bullet.rectangle"
+                        )
+                        settingsTab(
+                            2,
+                            title: state.tr("场景", "Scenarios"),
+                            symbol: "square.grid.2x2"
+                        )
+                    }
+                    .padding(4)
+                    .frame(width: 292)
+                    .background(Color.primary.opacity(0.04), in: Capsule())
+                    .overlay {
+                        Capsule().stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+                    }
+                    Spacer(minLength: 0)
                 }
-                .pickerStyle(.segmented)
                 .frame(maxWidth: .infinity)
 
-                Button {
-                    tab = 3
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "gearshape")
-                        Text(state.tr("通用", "General"))
-                    }
-                    .padding(.vertical, 4)
-                    .padding(.horizontal, 8)
-                    .background(tab == 3 ? Color.accentColor.opacity(0.2) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                HStack(spacing: 0) {
+                    settingsTab(
+                        3,
+                        title: state.tr("通用", "General"),
+                        symbol: "gearshape"
+                    )
                 }
-                .buttonStyle(.plain)
+                .padding(4)
+                .frame(width: 92)
+                .background(Color.primary.opacity(0.04), in: Capsule())
+                .overlay {
+                    Capsule().stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+                }
             }
-            .padding(8)
+            .padding(.horizontal, 16)
+            .frame(height: 54)
+            .background {
+                LinearGradient(
+                    colors: [
+                        titleAccent.opacity(0.10),
+                        titleAccent.opacity(0.035),
+                        XDialPalette.accent.opacity(0.025),
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            }
 
-            if state.configDirty {
-                dirtyBanner
-            }
             if !state.installation.isReady {
                 installationBanner
+            } else if state.configDirty {
+                dirtyBanner
             }
 
             Divider()
@@ -45,39 +109,149 @@ struct SettingsView: View {
             ZStack {
                 if tab == 0 { LinesTab() }
                 else if tab == 1 { RulesTab() }
-                else if tab == 2 { ModesTab() }
+                else if tab == 2 { ScenariosTab() }
                 else { GeneralTab() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(XDialPalette.canvas)
         }
         .frame(width: 540, height: 520)
+        .background(XDialPalette.canvas)
     }
 
-    /// 设置窗口里任何一处编辑都可能造成"引擎还在跑旧配置"，所以横幅放在
-    /// tab 之上、四个 tab 共用一份，而不是每个 tab 各自提醒一遍。
-    private var dirtyBanner: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.caption)
-                .foregroundStyle(.orange)
-            Text(state.tr("配置已修改，重连后生效", "Config changed — reconnect to apply"))
-                .font(.caption)
-                .foregroundStyle(.orange)
-            Spacer()
-            Button(state.tr("立即重连", "Reconnect now")) { state.reconnect() }
-                .controlSize(.small)
-                .disabled(state.isBusy || !state.canConnect)
+    private var titleAccent: Color {
+        if state.isConnected { return XDialPalette.success }
+        if state.isBusy { return XDialPalette.progress }
+        if state.engine.lastError != nil { return XDialPalette.danger }
+        return Color.secondary.opacity(0.82)
+    }
+
+    private func settingsTab(
+        _ index: Int,
+        title: String,
+        symbol: String
+    ) -> some View {
+        let selected = tab == index
+        return Button {
+            tab = index
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: symbol)
+                    .font(.system(size: 10.5, weight: .medium))
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .foregroundStyle(
+                selected ? XDialPalette.selection : Color.secondary
+            )
+            .frame(maxWidth: .infinity)
+            .frame(height: 28)
+            .background(
+                selected
+                    ? XDialPalette.selection.opacity(0.13)
+                    : Color.clear,
+                in: Capsule()
+            )
+            .overlay {
+                if selected {
+                    Capsule().stroke(
+                        XDialPalette.selection.opacity(0.19),
+                        lineWidth: 0.5
+                    )
+                }
+            }
+            .contentShape(Capsule())
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(Color.orange.opacity(0.12))
+        .buttonStyle(.plain)
+    }
+
+    /// 当前事务依赖的已保存配置发生变化时，四个 Tab 共用这一条状态轨。
+    /// 它是“运行快照待应用”，不是错误，因此不使用危险色或独立警告卡片。
+    private var dirtyBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(XDialPalette.warning)
+            Text(
+                state.tr(
+                    "修改已保存，当前连接尚未应用",
+                    "Changes saved; the current connection has not applied them"
+                )
+            )
+            .font(.system(size: 11.5, weight: .medium))
+            .foregroundStyle(.primary.opacity(0.82))
+            .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            if state.isBusy {
+                Text(state.tr("连接完成后可应用", "Apply after connecting"))
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            } else if state.canConnect {
+                Button { state.reconnect() } label: {
+                    Label(
+                        state.tr("应用并重连", "Apply & Reconnect"),
+                        systemImage: "arrow.clockwise"
+                    )
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .foregroundStyle(XDialPalette.primaryAction)
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background(
+                        XDialPalette.primaryAction.opacity(0.09),
+                        in: Capsule()
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint(
+                    state.tr(
+                        "使用已保存配置重新建立当前连接",
+                        "Reconnect using the saved configuration"
+                    )
+                )
+            } else {
+                Text(dirtyConfigurationBlocker)
+                .font(.system(size: 10.5))
+                .foregroundStyle(XDialPalette.warning)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(minHeight: 36)
+        .background {
+            LinearGradient(
+                colors: [
+                    XDialPalette.warning.opacity(0.085),
+                    XDialPalette.warning.opacity(0.035),
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        }
+        .overlay(alignment: .top) {
+            Divider().opacity(0.55)
+        }
+    }
+
+    private var dirtyConfigurationBlocker: String {
+        if !state.installation.isReady {
+            return state.tr("请先完成安装", "Complete setup first")
+        }
+        if state.activeScenario == nil {
+            return state.tr("请先选择场景", "Choose a scenario first")
+        }
+        return state.tr(
+            "请先完善当前场景",
+            "Complete the current scenario first"
+        )
     }
 
     private var installationBanner: some View {
         HStack(spacing: 6) {
             Image(systemName: "shield.lefthalf.filled")
                 .font(.caption)
-                .foregroundStyle(.orange)
+                .foregroundStyle(XDialPalette.progress)
             Text(
                 state.installation.report.error?.message
                     ?? state.tr(
@@ -86,7 +260,7 @@ struct SettingsView: View {
                     )
             )
             .font(.caption)
-            .foregroundStyle(.orange)
+            .foregroundStyle(XDialPalette.progress)
             Spacer()
             Button(state.tr("查看进度", "View Progress")) {
                 state.installation.present()
@@ -94,8 +268,14 @@ struct SettingsView: View {
             .controlSize(.small)
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(Color.orange.opacity(0.12))
+        .frame(minHeight: 34)
+        .background(XDialPalette.progress.opacity(0.10), in: RoundedRectangle(cornerRadius: 9))
+        .overlay {
+            RoundedRectangle(cornerRadius: 9)
+                .stroke(XDialPalette.progress.opacity(0.16), lineWidth: 0.5)
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
     }
 }
 
@@ -103,112 +283,189 @@ struct SettingsView: View {
 
 struct GeneralTab: View {
     @EnvironmentObject var state: AppState
-    @State private var confirmingUninstall = false
-    @State private var deleteDataOnUninstall = false
-    @State private var uninstallError: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Group {
-                HStack {
-                    Text(state.tr("语言", "Language"))
-                        .frame(width: 120, alignment: .leading)
-                    Picker("", selection: $state.language) {
-                        ForEach(Lang.allCases, id: \.self) { l in
-                            Text(l.displayName).tag(l)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                SettingsPanel {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            Text(state.tr("外观", "Appearance"))
+                                .font(.system(size: 12))
+                            Spacer()
+                            Picker(
+                                state.tr("外观", "Appearance"),
+                                selection: $state.appearance
+                            ) {
+                                appearanceOption(
+                                    .system,
+                                    title: state.tr(
+                                        "跟随系统",
+                                        "Follow System"
+                                    ),
+                                    symbol: "circle.lefthalf.filled"
+                                )
+                                appearanceOption(
+                                    .light,
+                                    title: state.tr("白天", "Light"),
+                                    symbol: "sun.max.fill"
+                                )
+                                appearanceOption(
+                                    .dark,
+                                    title: state.tr("黑夜", "Dark"),
+                                    symbol: "moon.fill"
+                                )
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .controlSize(.small)
+                            .frame(width: 132)
+                            .accessibilityLabel(
+                                state.tr("外观", "Appearance")
+                            )
+                        }
+                        .frame(minHeight: 28)
+
+                        HStack(spacing: 8) {
+                            Text(state.tr("语言", "Language"))
+                                .font(.system(size: 12))
+                            Spacer()
+                            Picker("", selection: $state.language) {
+                                ForEach(Lang.allCases, id: \.self) { l in
+                                    Text(l.displayName).tag(l)
+                                }
+                            }
+                            .font(.system(size: 12))
+                            .pickerStyle(.menu)
+                            .controlSize(.small)
+                            .frame(width: 136)
+                        }
+                        .frame(minHeight: 28)
+
+                        Toggle(isOn: $state.launchAtLogin) {
+                            Text(state.tr("开机自动启动", "Launch at login"))
+                                .font(.system(size: 12))
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Toggle(isOn: $state.autoConnect) {
+                                Text(state.tr(
+                                    "启动时自动连接",
+                                    "Connect automatically on launch"
+                                ))
+                                .font(.system(size: 12))
+                            }
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                            .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                            Text(state.tr(
+                                "此选项控制 XDial 启动后连接当前场景。运行中断线时，XDial 会尝试自动恢复连接。",
+                                "This controls connecting the active Scenario when XDial launches. If the connection drops while running, XDial attempts to restore it automatically."
+                            ))
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
                         }
                     }
-                    .pickerStyle(.menu)
-                    .frame(width: 160)
-                    Spacer()
                 }
 
-                Toggle(isOn: $state.launchAtLogin) {
-                    Text(state.tr("开机自动启动", "Launch at login"))
-                }
-                .toggleStyle(.switch)
+                SettingsPanel {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: installationStatusSymbol)
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(installationStatusColor)
+                                .frame(width: 18, height: 18)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(state.tr(
+                                    "安装与卸载",
+                                    "Install & Uninstall"
+                                ))
+                                .font(.system(size: 12, weight: .semibold))
+                                Text(installationStatusText)
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Toggle(isOn: $state.autoConnect) {
-                        Text(state.tr(
-                            "启动时自动连接",
-                            "Connect automatically on launch"
-                        ))
+                        HStack(spacing: 8) {
+                            Spacer()
+                            Button {
+                                state.installation.present(
+                                    operation: .install
+                                )
+                            } label: {
+                                Label(
+                                    state.tr("安装", "Install"),
+                                    systemImage: "square.and.arrow.down"
+                                )
+                                .font(.system(size: 11.5))
+                            }
+                            .controlSize(.small)
+
+                            Button(role: .destructive) {
+                                state.installation.present(
+                                    operation: .uninstall
+                                )
+                            } label: {
+                                Label(
+                                    state.tr("卸载", "Uninstall"),
+                                    systemImage: "trash"
+                                )
+                                .font(.system(size: 11.5))
+                            }
+                            .controlSize(.small)
+                        }
                     }
-                    .toggleStyle(.switch)
-                    Text(state.tr(
-                        "此选项控制 XDial 启动后连接当前模式。运行中断线时，XDial 会尝试自动恢复连接。",
-                        "This controls connecting the active Mode when XDial launches. If the connection drops while running, XDial attempts to restore it automatically."
-                    ))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, 2)
                 }
             }
-            .padding(.horizontal, 16)
-
-            Divider().padding(.vertical, 4)
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text(state.tr("卸载", "Uninstall"))
-                    .font(.headline)
-                Text(state.tr(
-                    "断开 XDial，移除网络配置、网络扩展和后台服务，然后把应用移到废纸篓。",
-                    "Disconnect XDial, remove its network configuration, extension, and background service, then move the app to Trash."
-                ))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                Button(role: .destructive) {
-                    confirmingUninstall = true
-                } label: {
-                    Text(state.tr("卸载…", "Uninstall…"))
-                }
-            }
-            .padding(.horizontal, 16)
-
-            Spacer()
-
-            if let err = uninstallError {
-                Text(err)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 16)
-            }
-        }
-        .padding(.vertical, 16)
-        .confirmationDialog(
-            state.tr("确认卸载 XDial？", "Uninstall XDial?"),
-            isPresented: $confirmingUninstall,
-            titleVisibility: .visible
-        ) {
-            Button(state.tr("卸载 XDial（保留设置）", "Uninstall XDial (keep settings)")) {
-                deleteDataOnUninstall = false
-                runUninstall()
-            }
-            Button(state.tr("卸载并删除所有数据", "Uninstall and delete all data"), role: .destructive) {
-                deleteDataOnUninstall = true
-                runUninstall()
-            }
-            Button(state.tr("取消", "Cancel"), role: .cancel) {}
-        } message: {
-            Text(state.tr(
-                "「卸载并删除所有数据」会清除线路、规则、模式，以及钥匙串里的密码。",
-                "“Uninstall and delete all data” removes lines, rules, modes, and Keychain-stored passwords."
-            ))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
         }
     }
 
-    private func runUninstall() {
-        state.uninstall(deleteData: deleteDataOnUninstall) { ok, err in
-            if ok {
-                uninstallError = nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    NSApp.terminate(nil)
-                }
-            } else {
-                uninstallError = err
-            }
+    private func appearanceOption(
+        _ appearance: AppAppearance,
+        title: String,
+        symbol: String
+    ) -> some View {
+        Label(title, systemImage: symbol)
+            .labelStyle(.iconOnly)
+            .accessibilityLabel(title)
+            .tag(appearance)
+            .help(title)
+    }
+
+    private var installationStatusText: String {
+        if state.installation.isReady {
+            return state.tr(
+                "后台服务与网络扩展均已安装",
+                "Background service and network extension are installed"
+            )
         }
+        return state.installation.report.error?.message
+            ?? state.tr(
+                "安装尚未完成",
+                "Installation is not complete"
+            )
+    }
+
+    private var installationStatusSymbol: String {
+        if state.installation.isReady { return "checkmark.shield.fill" }
+        if state.installation.report.state == .failed {
+            return "exclamationmark.shield.fill"
+        }
+        return "shield.lefthalf.filled"
+    }
+
+    private var installationStatusColor: Color {
+        if state.installation.isReady { return XDialPalette.success }
+        if state.installation.report.state == .failed {
+            return XDialPalette.danger
+        }
+        return XDialPalette.progress
     }
 }
 
@@ -224,36 +481,82 @@ struct LinesTab: View {
                 VStack(spacing: 8) {
                     ForEach($state.profile.lines) { $line in
                         LineRow(line: $line, onDelete: { delete(line) })
+                            .draggable(SettingsReorderItem(kind: "line", id: line.id))
+                            .dropDestination(for: SettingsReorderItem.self) { items, _ in
+                                moveLine(items.first, to: line.id)
+                            }
                     }
                     ForEach($state.profile.subscriptions) { $sub in
                         SubscriptionRow(sub: $sub, onDelete: { deleteSub(sub) })
+                            .draggable(SettingsReorderItem(kind: "subscription", id: sub.id))
+                            .dropDestination(for: SettingsReorderItem.self) { items, _ in
+                                moveSubscription(items.first, to: sub.id)
+                            }
                     }
                 }
-                .padding(10)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
             }
             Divider()
-            HStack {
-                Spacer()
+            AddBar {
                 Menu {
-                    Button("VPN") { add(type: "vpn") }
-                    Button("Trojan") { add(type: "trojan") }
-                    Button("Shadowsocks") { add(type: "shadowsocks") }
-                    Button("VMess") { add(type: "vmess") }
-                    Button("AnyTLS") { add(type: "anytls") }
-                    Button("Tailscale") { add(type: "tailscale") }
+                    lineTypeButton("VPN", type: "vpn", icon: "lock.shield")
+                    lineTypeButton(
+                        "Trojan",
+                        type: "trojan",
+                        icon: "shield.lefthalf.filled"
+                    )
+                    lineTypeButton(
+                        "Shadowsocks",
+                        type: "shadowsocks",
+                        icon: "eye.slash"
+                    )
+                    lineTypeButton(
+                        "VMess",
+                        type: "vmess",
+                        icon: "point.3.connected.trianglepath.dotted"
+                    )
+                    lineTypeButton(
+                        "AnyTLS",
+                        type: "anytls",
+                        icon: "lock.square"
+                    )
+                    lineTypeButton(
+                        "Tailscale",
+                        type: "tailscale",
+                        icon: "circle.grid.3x3.fill"
+                    )
                     Divider()
-                    Button(state.tr("从订阅导入…", "Import from subscription…")) {
+                    Button {
                         showAddSub = true
+                    } label: {
+                        Label(
+                            state.tr(
+                                "从订阅导入…",
+                                "Import from subscription…"
+                            ),
+                            systemImage: "tray.and.arrow.down"
+                        )
                     }
                 } label: {
                     Label(state.tr("添加线路", "Add Line"), systemImage: "plus")
                 }
-                .menuStyle(.borderlessButton)
-                .padding(8)
             }
         }
         .sheet(isPresented: $showAddSub) {
             AddSubscriptionSheet(isPresented: $showAddSub)
+        }
+    }
+
+    private func lineTypeButton(
+        _ title: String,
+        type: String,
+        icon: String
+    ) -> some View {
+        Button {
+            add(type: type)
+        } label: {
+            Label(title, systemImage: icon)
         }
     }
 
@@ -284,6 +587,36 @@ struct LinesTab: View {
 
     private func deleteSub(_ sub: Subscription) {
         state.deleteSubscription(sub.id)
+    }
+
+    private func moveLine(
+        _ item: SettingsReorderItem?,
+        to targetID: String
+    ) -> Bool {
+        guard let item, item.kind == "line",
+              reorder(
+                &state.profile.lines,
+                draggedID: item.id,
+                targetID: targetID,
+                id: { $0.id }
+              ) else { return false }
+        state.save()
+        return true
+    }
+
+    private func moveSubscription(
+        _ item: SettingsReorderItem?,
+        to targetID: String
+    ) -> Bool {
+        guard let item, item.kind == "subscription",
+              reorder(
+                &state.profile.subscriptions,
+                draggedID: item.id,
+                targetID: targetID,
+                id: { $0.id }
+              ) else { return false }
+        state.save()
+        return true
     }
 }
 
@@ -326,7 +659,7 @@ private struct RuntimeResourceBadge: View {
         case .notObserved:
             return state.tr("尚未运行", "Not run")
         case .notPlanned:
-            return state.tr("本次未使用", "Not in use")
+            return state.tr("未激活", "Inactive")
         case let .task(taskState):
             switch taskState {
             case .pending:
@@ -385,12 +718,14 @@ private struct RuntimeResourceBadge: View {
             switch taskState {
             case .pending, .rolledBack, .skipped:
                 return .secondary
-            case .running, .committing, .rollingBack:
-                return .orange
+            case .running, .committing:
+                return XDialPalette.progress
+            case .rollingBack:
+                return XDialPalette.selection
             case .ready, .committed:
-                return .green
+                return XDialPalette.success
             case .failed:
-                return .red
+                return XDialPalette.danger
             }
         }
     }
@@ -412,8 +747,8 @@ private struct RuntimeResourceBadge: View {
             )
         case .notPlanned:
             return state.tr(
-                "这条线路没有被本次运行中的 Mode 引用。",
-                "This resource is not referenced by the runtime Mode."
+                "这条线路没有被本次运行中的 Scenario 引用。",
+                "This resource is not referenced by the runtime Scenario."
             )
         case .task:
             return label
@@ -518,7 +853,7 @@ struct LineRow: View {
                 systemImage: "exclamationmark.octagon.fill"
             )
             .font(.caption)
-            .foregroundStyle(.red)
+            .foregroundStyle(XDialPalette.danger)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.bottom, 4)
         }
@@ -596,19 +931,19 @@ struct LineRow: View {
 
     private var tailscaleStatusColor: Color {
         if tailscaleRuntimeConnected {
-            return .green
+            return XDialPalette.success
         }
         if tailscaleStatus?.isRunning == true {
             if !line.tailscaleExitNode.isEmpty,
                tailscaleStatus?.exitNodes.first(where: { $0.ip == line.tailscaleExitNode })?.online != true {
-                return .orange
+                return XDialPalette.warning
             }
-            return .green
+            return XDialPalette.success
         }
         if tailscaleStatus != nil || tailscaleError != nil {
-            return .orange
+            return XDialPalette.warning
         }
-        return .gray
+        return XDialPalette.disabled
     }
 
     private var tailscaleStatusLabel: String {
@@ -688,7 +1023,7 @@ struct LineRow: View {
             if let issue = anyTLSVisibleValidationIssue {
                 Label(issue, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption2)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(XDialPalette.danger)
                     .fixedSize(horizontal: false, vertical: true)
             }
         case "tailscale":
@@ -726,7 +1061,7 @@ struct LineRow: View {
             if let error = tailscaleError {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(XDialPalette.warning)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -746,8 +1081,8 @@ struct LineRow: View {
             .accessibilityIdentifier("tailscale-magic-dns-toggle")
 
             Text(state.tr(
-                "解析并访问 Tailnet 节点；仅在当前 Mode 使用这条线路时生效，Mode 中已有的显式域名规则优先。",
-                "Resolve and reach Tailnet peers only when the current Mode uses this line. Explicit domain rules in the Mode take priority."
+                "解析并访问 Tailnet 节点；仅在当前 Scenario 使用这条线路时生效，Scenario 中已有的显式域名规则优先。",
+                "Resolve and reach Tailnet peers only when the current Scenario uses this line. Explicit domain rules in the Scenario take priority."
             ))
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -881,7 +1216,7 @@ struct LineRow: View {
                 systemImage: "exclamationmark.triangle.fill"
             )
             .font(.caption)
-            .foregroundStyle(.orange)
+            .foregroundStyle(XDialPalette.warning)
         }
 
         HStack {
@@ -1185,7 +1520,7 @@ struct LineRow: View {
                 ))
                 .font(.caption2)
                 .foregroundStyle(
-                    line.tfo ? Color.red : Color.secondary
+                    line.tfo ? XDialPalette.danger : Color.secondary
                 )
             }
             Spacer()
@@ -1204,7 +1539,7 @@ struct LineRow: View {
                     systemImage: "checkmark.circle.fill"
                 )
                 .font(.caption)
-                .foregroundStyle(.green)
+                .foregroundStyle(XDialPalette.success)
                 Text(state.tr(
                     line.udp
                         ? "AnyTLS 数据面原生承载 UDP"
@@ -1215,7 +1550,7 @@ struct LineRow: View {
                 ))
                 .font(.caption2)
                 .foregroundStyle(
-                    line.udp ? Color.secondary : Color.orange
+                    line.udp ? Color.secondary : XDialPalette.warning
                 )
                 .fixedSize(horizontal: false, vertical: true)
             }
@@ -1356,13 +1691,17 @@ struct RulesTab: View {
                 VStack(spacing: 8) {
                     ForEach($state.profile.ruleSets) { $rule in
                         RuleSetRow(rule: $rule, onDelete: { delete(rule) })
+                            .draggable(SettingsReorderItem(kind: "rule", id: rule.id))
+                            .dropDestination(for: SettingsReorderItem.self) { items, _ in
+                                moveRule(items.first, to: rule.id)
+                            }
                     }
                 }
-                .padding(10)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
             }
             Divider()
-            HStack {
-                Spacer()
+            AddBar {
                 Menu {
                     Menu(state.tr("URL 规则", "URL Rule")) {
                         ForEach(presetCatalog.presets) { preset in
@@ -1387,8 +1726,6 @@ struct RulesTab: View {
                         systemImage: "plus"
                     )
                 }
-                .menuStyle(.borderlessButton)
-                .padding(8)
             }
         }
         .alert(
@@ -1453,17 +1790,32 @@ struct RulesTab: View {
 
     private func delete(_ rule: RuleSet) {
         state.profile.ruleSets.removeAll { $0.id == rule.id }
-        for i in state.profile.modes.indices {
-            state.profile.modes[i].bindings.removeAll { $0.ruleSetID == rule.id }
+        for i in state.profile.scenarios.indices {
+            state.profile.scenarios[i].bindings.removeAll { $0.ruleSetID == rule.id }
         }
         state.save()
+    }
+
+    private func moveRule(
+        _ item: SettingsReorderItem?,
+        to targetID: String
+    ) -> Bool {
+        guard let item, item.kind == "rule",
+              reorder(
+                &state.profile.ruleSets,
+                draggedID: item.id,
+                targetID: targetID,
+                id: { $0.id }
+              ) else { return false }
+        state.save()
+        return true
     }
 }
 
 struct RuleSetRow: View {
     @SwiftUI.Binding var rule: RuleSet
     var onDelete: () -> Void
-    @State private var expanded = true
+    @State private var expanded = false
     @State private var domainsText = ""
     @State private var cidrsText = ""
     @State private var processesText = ""
@@ -1500,6 +1852,43 @@ struct RuleSetRow: View {
                 Spacer()
                 Text(ruleTypeLabel)
                     .font(.caption).foregroundStyle(.secondary)
+                Button {
+                    rule.invert.toggle()
+                    state.save()
+                } label: {
+                    Label(
+                        state.tr("反向", "Invert"),
+                        systemImage: "arrow.left.arrow.right"
+                    )
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(
+                        rule.invert ? XDialPalette.selection : Color.secondary
+                    )
+                    .padding(.horizontal, 7)
+                    .frame(height: 21)
+                    .background(
+                        rule.invert
+                            ? XDialPalette.selection.opacity(0.11)
+                            : Color.primary.opacity(0.035),
+                        in: Capsule()
+                    )
+                    .overlay {
+                        Capsule().stroke(
+                            rule.invert
+                                ? XDialPalette.selection.opacity(0.22)
+                                : Color.primary.opacity(0.07),
+                            lineWidth: 0.5
+                        )
+                    }
+                }
+                .buttonStyle(.plain)
+                .help(state.tr(
+                    "反向匹配：匹配该规则之外的流量",
+                    "Invert: match traffic outside this rule"
+                ))
+                .accessibilityValue(rule.invert
+                    ? state.tr("已开启", "On")
+                    : state.tr("已关闭", "Off"))
             },
             detail: {
                 VStack(alignment: .leading, spacing: 4) {
@@ -1577,15 +1966,6 @@ struct RuleSetRow: View {
                 .labelsHidden()
                 .onChange(of: rule.format) { _, _ in state.save() }
             }
-            Toggle(
-                state.tr(
-                    "反向匹配（匹配列表之外）",
-                    "Invert (match outside the list)"
-                ),
-                isOn: $rule.invert
-            )
-            .font(.caption)
-            .onChange(of: rule.invert) { _, _ in state.save() }
         }
         .padding(.leading, 18)
     }
@@ -1741,9 +2121,9 @@ private enum ApplicationRulePicker {
     }
 }
 
-// MARK: - 模式 Tab
+// MARK: - 场景 Tab
 
-struct ModesTab: View {
+struct ScenariosTab: View {
     @EnvironmentObject var state: AppState
     @State private var showTemplate = false
     @State private var newName = ""
@@ -1753,49 +2133,82 @@ struct ModesTab: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 8) {
-                    ForEach($state.profile.modes) { $mode in
-                        ModeRow(
-                            mode: $mode,
-                            isActive: mode.id == state.profile.activeModeID,
-                            isExpanded: expandedID == mode.id,
-                            onToggle: { expandedID = expandedID == mode.id ? nil : mode.id },
-                            // 和主 popover 的 Picker、DebugServer 的 select-mode
+                    ForEach($state.profile.scenarios) { $scenario in
+                        let scenarioID = scenario.id
+                        ScenarioRow(
+                            scenario: $scenario,
+                            isActive: scenarioID == state.profile.activeScenarioID,
+                            isExpanded: expandedID == scenarioID,
+                            onToggle: {
+                                expandedID = expandedID == scenarioID
+                                    ? nil
+                                    : scenarioID
+                            },
+                            // 和主 popover 的 Picker、DebugServer 的 select-scenario
                             // 走同一个 intent，门禁与 dirty 置位只有一处实现
-                            onActivate: { state.activateMode(mode.id) },
-                            onDelete: { state.deleteMode(mode) }
+                            onActivate: { state.activateScenario(scenarioID) },
+                            onDelete: {
+                                if expandedID == scenarioID {
+                                    expandedID = nil
+                                }
+                                state.deleteScenario(id: scenarioID)
+                            }
                         )
+                        .draggable(SettingsReorderItem(kind: "scenario", id: scenarioID))
+                        .dropDestination(for: SettingsReorderItem.self) { items, _ in
+                            moveScenario(items.first, to: scenarioID)
+                        }
                     }
                 }
-                .padding(10)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
             }
             Divider()
             AddBar {
                 Menu {
-                    ForEach(ModeTemplate.allCases, id: \.self) { t in
+                    ForEach(ScenarioTemplate.allCases, id: \.self) { t in
                         Button(t.displayName) {
-                            state.createMode(from: t, named: t.displayName)
+                            state.createScenario(from: t, named: t.displayName)
                         }
                     }
                 } label: {
-                    Label(state.tr("添加模式", "Add Mode"), systemImage: "plus")
+                    Label(state.tr("添加场景", "Add Scenario"), systemImage: "plus")
                 }
             }
         }
     }
 
+    private func moveScenario(
+        _ item: SettingsReorderItem?,
+        to targetID: String
+    ) -> Bool {
+        guard let item, item.kind == "scenario",
+              reorder(
+                &state.profile.scenarios,
+                draggedID: item.id,
+                targetID: targetID,
+                id: { $0.id }
+              ) else { return false }
+        state.save()
+        return true
+    }
+
 }
 
-struct ModeRow: View {
-    @SwiftUI.Binding var mode: Mode
+struct ScenarioRow: View {
+    @SwiftUI.Binding var scenario: Scenario
     let isActive: Bool
     let isExpanded: Bool
     let onToggle: () -> Void
     let onActivate: () -> Void
     let onDelete: () -> Void
     @EnvironmentObject var state: AppState
+    @State private var newSSID = ""
+    @State private var ssidError: String?
+    @State private var showsIconPicker = false
 
     private var bindingSummary: String {
-        let n = mode.bindings.count
+        let n = scenario.bindings.count
         return n == 0 ? state.tr("无规则", "No rules") : "\(n) \(state.tr("条规则", "rules"))"
     }
 
@@ -1808,22 +2221,194 @@ struct ModeRow: View {
             header: {
                 if isActive {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.caption).foregroundColor(.accentColor)
+                        .font(.caption)
+                        .foregroundStyle(XDialPalette.selection)
                 } else {
                     Image(systemName: "circle")
                         .font(.caption).foregroundStyle(.secondary)
                         .onTapGesture { onActivate() }
                 }
-                Text(mode.name).font(.system(size: 13, weight: .medium))
-                Text(bindingSummary).font(.caption).foregroundStyle(.secondary)
+                Image(systemName: iconPreset.symbol)
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20, height: 20)
+                    .accessibilityHidden(true)
+                HStack(spacing: 7) {
+                    Text(scenario.name)
+                        .font(.system(size: 13, weight: .medium))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(
+                            minWidth: 72,
+                            idealWidth: 108,
+                            maxWidth: 148,
+                            alignment: .leading
+                        )
+                        .layoutPriority(2)
+                    Text(bindingSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                        .layoutPriority(2)
+
+                    if !scenario.matchSSIDs.isEmpty {
+                        ScenarioSSIDCapsuleLayout(
+                            horizontalSpacing: 4,
+                            minimumItemWidth: 48,
+                            maximumItemWidth: 148
+                        ) {
+                            ForEach(scenario.matchSSIDs, id: \.self) { ssid in
+                                scenarioSSIDCapsule(ssid)
+                            }
+                        }
+                        .frame(
+                            minWidth: 0,
+                            maxWidth: .infinity,
+                            alignment: .leading
+                        )
+                        .clipped()
+                        .layoutPriority(-1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             },
             detail: {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-                        TextField("", text: $mode.name)
+                        TextField("", text: $scenario.name)
                             .textFieldStyle(.roundedBorder).font(.caption)
-                            .onChange(of: mode.name) { _, _ in state.save() }
+                            .onChange(of: scenario.name) { _, _ in state.save() }
+                        Button {
+                            showsIconPicker.toggle()
+                        } label: {
+                            ZStack(alignment: .bottomTrailing) {
+                                Image(systemName: iconPreset.symbol)
+                                    .font(.system(size: 15, weight: .regular))
+                                if scenario.iconOverride == nil {
+                                    Image(systemName: "sparkles")
+                                        .font(.system(size: 7, weight: .semibold))
+                                        .offset(x: 3, y: 2)
+                                }
+                            }
+                            .foregroundStyle(XDialPalette.selection)
+                            .frame(width: 30, height: 26)
+                            .background(
+                                XDialPalette.selection.opacity(0.09),
+                                in: RoundedRectangle(cornerRadius: 7)
+                            )
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 7)
+                                    .stroke(
+                                        XDialPalette.selection.opacity(0.16),
+                                        lineWidth: 0.5
+                                    )
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help(state.tr("选择场景图标", "Choose scenario icon"))
+                        .accessibilityLabel(
+                            state.tr("场景图标", "Scenario icon")
+                        )
+                        .accessibilityValue(iconAccessibilityValue)
+                        .popover(isPresented: $showsIconPicker) {
+                            ScenarioIconPicker(scenario: $scenario)
+                                .environmentObject(state)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Label(
+                                state.tr("Wi-Fi 自动切换", "Automatic Wi-Fi switch"),
+                                systemImage: "wifi"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            Spacer()
+                            if let currentSSID = state.currentSSID {
+                                Button(state.tr(
+                                    "使用当前：\(currentSSID)",
+                                    "Use current: \(currentSSID)"
+                                )) {
+                                    addSSID(currentSSID)
+                                }
+                                .buttonStyle(.borderless)
+                                .controlSize(.small)
+                            } else {
+                                Button(
+                                    state.wifiSSIDAccessState == .denied
+                                        ? state.tr(
+                                            "打开位置设置",
+                                            "Open Location Settings"
+                                        )
+                                        : state.tr(
+                                            "读取当前 Wi-Fi",
+                                            "Read current Wi-Fi"
+                                        )
+                                ) {
+                                    state.requestSSIDAccess()
+                                }
+                                .buttonStyle(.borderless)
+                                .controlSize(.small)
+                                .foregroundStyle(XDialPalette.primaryAction)
+                            }
+                        }
+
+                        ForEach(scenario.matchSSIDs, id: \.self) { ssid in
+                            HStack(spacing: 7) {
+                                Image(systemName: "wifi")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                Text(ssid)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                Spacer()
+                                Button {
+                                    state.removeSSID(ssid, from: scenario.id)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.horizontal, 8)
+                            .frame(height: 27)
+                            .background(.quaternary.opacity(0.55))
+                            .clipShape(RoundedRectangle(cornerRadius: 7))
+                        }
+
+                        HStack(spacing: 6) {
+                            TextField(
+                                state.tr("添加 SSID", "Add SSID"),
+                                text: $newSSID
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption)
+                            .onSubmit { addSSID(newSSID) }
+                            Button {
+                                addSSID(newSSID)
+                            } label: {
+                                Image(systemName: "plus.circle.fill")
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(newSSID.trimmingCharacters(
+                                in: .whitespacesAndNewlines
+                            ).isEmpty)
+                        }
+
+                        if let ssidError {
+                            Text(ssidError)
+                                .font(.caption2)
+                                .foregroundStyle(XDialPalette.danger)
+                        } else if state.wifiSSIDAccessState == .denied {
+                            Text(state.tr(
+                                "需要在系统设置中允许 XDial 访问位置，macOS 才会提供 SSID。",
+                                "Allow XDial location access in System Settings so macOS can provide the SSID."
+                            ))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        }
                     }
 
                     Divider()
@@ -1834,7 +2419,7 @@ struct ModeRow: View {
                         Text(state.tr("线路", "Line")).font(.caption).foregroundStyle(.secondary)
                     }
 
-                    ForEach(mode.bindings) { binding in
+                    ForEach(scenario.bindings) { binding in
                         bindingRow(binding)
                     }
 
@@ -1845,8 +2430,8 @@ struct ModeRow: View {
                             .font(.caption)
                             .frame(width: 200, alignment: .leading)
                         exitPicker(selectedID: SwiftUI.Binding(
-                            get: { mode.defaultTargetID },
-                            set: { mode.defaultTargetID = $0; state.save() }
+                            get: { scenario.defaultTargetID },
+                            set: { scenario.defaultTargetID = $0; state.save() }
                         ))
                     }
 
@@ -1854,7 +2439,7 @@ struct ModeRow: View {
                     HStack {
                         Spacer()
                         Menu {
-                            let usedIDs = Set(mode.bindings.map { $0.ruleSetID })
+                            let usedIDs = Set(scenario.bindings.map { $0.ruleSetID })
                             let available = state.profile.ruleSets.filter { !usedIDs.contains($0.id) }
                             if available.isEmpty {
                                 Button(state.tr("（无可用规则）", "(No rule available)")) {}.disabled(true)
@@ -1862,7 +2447,7 @@ struct ModeRow: View {
                                 ForEach(available) { rule in
                                     Button(rule.name) {
                                         let firstExit = state.profile.lines.first?.id ?? ""
-                                        mode.bindings.append(RuleBinding(ruleSetID: rule.id, lineID: firstExit))
+                                        scenario.bindings.append(RuleBinding(ruleSetID: rule.id, lineID: firstExit))
                                         state.save()
                                     }
                                 }
@@ -1878,27 +2463,93 @@ struct ModeRow: View {
         )
     }
 
+    private func addSSID(_ value: String) {
+        ssidError = state.addSSID(value, to: scenario.id)
+        if ssidError == nil {
+            newSSID = ""
+        }
+    }
+
+    private var iconPreset: ScenarioIconPreset {
+        ScenarioIconCatalog.resolvedPreset(for: scenario)
+    }
+
+    private var iconAccessibilityValue: String {
+        let name = state.tr(iconPreset.zhName, iconPreset.enName)
+        return scenario.iconOverride == nil
+            ? state.tr("自动：\(name)", "Automatic: \(name)")
+            : state.tr("手动：\(name)", "Manual: \(name)")
+    }
+
+    private func scenarioSSIDCapsule(_ ssid: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "wifi")
+                .font(.system(size: 8.5, weight: .medium))
+            Text(ssid)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.system(size: 10.5))
+        .foregroundStyle(XDialPalette.information)
+        .padding(.horizontal, 7)
+        .frame(minWidth: 48, maxWidth: 148, alignment: .leading)
+        .frame(height: 20)
+        .background(
+            XDialPalette.information.opacity(0.08),
+            in: Capsule()
+        )
+        .overlay {
+            Capsule().stroke(
+                XDialPalette.information.opacity(0.14),
+                lineWidth: 0.5
+            )
+        }
+        .help(ssid)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            state.tr("Wi-Fi：\(ssid)", "Wi-Fi: \(ssid)")
+        )
+        .accessibilityValue(ssid)
+    }
+
     @ViewBuilder
     private func bindingRow(_ binding: RuleBinding) -> some View {
-        if let idx = mode.bindings.firstIndex(where: { $0.ruleSetID == binding.ruleSetID }) {
+        if let idx = scenario.bindings.firstIndex(where: { $0.ruleSetID == binding.ruleSetID }) {
             let isEmpty = binding.lineID.isEmpty && binding.subscriptionID.isEmpty
             HStack {
                 HStack(spacing: 4) {
                     if isEmpty {
                         Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.caption2).foregroundStyle(.orange)
+                            .font(.caption2).foregroundStyle(XDialPalette.warning)
                     }
                     Text(state.profile.ruleSets.first(where: { $0.id == binding.ruleSetID })?.name ?? "（已删除）")
                 }
                 .frame(width: 200, alignment: .leading)
-                exitPicker(selectedID: $mode.bindings[idx].targetID)
+                exitPicker(selectedID: $scenario.bindings[idx].targetID)
                 Button {
-                    mode.bindings.removeAll { $0.ruleSetID == binding.ruleSetID }
+                    scenario.bindings.removeAll { $0.ruleSetID == binding.ruleSetID }
                     state.save()
                 } label: {
-                    Image(systemName: "minus.circle").foregroundStyle(.red)
+                    Image(systemName: "minus.circle").foregroundStyle(XDialPalette.danger)
                 }
                 .buttonStyle(.plain)
+            }
+            .draggable(SettingsReorderItem(
+                kind: "scenario-binding:\(scenario.id)",
+                id: binding.ruleSetID
+            ))
+            .dropDestination(for: SettingsReorderItem.self) { items, _ in
+                guard let item = items.first,
+                      item.kind == "scenario-binding:\(scenario.id)",
+                      reorder(
+                        &scenario.bindings,
+                        draggedID: item.id,
+                        targetID: binding.ruleSetID,
+                        id: { $0.ruleSetID }
+                      ) else { return false }
+                state.save()
+                return true
             }
         }
     }
@@ -1921,6 +2572,316 @@ struct ModeRow: View {
         .onChange(of: selectedID.wrappedValue) { _, _ in state.save() }
     }
 
+}
+
+/// Keeps every saved SSID on one compact row. Wider capsules yield space first
+/// until each reaches the two-CJK-character minimum; any remaining tail is
+/// clipped by the caller instead of increasing card height or displacing the
+/// Scenario name and trailing controls.
+private struct ScenarioSSIDCapsuleLayout: Layout {
+    let horizontalSpacing: CGFloat
+    let minimumItemWidth: CGFloat
+    let maximumItemWidth: CGFloat
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        let idealSizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        let naturalWidth = idealSizes.reduce(0) {
+            $0 + min(maximumItemWidth, max(minimumItemWidth, $1.width))
+        } + spacingWidth(for: subviews.count)
+        let availableWidth = max(0, proposal.width ?? naturalWidth)
+        let widths = compressedWidths(
+            idealSizes.map(\.width),
+            availableWidth: availableWidth
+        )
+        let height = zip(subviews, widths).reduce(CGFloat.zero) { result, pair in
+            max(
+                result,
+                pair.0.sizeThatFits(
+                    ProposedViewSize(width: pair.1, height: nil)
+                ).height
+            )
+        }
+        return CGSize(
+            width: min(availableWidth, widths.reduce(0, +) + spacingWidth(for: widths.count)),
+            height: height
+        )
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        let widths = compressedWidths(
+            subviews.map { $0.sizeThatFits(.unspecified).width },
+            availableWidth: bounds.width
+        )
+        var x = bounds.minX
+        for (index, subview) in subviews.enumerated() {
+            subview.place(
+                at: CGPoint(
+                    x: x,
+                    y: bounds.midY
+                ),
+                anchor: .leading,
+                proposal: ProposedViewSize(
+                    width: widths[index],
+                    height: bounds.height
+                )
+            )
+            x += widths[index] + horizontalSpacing
+        }
+    }
+
+    private func compressedWidths(
+        _ idealWidths: [CGFloat],
+        availableWidth: CGFloat
+    ) -> [CGFloat] {
+        guard !idealWidths.isEmpty else { return [] }
+        let widths = idealWidths.map {
+            min(maximumItemWidth, max(minimumItemWidth, $0))
+        }
+        let widthBudget = max(
+            0,
+            availableWidth - spacingWidth(for: widths.count)
+        )
+        guard widths.reduce(0, +) > widthBudget else { return widths }
+
+        let minimumTotal = CGFloat(widths.count) * minimumItemWidth
+        guard widthBudget > minimumTotal else {
+            return Array(
+                repeating: minimumItemWidth,
+                count: widths.count
+            )
+        }
+
+        // Water-fill from the widest capsules downward. Short SSIDs keep their
+        // natural width until the longer ones have compressed to the same cap.
+        var lowerBound = minimumItemWidth
+        var upperBound = widths.max() ?? minimumItemWidth
+        for _ in 0..<24 {
+            let cap = (lowerBound + upperBound) / 2
+            let cappedTotal = widths.reduce(0) {
+                $0 + min($1, cap)
+            }
+            if cappedTotal > widthBudget {
+                upperBound = cap
+            } else {
+                lowerBound = cap
+            }
+        }
+        return widths.map { min($0, lowerBound) }
+    }
+
+    private func spacingWidth(for itemCount: Int) -> CGFloat {
+        CGFloat(max(0, itemCount - 1)) * horizontalSpacing
+    }
+}
+
+private struct ScenarioIconPicker: View {
+    private static let automaticKey = "__automatic__"
+    private let columns = Array(
+        repeating: GridItem(.fixed(34), spacing: 8),
+        count: 6
+    )
+
+    @SwiftUI.Binding var scenario: Scenario
+    @EnvironmentObject private var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var focusedKey: String?
+    @State private var hoveredKey: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(previewName)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, minHeight: 16, alignment: .leading)
+
+            automaticButton
+
+            Divider()
+
+            LazyVGrid(columns: columns, spacing: 8) {
+                ForEach(ScenarioIconCatalog.presets) { preset in
+                    iconButton(preset)
+                }
+            }
+        }
+        .padding(12)
+        .frame(width: 268)
+        .background(XDialPalette.elevated)
+        .onAppear {
+            focusedKey = scenario.iconOverride
+                ?? Self.automaticKey
+        }
+        .onMoveCommand(perform: moveFocus)
+        .onExitCommand { dismiss() }
+    }
+
+    private var automaticPreset: ScenarioIconPreset {
+        ScenarioIconCatalog.automaticPreset(
+            name: scenario.name,
+            ssids: scenario.matchSSIDs
+        )
+    }
+
+    private var previewName: String {
+        if hoveredKey == Self.automaticKey {
+            return automaticLabel
+        }
+        if let hoveredKey,
+           let preset = ScenarioIconCatalog.preset(forKey: hoveredKey) {
+            return state.tr(preset.zhName, preset.enName)
+        }
+        if scenario.iconOverride == nil {
+            return automaticLabel
+        }
+        let preset = ScenarioIconCatalog.resolvedPreset(for: scenario)
+        return state.tr(preset.zhName, preset.enName)
+    }
+
+    private var automaticLabel: String {
+        let matched = state.tr(automaticPreset.zhName, automaticPreset.enName)
+        return state.tr("自动匹配 · \(matched)", "Automatic · \(matched)")
+    }
+
+    private var automaticButton: some View {
+        let selected = scenario.iconOverride == nil
+        return Button {
+            select(nil)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: automaticPreset.symbol)
+                    .font(.system(size: 15, weight: .regular))
+                    .frame(width: 20)
+                Text(state.tr("自动匹配", "Automatic"))
+                    .font(.system(size: 11.5, weight: .medium))
+                Spacer()
+                Image(systemName: selected ? "checkmark" : "sparkles")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(
+                        selected ? XDialPalette.selection : Color.secondary
+                    )
+            }
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 9)
+            .frame(height: 32)
+            .background(
+                selected
+                    ? XDialPalette.selection.opacity(0.10)
+                    : Color.primary.opacity(0.025),
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(
+                        selected
+                            ? XDialPalette.selection.opacity(0.28)
+                            : XDialPalette.divider.opacity(0.58),
+                        lineWidth: selected ? 1 : 0.5
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+        .focused($focusedKey, equals: Self.automaticKey)
+        .onHover { hoveredKey = $0 ? Self.automaticKey : nil }
+        .accessibilityValue(selected
+            ? state.tr("已选择", "Selected")
+            : ""
+        )
+    }
+
+    private func iconButton(_ preset: ScenarioIconPreset) -> some View {
+        let selected = manualSelectionID == preset.id
+        return Button {
+            select(preset.id)
+        } label: {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: preset.symbol)
+                    .font(.system(size: 16, weight: .regular))
+                    .foregroundStyle(
+                        selected ? XDialPalette.selection : Color.primary.opacity(0.72)
+                    )
+                    .frame(width: 34, height: 34)
+                if selected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(XDialPalette.selection)
+                        .offset(x: 2, y: -2)
+                }
+            }
+            .background(
+                selected
+                    ? XDialPalette.selection.opacity(0.10)
+                    : Color.clear,
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(
+                        selected
+                            ? XDialPalette.selection.opacity(0.32)
+                            : Color.primary.opacity(0.07),
+                        lineWidth: selected ? 1 : 0.5
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+        .focused($focusedKey, equals: preset.id)
+        .onHover { hoveredKey = $0 ? preset.id : nil }
+        .help(state.tr(preset.zhName, preset.enName))
+        .accessibilityLabel(state.tr(preset.zhName, preset.enName))
+        .accessibilityValue(selected
+            ? state.tr("已选择", "Selected")
+            : ""
+        )
+    }
+
+    private var manualSelectionID: String? {
+        guard let override = scenario.iconOverride else { return nil }
+        return ScenarioIconCatalog.preset(forKey: override)?.id
+            ?? ScenarioIconCatalog.fallback.id
+    }
+
+    private func select(_ key: String?) {
+        scenario.iconOverride = key
+        state.save()
+        dismiss()
+    }
+
+    private func moveFocus(_ direction: MoveCommandDirection) {
+        let keys = [Self.automaticKey]
+            + ScenarioIconCatalog.presets.map(\.id)
+        guard let current = focusedKey,
+              let index = keys.firstIndex(of: current) else {
+            focusedKey = keys.first
+            return
+        }
+
+        let nextIndex: Int
+        switch direction {
+        case .left:
+            nextIndex = max(0, index - 1)
+        case .right:
+            nextIndex = min(keys.count - 1, index + 1)
+        case .up:
+            nextIndex = index <= 6 ? 0 : index - 6
+        case .down:
+            nextIndex = index == 0
+                ? 1
+                : min(keys.count - 1, index + 6)
+        @unknown default:
+            return
+        }
+        focusedKey = keys[nextIndex]
+        hoveredKey = keys[nextIndex]
+    }
 }
 
 // MARK: - 订阅行
@@ -2024,7 +2985,7 @@ struct SubscriptionRow: View {
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.06))
                 HStack(spacing: 0) {
-                    Color.accentColor.opacity(0.5)
+                    XDialPalette.divider.opacity(0.72)
                         .frame(width: 3)
                         .clipShape(RoundedRectangle(cornerRadius: 1.5))
                     Spacer()
@@ -2146,7 +3107,7 @@ struct AddSubscriptionSheet: View {
             if let error = parseError {
                 Text(error)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(XDialPalette.danger)
             }
 
             if let r = parsedResult {
@@ -2156,7 +3117,7 @@ struct AddSubscriptionSheet: View {
                 )
                 Text(summary)
                     .font(.caption)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(XDialPalette.success)
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {

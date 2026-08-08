@@ -1,3 +1,8 @@
+enum RuntimeConfigurationSignature: Equatable {
+    case valid(String)
+    case invalid
+}
+
 struct ConfigurationDirtyTracker<Snapshot: Equatable> {
     private(set) var isDirty = false
     private var lastSaved: Snapshot?
@@ -13,6 +18,13 @@ struct ConfigurationDirtyTracker<Snapshot: Equatable> {
         lastSaved = snapshot
         applied = snapshot
         isDirty = false
+    }
+
+    /// Adopt the fingerprint recorded by the running transaction without
+    /// discarding edits that may already have happened after it started.
+    mutating func adoptApplied(_ snapshot: Snapshot) {
+        applied = snapshot
+        isDirty = lastSaved.map { $0 != snapshot } ?? false
     }
 
     mutating func recordSave(

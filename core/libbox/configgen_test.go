@@ -61,12 +61,12 @@ func TestGenerateNEConfigIncludesTailscaleEndpointWithMobileDNSDispatcher(t *tes
 				TailscaleMagicDNS: true,
 			},
 		},
-		// MagicDNS 只对 active Mode 引用且显式勾选的线路生成。
-		Modes: []config.Mode{{
-			ID: "mode", DefaultLineID: "tailnet",
+		// MagicDNS 只对 active Scenario 引用且显式勾选的线路生成。
+		Scenarios: []config.Scenario{{
+			ID: "scenario", DefaultLineID: "tailnet",
 		}},
-		ActiveModeID: "mode",
-		Tailscale:    config.TailscaleIdentity{Hostname: "xdial-mobile"},
+		ActiveScenarioID: "scenario",
+		Tailscale:        config.TailscaleIdentity{Hostname: "xdial-mobile"},
 	}
 	profileJSON, err := json.Marshal(profile)
 	if err != nil {
@@ -122,9 +122,9 @@ func TestGenerateTailscaleSetupConfigIsIsolated(t *testing.T) {
 			{ID: "tailnet", Type: config.LineTypeTailscale, Enabled: false, TailscaleExitNode: "must-not-activate"},
 			{ID: "other-tailnet", Type: config.LineTypeTailscale, Enabled: true},
 		},
-		Modes:        []config.Mode{{ID: "mode", DefaultLineID: "vpn"}},
-		ActiveModeID: "mode",
-		Tailscale:    config.TailscaleIdentity{Hostname: "xdial-mobile"},
+		Scenarios:        []config.Scenario{{ID: "scenario", DefaultLineID: "vpn"}},
+		ActiveScenarioID: "scenario",
+		Tailscale:        config.TailscaleIdentity{Hostname: "xdial-mobile"},
 	}
 	profileJSON, err := json.Marshal(profile)
 	if err != nil {
@@ -270,10 +270,10 @@ func TestGenerateNEConfigRejectsOversizedOutput(t *testing.T) {
 		RuleSets: []config.RuleSet{
 			{ID: "large", Name: "Large", Type: config.RuleSetTypeManual, Enabled: true, Domains: domains},
 		},
-		Modes: []config.Mode{
-			{ID: "mode", Name: "Mode", Bindings: []config.RuleBinding{{RuleSetID: "large", LineID: "ac"}}, DefaultLineID: "direct"},
+		Scenarios: []config.Scenario{
+			{ID: "scenario", Name: "Scenario", Bindings: []config.RuleBinding{{RuleSetID: "large", LineID: "ac"}}, DefaultLineID: "direct"},
 		},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	data, err := json.Marshal(profile)
 	if err != nil {
@@ -293,11 +293,11 @@ func TestMaterializeNERuleSetsUsesStrictLocalFile(t *testing.T) {
 			ID: "remote", Type: config.RuleSetTypeURL, Enabled: true,
 			URL: "https://rules.example.com/path-token/list.json?token=must-not-remain", Format: "json",
 		}},
-		Modes: []config.Mode{{
-			ID: "mode", Bindings: []config.RuleBinding{{RuleSetID: "remote", LineID: "direct"}},
+		Scenarios: []config.Scenario{{
+			ID: "scenario", Bindings: []config.RuleBinding{{RuleSetID: "remote", LineID: "direct"}},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	want := []byte(`{"version":1,"rules":[]}`)
 	var fetchedURL string
@@ -348,15 +348,15 @@ func TestMaterializeNERuleSetsReportsExactStructuredFailure(t *testing.T) {
 			Enabled: true, URL: "https://rules.example/cnip.srs",
 			Format: "binary",
 		}},
-		Modes: []config.Mode{{
-			ID: "mode",
+		Scenarios: []config.Scenario{{
+			ID: "scenario",
 			Bindings: []config.RuleBinding{{
 				RuleSetID: "cnip",
 				LineID:    "direct",
 			}},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	var events []connectionPreparationEvent
 	err := materializeNERuleSetsWithEvents(
@@ -394,11 +394,11 @@ func TestMaterializeNERuleSetsReusesValidatedCacheAcrossStarts(t *testing.T) {
 				ID: "cnip", Type: config.RuleSetTypeURL, Enabled: true,
 				URL: rawURL, Format: "json",
 			}},
-			Modes: []config.Mode{{
-				ID: "mode", Bindings: []config.RuleBinding{{RuleSetID: "cnip", LineID: "direct"}},
+			Scenarios: []config.Scenario{{
+				ID: "scenario", Bindings: []config.RuleBinding{{RuleSetID: "cnip", LineID: "direct"}},
 				DefaultLineID: "direct",
 			}},
-			ActiveModeID: "mode",
+			ActiveScenarioID: "scenario",
 		}
 	}
 	content := []byte(`{"version":1,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}`)
@@ -439,11 +439,11 @@ func TestMaterializeNERuleSetsStartsImmediatelyFromStaleValidatedCache(t *testin
 			ID: "cnip", Type: config.RuleSetTypeURL, Enabled: true,
 			URL: "https://rules.example.com/geoip-cn.json", Format: "json",
 		}},
-		Modes: []config.Mode{{
-			ID: "mode", Bindings: []config.RuleBinding{{RuleSetID: "cnip", LineID: "direct"}},
+		Scenarios: []config.Scenario{{
+			ID: "scenario", Bindings: []config.RuleBinding{{RuleSetID: "cnip", LineID: "direct"}},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	content := []byte(`{"version":1,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}`)
 	if err := materializeNERuleSets(profile, basePath, func(string, int64) ([]byte, error) {
@@ -463,11 +463,11 @@ func TestMaterializeNERuleSetsStartsImmediatelyFromStaleValidatedCache(t *testin
 			ID: "cnip", Type: config.RuleSetTypeURL, Enabled: true,
 			URL: "https://rules.example.com/geoip-cn.json", Format: "json",
 		}},
-		Modes: []config.Mode{{
-			ID: "mode", Bindings: []config.RuleBinding{{RuleSetID: "cnip", LineID: "direct"}},
+		Scenarios: []config.Scenario{{
+			ID: "scenario", Bindings: []config.RuleBinding{{RuleSetID: "cnip", LineID: "direct"}},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	fetchCalls := 0
 	pending, err := materializeNERuleSetsWithRefreshEvents(reconnect, basePath, func(string, int64) ([]byte, error) {
@@ -506,12 +506,12 @@ func TestGenerateTransparentProxyRuleSetBootstrapSeparatesColdAndWarmRefresh(t *
 				URL: "https://rules.example.com/list.json", Format: "json",
 				FetchLineID: fetchLineID,
 			}},
-			Modes: []config.Mode{{
-				ID:            "mode",
+			Scenarios: []config.Scenario{{
+				ID:            "scenario",
 				Bindings:      []config.RuleBinding{{RuleSetID: "remote", LineID: "direct"}},
 				DefaultLineID: "direct",
 			}},
-			ActiveModeID: "mode",
+			ActiveScenarioID: "scenario",
 		}
 	}
 	generate := func(profile config.Profile) transparentProxyRuleSetBootstrap {
@@ -600,12 +600,12 @@ func TestGenerateTransparentProxyRuleSetBootstrapDefaultsToDirect(t *testing.T) 
 			ID: "remote", Type: config.RuleSetTypeURL, Enabled: true,
 			URL: "https://rules.example.com/list.srs", Format: "srs",
 		}},
-		Modes: []config.Mode{{
-			ID:            "mode",
+		Scenarios: []config.Scenario{{
+			ID:            "scenario",
 			Bindings:      []config.RuleBinding{{RuleSetID: "remote", LineID: "proxy"}},
 			DefaultLineID: "proxy",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	profileJSON, err := json.Marshal(profile)
 	if err != nil {
@@ -641,11 +641,11 @@ func TestMaterializeNERuleSetsDoesNotReuseCacheForChangedURL(t *testing.T) {
 				ID: "cnip", Type: config.RuleSetTypeURL, Enabled: true,
 				URL: rawURL, Format: "json",
 			}},
-			Modes: []config.Mode{{
-				ID: "mode", Bindings: []config.RuleBinding{{RuleSetID: "cnip", LineID: "direct"}},
+			Scenarios: []config.Scenario{{
+				ID: "scenario", Bindings: []config.RuleBinding{{RuleSetID: "cnip", LineID: "direct"}},
 				DefaultLineID: "direct",
 			}},
-			ActiveModeID: "mode",
+			ActiveScenarioID: "scenario",
 		}
 	}
 	content := []byte(`{"version":1,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}`)
@@ -673,11 +673,11 @@ func TestMaterializeNERuleSetsConvertsPlainText(t *testing.T) {
 			ID: "plain", Type: config.RuleSetTypeURL, Enabled: true,
 			URL: "https://rules.example.com/list.txt", Format: "text",
 		}},
-		Modes: []config.Mode{{
-			ID: "mode", Bindings: []config.RuleBinding{{RuleSetID: "plain", LineID: "direct"}},
+		Scenarios: []config.Scenario{{
+			ID: "scenario", Bindings: []config.RuleBinding{{RuleSetID: "plain", LineID: "direct"}},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	input := []byte("# comment\nexample.com\n||blocked.example^\nDOMAIN,exact.example\nIP-CIDR,192.0.2.9/24\n0.0.0.0 hosts.example\n")
 	err := materializeNERuleSets(profile, t.TempDir(), func(string, int64) ([]byte, error) {
@@ -834,8 +834,8 @@ func TestGenerateTransparentProxySessionCarriesActiveAnyConnectOnlyInEnvelope(t 
 			VPNPassword:   "secret-password",
 			AllowInsecure: true,
 		}},
-		Modes:        []config.Mode{{ID: "mode", DefaultLineID: "company"}},
-		ActiveModeID: "mode",
+		Scenarios:        []config.Scenario{{ID: "scenario", DefaultLineID: "company"}},
+		ActiveScenarioID: "scenario",
 	}
 	profileData, err := json.Marshal(profile)
 	if err != nil {
@@ -858,14 +858,27 @@ func TestGenerateTransparentProxySessionCarriesActiveAnyConnectOnlyInEnvelope(t 
 		t.Fatal(err)
 	}
 	if session.AnyConnect == nil ||
+		session.AnyConnect.LineID != "company" ||
 		session.AnyConnect.Server != "vpn.example.com:8443" ||
 		session.AnyConnect.Username != "employee" ||
 		session.AnyConnect.Password != "secret-password" ||
 		!session.AnyConnect.AllowInsecure {
 		t.Fatalf("active AnyConnect session is incomplete: %+v", session.AnyConnect)
 	}
-	if session.Plan == nil || session.Plan.Mode.ID != "mode" {
+	if session.Plan == nil || session.Plan.Scenario.ID != "scenario" {
 		t.Fatalf("dynamic connection plan is missing: %+v", session.Plan)
+	}
+	identity := session.LineRuntimeIdentities["company"]
+	if !strings.HasPrefix(identity, lineRuntimeIdentityPrefix) {
+		t.Fatalf("active AnyConnect runtime identity is missing: %q", identity)
+	}
+	planData, err := json.Marshal(session.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(planData), "line_runtime_identities") ||
+		strings.Contains(string(planData), identity) {
+		t.Fatal("private Line runtime identity leaked into ConnectionPlan")
 	}
 	if strings.Contains(session.ConfigJSON, "secret-password") ||
 		strings.Contains(session.ConfigJSON, "employee") {
@@ -890,6 +903,94 @@ func TestGenerateTransparentProxySessionCarriesActiveAnyConnectOnlyInEnvelope(t 
 	}
 	if !foundVPN {
 		t.Fatalf("in-process AnyConnect outbound is missing: %v", outbounds)
+	}
+}
+
+func TestLineRuntimeIdentityUsesEffectiveCapabilityNotPresentation(
+	t *testing.T,
+) {
+	profile := &config.Profile{}
+	base := &config.Line{
+		ID:            "company-a",
+		Name:          "公司",
+		Type:          config.LineTypeVPN,
+		Enabled:       true,
+		VPNServer:     "vpn.example.com:443",
+		VPNUsername:   "employee",
+		VPNPassword:   "secret",
+		AllowInsecure: false,
+	}
+	want, err := lineRuntimeIdentity(profile, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	presentationOnly := *base
+	presentationOnly.ID = "company-b"
+	presentationOnly.Name = "Renamed"
+	presentationOnly.Enabled = false
+	got, err := lineRuntimeIdentity(profile, &presentationOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("presentation-only change altered runtime identity: %q != %q", got, want)
+	}
+
+	changedCredential := *base
+	changedCredential.VPNPassword = "different"
+	credentialIdentity, err := lineRuntimeIdentity(
+		profile,
+		&changedCredential,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credentialIdentity == want {
+		t.Fatal("changed AnyConnect credential reused the old runtime identity")
+	}
+
+	changedTLS := *base
+	changedTLS.AllowInsecure = true
+	tlsIdentity, err := lineRuntimeIdentity(profile, &changedTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tlsIdentity == want {
+		t.Fatal("changed AnyConnect TLS policy reused the old runtime identity")
+	}
+}
+
+func TestActiveLineRuntimeIdentitiesExcludeUnreferencedLines(t *testing.T) {
+	profile := &config.Profile{
+		Lines: []config.Line{
+			{ID: "direct", Type: config.LineTypeDirect, Enabled: true},
+			{
+				ID: "active", Type: config.LineTypeVPN, Enabled: true,
+				VPNServer: "vpn.example.com", VPNUsername: "u", VPNPassword: "p",
+			},
+			{
+				ID: "unused", Type: config.LineTypeVPN, Enabled: true,
+				VPNServer: "unused.example.com", VPNUsername: "u", VPNPassword: "p",
+			},
+		},
+		Scenarios: []config.Scenario{{
+			ID: "scenario", DefaultLineID: "active",
+		}},
+		ActiveScenarioID: "scenario",
+	}
+	plan, err := config.BuildConnectionPlan(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identities, err := activeLineRuntimeIdentities(profile, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(identities) != 1 || identities["active"] == "" {
+		t.Fatalf("active runtime identities = %#v", identities)
+	}
+	if _, exists := identities["unused"]; exists {
+		t.Fatal("unreferenced Line received a live runtime capability identity")
 	}
 }
 
@@ -925,15 +1026,15 @@ func TestGenerateTransparentProxySessionCarriesOnlyActiveApplicationCredentials(
 				}},
 			},
 		},
-		Modes: []config.Mode{{
-			ID: "mode",
+		Scenarios: []config.Scenario{{
+			ID: "scenario",
 			Bindings: []config.RuleBinding{
 				{RuleSetID: "active-app", LineID: "us"},
 				{RuleSetID: "disabled-app", LineID: "us"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	profileData, err := json.Marshal(profile)
 	if err != nil {
@@ -1007,8 +1108,8 @@ func TestGenerateConnectionPlanIsSideEffectFreeAndCredentialFree(t *testing.T) {
 			VPNUsername: "employee",
 			VPNPassword: "secret-password",
 		}},
-		Modes:        []config.Mode{{ID: "mode", Name: "Work", DefaultLineID: "company"}},
-		ActiveModeID: "mode",
+		Scenarios:        []config.Scenario{{ID: "scenario", Name: "Work", DefaultLineID: "company"}},
+		ActiveScenarioID: "scenario",
 	}
 	profileData, err := json.Marshal(profile)
 	if err != nil {
@@ -1027,7 +1128,7 @@ func TestGenerateConnectionPlanIsSideEffectFreeAndCredentialFree(t *testing.T) {
 	if err := json.Unmarshal([]byte(planJSON), &plan); err != nil {
 		t.Fatal(err)
 	}
-	if plan.Mode.ID != "mode" || len(plan.Tasks) == 0 {
+	if plan.Scenario.ID != "scenario" || len(plan.Tasks) == 0 {
 		t.Fatalf("invalid connection plan: %+v", plan)
 	}
 }
@@ -1044,8 +1145,8 @@ func TestGenerateConnectionPlanRejectsUnavailableActiveProxyLine(t *testing.T) {
 			AnyTLSPassword: "secret",
 			TFO:            true,
 		}},
-		Modes:        []config.Mode{{ID: "mode", DefaultLineID: "anytls"}},
-		ActiveModeID: "mode",
+		Scenarios:        []config.Scenario{{ID: "scenario", DefaultLineID: "anytls"}},
+		ActiveScenarioID: "scenario",
 	}
 	profileData, err := json.Marshal(profile)
 	if err != nil {
@@ -1082,15 +1183,15 @@ func TestActiveLineOutboundsUsesExactConnectionPlan(t *testing.T) {
 			Enabled: true,
 			Domains: []string{"active.example"},
 		}},
-		Modes: []config.Mode{{
-			ID:            "mode",
+		Scenarios: []config.Scenario{{
+			ID:            "scenario",
 			DefaultLineID: "direct",
 			Bindings: []config.RuleBinding{{
 				RuleSetID: "active-rule",
 				LineID:    "active-proxy",
 			}},
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	plan, err := config.BuildConnectionPlan(profile)
 	if err != nil {
@@ -1308,12 +1409,12 @@ func transparentProxySubscriptionCapabilityProfile() config.Profile {
 				}},
 			},
 		},
-		Modes: []config.Mode{{
-			ID:                    "mode",
+		Scenarios: []config.Scenario{{
+			ID:                    "scenario",
 			Name:                  "Subscription",
 			DefaultSubscriptionID: "active-sub",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 }
 
@@ -1353,15 +1454,15 @@ func TestGenerateTransparentProxySessionCarriesActiveTailscaleReadinessTarget(t 
 			Enabled: true,
 			CIDRs:   []string{"203.0.113.0/24"},
 		}},
-		Modes: []config.Mode{{
-			ID:            "mode",
+		Scenarios: []config.Scenario{{
+			ID:            "scenario",
 			DefaultLineID: "direct",
 			Bindings: []config.RuleBinding{{
 				RuleSetID: "cn",
 				LineID:    "japan",
 			}},
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	profileData, err := json.Marshal(profile)
 	if err != nil {
@@ -1406,10 +1507,10 @@ func TestGenerateTransparentProxySessionCarriesMagicDNSToggle(t *testing.T) {
 				TailscaleExitNode: "100.64.0.9", TailscaleMagicDNS: true,
 			},
 		},
-		Modes: []config.Mode{{
-			ID: "mode", DefaultLineID: "tailnet",
+		Scenarios: []config.Scenario{{
+			ID: "scenario", DefaultLineID: "tailnet",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	profileData, err := json.Marshal(profile)
 	if err != nil {
@@ -1446,8 +1547,8 @@ func TestGenerateTransparentProxySessionStillRequiresExitNodeWithMagicDNS(t *tes
 			ID: "tailnet", Type: config.LineTypeTailscale, Enabled: true,
 			TailscaleMagicDNS: true,
 		}},
-		Modes:        []config.Mode{{ID: "mode", DefaultLineID: "tailnet"}},
-		ActiveModeID: "mode",
+		Scenarios:        []config.Scenario{{ID: "scenario", DefaultLineID: "tailnet"}},
+		ActiveScenarioID: "scenario",
 	}
 	profileData, err := json.Marshal(profile)
 	if err != nil {

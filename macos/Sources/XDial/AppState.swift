@@ -11,15 +11,18 @@ final class AppState: ObservableObject {
     #endif
 
     @Published var profile: Profile
+    @Published private(set) var currentSSID: String?
+    @Published private(set) var wifiSSIDAccessState:
+        WiFiSSIDAccessState = .permissionRequired
 
     @Published var helperInstalled: Bool = false
     /// SMAppService 已注册但等用户在系统设置「登录项」里批准
     @Published var helperNeedsApproval: Bool = false
 
-    /// 配置已改但尚未下发引擎。
+    /// 当前事务实际依赖的配置已改，但尚未下发引擎。
     ///
-    /// 引擎只在 start 时拿一次 profile 快照，之后 UI 的编辑只落盘、不下发；
-    /// 若不显式暴露这个差异，用户切了模式却发现行为没变，只能怀疑是 bug。
+    /// 引擎只在 start 时拿一次有效运行配置快照，之后 UI 的编辑只落盘、不下发；
+    /// 未被本次 ConnectionPlan 引用的对象、SSID 与纯展示字段不属于这份快照。
     /// v1 的语义是「提示 + 一键重连」：绝不在用户没点的时候自动重启数据面，
     /// 那会造成连接期间无提示断流。
     ///
@@ -28,13 +31,21 @@ final class AppState: ObservableObject {
     /// objectWillChange 是变更前触发的，靠事件回调去清位会慢一拍。
     @Published private var configDirtyFlag = false
     private var configurationChanges =
-        ConfigurationDirtyTracker<Profile>()
+        ConfigurationDirtyTracker<RuntimeConfigurationSignature>()
 
     var configDirty: Bool { configDirtyFlag && engineHoldsSnapshot }
 
     @Published var language: Lang {
         didSet {
             xdialDefaults.set(language.rawValue, forKey: "xdial.language")
+        }
+    }
+    @Published var appearance: AppAppearance {
+        didSet {
+            xdialDefaults.set(
+                appearance.rawValue,
+                forKey: "xdial.appearance"
+            )
         }
     }
     @Published var launchAtLogin: Bool {
@@ -67,9 +78,29 @@ final class AppState: ObservableObject {
     private var initialStatusSynchronized = false
     private var launchAutoConnectPending = false
     private var connectionAttempts = ConnectionAttemptGate()
-    @Published private(set) var modeSwitchTargetID: String?
-    private var modeSwitchGeneration = 0
-    private var modeSwitchTask: Task<Void, Never>?
+    @Published private(set) var scenarioSwitchTargetID: String?
+    private var scenarioSwitchGeneration = 0
+    private var scenarioSwitchInFlight: ScenarioSwitchAttempt?
+    private var scenarioSwitchCancellationRequested = false
+    private var scenarioSwitchRequiresUnderlayRefresh = false
+    private var networkEpochSwitchCoordinator =
+        NetworkEpochSwitchCoordinator()
+    private var networkEpochQuietWorkItem: DispatchWorkItem?
+    private lazy var wifiSSIDMonitor = WiFiSSIDMonitor(
+        onSettling: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleWiFiSSIDSettling()
+            }
+        },
+        onUpdate: { [weak self] ssid, accessState in
+            Task { @MainActor [weak self] in
+                self?.handleWiFiSSIDUpdate(
+                    ssid: ssid,
+                    accessState: accessState
+                )
+            }
+        }
+    )
 
     private let profileKey = "xdial.profile"
     private let keychainPrefix = "xdial-line-"
@@ -97,6 +128,7 @@ final class AppState: ObservableObject {
     var isConnected: Bool { engine.isConnected }
     var isBusy: Bool {
         engine.isBusy || wakeReconnectPhase != nil
+            || scenarioSwitchTargetID != nil
     }
     var automaticReconnectState: AutomaticReconnectRuntimeState {
         engine.automaticReconnectState
@@ -250,20 +282,26 @@ final class AppState: ObservableObject {
         // 真正阻止新事务的只能是引擎自身的连接/断开状态。
         guard !engine.isBusy else { return false }
         guard installation.isReady else { return false }
-        guard let mode = activeMode else { return false }
-        return hasRequiredCredentials(for: mode)
+        guard let scenario = activeScenario else { return false }
+        return hasRequiredCredentials(for: scenario)
     }
 
-    private func hasRequiredCredentials(for mode: Mode) -> Bool {
-        // 必须有效的 VPN 凭据（如果模式用到 VPN）
-        for binding in mode.bindings {
+    private func hasRequiredCredentials(for scenario: Scenario) -> Bool {
+        // Empty Scenarios are valid drafts, but connecting them would make the
+        // Go planner invent Direct as an undeclared default policy.
+        guard !scenario.defaultLineID.isEmpty
+                || !scenario.defaultSubscriptionID.isEmpty else {
+            return false
+        }
+        // 必须有效的 VPN 凭据（如果场景用到 VPN）
+        for binding in scenario.bindings {
             if let line = profile.lines.first(where: { $0.id == binding.lineID }),
                line.type == "vpn",
                (line.vpnServer.isEmpty || line.vpnUsername.isEmpty || line.vpnPassword.isEmpty) {
                 return false
             }
         }
-        if let line = profile.lines.first(where: { $0.id == mode.defaultLineID }),
+        if let line = profile.lines.first(where: { $0.id == scenario.defaultLineID }),
            line.type == "vpn",
            (line.vpnServer.isEmpty || line.vpnUsername.isEmpty || line.vpnPassword.isEmpty) {
             return false
@@ -272,13 +310,13 @@ final class AppState: ObservableObject {
     }
 
     var statusText: String {
-        if let modeSwitchTargetID,
-           let mode = profile.modes.first(where: {
-               $0.id == modeSwitchTargetID
+        if let scenarioSwitchTargetID,
+           let scenario = profile.scenarios.first(where: {
+               $0.id == scenarioSwitchTargetID
            }) {
             return tr(
-                "正在切换至 \(mode.name)…",
-                "Switching to \(mode.name)…"
+                "正在切换至 \(scenario.name)…",
+                "Switching to \(scenario.name)…"
             )
         }
         if let wakeReconnectPhase {
@@ -311,17 +349,17 @@ final class AppState: ObservableObject {
         }
     }
 
-    var activeMode: Mode? {
-        profile.modes.first { $0.id == profile.activeModeID }
+    var activeScenario: Scenario? {
+        profile.scenarios.first { $0.id == profile.activeScenarioID }
     }
 
     var activeSubscriptions: [Subscription] {
-        guard let mode = activeMode else { return [] }
-        var ids = Set(mode.bindings.compactMap {
+        guard let scenario = activeScenario else { return [] }
+        var ids = Set(scenario.bindings.compactMap {
             $0.subscriptionID.isEmpty ? nil : $0.subscriptionID
         })
-        if !mode.defaultSubscriptionID.isEmpty {
-            ids.insert(mode.defaultSubscriptionID)
+        if !scenario.defaultSubscriptionID.isEmpty {
+            ids.insert(scenario.defaultSubscriptionID)
         }
         return profile.subscriptions.filter { ids.contains($0.id) && $0.enabled }
     }
@@ -379,6 +417,13 @@ final class AppState: ObservableObject {
         } else {
             self.language = .system
         }
+        if let savedAppearance = xdialDefaults.string(
+            forKey: "xdial.appearance"
+        ), let appearance = AppAppearance(rawValue: savedAppearance) {
+            self.appearance = appearance
+        } else {
+            self.appearance = .system
+        }
         self.launchAtLogin = xdialDefaults.bool(forKey: "xdial.launchAtLogin")
         if let savedAutoConnect = xdialDefaults.object(
             forKey: "xdial.autoConnect"
@@ -395,6 +440,11 @@ final class AppState: ObservableObject {
         engine.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &engineSubs)
+        engine.underlayChangeHandler = { [weak self] fingerprint in
+            self?.handleUnderlayChange(
+                underlayFingerprint: fingerprint
+            )
+        }
         installation.objectWillChange
             .sink { [weak self] _ in
                 self?.objectWillChange.send()
@@ -437,16 +487,24 @@ final class AppState: ObservableObject {
                         status: status,
                         report: report
                     )
+                    self.synchronizeAppliedConfiguration(
+                        status: status,
+                        report: report
+                    )
                     self.runLaunchAutoConnectIfNeeded()
                     self.restoreAdoptedRuntimeIfNeeded(
                         runtimeStatus: status
                     )
+                    self.driveScenarioSwitchIfPossible()
                 }
             }
             .store(in: &engineSubs)
         loadSaved()
+        // 首次启动就取得当前 SSID，设置页才能直接把正在使用的 Wi-Fi
+        // 加到场景；等用户先配置触发条件再申请会形成无法初始化的闭环。
+        wifiSSIDMonitor.start(requestAuthorization: true)
         configurationChanges.load(
-            Self.runtimeConfigurationSnapshot(profile)
+            runtimeConfigurationSignature()
         )
         checkHelper()
         installation.start()
@@ -458,6 +516,10 @@ final class AppState: ObservableObject {
                 self.initialStatusSynchronized = true
                 self.synchronizeConnectionDesiredState(
                     runtimeStatus: self.engine.status,
+                    report: self.engine.connectionReport
+                )
+                self.synchronizeAppliedConfiguration(
+                    status: self.engine.status,
                     report: self.engine.connectionReport
                 )
                 self.runLaunchAutoConnectIfNeeded()
@@ -600,12 +662,20 @@ final class AppState: ObservableObject {
         }
     }
 
-    var desiredConnectionModeIDForDiagnostics: String {
-        connectionDesired.modeID ?? ""
+    var desiredConnectionScenarioIDForDiagnostics: String {
+        connectionDesired.scenarioID ?? ""
     }
 
     var desiredConnectionOwnershipForDiagnostics: String {
         connectionDesired.runtimeOwnership?.rawValue ?? ""
+    }
+
+    var scenarioSwitchInFlightForDiagnostics: Bool {
+        scenarioSwitchInFlight != nil
+    }
+
+    var scenarioSwitchSourceTransactionIDForDiagnostics: String {
+        scenarioSwitchInFlight?.sourceTransactionID ?? ""
     }
 
     private func synchronizeConnectionDesiredState(
@@ -615,9 +685,9 @@ final class AppState: ObservableObject {
         if AutomaticConnectionPolicy.holdsConnectionIntent(
             runtimeStatus: runtimeStatus
         ) {
-            let modeID = report?.mode.id ?? activeMode?.id ?? ""
-            if !modeID.isEmpty {
-                connectionDesired.observeExistingConnection(modeID: modeID)
+            let scenarioID = report?.scenario.id ?? activeScenario?.id ?? ""
+            if !scenarioID.isEmpty {
+                connectionDesired.observeExistingConnection(scenarioID: scenarioID)
             }
             return
         }
@@ -650,7 +720,7 @@ final class AppState: ObservableObject {
             launchAutoConnectPending = false
             connectionDesired.settleInitialDisconnection()
             appLog(
-                "launch auto-connect skipped: active Mode is not ready"
+                "launch auto-connect skipped: active Scenario is not ready"
             )
             return
         }
@@ -741,7 +811,7 @@ final class AppState: ObservableObject {
         guard connectionDesired.wantsConnection else {
             let action = DesiredConnectionReconcilePolicy.decide(
                 desired: connectionDesired,
-                activeModeID: activeMode?.id ?? "",
+                activeScenarioID: activeScenario?.id ?? "",
                 runtimeStatus: engine.status,
                 canConnect: canConnect,
                 networkWaitCompleted: false
@@ -761,7 +831,7 @@ final class AppState: ObservableObject {
 
         let action = DesiredConnectionReconcilePolicy.decide(
             desired: connectionDesired,
-            activeModeID: activeMode?.id ?? "",
+            activeScenarioID: activeScenario?.id ?? "",
             runtimeStatus: engine.status,
             canConnect: canConnect,
             networkWaitCompleted: false
@@ -774,21 +844,21 @@ final class AppState: ObservableObject {
         case .stopRuntime:
             cancelWakeReconnectTask()
             engine.stop(userInitiated: true)
-        case let .modeChanged(expectedModeID, activeModeID):
+        case let .scenarioChanged(expectedScenarioID, activeScenarioID):
             failDesiredConnectionReconcile(
                 message: tr(
-                    "无法恢复连接：当前模式已变化，请手动连接",
-                    "Could not restore the connection because the active Mode changed"
+                    "无法恢复连接：当前场景已变化，请手动连接",
+                    "Could not restore the connection because the active Scenario changed"
                 ),
-                log: "connection restore blocked: desired Mode \(expectedModeID), active Mode \(activeModeID)"
+                log: "connection restore blocked: desired Scenario \(expectedScenarioID), active Scenario \(activeScenarioID)"
             )
         case .configurationUnavailable:
             failDesiredConnectionReconcile(
                 message: tr(
-                    "无法自动恢复连接，请检查当前模式配置",
-                    "Could not restore the connection; check the active Mode configuration"
+                    "无法自动恢复连接，请检查当前场景配置",
+                    "Could not restore the connection; check the active Scenario configuration"
                 ),
-                log: "connection restore blocked: active Mode is not ready"
+                log: "connection restore blocked: active Scenario is not ready"
             )
         case .startAutomatically:
             // networkWaitCompleted 为 false 时不会直接进入 start。
@@ -851,35 +921,35 @@ final class AppState: ObservableObject {
             }
             let action = DesiredConnectionReconcilePolicy.decide(
                 desired: self.connectionDesired,
-                activeModeID: self.activeMode?.id ?? "",
+                activeScenarioID: self.activeScenario?.id ?? "",
                 runtimeStatus: self.engine.status,
                 canConnect: self.canConnect,
                 networkWaitCompleted: true
             )
             switch action {
-            case let .startAutomatically(modeID):
-                appLog("wake reconnect started for Mode \(modeID)")
+            case let .startAutomatically(scenarioID):
+                appLog("wake reconnect started for Scenario \(scenarioID)")
                 self.wakeReconnectPhase = .startingConnection
-                if !self.connectAutomatically(expectedModeID: modeID) {
+                if !self.connectAutomatically(expectedScenarioID: scenarioID) {
                     self.wakeReconnectPhase = nil
                 }
             case .none:
                 self.wakeReconnectPhase = nil
-            case let .modeChanged(expectedModeID, activeModeID):
+            case let .scenarioChanged(expectedScenarioID, activeScenarioID):
                 self.failDesiredConnectionReconcile(
                     message: self.tr(
-                        "无法恢复连接：当前模式已变化，请手动连接",
-                        "Could not restore the connection because the active Mode changed"
+                        "无法恢复连接：当前场景已变化，请手动连接",
+                        "Could not restore the connection because the active Scenario changed"
                     ),
-                    log: "connection restore blocked: desired Mode \(expectedModeID), active Mode \(activeModeID)"
+                    log: "connection restore blocked: desired Scenario \(expectedScenarioID), active Scenario \(activeScenarioID)"
                 )
             case .configurationUnavailable:
                 self.failDesiredConnectionReconcile(
                     message: self.tr(
-                        "无法自动恢复连接，请检查当前模式配置",
-                        "Could not restore the connection; check the active Mode configuration"
+                        "无法自动恢复连接，请检查当前场景配置",
+                        "Could not restore the connection; check the active Scenario configuration"
                     ),
-                    log: "connection restore blocked: active Mode is not ready"
+                    log: "connection restore blocked: active Scenario is not ready"
                 )
             case .stopRuntime:
                 self.wakeReconnectPhase = nil
@@ -974,26 +1044,26 @@ final class AppState: ObservableObject {
     // MARK: - Connect
 
     func connect() {
-        guard let activeMode else { return }
-        connectionDesired.userRequestedConnection(modeID: activeMode.id)
+        guard let activeScenario else { return }
+        connectionDesired.userRequestedConnection(scenarioID: activeScenario.id)
         cancelWakeReconnectTask()
         beginConnection()
     }
 
     @discardableResult
     private func connectAutomatically(
-        expectedModeID: String? = nil
+        expectedScenarioID: String? = nil
     ) -> Bool {
-        guard let activeMode else { return false }
-        if let expectedModeID, expectedModeID != activeMode.id {
+        guard let activeScenario else { return false }
+        if let expectedScenarioID, expectedScenarioID != activeScenario.id {
             appLog(
-                "automatic connection ignored: desired Mode "
-                    + "\(expectedModeID), active Mode \(activeMode.id)"
+                "automatic connection ignored: desired Scenario "
+                    + "\(expectedScenarioID), active Scenario \(activeScenario.id)"
             )
             return false
         }
         guard connectionDesired.automaticConnectionRequested(
-            modeID: activeMode.id
+            scenarioID: activeScenario.id
         ) else {
             appLog("automatic connection ignored after explicit disconnect")
             return false
@@ -1015,11 +1085,11 @@ final class AppState: ObservableObject {
         NetworkInfo.shared.clear()
         // 这次 save 本身就是在下发前落盘，不该把自己标成"未下发"
         save(markDirty: false)
+        let profileJSON = buildProfileJSON()
         configurationChanges.markApplied(
-            Self.runtimeConfigurationSnapshot(profile)
+            runtimeConfigurationSignature(profileJSON: profileJSON)
         )
         configDirtyFlag = false
-        let profileJSON = buildProfileJSON()
         let tailscaleLineIDs = profile.lines
             .filter { $0.type == "tailscale" }
             .map(\.id)
@@ -1073,7 +1143,7 @@ final class AppState: ObservableObject {
         launchAutoConnectPending = false
         connectionAttempts.cancel()
         cancelWakeReconnectTask()
-        cancelModeSwitch()
+        cancelScenarioSwitch()
         NetworkInfo.shared.clear()
         // 引擎不再攥着旧快照，残留提示没有意义
         configDirtyFlag = false
@@ -1083,89 +1153,498 @@ final class AppState: ObservableObject {
 
     /// 一键重连：把当前配置重新下发给引擎。
     func reconnect() {
-        guard let activeMode else { return }
-        switchMode(to: activeMode.id)
+        guard let activeScenario else { return }
+        cancelNetworkEpochQuietWindow()
+        _ = enqueueScenarioSwitch(
+            to: activeScenario.id,
+            requiresUnderlayRefresh: true
+        )
     }
 
-    /// 切换模式是一个保持“仍需连接”意图的独立操作，不能借用
-    /// `disconnect()`；后者会把用户意图改成明确断开。新点击通过 generation
-    /// 覆盖旧点击，且只有旧事务完整落到 disconnected 后才会启动新事务。
+    /// 切换场景是一个保持“仍需连接”意图的一等操作。已提交会话通过
+    /// Provider 的 staged Switch 保留旧事务，绝不先 `stopVPNTunnel`；新点击只
+    /// 覆盖待切目标，控制面始终 single-flight。
     @discardableResult
-    func switchMode(to id: String) -> Bool {
-        guard let mode = profile.modes.first(where: { $0.id == id }) else {
+    func switchScenario(to id: String) -> Bool {
+        // 手动选择在当前稳定网络上拥有优先级；若 quiet window 中还有
+        // 旧 SSID/Underlay 样本，本次 Switch 自己会重新捕获最终 Underlay。
+        cancelNetworkEpochQuietWindow()
+        // D39 keeps an explicit Disconnect authoritative. The same public
+        // selection entrypoint still persists the Scenario, but it must not
+        // turn that selection into a new connection intent until the user
+        // explicitly connects again.
+        if case .disconnected(explicit: true) = connectionDesired.value {
+            return persistActiveScenario(id)
+        }
+        return enqueueScenarioSwitch(
+            to: id,
+            requiresUnderlayRefresh: false
+        )
+    }
+
+    @discardableResult
+    private func enqueueScenarioSwitch(
+        to id: String,
+        requiresUnderlayRefresh: Bool
+    ) -> Bool {
+        guard let scenario = profile.scenarios.first(where: { $0.id == id }) else {
             return false
         }
-        guard hasRequiredCredentials(for: mode) else { return false }
-        guard activateMode(id) else { return false }
+        guard hasRequiredCredentials(for: scenario) else { return false }
 
-        connectionDesired.userRequestedConnection(modeID: id)
-        launchAutoConnectPending = false
-        connectionAttempts.cancel()
-        cancelWakeReconnectTask()
-        cancelModeSwitch()
-        NetworkInfo.shared.clear()
-
-        modeSwitchGeneration += 1
-        let generation = modeSwitchGeneration
-        modeSwitchTargetID = id
-
-        if engine.status == "disconnected" {
-            finishModeSwitch(generation: generation, targetModeID: id)
+        if let inFlight = scenarioSwitchInFlight,
+           inFlight.targetScenarioID == id,
+           !scenarioSwitchCancellationRequested,
+           !requiresUnderlayRefresh {
+            return true
+        }
+        if scenarioSwitchInFlight == nil,
+           scenarioSwitchTargetID == id,
+           !requiresUnderlayRefresh {
             return true
         }
 
-        engine.stop()
-        modeSwitchTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            let deadline = Date().addingTimeInterval(10)
-            while Date() < deadline {
-                guard generation == self.modeSwitchGeneration,
-                      !Task.isCancelled else {
-                    return
-                }
-                if self.engine.status == "disconnected" {
-                    self.finishModeSwitch(
-                        generation: generation,
-                        targetModeID: id
-                    )
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-            guard generation == self.modeSwitchGeneration,
-                  !Task.isCancelled else {
-                return
-            }
-            self.modeSwitchTask = nil
-            self.modeSwitchTargetID = nil
-            self.engine.lastError = self.tr(
-                "切换超时：当前连接未能在 10 秒内完成断开",
-                "Switch timed out: the current connection did not finish disconnecting within 10s"
-            )
+        connectionDesired.userRequestedConnection(scenarioID: id)
+        launchAutoConnectPending = false
+        connectionAttempts.cancel()
+        cancelWakeReconnectTask()
+        scenarioSwitchGeneration += 1
+        scenarioSwitchTargetID = id
+        scenarioSwitchRequiresUnderlayRefresh =
+            scenarioSwitchRequiresUnderlayRefresh
+            || requiresUnderlayRefresh
+
+        if let inFlight = scenarioSwitchInFlight,
+           (inFlight.targetScenarioID != id
+                || requiresUnderlayRefresh),
+           !scenarioSwitchCancellationRequested {
+            scenarioSwitchCancellationRequested = true
+            engine.cancelScenarioSwitch()
         }
+        driveScenarioSwitchIfPossible()
         return true
     }
 
-    private func finishModeSwitch(
-        generation: Int,
-        targetModeID: String
-    ) {
-        guard generation == modeSwitchGeneration,
-              modeSwitchTargetID == targetModeID,
-              profile.activeModeID == targetModeID,
-              connectionDesired.modeID == targetModeID else {
+    private func driveScenarioSwitchIfPossible() {
+        guard scenarioSwitchInFlight == nil,
+              let targetScenarioID = scenarioSwitchTargetID,
+              connectionDesired.scenarioID == targetScenarioID else {
             return
         }
-        modeSwitchTask = nil
-        modeSwitchTargetID = nil
-        connect()
+
+        if engine.status == "disconnected" {
+            let generation = scenarioSwitchGeneration
+            guard persistActiveScenario(targetScenarioID) else {
+                scenarioSwitchTargetID = nil
+                scenarioSwitchRequiresUnderlayRefresh = false
+                return
+            }
+            if scenarioSwitchGeneration == generation {
+                scenarioSwitchTargetID = nil
+                scenarioSwitchRequiresUnderlayRefresh = false
+            }
+            connect()
+            return
+        }
+
+        guard
+            engine.status == "connected",
+            let sourceReport = engine.connectionReport,
+            sourceReport.state == .committed,
+            !sourceReport.systemTakeoverRemoved
+        else {
+            // Connecting/reconnecting/disconnecting is already a single
+            // system transaction. Keep only the latest target and resume when
+            // the structured runtime reaches a settled state.
+            return
+        }
+
+        let generation = scenarioSwitchGeneration
+        let requiresUnderlayRefresh =
+            scenarioSwitchRequiresUnderlayRefresh
+        let profileJSON = buildProfileJSON(
+            activeScenarioID: targetScenarioID
+        )
+        scenarioSwitchInFlight = ScenarioSwitchAttempt(
+            generation: generation,
+            targetScenarioID: targetScenarioID,
+            sourceTransactionID: sourceReport.transactionID,
+            sourceScenarioID: sourceReport.scenario.id,
+            requiresUnderlayRefresh: requiresUnderlayRefresh
+        )
+        scenarioSwitchRequiresUnderlayRefresh = false
+        scenarioSwitchCancellationRequested = false
+        engine.switchScenario(profileJSON: profileJSON) {
+            [weak self] result in
+            guard let self else { return }
+            self.finishScenarioSwitch(
+                generation: generation,
+                targetScenarioID: targetScenarioID,
+                result: result
+            )
+        }
     }
 
-    private func cancelModeSwitch() {
-        modeSwitchGeneration += 1
-        modeSwitchTask?.cancel()
-        modeSwitchTask = nil
-        modeSwitchTargetID = nil
+    private func finishScenarioSwitch(
+        generation: Int,
+        targetScenarioID: String,
+        result: Result<ConnectionReport, Error>
+    ) {
+        guard
+            let inFlight = scenarioSwitchInFlight,
+            inFlight.generation == generation,
+            inFlight.targetScenarioID == targetScenarioID
+        else {
+            return
+        }
+        let cancellationWasRequested =
+            scenarioSwitchCancellationRequested
+        let cancellationNeedsSourceRestore =
+            cancellationWasRequested
+            && scenarioSwitchTargetID == nil
+            && targetScenarioID != inFlight.sourceScenarioID
+        scenarioSwitchInFlight = nil
+        scenarioSwitchCancellationRequested = false
+
+        switch result {
+        case let .success(report):
+            if
+                report.scenario.id == targetScenarioID,
+                !report.configurationFingerprint.isEmpty,
+                report.state == .committed,
+                !report.systemTakeoverRemoved
+            {
+                var updated = profile
+                updated.activeScenarioID = targetScenarioID
+                profile = updated
+                save(markDirty: false)
+                configurationChanges.markApplied(
+                    .valid(report.configurationFingerprint)
+                )
+                configDirtyFlag = false
+                NetworkInfo.shared.clear()
+                if cancellationNeedsSourceRestore {
+                    // Cancellation can race the Provider's commit point. Once
+                    // the target is already committed it is too late to abort,
+                    // so restore the user's source intent with a second staged
+                    // Switch instead of tearing down the live session.
+                    scenarioSwitchTargetID = inFlight.sourceScenarioID
+                    scenarioSwitchRequiresUnderlayRefresh = false
+                }
+            } else {
+                engine.lastError = tr(
+                    "场景切换返回了不一致的运行状态",
+                    "Scenario switch returned inconsistent runtime state"
+                )
+            }
+        case let .failure(error):
+            // The Provider contract guarantees that a failed/aborted staged
+            // switch leaves the source transaction committed. Do not persist
+            // the target Scenario or replace the source report.
+            if cancellationWasRequested {
+                engine.lastError = nil
+            } else {
+                engine.lastError = error.localizedDescription
+            }
+            if scenarioSwitchGeneration == generation {
+                connectionDesired.userRequestedConnection(
+                    scenarioID: inFlight.sourceScenarioID
+                )
+            }
+        }
+
+        if scenarioSwitchGeneration == generation {
+            scenarioSwitchTargetID = nil
+            scenarioSwitchRequiresUnderlayRefresh = false
+            return
+        }
+        driveScenarioSwitchIfPossible()
+    }
+
+    /// Clicking the candidate again cancels only that staged Switch. The
+    /// committed source generation remains connected and authoritative.
+    func cancelPendingScenarioSwitch() {
+        cancelNetworkEpochQuietWindow()
+        guard scenarioSwitchTargetID != nil
+                || scenarioSwitchInFlight != nil else {
+            return
+        }
+        scenarioSwitchGeneration += 1
+        scenarioSwitchTargetID = nil
+        scenarioSwitchRequiresUnderlayRefresh = false
+        if let sourceScenarioID = scenarioSwitchInFlight?.sourceScenarioID
+                ?? engine.connectionReport?.scenario.id,
+           !sourceScenarioID.isEmpty {
+            connectionDesired.userRequestedConnection(
+                scenarioID: sourceScenarioID
+            )
+        }
+        if scenarioSwitchInFlight != nil,
+           !scenarioSwitchCancellationRequested {
+            scenarioSwitchCancellationRequested = true
+            engine.cancelScenarioSwitch()
+        }
+    }
+
+    private func cancelScenarioSwitch() {
+        scenarioSwitchGeneration += 1
+        if scenarioSwitchInFlight != nil {
+            engine.cancelScenarioSwitch()
+        }
+        scenarioSwitchInFlight = nil
+        scenarioSwitchCancellationRequested = false
+        scenarioSwitchTargetID = nil
+        scenarioSwitchRequiresUnderlayRefresh = false
+    }
+
+    // MARK: - Wi-Fi scenario activation
+
+    func requestSSIDAccess() {
+        wifiSSIDMonitor.requestAuthorizationAndRefresh()
+        guard wifiSSIDAccessState == .denied,
+              let url = URL(
+                  string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"
+              )
+        else {
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    @discardableResult
+    func addSSID(_ rawSSID: String, to scenarioID: String) -> String? {
+        let ssid = Self.normalizedSSID(rawSSID)
+        guard !ssid.isEmpty else {
+            return tr("SSID 不能为空", "SSID cannot be empty")
+        }
+        guard let index = profile.scenarios.firstIndex(where: {
+            $0.id == scenarioID
+        }) else {
+            return tr("场景不存在", "Scenario does not exist")
+        }
+        if let owner = profile.scenarios.first(where: {
+            $0.id != scenarioID && $0.matchSSIDs.contains(ssid)
+        }) {
+            return tr(
+                "这个 SSID 已用于「\(owner.name)」",
+                "This SSID is already used by “\(owner.name)”"
+            )
+        }
+        guard !profile.scenarios[index].matchSSIDs.contains(ssid) else {
+            return nil
+        }
+        profile.scenarios[index].matchSSIDs.append(ssid)
+        save()
+        wifiSSIDMonitor.start(requestAuthorization: true)
+        activateScenarioForCurrentSSIDIfNeeded()
+        return nil
+    }
+
+    func removeSSID(_ ssid: String, from scenarioID: String) {
+        guard let index = profile.scenarios.firstIndex(where: {
+            $0.id == scenarioID
+        }) else {
+            return
+        }
+        profile.scenarios[index].matchSSIDs.removeAll { $0 == ssid }
+        save()
+    }
+
+    private func handleWiFiSSIDUpdate(
+        ssid: String?,
+        accessState: WiFiSSIDAccessState
+    ) {
+        currentSSID = ssid
+        wifiSSIDAccessState = accessState
+        activateScenarioForCurrentSSIDIfNeeded()
+    }
+
+    private func handleWiFiSSIDSettling() {
+        let currentDesiredScenarioID = scenarioSwitchTargetID
+            ?? connectionDesired.scenarioID
+            ?? engine.connectionReport?.scenario.id
+            ?? profile.activeScenarioID
+        guard let token = networkEpochSwitchCoordinator
+            .observeSSIDSettling(
+                currentDesiredScenarioID: currentDesiredScenarioID
+            ) else {
+            return
+        }
+        scheduleNetworkEpochSettlement(token)
+    }
+
+    private func activateScenarioForCurrentSSIDIfNeeded() {
+        guard wifiSSIDAccessState == .ready else { return }
+        let currentDesiredScenarioID = scenarioSwitchTargetID
+            ?? connectionDesired.scenarioID
+            ?? engine.connectionReport?.scenario.id
+            ?? profile.activeScenarioID
+        let matchedScenarioID = currentSSID.flatMap {
+            profile.scenario(matchingSSID: $0)?.id
+        }
+        if matchedScenarioID == nil, currentSSID != nil {
+            networkEpochSwitchCoordinator.noteUnmatchedSSID()
+        }
+        guard let resolvedScenarioID = matchedScenarioID
+                ?? (networkEpochSwitchCoordinator.hasPendingIntent
+                    ? currentDesiredScenarioID
+                    : nil) else {
+            return
+        }
+        if resolvedScenarioID == currentDesiredScenarioID,
+           !networkEpochSwitchCoordinator.hasPendingIntent {
+            return
+        }
+        guard let token =
+            networkEpochSwitchCoordinator.observeSSIDResolution(
+                desiredScenarioID: resolvedScenarioID
+            )
+        else {
+            return
+        }
+        scheduleNetworkEpochSettlement(token)
+    }
+
+    private func handleUnderlayChange(
+        underlayFingerprint: String
+    ) {
+        guard automaticScenarioChangeKeepsConnection else {
+            return
+        }
+        let desiredScenarioID = scenarioSwitchTargetID
+            ?? connectionDesired.scenarioID
+            ?? engine.connectionReport?.scenario.id
+            ?? profile.activeScenarioID
+        guard let token =
+            networkEpochSwitchCoordinator.observeUnderlayChange(
+                currentDesiredScenarioID: desiredScenarioID,
+                underlayFingerprint: underlayFingerprint
+            ) else {
+            return
+        }
+        scheduleNetworkEpochSettlement(token)
+    }
+
+    private func scheduleNetworkEpochSettlement(
+        _ token: NetworkEpochSwitchCoordinator.QuietToken
+    ) {
+        networkEpochQuietWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.networkEpochQuietWorkItem = nil
+            guard self.networkEpochSwitchCoordinator.isCurrent(token) else {
+                return
+            }
+            self.engine.captureCurrentUnderlayFingerprint {
+                [weak self] result in
+                guard let self,
+                      self.networkEpochSwitchCoordinator.isCurrent(token)
+                else {
+                    return
+                }
+                guard case let .success(fingerprint) = result,
+                      var stableToken = self
+                        .networkEpochSwitchCoordinator
+                        .refreshUnderlayFingerprint(fingerprint)
+                else {
+                    // Do not launch a candidate from a stale or partial
+                    // Underlay. Keep the same epoch pending until a complete
+                    // adjacent sample becomes readable.
+                    self.scheduleNetworkEpochSettlement(token)
+                    return
+                }
+
+                if let wifi = self.wifiSSIDMonitor
+                    .sampleCurrentForNetworkEpoch() {
+                    self.currentSSID = wifi.ssid
+                    self.wifiSSIDAccessState = wifi.accessState
+                    let currentDesiredScenarioID =
+                        self.scenarioSwitchTargetID
+                        ?? self.connectionDesired.scenarioID
+                        ?? self.engine.connectionReport?.scenario.id
+                        ?? self.profile.activeScenarioID
+                    let matchedScenarioID = wifi.ssid.flatMap {
+                        self.profile.scenario(matchingSSID: $0)?.id
+                    }
+                    if matchedScenarioID == nil, wifi.ssid != nil {
+                        self.networkEpochSwitchCoordinator
+                            .noteUnmatchedSSID()
+                    }
+                    if let refreshed = self
+                        .networkEpochSwitchCoordinator
+                        .observeSSIDResolution(
+                            desiredScenarioID: matchedScenarioID
+                                ?? currentDesiredScenarioID
+                        ) {
+                        stableToken = refreshed
+                    }
+                }
+
+                guard let intent = self
+                    .networkEpochSwitchCoordinator.settle(stableToken) else {
+                    return
+                }
+                self.consumeNetworkEpochSwitchIntent(intent)
+            }
+        }
+        networkEpochQuietWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            // CoreWLAN deliberately waits one second before reading SSID.
+            // Keep this adjacent-sample window slightly longer so the stable
+            // value joins the same physical epoch.
+            deadline: .now() + 1.2,
+            execute: workItem
+        )
+    }
+
+    private func consumeNetworkEpochSwitchIntent(
+        _ intent: NetworkEpochSwitchCoordinator.Intent
+    ) {
+        guard profile.scenarios.contains(where: {
+            $0.id == intent.desiredScenarioID
+        }) else {
+            return
+        }
+        let currentDesiredScenarioID = scenarioSwitchTargetID
+            ?? connectionDesired.scenarioID
+            ?? engine.connectionReport?.scenario.id
+            ?? profile.activeScenarioID
+        if !intent.underlayChanged,
+           intent.desiredScenarioID == currentDesiredScenarioID {
+            return
+        }
+        appLog(
+            "Network epoch \(intent.epoch) selected Scenario "
+                + intent.desiredScenarioID
+        )
+        if automaticScenarioChangeKeepsConnection {
+            _ = enqueueScenarioSwitch(
+                to: intent.desiredScenarioID,
+                requiresUnderlayRefresh: intent.underlayChanged
+            )
+        } else {
+            _ = persistActiveScenario(intent.desiredScenarioID)
+        }
+    }
+
+    private func cancelNetworkEpochQuietWindow() {
+        networkEpochQuietWorkItem?.cancel()
+        networkEpochQuietWorkItem = nil
+        networkEpochSwitchCoordinator.cancel()
+    }
+
+    private var automaticScenarioChangeKeepsConnection: Bool {
+        if case .disconnected(explicit: true) = connectionDesired.value {
+            return false
+        }
+        return connectionDesired.wantsConnection
+            || AutomaticConnectionPolicy.holdsConnectionIntent(
+                runtimeStatus: engine.status
+            )
+    }
+
+    private static func normalizedSSID(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Intents（UI 与 DebugServer 共用的唯一入口）
@@ -1173,13 +1652,25 @@ final class AppState: ObservableObject {
     // DebugServer 绝不能自己改 profile —— 那会绕开这里的门禁与 dirty 置位，
     // 让调试验收给出"看起来生效了"的假象。
 
-    /// 激活模式。UI 的模式 Picker、设置窗口的激活按钮、DebugServer 的 select-mode
+    /// 激活场景。UI 的场景 Picker、设置窗口的激活按钮、DebugServer 的 select-scenario
     /// 全部走这一条路径。
     @discardableResult
-    func activateMode(_ id: String) -> Bool {
-        guard profile.modes.contains(where: { $0.id == id }) else { return false }
-        guard profile.activeModeID != id else { return true }
-        profile.activeModeID = id
+    func activateScenario(_ id: String) -> Bool {
+        // Settings, the Scenario picker and Debug all express the same user
+        // intent. While connected this enters Provider Prepare→Commit; while
+        // disconnected the same coordinator persists the selection and starts
+        // a normal transaction. No caller may mutate activeScenarioID around
+        // the staged Switch gate.
+        switchScenario(to: id)
+    }
+
+    @discardableResult
+    private func persistActiveScenario(_ id: String) -> Bool {
+        guard profile.scenarios.contains(where: { $0.id == id }) else {
+            return false
+        }
+        guard profile.activeScenarioID != id else { return true }
+        profile.activeScenarioID = id
         save()
         return true
     }
@@ -1217,9 +1708,10 @@ final class AppState: ObservableObject {
 
     /// 落盘 profile。
     ///
-    /// - Parameter markDirty: 是否把这次改动记成"引擎尚未拿到"。默认 true —— 所有
-    ///   用户编辑都算。只有两类内部写入传 false：连接前的落盘（马上就下发了），
-    ///   以及 verified 这类纯展示标记的回写（不影响数据面行为）。
+    /// - Parameter markDirty: 是否重新比较当前有效运行指纹。默认 true；未被当前事务
+    ///   引用的资源、SSID、显示名称和视觉排序会由 Go 投影排除，不会误报。只有两类
+    ///   内部写入传 false：连接前的落盘（马上就下发了），以及 verified 这类纯展示
+    ///   标记的回写（不影响数据面行为）。
     func save(markDirty: Bool = true) {
         if profile.lines.contains(where: { $0.type == "tailscale" }),
            profile.tailscale.hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1311,7 +1803,7 @@ final class AppState: ObservableObject {
         xdialDefaults.set(data, forKey: profileKey)
 
         configurationChanges.recordSave(
-            Self.runtimeConfigurationSnapshot(profile),
+            runtimeConfigurationSignature(),
             markDirty: markDirty,
             engineHoldsSnapshot: engineHoldsSnapshot
         )
@@ -1351,7 +1843,7 @@ final class AppState: ObservableObject {
         var loaded: Profile
         do {
             loaded = try JSONDecoder().decode(Profile.self, from: rewrittenData)
-            appLog("loadSaved: decoded OK, \(loaded.lines.count) lines, \(loaded.modes.count) modes, \(loaded.subscriptions.count) subs")
+            appLog("loadSaved: decoded OK, \(loaded.lines.count) lines, \(loaded.scenarios.count) scenarios, \(loaded.subscriptions.count) subs")
         } catch {
             appLog("loadSaved: decode failed: \(error)")
             if let old = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1432,7 +1924,7 @@ final class AppState: ObservableObject {
         }
 
         // D33 恢复桌面内置 Tailscale。旧版本已经留下 Line 但尚未有全局设备名时，
-        // 只补一份稳定身份；不迁移、删除或重写任何 Mode 引用。
+        // 只补一份稳定身份；不迁移、删除或重写任何 Scenario 引用。
         if loaded.lines.contains(where: { $0.type == "tailscale" }),
            loaded.tailscale.hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             loaded.tailscale.hostname = Self.newTailscaleHostname()
@@ -1448,22 +1940,34 @@ final class AppState: ObservableObject {
         "xdial-" + String(UUID().uuidString.lowercased().prefix(8))
     }
 
-    private static func runtimeConfigurationSnapshot(
-        _ profile: Profile
-    ) -> Profile {
-        var snapshot = profile
-        for index in snapshot.lines.indices {
-            snapshot.lines[index].verified = false
+    private func runtimeConfigurationSignature(
+        profileJSON: String? = nil
+    ) -> RuntimeConfigurationSignature {
+        let json = profileJSON ?? buildProfileJSON()
+        switch engine.runtimeConfigurationFingerprint(profileJSON: json) {
+        case let .success(fingerprint):
+            return .valid(fingerprint)
+        case .failure:
+            // An invalid currently-selected configuration differs from the
+            // valid snapshot still held by a running transaction. Planning
+            // will surface the exact error if the user chooses to apply it.
+            return .invalid
         }
-        for subscriptionIndex in snapshot.subscriptions.indices {
-            for lineIndex in
-                snapshot.subscriptions[subscriptionIndex].lines.indices
-            {
-                snapshot.subscriptions[subscriptionIndex]
-                    .lines[lineIndex].verified = false
-            }
+    }
+
+    private func synchronizeAppliedConfiguration(
+        status: String,
+        report: ConnectionReport?
+    ) {
+        guard AutomaticConnectionPolicy.holdsConnectionIntent(
+            runtimeStatus: status
+        ),
+        let fingerprint = report?.configurationFingerprint,
+        !fingerprint.isEmpty else {
+            return
         }
-        return snapshot
+        configurationChanges.adoptApplied(.valid(fingerprint))
+        configDirtyFlag = configurationChanges.isDirty
     }
 
     // MARK: - Legacy 命名 key 迁移（比喻命名 → 正式命名）
@@ -1494,8 +1998,8 @@ final class AppState: ObservableObject {
     }
 
     /// 把一份比喻命名的 profile 字典按对照表精确重写成正式命名字典。
-    /// 顶层：ports→lines、cargoes→rule_sets、cruises→modes、active_cruise_id→active_mode_id。
-    /// mode 内嵌：default_port_id→default_line_id；binding 内嵌：cargo_id→rule_set_id、port_id→line_id。
+    /// 顶层：ports→lines、cargoes→rule_sets、cruises→scenarios、active_cruise_id→active_scenario_id。
+    /// scenario 内嵌：default_port_id→default_line_id；binding 内嵌：cargo_id→rule_set_id、port_id→line_id。
     /// subscription 内嵌：ports→lines（其内部 Line 字段如 trojan_port 保持不变）。
     private static func rewriteLegacyMetaphorKeys(_ dict: [String: Any]) -> [String: Any] {
         var out = dict
@@ -1504,16 +2008,16 @@ final class AppState: ObservableObject {
         if let v = out.removeValue(forKey: "ports") { out["lines"] = v }
         // 顶层 rule_sets
         if let v = out.removeValue(forKey: "cargoes") { out["rule_sets"] = v }
-        // 顶层 active_mode_id
-        if let v = out.removeValue(forKey: "active_cruise_id") { out["active_mode_id"] = v }
+        // 顶层 active_scenario_id
+        if let v = out.removeValue(forKey: "active_cruise_id") { out["active_scenario_id"] = v }
 
-        // 顶层 modes（含其内嵌 bindings / default_port_id 重写）
+        // 顶层 scenarios（含其内嵌 bindings / default_port_id 重写）
         if let cruises = out.removeValue(forKey: "cruises") as? [[String: Any]] {
-            out["modes"] = cruises.map { rewriteLegacyMode($0) }
+            out["scenarios"] = cruises.map { rewriteLegacyScenario($0) }
         } else if let cruises = out["cruises"] {
             // 类型不是 [[String:Any]]（异常数据）也搬过去，避免丢数据
             out.removeValue(forKey: "cruises")
-            out["modes"] = cruises
+            out["scenarios"] = cruises
         }
 
         // subscriptions 内嵌 ports → lines
@@ -1528,8 +2032,8 @@ final class AppState: ObservableObject {
         return out
     }
 
-    /// 重写单个 mode 字典：default_port_id → default_line_id，bindings 逐条重写。
-    private static func rewriteLegacyMode(_ dict: [String: Any]) -> [String: Any] {
+    /// 重写单个 scenario 字典：default_port_id → default_line_id，bindings 逐条重写。
+    private static func rewriteLegacyScenario(_ dict: [String: Any]) -> [String: Any] {
         var m = dict
         if let v = m.removeValue(forKey: "default_port_id") { m["default_line_id"] = v }
         if let bindings = m["bindings"] as? [[String: Any]] {
@@ -1556,7 +2060,7 @@ final class AppState: ObservableObject {
         return ""
     }
 
-    /// 把旧格式 profile (v0.2: exits/rules/strategies) 迁移到新格式 (lines/rule_sets/modes)
+    /// 把旧格式 profile (v0.2: exits/rules/strategies) 迁移到新格式 (lines/rule_sets/scenarios)
     static func migrate(oldProfile: [String: Any]) -> Profile? {
         var p = Profile()
         // 旧版本的 v0.2 里是 exits/rules/strategies
@@ -1575,7 +2079,7 @@ final class AppState: ObservableObject {
             }
         }
         if let oldStrategies = oldProfile["strategies"] as? [[String: Any]] {
-            p.modes = oldStrategies.compactMap { dict -> Mode? in
+            p.scenarios = oldStrategies.compactMap { dict -> Scenario? in
                 // 旧 strategy.bindings 用 rule_id/exit_id；旧 default_exit_id
                 var fixed = dict
                 if let oldBindings = dict["bindings"] as? [[String: Any]] {
@@ -1591,14 +2095,14 @@ final class AppState: ObservableObject {
                     fixed.removeValue(forKey: "default_exit_id")
                 }
                 guard let data = try? JSONSerialization.data(withJSONObject: fixed),
-                      let c = try? JSONDecoder().decode(Mode.self, from: data) else { return nil }
+                      let c = try? JSONDecoder().decode(Scenario.self, from: data) else { return nil }
                 return c
             }
         }
         if let active = oldProfile["active_strategy_id"] as? String {
-            p.activeModeID = active
+            p.activeScenarioID = active
         }
-        return p.lines.isEmpty && p.ruleSets.isEmpty && p.modes.isEmpty ? nil : p
+        return p.lines.isEmpty && p.ruleSets.isEmpty && p.scenarios.isEmpty ? nil : p
     }
 
     func checkHelper() {
@@ -1643,18 +2147,18 @@ final class AppState: ObservableObject {
 
     func deleteSubscription(_ id: String) {
         profile.subscriptions.removeAll { $0.id == id }
-        for i in profile.modes.indices {
-            profile.modes[i].bindings.removeAll { $0.subscriptionID == id }
-            if profile.modes[i].defaultSubscriptionID == id {
-                profile.modes[i].defaultSubscriptionID = ""
+        for i in profile.scenarios.indices {
+            profile.scenarios[i].bindings.removeAll { $0.subscriptionID == id }
+            if profile.scenarios[i].defaultSubscriptionID == id {
+                profile.scenarios[i].defaultSubscriptionID = ""
             }
         }
         save()
     }
 
-    // MARK: - Mode Management
+    // MARK: - Scenario Management
 
-    func createMode(from template: ModeTemplate, named name: String) {
+    func createScenario(from template: ScenarioTemplate, named name: String) {
         let direct = profile.lines.first(where: { $0.type == "direct" })?.id ?? "direct"
         let vpn = profile.lines.first(where: { $0.type == "vpn" })?.id ?? "vpn"
         let ss = profile.lines.first(where: { $0.type != "direct" && $0.type != "vpn" })?.id ?? "ss"
@@ -1665,7 +2169,7 @@ final class AppState: ObservableObject {
         let gfwRule = profile.ruleSets
             .first(where: { $0.type == "url" && $0.enabled })?.id ?? ""
 
-        var s: Mode
+        var s: Scenario
         switch template {
         case .overseas:
             s = Profile.templateOverseas(
@@ -1689,33 +2193,58 @@ final class AppState: ObservableObject {
                 directLineID: direct
             )
         case .blank:
-            s = Mode(id: UUID().uuidString, name: name, defaultLineID: direct)
+            // 空白模板只创建领域对象，不替用户作任何流量裁决。
+            // 默认 Line、RuleSet binding 与 SSID 都必须由用户显式配置。
+            s = Scenario(id: UUID().uuidString, name: name)
         }
         s.name = name
-        profile.modes.append(s)
-        if profile.activeModeID.isEmpty {
-            profile.activeModeID = s.id
+        profile.scenarios.append(s)
+        if profile.activeScenarioID.isEmpty {
+            profile.activeScenarioID = s.id
         }
         save()
     }
 
-    func deleteMode(_ s: Mode) {
-        profile.modes.removeAll { $0.id == s.id }
-        if profile.activeModeID == s.id {
-            profile.activeModeID = profile.modes.first?.id ?? ""
+    func deleteScenario(id: String) {
+        guard profile.scenarios.contains(where: { $0.id == id }) else {
+            return
         }
+
+        // ForEach($collection) 删除后会立刻重建行 Binding。先在值副本中完成
+        // 整次变更、再整体赋回 @Published，确保设置窗口、Popover 与 Debug
+        // 同时收到同一份场景清单，不能只依赖嵌套数组的 writeback 通知。
+        var updated = profile
+        updated.scenarios.removeAll { $0.id == id }
+        if updated.activeScenarioID == id {
+            updated.activeScenarioID = updated.scenarios.first?.id ?? ""
+        }
+        profile = updated
         save()
     }
 
     // MARK: - Build profile JSON
 
-    func buildProfileJSON() -> String {
-        guard let data = try? JSONEncoder().encode(profile) else { return "{}" }
+    func buildProfileJSON(
+        activeScenarioID: String? = nil
+    ) -> String {
+        var snapshot = profile
+        if let activeScenarioID {
+            snapshot.activeScenarioID = activeScenarioID
+        }
+        guard let data = try? JSONEncoder().encode(snapshot) else { return "{}" }
         return String(data: data, encoding: .utf8) ?? "{}"
     }
 }
 
-enum ModeTemplate: String, CaseIterable {
+private struct ScenarioSwitchAttempt {
+    let generation: Int
+    let targetScenarioID: String
+    let sourceTransactionID: String
+    let sourceScenarioID: String
+    let requiresUnderlayRefresh: Bool
+}
+
+enum ScenarioTemplate: String, CaseIterable {
     case overseas, domestic, domesticSS, blank
 
     var displayName: String {

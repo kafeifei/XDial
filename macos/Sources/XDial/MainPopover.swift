@@ -18,42 +18,32 @@ struct MainPopover: View {
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var networkInfo = NetworkInfo.shared
     @StateObject private var trafficInfo = TrafficInfo()
-    @State private var hoveredModeID: String?
-    @State private var showsConnectionInfo = true
-    @State private var showsConnectionProgress = false
+    @State private var hoveredScenarioID: String?
+    @State private var showsConnectionDetails = true
 
     private let minimumPopoverWidth: CGFloat = 340
-    private let maximumModesPerRow = 5
-    private let modeItemWidth: CGFloat = 72
-    private let modeItemSpacing: CGFloat = 14
-    private let modeHorizontalPadding: CGFloat = 24
+    private let maximumScenariosPerRow = 4
+    private let scenarioItemWidth: CGFloat = 72
+    private let scenarioItemSpacing: CGFloat = 14
+    private let scenarioHorizontalPadding: CGFloat = 24
     private let sphereDiameter: CGFloat = 64
-    private let stormBlue = Color(
-        red: 0.27,
-        green: 0.43,
-        blue: 0.60
-    )
-    private let mossGreen = Color(
-        red: 0.30,
-        green: 0.50,
-        blue: 0.27
-    )
-    private let clayRed = Color(
-        red: 0.69,
-        green: 0.29,
-        blue: 0.22
-    )
+    private let actionColor = XDialPalette.primaryAction
+    private let progressColor = XDialPalette.progress
+    private let successColor = XDialPalette.success
+    private let dangerColor = XDialPalette.danger
+    private let warningColor = XDialPalette.warning
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            modeCarousel
+            scenarioCarousel
             if showsStatusBand {
                 Divider()
                 statusBand
-                if showsConnectionProgress,
+                if showsConnectionDetails,
                    state.isBusy,
+                   state.scenarioSwitchTargetID == nil,
                    let report = state.presentedConnectionReport,
                    !report.tasks.isEmpty {
                     Divider()
@@ -69,9 +59,9 @@ struct MainPopover: View {
         .frame(width: popoverWidth)
         .animation(
             .easeInOut(duration: 0.2),
-            value: state.profile.modes.count
+            value: state.profile.scenarios.count
         )
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(XDialPalette.elevated)
         .contextMenu {
             Button(state.tr("安装状态…", "Installation Status…")) {
                 state.installation.present()
@@ -88,7 +78,6 @@ struct MainPopover: View {
         }
         .onChange(of: state.presentedConnectionReport?.transactionID) {
             synchronizeTrafficSampling()
-            showsConnectionProgress = false
         }
     }
 
@@ -162,21 +151,21 @@ struct MainPopover: View {
 
     private var headerAccent: Color {
         if state.isConnected {
-            return mossGreen
+            return successColor
         }
         if state.isBusy {
-            return stormBlue
+            return progressColor
         }
         if let report = state.presentedConnectionReport,
            report.error != nil || report.state == .failed {
-            return clayRed
+            return dangerColor
         }
         return Color.secondary.opacity(0.82)
     }
 
     @ViewBuilder
-    private var modeCarousel: some View {
-        if state.profile.modes.isEmpty {
+    private var scenarioCarousel: some View {
+        if state.profile.scenarios.isEmpty {
             VStack(spacing: 7) {
                 Circle()
                     .strokeBorder(
@@ -189,61 +178,68 @@ struct MainPopover: View {
                             .font(.title2)
                             .foregroundStyle(.secondary)
                     }
-                Text(state.tr("暂无模式", "No Modes"))
+                Text(state.tr("暂无场景", "No Scenarios"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity)
             .frame(height: 142)
         } else {
-            let indexedModes = Array(state.profile.modes.enumerated())
+            let indexedScenarios = Array(state.profile.scenarios.enumerated())
+            let columnCount = scenarioColumnCount
             let rowCount = Int(
                 ceil(
-                    Double(indexedModes.count)
-                        / Double(maximumModesPerRow)
+                    Double(indexedScenarios.count)
+                        / Double(columnCount)
                 )
             )
             VStack(spacing: 18) {
                 ForEach(0..<rowCount, id: \.self) { rowIndex in
-                    let start = rowIndex * maximumModesPerRow
+                    let start = rowIndex * columnCount
                     let end = min(
-                        indexedModes.count,
-                        start + maximumModesPerRow
+                        indexedScenarios.count,
+                        start + columnCount
                     )
-                    HStack(alignment: .top, spacing: modeItemSpacing) {
+                    HStack(alignment: .top, spacing: scenarioItemSpacing) {
                         ForEach(
-                            indexedModes[start..<end],
+                            indexedScenarios[start..<end],
                             id: \.element.id
-                        ) { indexedMode in
-                            modeSphere(
-                                indexedMode.element,
-                                index: indexedMode.offset
-                            )
+                        ) { indexedScenario in
+                            scenarioSphere(indexedScenario.element)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .center)
                 }
             }
-            .padding(.horizontal, modeHorizontalPadding)
+            .padding(.horizontal, scenarioHorizontalPadding)
             .padding(.vertical, 18)
         }
     }
 
     private var popoverWidth: CGFloat {
-        let modeCount = state.profile.modes.count
-        guard modeCount > 0 else { return minimumPopoverWidth }
-        let columnCount = min(modeCount, maximumModesPerRow)
-        let contentWidth = CGFloat(columnCount) * modeItemWidth
-            + CGFloat(max(0, columnCount - 1)) * modeItemSpacing
-            + modeHorizontalPadding * 2
+        let scenarioCount = state.profile.scenarios.count
+        guard scenarioCount > 0 else { return minimumPopoverWidth }
+        let columnCount = scenarioColumnCount
+        let contentWidth = CGFloat(columnCount) * scenarioItemWidth
+            + CGFloat(max(0, columnCount - 1)) * scenarioItemSpacing
+            + scenarioHorizontalPadding * 2
         return max(minimumPopoverWidth, contentWidth)
     }
 
-    private func modeSphere(_ mode: Mode, index: Int) -> some View {
-        let visualState = visualState(for: mode)
-        let hovered = hoveredModeID == mode.id
+    /// 先以每行最多四个求出不可避免的最少行数，再把项目均匀分到这些行。
+    /// 这样 5 个是 3+2，6 个是 3+3，不会因为新增一行仍保持四列宽。
+    private var scenarioColumnCount: Int {
+        ScenarioGridLayout.columnCount(
+            itemCount: state.profile.scenarios.count,
+            maximumPerRow: maximumScenariosPerRow
+        )
+    }
+
+    private func scenarioSphere(_ scenario: Scenario) -> some View {
+        let visualState = visualState(for: scenario)
+        let hovered = hoveredScenarioID == scenario.id
         return Button {
-            performModeAction(mode, visualState: visualState)
+            performScenarioAction(scenario, visualState: visualState)
         } label: {
             VStack(spacing: 8) {
                 ZStack {
@@ -254,8 +250,8 @@ struct MainPopover: View {
                             Color.secondary.opacity(0.34),
                             lineWidth: 1.2
                         )
-                    progressRing(for: visualState, mode: mode)
-                    Image(systemName: modeIcon(mode, index: index))
+                    progressRing(for: visualState, scenario: scenario)
+                    Image(systemName: scenarioIcon(scenario))
                         .font(.system(size: 25, weight: .regular))
                         .foregroundStyle(iconColor(for: visualState))
                 }
@@ -279,7 +275,7 @@ struct MainPopover: View {
                             }
                     }
                 }
-                Text(mode.name)
+                Text(scenario.name)
                     .font(.system(size: 12))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
@@ -289,17 +285,17 @@ struct MainPopover: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering in
-            hoveredModeID = hovering ? mode.id : nil
+            hoveredScenarioID = hovering ? scenario.id : nil
         }
-        .help(actionHelp(for: mode, visualState: visualState))
-        .accessibilityLabel(mode.name)
-        .accessibilityHint(actionHelp(for: mode, visualState: visualState))
+        .help(actionHelp(for: scenario, visualState: visualState))
+        .accessibilityLabel(scenario.name)
+        .accessibilityHint(actionHelp(for: scenario, visualState: visualState))
     }
 
     @ViewBuilder
     private func progressRing(
-        for visualState: ModeVisualState,
-        mode: Mode
+        for visualState: ScenarioVisualState,
+        scenario: Scenario
     ) -> some View {
         switch visualState {
         case .idleSelected:
@@ -316,7 +312,7 @@ struct MainPopover: View {
             Circle()
                 .trim(from: 0, to: max(0.035, connectionProgress))
                 .stroke(
-                    stormBlue,
+                    progressColor,
                     style: StrokeStyle(
                         lineWidth: 4,
                         lineCap: .butt
@@ -329,12 +325,12 @@ struct MainPopover: View {
                 )
         case .connected:
             Circle()
-                .stroke(mossGreen, lineWidth: 4)
+                .stroke(successColor, lineWidth: 4)
         case .failed:
             Circle()
                 .trim(from: 0.06, to: 0.94)
                 .stroke(
-                    clayRed,
+                    dangerColor,
                     style: StrokeStyle(
                         lineWidth: 4,
                         lineCap: .butt
@@ -348,7 +344,7 @@ struct MainPopover: View {
         HStack(spacing: 8) {
             if state.isBusy {
                 Circle()
-                    .fill(stormBlue)
+                    .fill(progressColor)
                     .frame(width: 8, height: 8)
                 Text(state.statusText)
                     .font(.system(size: 12))
@@ -358,7 +354,7 @@ struct MainPopover: View {
                    !report.tasks.isEmpty {
                     Button {
                         withAnimation(.easeInOut(duration: 0.18)) {
-                            showsConnectionProgress.toggle()
+                            showsConnectionDetails.toggle()
                         }
                     } label: {
                         HStack(spacing: 5) {
@@ -374,9 +370,7 @@ struct MainPopover: View {
                             )
                             .monospacedDigit()
                             Image(
-                                systemName: showsConnectionProgress
-                                    ? "chevron.up"
-                                    : "chevron.down"
+                                systemName: connectionDetailsSymbol
                             )
                             .font(.system(size: 8, weight: .semibold))
                         }
@@ -386,29 +380,103 @@ struct MainPopover: View {
                     }
                     .buttonStyle(.plain)
                     .help(
-                        showsConnectionProgress
-                            ? state.tr("收起连接步骤", "Hide connection steps")
-                            : state.tr("展开连接步骤", "Show connection steps")
+                        connectionDetailsActionLabel
                     )
+                    .accessibilityLabel(connectionDetailsActionLabel)
                 }
             } else if state.configDirty && state.isConnected {
-                Circle()
-                    .fill(clayRed.opacity(0.9))
-                    .frame(width: 8, height: 8)
-                Text(
-                    state.tr(
-                        "模式配置已变化，点击目标圆球切换",
-                        "Mode changed; click a sphere to switch"
+                if state.canConnect {
+                    Button { state.reconnect() } label: {
+                        dirtyStatusRow(showsAction: true)
+                    }
+                    .buttonStyle(.plain)
+                    .help(
+                        state.tr(
+                            "应用已保存配置并重连",
+                            "Apply saved changes and reconnect"
+                        )
                     )
-                )
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                Spacer()
+                    .accessibilityLabel(
+                        state.tr(
+                            "修改已保存，当前连接尚未应用",
+                            "Saved changes are not applied"
+                        )
+                    )
+                    .accessibilityHint(
+                        state.tr(
+                            "按下以应用配置并重连",
+                            "Press to apply the configuration and reconnect"
+                        )
+                    )
+                } else {
+                    dirtyStatusRow(showsAction: false)
+                        .accessibilityElement(children: .combine)
+                }
             }
         }
         .padding(.horizontal, 20)
-        .frame(height: 44)
+        .padding(.vertical, 8)
+        .frame(minHeight: 44)
+        .background {
+            if state.configDirty && state.isConnected && !state.isBusy {
+                LinearGradient(
+                    colors: [
+                        warningColor.opacity(0.075),
+                        warningColor.opacity(0.025),
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            }
+        }
+    }
+
+    private func dirtyStatusRow(showsAction: Bool) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(warningColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(
+                    state.tr(
+                        "修改已保存，当前连接尚未应用",
+                        "Saved changes are not applied"
+                    )
+                )
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.primary.opacity(0.82))
+                .fixedSize(horizontal: false, vertical: true)
+                if !showsAction {
+                    Text(dirtyConfigurationBlocker)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(warningColor)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 8)
+            if showsAction {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(actionColor)
+                    .frame(width: 28, height: 28)
+                    .background(actionColor.opacity(0.09), in: Circle())
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+    }
+
+    private var dirtyConfigurationBlocker: String {
+        if !state.installation.isReady {
+            return state.tr("请先完成安装", "Complete setup first")
+        }
+        if state.activeScenario == nil {
+            return state.tr("请先选择场景", "Choose a scenario first")
+        }
+        return state.tr(
+            "请先完善当前场景",
+            "Complete the current scenario first"
+        )
     }
 
     private func connectionProgressDetails(
@@ -445,6 +513,16 @@ struct MainPopover: View {
 
     private var showsStatusBand: Bool {
         state.isBusy || (state.configDirty && state.isConnected)
+    }
+
+    private var connectionDetailsSymbol: String {
+        showsConnectionDetails ? "chevron.down" : "chevron.right"
+    }
+
+    private var connectionDetailsActionLabel: String {
+        showsConnectionDetails
+            ? state.tr("收起详情", "Collapse details")
+            : state.tr("展开详情", "Expand details")
     }
 
     @ViewBuilder
@@ -497,48 +575,38 @@ struct MainPopover: View {
                     if hasConnectionInfo {
                         Button {
                             withAnimation(.easeInOut(duration: 0.18)) {
-                                showsConnectionInfo.toggle()
+                                showsConnectionDetails.toggle()
                             }
                         } label: {
                             Image(
-                                systemName: showsConnectionInfo
-                                    ? "chevron.down"
-                                    : "chevron.right"
+                                systemName: connectionDetailsSymbol
                             )
                             .font(.system(size: 10, weight: .semibold))
                             .frame(width: 22, height: 22)
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary)
-                        .help(
-                            showsConnectionInfo
-                                ? state.tr("收起详情", "Collapse details")
-                                : state.tr("展开详情", "Expand details")
-                        )
-                        .accessibilityLabel(
-                            showsConnectionInfo
-                                ? state.tr("收起详情", "Collapse details")
-                                : state.tr("展开详情", "Expand details")
-                        )
+                        .help(connectionDetailsActionLabel)
+                        .accessibilityLabel(connectionDetailsActionLabel)
                     }
                 }
             }
             .padding(.horizontal, 18)
             .frame(height: 54)
 
-            if hasConnectionInfo && showsConnectionInfo {
+            if hasConnectionInfo && showsConnectionDetails {
                 Divider()
                 connectionOverview(report)
             }
 
             if let errorMessage = reportErrorMessage(in: report) {
-                if hasConnectionInfo && showsConnectionInfo {
+                if hasConnectionInfo && showsConnectionDetails {
                     Divider()
                 }
                 factRow(
                     symbol: "exclamationmark.circle.fill",
                     text: errorMessage,
-                    color: clayRed
+                    color: dangerColor
                 )
             }
         }
@@ -575,7 +643,7 @@ struct MainPopover: View {
             ForEach(lineTasks(in: report)) { task in
                 GridRow {
                     Circle()
-                        .fill(mossGreen)
+                        .fill(successColor)
                         .frame(width: 7, height: 7)
                     Text(task.name)
                         .font(.system(size: 12))
@@ -613,12 +681,12 @@ struct MainPopover: View {
                         .foregroundStyle(.tertiary)
                     Text(mapping.lineName)
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(mossGreen)
+                        .foregroundStyle(successColor)
                         .lineLimit(1)
                     if mapping.error != nil {
                         Image(systemName: "exclamationmark.circle.fill")
                             .font(.system(size: 10))
-                            .foregroundStyle(clayRed)
+                            .foregroundStyle(dangerColor)
                     }
                 }
                 .frame(maxWidth: .infinity, minHeight: 20, alignment: .leading)
@@ -640,7 +708,7 @@ struct MainPopover: View {
             factRow(
                 symbol: "circle.fill",
                 text: ingressFact(ingress),
-                color: clayRed
+                color: dangerColor
             )
             Divider().padding(.leading, 24)
 
@@ -651,8 +719,8 @@ struct MainPopover: View {
                 text: rollbackFact(report),
                 color: report.rollbackComplete &&
                     report.systemTakeoverRemoved
-                    ? mossGreen
-                    : clayRed
+                    ? successColor
+                    : dangerColor
             )
         }
     }
@@ -662,7 +730,7 @@ struct MainPopover: View {
     ) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Circle()
-                .fill(clayRed)
+                .fill(dangerColor)
                 .frame(width: 9, height: 9)
                 .padding(.top, 4)
             VStack(alignment: .leading, spacing: 6) {
@@ -777,8 +845,8 @@ struct MainPopover: View {
         .padding(.vertical, 11)
     }
 
-    private var currentRuntimeModeID: String? {
-        state.presentedConnectionReport?.mode.id
+    private var currentRuntimeScenarioID: String? {
+        state.presentedConnectionReport?.scenario.id
     }
 
     private var expandableReport: ConnectionReport? {
@@ -795,6 +863,9 @@ struct MainPopover: View {
     }
 
     private var connectionProgress: Double {
+        // During a staged Switch the committed report still describes the
+        // source generation. It must never be presented as candidate progress.
+        guard state.scenarioSwitchTargetID == nil else { return 0 }
         guard let report = state.presentedConnectionReport,
               !report.tasks.isEmpty else {
             return 0
@@ -858,11 +929,11 @@ struct MainPopover: View {
         case .pending, .skipped:
             return Color.secondary.opacity(0.72)
         case .running, .committing:
-            return stormBlue
+            return progressColor
         case .ready, .committed:
-            return mossGreen
+            return successColor
         case .failed:
-            return clayRed
+            return dangerColor
         case .rollingBack, .rolledBack:
             return Color.secondary.opacity(0.82)
         }
@@ -893,13 +964,17 @@ struct MainPopover: View {
         }
     }
 
-    private func visualState(for mode: Mode) -> ModeVisualState {
-        if let targetModeID = state.modeSwitchTargetID {
-            if mode.id == targetModeID { return .connecting }
+    private func visualState(for scenario: Scenario) -> ScenarioVisualState {
+        if let targetScenarioID = state.scenarioSwitchTargetID {
+            if scenario.id == targetScenarioID { return .connecting }
+            if scenario.id == currentRuntimeScenarioID,
+               state.isConnected {
+                return .connected
+            }
             return .idle
         }
-        guard mode.id == currentRuntimeModeID else {
-            return mode.id == state.profile.activeModeID
+        guard scenario.id == currentRuntimeScenarioID else {
+            return scenario.id == state.profile.activeScenarioID
                 ? .idleSelected
                 : .idle
         }
@@ -912,21 +987,24 @@ struct MainPopover: View {
         return .idleSelected
     }
 
-    private func performModeAction(
-        _ mode: Mode,
-        visualState: ModeVisualState
+    private func performScenarioAction(
+        _ scenario: Scenario,
+        visualState: ScenarioVisualState
     ) {
-        if let targetModeID = state.modeSwitchTargetID {
-            if mode.id == targetModeID {
+        if let targetScenarioID = state.scenarioSwitchTargetID {
+            if scenario.id == targetScenarioID {
+                state.cancelPendingScenarioSwitch()
+            } else if scenario.id == currentRuntimeScenarioID,
+                      state.isConnected {
                 state.disconnect()
             } else {
-                state.switchMode(to: mode.id)
+                state.switchScenario(to: scenario.id)
             }
             return
         }
 
-        if mode.id != currentRuntimeModeID {
-            state.switchMode(to: mode.id)
+        if scenario.id != currentRuntimeScenarioID {
+            state.switchScenario(to: scenario.id)
             return
         }
 
@@ -936,45 +1014,50 @@ struct MainPopover: View {
         case .connected:
             state.disconnect()
         case .failed, .idle, .idleSelected:
-            state.switchMode(to: mode.id)
+            state.switchScenario(to: scenario.id)
         }
     }
 
     private func badge(
-        for visualState: ModeVisualState,
+        for visualState: ScenarioVisualState,
         hovered: Bool
-    ) -> ModeBadge? {
+    ) -> ScenarioBadge? {
         switch visualState {
         case .idle, .idleSelected:
             return hovered
-                ? ModeBadge(symbol: "play.fill", color: stormBlue)
+                ? ScenarioBadge(symbol: "play.fill", color: actionColor)
                 : nil
         case .connecting:
             return hovered
-                ? ModeBadge(symbol: "xmark", color: stormBlue)
+                ? ScenarioBadge(symbol: "xmark", color: actionColor)
                 : nil
         case .connected:
             return hovered
-                ? ModeBadge(symbol: "power", color: clayRed)
-                : ModeBadge(symbol: "checkmark", color: mossGreen)
+                ? ScenarioBadge(symbol: "power", color: dangerColor)
+                : ScenarioBadge(symbol: "checkmark", color: successColor)
         case .failed:
             return hovered
-                ? ModeBadge(symbol: "arrow.clockwise", color: stormBlue)
-                : ModeBadge(
+                ? ScenarioBadge(symbol: "arrow.clockwise", color: actionColor)
+                : ScenarioBadge(
                     symbol: "exclamationmark",
-                    color: clayRed
+                    color: dangerColor
                 )
         }
     }
 
     private func actionHelp(
-        for mode: Mode,
-        visualState: ModeVisualState
+        for scenario: Scenario,
+        visualState: ScenarioVisualState
     ) -> String {
-        if let targetModeID = state.modeSwitchTargetID {
-            return mode.id == targetModeID
-                ? state.tr("取消切换", "Cancel switch")
-                : state.tr("切换连接", "Switch connection")
+        if let targetScenarioID = state.scenarioSwitchTargetID {
+            if scenario.id == targetScenarioID {
+                return state.tr("取消切换", "Cancel switch")
+            }
+            if scenario.id == currentRuntimeScenarioID,
+               state.isConnected {
+                return state.tr("断开", "Disconnect")
+            }
+            return state.tr("切换连接", "Switch connection")
         }
         switch visualState {
         case .connecting:
@@ -985,52 +1068,23 @@ struct MainPopover: View {
             return state.tr("重试", "Retry")
         case .idle, .idleSelected:
             if (state.isConnected || state.isBusy)
-                && mode.id != currentRuntimeModeID {
+                && scenario.id != currentRuntimeScenarioID {
                 return state.tr("切换连接", "Switch connection")
             }
             return state.tr("连接", "Connect")
         }
     }
 
-    private func modeIcon(_ mode: Mode, index: Int) -> String {
-        let normalizedName = mode.name.lowercased()
-        if normalizedName.contains("vpn") {
-            return "briefcase"
-        }
-        if normalizedName.contains("国内") ||
-            normalizedName.contains("china") {
-            return "globe.asia.australia"
-        }
-        if normalizedName.contains("公司") ||
-            normalizedName.contains("office") ||
-            normalizedName.contains("work") {
-            return "building.2"
-        }
-        if normalizedName.contains("全季") ||
-            normalizedName.contains("season") {
-            return "leaf"
-        }
-        if normalizedName.contains("全代理") ||
-            normalizedName.contains("global") {
-            return "shield.lefthalf.filled"
-        }
-        let icons = [
-            "briefcase",
-            "globe.asia.australia",
-            "building.2",
-            "leaf",
-            "shield.lefthalf.filled",
-            "point.3.connected.trianglepath.dotted",
-        ]
-        return icons[index % icons.count]
+    private func scenarioIcon(_ scenario: Scenario) -> String {
+        ScenarioIconCatalog.resolvedPreset(for: scenario).symbol
     }
 
-    private func iconColor(for visualState: ModeVisualState) -> Color {
+    private func iconColor(for visualState: ScenarioVisualState) -> Color {
         switch visualState {
         case .connected:
-            mossGreen
+            successColor
         case .failed:
-            clayRed
+            dangerColor
         default:
             Color.primary.opacity(0.84)
         }
@@ -1045,13 +1099,13 @@ struct MainPopover: View {
     private func policyMappings(
         in report: ConnectionReport
     ) -> [PolicyMapping] {
-        guard let mode = state.profile.modes.first(where: {
-            $0.id == report.mode.id
+        guard let scenario = state.profile.scenarios.first(where: {
+            $0.id == report.scenario.id
         }) else {
             return []
         }
 
-        var mappings = mode.bindings.map { binding in
+        var mappings = scenario.bindings.map { binding in
             let ruleName = state.profile.ruleSets.first {
                 $0.id == binding.ruleSetID
             }?.name ?? binding.ruleSetID
@@ -1066,18 +1120,18 @@ struct MainPopover: View {
             )
         }
 
-        if !mode.defaultLineID.isEmpty
-            || !mode.defaultSubscriptionID.isEmpty {
+        if !scenario.defaultLineID.isEmpty
+            || !scenario.defaultSubscriptionID.isEmpty {
             mappings.append(
                 PolicyMapping(
                     id: "default",
                     ruleName: state.tr("其他流量", "Other Traffic"),
                     lineName: policyTargetName(
-                        lineID: mode.defaultLineID,
-                        subscriptionID: mode.defaultSubscriptionID
+                        lineID: scenario.defaultLineID,
+                        subscriptionID: scenario.defaultSubscriptionID
                     ),
                     error: lineError(
-                        lineID: mode.defaultLineID,
+                        lineID: scenario.defaultLineID,
                         in: report
                     )
                 )
@@ -1224,7 +1278,7 @@ struct MainPopover: View {
     }
 }
 
-private enum ModeVisualState {
+private enum ScenarioVisualState {
     case idle
     case idleSelected
     case connecting
@@ -1232,7 +1286,7 @@ private enum ModeVisualState {
     case failed
 }
 
-private struct ModeBadge {
+private struct ScenarioBadge {
     let symbol: String
     let color: Color
 }

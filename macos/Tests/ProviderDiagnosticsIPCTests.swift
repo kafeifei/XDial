@@ -390,8 +390,8 @@ final class ProviderDiagnosticsIPCTests: XCTestCase {
     func testTrafficLedgerIsBoundToCurrentTransaction() {
         let ledger = ProviderTrafficLedger()
         ledger.reset(transactionID: "transaction-1")
-        ledger.recordDownload(2_048)
-        ledger.recordUpload(512)
+        ledger.recordDownload(2_048, transactionID: "transaction-1")
+        ledger.recordUpload(512, transactionID: "transaction-1")
         XCTAssertEqual(
             ledger.snapshot(transactionID: "transaction-1"),
             ProviderTrafficSnapshot(
@@ -402,6 +402,8 @@ final class ProviderDiagnosticsIPCTests: XCTestCase {
         XCTAssertNil(ledger.snapshot(transactionID: "old"))
 
         ledger.reset(transactionID: "transaction-2")
+        ledger.recordDownload(4_096, transactionID: "transaction-1")
+        ledger.recordUpload(1_024, transactionID: "transaction-1")
         XCTAssertEqual(
             ledger.snapshot(transactionID: "transaction-2"),
             ProviderTrafficSnapshot(

@@ -10,9 +10,9 @@ import (
 
 func TestTransparentProxyDNSRejectsMissingOrInvalidSystemSnapshot(t *testing.T) {
 	profile := &Profile{
-		Lines:        []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
-		ActiveModeID: "mode",
+		Lines:            []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "direct"}},
+		ActiveScenarioID: "scenario",
 	}
 	tests := []struct {
 		name      string
@@ -57,8 +57,8 @@ func TestTransparentProxyDomainEndpointUsesIsolatedBootstrapResolver(t *testing.
 				AnyTLSSNI:      "cover.example.com",
 			},
 		},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "taiwan"}},
-		ActiveModeID: "mode",
+		Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "taiwan"}},
+		ActiveScenarioID: "scenario",
 	}
 
 	cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
@@ -83,7 +83,7 @@ func TestTransparentProxyDomainEndpointUsesIsolatedBootstrapResolver(t *testing.
 		t.Fatalf("proxy endpoint bootstrap changed the Underlay resolver: %v", cfg.Route)
 	}
 	if cfg.DNS["final"] != lineResolver {
-		t.Fatalf("Mode default Line lost user-traffic DNS ownership: %v", cfg.DNS)
+		t.Fatalf("Scenario default Line lost user-traffic DNS ownership: %v", cfg.DNS)
 	}
 	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
 		`{"action":"resolve","server":"` + lineResolver + `"}`,
@@ -105,8 +105,8 @@ func TestTransparentProxyEndpointBootstrapOnlyCoversActiveDomainServers(t *testi
 					AnyTLSSNI:      "cover.example.com",
 				},
 			},
-			Modes:        []Mode{{ID: "mode", DefaultLineID: "taiwan"}},
-			ActiveModeID: "mode",
+			Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "taiwan"}},
+			ActiveScenarioID: "scenario",
 		}
 
 		cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
@@ -130,8 +130,8 @@ func TestTransparentProxyEndpointBootstrapOnlyCoversActiveDomainServers(t *testi
 					AnyTLSPassword: "secret",
 				},
 			},
-			Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
-			ActiveModeID: "mode",
+			Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "direct"}},
+			ActiveScenarioID: "scenario",
 		}
 
 		cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
@@ -178,15 +178,15 @@ func TestTransparentProxySubscriptionNodeDomainEndpointsUseBootstrapResolver(t *
 				},
 			},
 		}},
-		Modes: []Mode{{
-			ID: "mode",
+		Scenarios: []Scenario{{
+			ID: "scenario",
 			Bindings: []RuleBinding{{
 				RuleSetID:      "stream",
 				SubscriptionID: "sub",
 			}},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 
 	cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
@@ -214,15 +214,15 @@ func TestTransparentProxyDNSCompilesManualDomainThenCIDRInCausalOrder(t *testing
 			Domains: []string{"corp.example"},
 			CIDRs:   []string{"10.0.0.0/8"},
 		}},
-		Modes: []Mode{{
-			ID: "mode",
+		Scenarios: []Scenario{{
+			ID: "scenario",
 			Bindings: []RuleBinding{{
 				RuleSetID: "company",
 				LineID:    "company",
 			}},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 
 	cfg, raw := generateTransparentProxyDNSTestConfig(t, profile)
@@ -281,9 +281,9 @@ func TestTransparentProxyDNSClassifiesURLRulesAndPreservesBindingOrder(t *testin
 				RuntimeMatchKind: RuleSetMatchMixed,
 			},
 		},
-		Modes: []Mode{{
-			ID: "mode",
-			// 故意与 RuleSets 声明顺序不同，锁定唯一合法顺序来源是 Mode bindings。
+		Scenarios: []Scenario{{
+			ID: "scenario",
+			// 故意与 RuleSets 声明顺序不同，锁定唯一合法顺序来源是 Scenario bindings。
 			Bindings: []RuleBinding{
 				{RuleSetID: "mixed", LineID: "japan"},
 				{RuleSetID: "domain", LineID: "japan"},
@@ -291,7 +291,7 @@ func TestTransparentProxyDNSClassifiesURLRulesAndPreservesBindingOrder(t *testin
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 
 	cfg, raw := generateTransparentProxyDNSTestConfig(t, profile)
@@ -345,15 +345,15 @@ func TestTransparentProxyDefaultLineOwnsFinalResolution(t *testing.T) {
 			Format:           "binary",
 			RuntimeMatchKind: RuleSetMatchIP,
 		}},
-		Modes: []Mode{{
-			ID: "mode",
+		Scenarios: []Scenario{{
+			ID: "scenario",
 			Bindings: []RuleBinding{{
 				RuleSetID: "cnip",
 				LineID:    "direct",
 			}},
 			DefaultLineID: "tailnet",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 
 	cfg, raw := generateTransparentProxyDNSTestConfig(t, profile)
@@ -406,15 +406,15 @@ func TestTransparentProxyMagicDNSToggleCompilesDynamicDNSAndPeerRoutes(t *testin
 				Enabled: true, Domains: []string{"cdn.example.com"},
 			},
 		},
-		Modes: []Mode{{
-			ID: "mode",
+		Scenarios: []Scenario{{
+			ID: "scenario",
 			Bindings: []RuleBinding{
 				{RuleSetID: "cdn", LineID: "direct"},
 				{RuleSetID: "ip-first", LineID: "direct"},
 			},
 			DefaultLineID: "tailnet",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 
 	profile.Lines[1].TailscaleMagicDNS = false
@@ -465,7 +465,7 @@ func TestTransparentProxyMagicDNSToggleCompilesDynamicDNSAndPeerRoutes(t *testin
 	}
 	if second["server"] != transparentSystemDNSTag ||
 		!reflect.DeepEqual(second["domain_suffix"], []interface{}{"cdn.example.com"}) {
-		t.Fatalf("ordinary Mode DNS ownership must follow MagicDNS: %v", dnsRules)
+		t.Fatalf("ordinary Scenario DNS ownership must follow MagicDNS: %v", dnsRules)
 	}
 	ordinaryDNS := func(source SingBoxConfig) map[string]interface{} {
 		servers := make([]interface{}, 0)
@@ -522,15 +522,15 @@ func TestTransparentProxyInvertedURLIPRuleKeepsSystemResolutionAndInvertsRoute(t
 			Invert:           true,
 			RuntimeMatchKind: RuleSetMatchIP,
 		}},
-		Modes: []Mode{{
-			ID: "mode",
+		Scenarios: []Scenario{{
+			ID: "scenario",
 			Bindings: []RuleBinding{{
 				RuleSetID: "outside-cn",
 				LineID:    "japan",
 			}},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 
 	cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
@@ -539,6 +539,102 @@ func TestTransparentProxyInvertedURLIPRuleKeepsSystemResolutionAndInvertsRoute(t
 		`{"invert":true,"outbound":"proxy-japan","rule_set":"ruleset-outside-cn"}`,
 		`{"action":"resolve","server":"xdial-system-dns"}`,
 	})
+}
+
+func TestTransparentProxyInvertedManualDomainRuleInvertsDNSAndRouteTogether(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{
+				ID:             "japan",
+				Type:           LineTypeTrojan,
+				Enabled:        true,
+				TrojanServer:   "192.0.2.10",
+				TrojanPort:     443,
+				TrojanPassword: "secret",
+				TrojanSNI:      "proxy.example",
+			},
+		},
+		RuleSets: []RuleSet{{
+			ID:      "outside-corp",
+			Type:    RuleSetTypeManual,
+			Enabled: true,
+			Invert:  true,
+			Domains: []string{"corp.example"},
+		}},
+		Scenarios: []Scenario{{
+			ID: "scenario",
+			Bindings: []RuleBinding{{
+				RuleSetID: "outside-corp",
+				LineID:    "japan",
+			}},
+			DefaultLineID: "direct",
+		}},
+		ActiveScenarioID: "scenario",
+	}
+
+	cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
+	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
+		`{"action":"resolve","domain_suffix":["corp.example"],"invert":true,"server":"proxy-dns-proxy-japan"}`,
+		`{"domain_suffix":["corp.example"],"invert":true,"outbound":"proxy-japan"}`,
+		`{"action":"resolve","server":"xdial-system-dns"}`,
+	})
+
+	found := false
+	for _, rawRule := range cfg.DNS["rules"].([]interface{}) {
+		rule := rawRule.(map[string]interface{})
+		if reflect.DeepEqual(rule["domain_suffix"], []interface{}{"corp.example"}) {
+			found = true
+			if rule["invert"] != true || rule["server"] != "proxy-dns-proxy-japan" {
+				t.Fatalf("inverted manual DNS rule drifted from route: %v", rule)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("inverted manual domain rule did not compile a DNS rule")
+	}
+}
+
+func TestTransparentProxyInvertedManualMixedRuleComplementsWholeUnion(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{
+				ID:             "japan",
+				Type:           LineTypeTrojan,
+				Enabled:        true,
+				TrojanServer:   "192.0.2.10",
+				TrojanPort:     443,
+				TrojanPassword: "secret",
+				TrojanSNI:      "proxy.example",
+			},
+		},
+		RuleSets: []RuleSet{{
+			ID:      "outside-company",
+			Type:    RuleSetTypeManual,
+			Enabled: true,
+			Invert:  true,
+			Domains: []string{"corp.example"},
+			CIDRs:   []string{"10.0.0.0/8"},
+		}},
+		Scenarios: []Scenario{{
+			ID: "scenario",
+			Bindings: []RuleBinding{{
+				RuleSetID: "outside-company",
+				LineID:    "japan",
+			}},
+			DefaultLineID: "direct",
+		}},
+		ActiveScenarioID: "scenario",
+	}
+
+	cfg, raw := generateTransparentProxyDNSTestConfig(t, profile)
+	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
+		`{"action":"resolve","server":"xdial-system-dns"}`,
+		`{"invert":true,"mode":"or","outbound":"proxy-japan","rules":[{"domain_suffix":["corp.example"]},{"ip_cidr":["10.0.0.0/8"]}],"type":"logical"}`,
+		`{"action":"resolve","server":"xdial-system-dns"}`,
+	})
+	singboxCheckConfig(t, raw, "transparent-inverted-manual-mixed")
 }
 
 func generateTransparentProxyDNSTestConfig(t *testing.T, profile *Profile) (SingBoxConfig, []byte) {

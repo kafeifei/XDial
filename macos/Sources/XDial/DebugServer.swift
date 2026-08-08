@@ -79,7 +79,7 @@ final class DebugServer {
                     "GET  /health",
                     "GET  /state",
                     "GET  /ax[?depth=N]",
-                    "POST /action  {action: connect|disconnect|reconnect|connect-with-failure|application-attribution-snapshot|begin-route-probe|routing-probe-snapshot|select-mode|ax-press|ax-set-value, ...}",
+                    "POST /action  {action: connect|disconnect|reconnect|connect-with-failure|application-attribution-snapshot|begin-route-probe|routing-probe-snapshot|select-scenario|ax-press|ax-set-value, ...}",
                 ],
             ]))
         }
@@ -149,16 +149,43 @@ final class DebugServer {
             s.wakeReconnectPhase?.rawValue ?? ""
         dict["desiredConnectionState"] =
             s.desiredConnectionStateForDiagnostics
-        dict["desiredConnectionModeID"] =
-            s.desiredConnectionModeIDForDiagnostics
+        dict["desiredConnectionScenarioID"] =
+            s.desiredConnectionScenarioIDForDiagnostics
         dict["desiredConnectionOwnership"] =
             s.desiredConnectionOwnershipForDiagnostics
-        dict["activeModeID"] = s.profile.activeModeID
+        dict["scenarioSwitchTargetID"] =
+            s.scenarioSwitchTargetID ?? ""
+        dict["scenarioSwitchInFlight"] =
+            s.scenarioSwitchInFlightForDiagnostics
+        dict["scenarioSwitchSourceTransactionID"] =
+            s.scenarioSwitchSourceTransactionIDForDiagnostics
+        if let switchProjection = s.engine.scenarioSwitchProjection {
+            dict["scenarioSwitchReport"] = [
+                "status": switchProjection.status,
+                "fromScenarioID": switchProjection.fromScenarioID,
+                "toScenarioID": switchProjection.toScenarioID,
+                "sourceCommittedTransactionID":
+                    switchProjection.sourceCommittedTransactionID,
+                "candidateTransactionID":
+                    switchProjection.candidateTransactionID,
+                "activeCommittedTransactionID":
+                    switchProjection.activeCommittedTransactionID,
+                "inFlight": switchProjection.inFlight,
+                "reusedLineIDs": switchProjection.reusedLineIDs,
+                "code": switchProjection.code ?? "",
+                "message": switchProjection.message ?? "",
+            ] as [String: Any]
+        }
+        dict["activeScenarioID"] = s.profile.activeScenarioID
         // 配置改了但引擎还在跑旧快照 —— 验收改动是否真正生效必须看这个
         dict["configDirty"] = s.configDirty
         if let report = s.engine.connectionReport,
            let data = try? JSONEncoder().encode(report),
-           let object = try? JSONSerialization.jsonObject(with: data) {
+           let rawObject = try? JSONSerialization.jsonObject(with: data),
+           var object = rawObject as? [String: Any] {
+            // The opaque identity is derived from configuration fields that
+            // can include credentials. Debug only needs the comparison result.
+            object.removeValue(forKey: "configuration_fingerprint")
             dict["connectionReport"] = object
         }
         if let data = try? JSONEncoder().encode(
@@ -592,20 +619,27 @@ final class DebugServer {
                     "code": providerDiagnosticsCode(error),
                 ])
             }
-        case "select-mode":
+        case "select-scenario":
             guard let id = obj["id"] as? String else {
                 return ("400 Bad Request", json(["error": "missing 'id'"]))
             }
             // 必须走和用户点击完全相同的 intent：直接改 state 会绕开门禁和
             // configDirty 置位，调试验收就会给出"已生效"的假象。
-            guard state.activateMode(id) else {
-                return ("404 Not Found", json(["error": "no such mode", "id": id]))
+            guard state.activateScenario(id) else {
+                return ("404 Not Found", json(["error": "no such scenario", "id": id]))
             }
-            return ok([
+            let result: [String: Any] = [
                 "ok": true,
-                "activeModeID": state.profile.activeModeID,
+                "activeScenarioID": state.profile.activeScenarioID,
+                "desiredConnectionScenarioID":
+                    state.desiredConnectionScenarioIDForDiagnostics,
+                "scenarioSwitchTargetID":
+                    state.scenarioSwitchTargetID ?? "",
+                "scenarioSwitchInFlight":
+                    state.scenarioSwitchInFlightForDiagnostics,
                 "configDirty": state.configDirty,
-            ])
+            ]
+            return ok(result)
         case "open-settings":
             NSApp.activate(ignoringOtherApps: true)
             if let w = settingsWindow() {
@@ -677,7 +711,7 @@ final class DebugServer {
             ])
         default:
             return ("400 Bad Request", json(["error": "unknown action: \(action)",
-                "available": ["connect", "disconnect", "reconnect", "select-mode", "open-settings",
+                "available": ["connect", "disconnect", "reconnect", "select-scenario", "open-settings",
                               "connect-with-failure",
                               "begin-route-probe", "routing-probe-snapshot",
                               "ax-press", "ax-set-value", "setup-helper", "check-helper",

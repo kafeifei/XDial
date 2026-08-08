@@ -29,6 +29,36 @@ func TestPrepareTailscaleDNSUnavailableWithoutMobileDataPlane(t *testing.T) {
 	}
 }
 
+func TestPreparedSwitchTailscaleUnavailableWithoutMobileDataPlane(t *testing.T) {
+	engine := New(nil)
+	privateEndpoint := "private-candidate-endpoint"
+	privateDNS := "private-candidate-dns"
+	errors := []error{}
+	_, err := engine.PreparedSwitchTailscaleStatus(privateEndpoint)
+	errors = append(errors, err)
+	_, err = engine.PreparePreparedSwitchTailscaleDNS(
+		privateEndpoint,
+		privateDNS,
+	)
+	errors = append(errors, err)
+	_, err = engine.ProbePreparedSwitchTailscalePeer(
+		privateEndpoint,
+		"100.64.0.1",
+		1_000,
+	)
+	errors = append(errors, err)
+	for _, candidateErr := range errors {
+		if candidateErr == nil ||
+			!strings.Contains(candidateErr.Error(), "unavailable") {
+			t.Fatalf("expected unavailable error, got %v", candidateErr)
+		}
+		if strings.Contains(candidateErr.Error(), privateEndpoint) ||
+			strings.Contains(candidateErr.Error(), privateDNS) {
+			t.Fatalf("error leaked candidate runtime tag: %v", candidateErr)
+		}
+	}
+}
+
 func TestTailscaleLogoutUnavailableWithoutMobileDataPlane(t *testing.T) {
 	engine := New(nil)
 	err := engine.TailscaleLogout("private-endpoint-name")

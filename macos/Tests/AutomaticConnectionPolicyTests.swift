@@ -44,15 +44,15 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
     func testInitialStatusAdoptsExistingConnectionOnlyWhileUnresolved() {
         var desired = ConnectionDesiredState()
 
-        desired.observeExistingConnection(modeID: "work")
+        desired.observeExistingConnection(scenarioID: "work")
 
         XCTAssertEqual(desired.value, .connected(
-            modeID: "work",
+            scenarioID: "work",
             runtimeOwnership: .adopted
         ))
 
         desired.userRequestedDisconnection()
-        desired.observeExistingConnection(modeID: "stale")
+        desired.observeExistingConnection(scenarioID: "stale")
         XCTAssertEqual(
             desired.value,
             .disconnected(explicit: true)
@@ -61,50 +61,50 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
 
     func testRepeatedWakeSignalsDoNotConsumeConnectionDesire() {
         var desired = ConnectionDesiredState()
-        desired.userRequestedConnection(modeID: "work")
+        desired.userRequestedConnection(scenarioID: "work")
 
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
-            activeModeID: "work",
+            activeScenarioID: "work",
             runtimeStatus: "connected",
             canConnect: false,
             networkWaitCompleted: false
         ), .none)
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
-            activeModeID: "work",
+            activeScenarioID: "work",
             runtimeStatus: "disconnected",
             canConnect: true,
             networkWaitCompleted: false
         ), .waitForNetwork)
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
-            activeModeID: "work",
+            activeScenarioID: "work",
             runtimeStatus: "disconnected",
             canConnect: false,
             networkWaitCompleted: false
         ), .waitForNetwork)
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
-            activeModeID: "work",
+            activeScenarioID: "work",
             runtimeStatus: "disconnected",
             canConnect: true,
             networkWaitCompleted: true
-        ), .startAutomatically(modeID: "work"))
+        ), .startAutomatically(scenarioID: "work"))
         XCTAssertEqual(desired.value, .connected(
-            modeID: "work",
+            scenarioID: "work",
             runtimeOwnership: .owned
         ))
     }
 
     func testWakeReconcileNeverRestartsAnActiveRuntime() {
         var desired = ConnectionDesiredState()
-        desired.userRequestedConnection(modeID: "work")
+        desired.userRequestedConnection(scenarioID: "work")
 
         for status in ["connecting", "reconnecting", "connected"] {
             XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
                 desired: desired,
-                activeModeID: "work",
+                activeScenarioID: "work",
                 runtimeStatus: status,
                 canConnect: false,
                 networkWaitCompleted: false
@@ -114,32 +114,32 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
 
     func testAdoptedRuntimeLossIsClaimedExactlyOnce() {
         var desired = ConnectionDesiredState()
-        desired.observeExistingConnection(modeID: "work")
+        desired.observeExistingConnection(scenarioID: "work")
 
         XCTAssertTrue(desired.beginRestoringAdoptedRuntime())
         XCTAssertFalse(desired.beginRestoringAdoptedRuntime())
         XCTAssertEqual(desired.value, .connected(
-            modeID: "work",
+            scenarioID: "work",
             runtimeOwnership: .restoring
         ))
 
         XCTAssertTrue(desired.automaticConnectionRequested(
-            modeID: "work"
+            scenarioID: "work"
         ))
         XCTAssertEqual(desired.value, .connected(
-            modeID: "work",
+            scenarioID: "work",
             runtimeOwnership: .owned
         ))
     }
 
     func testDuplicateWakeIsNoOpOnceConnectionTransactionStarted() {
         var desired = ConnectionDesiredState()
-        desired.userRequestedConnection(modeID: "work")
+        desired.userRequestedConnection(scenarioID: "work")
 
         for status in ["connecting", "reconnecting", "connected"] {
             XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
                 desired: desired,
-                activeModeID: "work",
+                activeScenarioID: "work",
                 runtimeStatus: status,
                 canConnect: false,
                 networkWaitCompleted: false
@@ -147,19 +147,19 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
         }
     }
 
-    func testWakeDoesNotSilentlyRestoreAChangedMode() {
+    func testWakeDoesNotSilentlyRestoreAChangedScenario() {
         var desired = ConnectionDesiredState()
-        desired.userRequestedConnection(modeID: "before-sleep")
+        desired.userRequestedConnection(scenarioID: "before-sleep")
 
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
-            activeModeID: "current",
+            activeScenarioID: "current",
             runtimeStatus: "disconnected",
             canConnect: true,
             networkWaitCompleted: true
-        ), .modeChanged(
-            expectedModeID: "before-sleep",
-            activeModeID: "current"
+        ), .scenarioChanged(
+            expectedScenarioID: "before-sleep",
+            activeScenarioID: "current"
         ))
     }
 
@@ -187,11 +187,11 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
         desired.userRequestedDisconnection()
 
         XCTAssertFalse(desired.automaticConnectionRequested(
-            modeID: "work"
+            scenarioID: "work"
         ))
         XCTAssertEqual(DesiredConnectionReconcilePolicy.decide(
             desired: desired,
-            activeModeID: "work",
+            activeScenarioID: "work",
             runtimeStatus: "connecting",
             canConnect: false,
             networkWaitCompleted: false
@@ -202,13 +202,13 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
         var desired = ConnectionDesiredState()
         desired.userRequestedDisconnection()
 
-        desired.userRequestedConnection(modeID: "work")
+        desired.userRequestedConnection(scenarioID: "work")
 
         XCTAssertTrue(desired.automaticConnectionRequested(
-            modeID: "work"
+            scenarioID: "work"
         ))
         XCTAssertEqual(desired.value, .connected(
-            modeID: "work",
+            scenarioID: "work",
             runtimeOwnership: .owned
         ))
     }

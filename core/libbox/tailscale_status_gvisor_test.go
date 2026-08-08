@@ -323,6 +323,28 @@ func TestTailscaleStatusErrorDoesNotEchoEndpointTag(t *testing.T) {
 	}
 }
 
+func TestPreparedSwitchTailscaleAPIsRequireCandidate(t *testing.T) {
+	instance := New(nil)
+	privateTag := "private-candidate-endpoint"
+	if _, err := instance.PreparedSwitchTailscaleStatus(privateTag); err == nil ||
+		strings.Contains(err.Error(), privateTag) {
+		t.Fatalf("prepared status error = %v", err)
+	}
+	if _, err := instance.PreparePreparedSwitchTailscaleDNS(
+		privateTag,
+		"private-candidate-dns",
+	); err == nil || strings.Contains(err.Error(), privateTag) {
+		t.Fatalf("prepared DNS error = %v", err)
+	}
+	if _, err := instance.ProbePreparedSwitchTailscalePeer(
+		privateTag,
+		"100.64.0.1",
+		1_000,
+	); err == nil || strings.Contains(err.Error(), privateTag) {
+		t.Fatalf("prepared peer probe error = %v", err)
+	}
+}
+
 func TestInstallTailscaleDNSMemorySnapshotReturnsOnlyBoundedMetadata(t *testing.T) {
 	rawTransport, err := boxHosts.NewTransport(
 		context.Background(),

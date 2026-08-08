@@ -69,7 +69,7 @@ struct MobileSettingsView: View {
                 Section(app.tr("配置摘要", "Configuration")) {
                     LabeledContent(app.tr("线路", "Lines"), value: "\(app.profile.lines.count)")
                     LabeledContent(app.tr("规则", "Rules"), value: "\(app.profile.ruleSets.count)")
-                    LabeledContent(app.tr("模式", "Modes"), value: "\(app.profile.modes.count)")
+                    LabeledContent(app.tr("场景", "Scenarios"), value: "\(app.profile.scenarios.count)")
                     LabeledContent(app.tr("订阅", "Subscriptions"), value: "\(app.profile.subscriptions.count)")
                 }
 
@@ -170,8 +170,8 @@ struct MobileSettingsView: View {
                 Button(app.tr("取消", "Cancel"), role: .cancel) {}
             } message: {
                 Text(app.tr(
-                    "线路、规则、模式和订阅将恢复为初始配置。此操作不会保留当前配置。",
-                    "Lines, rules, modes, and subscriptions will return to their initial configuration. The current configuration will not be kept."
+                    "线路、规则、场景和订阅将恢复为初始配置。此操作不会保留当前配置。",
+                    "Lines, rules, scenarios, and subscriptions will return to their initial configuration. The current configuration will not be kept."
                 ))
             }
             .confirmationDialog(
@@ -359,8 +359,8 @@ struct MobileSettingsView: View {
             return app.tr("配置中有重复的 \(kind) 标识。", "The configuration contains a duplicate \(kind) identifier.")
         case .unsupportedLineType(let type):
             return app.tr("配置包含不支持的线路类型：\(type)。", "The configuration contains an unsupported line type: \(type).")
-        case .invalidActiveMode:
-            return app.tr("当前模式在导入配置中不存在。", "The active mode does not exist in this configuration.")
+        case .invalidActiveScenario:
+            return app.tr("当前场景在导入配置中不存在。", "The active scenario does not exist in this configuration.")
         case .invalidReference(let reference):
             return app.tr("配置包含无效引用：\(reference)。", "The configuration contains an invalid reference: \(reference).")
         case .fileTooLarge:

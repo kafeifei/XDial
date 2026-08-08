@@ -63,6 +63,146 @@ final class ProviderRelayRegistryTests: XCTestCase {
         XCTAssertEqual(current.shutdownCount, 1)
     }
 
+    func testHandoffRoutesNewClaimsWithoutCancellingOldFlows() async {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let oldCompletion = RegistryAsyncGate()
+        let old = RelayFixture(cleanupGate: oldCompletion)
+        let oldReservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertEqual(oldReservation.endpoint, "endpoint-A")
+        XCTAssertTrue(registry.attach(old.handle, to: oldReservation))
+        XCTAssertTrue(old.handle.start {
+            registry.finish(oldReservation)
+        })
+        await old.waitUntilStarted()
+
+        let drain = registry.handoff(
+            generation: "B",
+            endpoint: "endpoint-B"
+        )
+        let newReservation = try! XCTUnwrap(registry.reserve())
+
+        XCTAssertEqual(drain.generation, "A")
+        XCTAssertEqual(drain.count, 1)
+        XCTAssertEqual(newReservation.generation, "B")
+        XCTAssertEqual(newReservation.endpoint, "endpoint-B")
+        XCTAssertEqual(old.shutdownCount, 0)
+        XCTAssertFalse(drain.wait(timeout: 0.01))
+
+        registry.finish(newReservation)
+        oldCompletion.open()
+        XCTAssertTrue(drain.wait(timeout: 1))
+        XCTAssertEqual(old.shutdownCount, 0)
+        XCTAssertEqual(registry.registeredCount, 0)
+    }
+
+    func testHandoffGraceExpiryCanCancelOnlyDrainingFlows() async {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let old = RelayFixture()
+        let oldReservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertTrue(registry.attach(old.handle, to: oldReservation))
+        XCTAssertTrue(old.handle.start {
+            registry.finish(oldReservation)
+        })
+        await old.waitUntilStarted()
+
+        let drain = registry.handoff(
+            generation: "B",
+            endpoint: "endpoint-B"
+        )
+        let newReservation = try! XCTUnwrap(registry.reserve())
+        let current = RelayFixture()
+        XCTAssertTrue(
+            registry.attach(current.handle, to: newReservation)
+        )
+
+        XCTAssertFalse(drain.wait(timeout: 0.01))
+        drain.cancel()
+        XCTAssertTrue(drain.wait(timeout: 1))
+        XCTAssertEqual(old.shutdownCount, 1)
+        XCTAssertEqual(current.shutdownCount, 0)
+
+        _ = registry.deactivateCurrent()
+        XCTAssertEqual(current.shutdownCount, 1)
+    }
+
+    func testRollbackHandoffDrainsCandidateWithoutTouchingSourceFlows() async {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let sourceCompletion = RegistryAsyncGate()
+        let source = RelayFixture(cleanupGate: sourceCompletion)
+        let sourceReservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertTrue(
+            registry.attach(source.handle, to: sourceReservation)
+        )
+        XCTAssertTrue(source.handle.start {
+            registry.finish(sourceReservation)
+        })
+        await source.waitUntilStarted()
+
+        let sourceDrain = registry.handoff(
+            generation: "B",
+            endpoint: "endpoint-B"
+        )
+        let candidate = RelayFixture()
+        let candidateReservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertTrue(
+            registry.attach(candidate.handle, to: candidateReservation)
+        )
+        XCTAssertTrue(candidate.handle.start {
+            registry.finish(candidateReservation)
+        })
+        await candidate.waitUntilStarted()
+
+        let candidateDrain = registry.handoff(
+            generation: "A",
+            endpoint: "endpoint-A"
+        )
+
+        XCTAssertEqual(sourceDrain.count, 1)
+        XCTAssertEqual(candidateDrain.count, 1)
+        candidateDrain.cancel()
+        XCTAssertTrue(candidateDrain.wait(timeout: 1))
+        XCTAssertEqual(candidate.shutdownCount, 1)
+        XCTAssertEqual(source.shutdownCount, 0)
+
+        let currentReservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertEqual(currentReservation.generation, "A")
+        XCTAssertEqual(currentReservation.endpoint, "endpoint-A")
+        registry.finish(currentReservation)
+
+        sourceCompletion.open()
+        XCTAssertTrue(sourceDrain.wait(timeout: 1))
+        XCTAssertEqual(source.shutdownCount, 0)
+    }
+
+    func testStopDuringHandoffDrainCancelsEveryGeneration() async {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let old = RelayFixture()
+        let oldReservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertTrue(registry.attach(old.handle, to: oldReservation))
+        XCTAssertTrue(old.handle.start {
+            registry.finish(oldReservation)
+        })
+        await old.waitUntilStarted()
+
+        _ = registry.handoff(generation: "B", endpoint: "endpoint-B")
+        let current = RelayFixture()
+        let currentReservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertTrue(
+            registry.attach(current.handle, to: currentReservation)
+        )
+
+        let drain = registry.deactivateCurrent()
+
+        XCTAssertEqual(drain.count, 2)
+        XCTAssertEqual(old.shutdownCount, 1)
+        XCTAssertEqual(current.shutdownCount, 1)
+        XCTAssertEqual(registry.registeredCount, 0)
+    }
+
     func testStopBetweenAttachAndStartCancelsDormantHandle() {
         let registry = ProviderRelayRegistry<String>()
         registry.activate(generation: "A", endpoint: "endpoint-A")

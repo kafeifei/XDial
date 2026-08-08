@@ -246,10 +246,11 @@ type tailscaleDERPHomeReselectionPayload struct {
 // 的状态、授权地址、可选出口节点和有限的连接诊断，不暴露 tailnet、用户、
 // 健康详情、DERP 区域、真实 endpoint 或节点密钥。
 func (l *Libbox) TailscaleStatus(endpointTag string) (string, error) {
-	endpoint, client, runtimeCtx, err := l.tailscaleRuntime(endpointTag)
+	endpoint, client, runtimeCtx, release, err := l.tailscaleRuntime(endpointTag)
 	if err != nil {
 		return "", err
 	}
+	defer release()
 	ctx, cancel := context.WithTimeout(runtimeCtx, tailscaleStatusTimeout)
 	defer cancel()
 	status, err := client.Status(ctx)
@@ -263,14 +264,40 @@ func (l *Libbox) TailscaleStatus(endpointTag string) (string, error) {
 	)
 }
 
+// PreparedSwitchTailscaleStatus applies the same redacted status contract to
+// the unpublished Box generation. The candidate lease prevents Abort or
+// Commit from closing its endpoint while LocalAPI is in use.
+func (l *Libbox) PreparedSwitchTailscaleStatus(
+	endpointTag string,
+) (string, error) {
+	endpoint, client, runtimeCtx, release, err :=
+		l.preparedSwitchTailscaleRuntime(endpointTag)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(runtimeCtx, tailscaleStatusTimeout)
+	defer cancel()
+	status, err := client.Status(ctx)
+	if err != nil {
+		return "", fmt.Errorf("prepared Tailscale status is unavailable")
+	}
+	return encodeTailscaleStatus(
+		status,
+		tailscaleRuntimeReadiness(endpoint),
+		tailscalePeerDERPPathLookup(endpoint),
+	)
+}
+
 // TailscaleDNSCaptureDomains returns the current endpoint-owned DNS suffixes,
 // exact hosts and single-label aliases for the Provider's ingress rules. It is
 // deliberately separate from TailscaleStatus so setup/UI status stays redacted.
 func (l *Libbox) TailscaleDNSCaptureDomains(endpointTag string) (string, error) {
-	endpoint, _, _, err := l.tailscaleRuntime(endpointTag)
+	endpoint, _, _, release, err := l.tailscaleRuntime(endpointTag)
 	if err != nil {
 		return "", err
 	}
+	defer release()
 	data, err := json.Marshal(endpoint.DNSCaptureDomains())
 	if err != nil {
 		return "", fmt.Errorf("Tailscale DNS capture domains are unavailable")
@@ -285,7 +312,8 @@ func (l *Libbox) TailscaleDNSCaptureDomains(endpointTag string) (string, error) 
 func (l *Libbox) PrepareTailscaleDNS(endpointTag string, dnsServerTag string) (string, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !l.running || l.box == nil || l.runtimeCtx == nil || l.runtimeCtx.Err() != nil {
+	if !l.running || l.box == nil || l.runtimeCtx == nil ||
+		l.runtimeCtx.Err() != nil || l.switchCommitInProgress {
 		return "", fmt.Errorf("connection is not running")
 	}
 	rawEndpoint, found := l.box.Endpoint().Get(strings.TrimSpace(endpointTag))
@@ -311,6 +339,66 @@ func (l *Libbox) PrepareTailscaleDNS(endpointTag string, dnsServerTag string) (s
 	}
 	if l.routingProbe != nil {
 		l.routingProbe.replaceDNSSnapshotAddresses(snapshot.Hosts)
+	}
+	return metadata, nil
+}
+
+// PreparePreparedSwitchTailscaleDNS installs an immutable DNS snapshot only
+// into the candidate generation. No active DNS transport or routing probe is
+// mutated before commit.
+func (l *Libbox) PreparePreparedSwitchTailscaleDNS(
+	endpointTag,
+	dnsServerTag string,
+) (string, error) {
+	l.mu.Lock()
+	candidate := l.preparedSwitch
+	if candidate == nil || candidate.box == nil ||
+		candidate.runtimeCtx == nil || candidate.runtimeCtx.Err() != nil ||
+		l.switchCommitInProgress {
+		l.mu.Unlock()
+		return "", fmt.Errorf("switch candidate is not prepared")
+	}
+	rawEndpoint, found := candidate.box.Endpoint().Get(
+		strings.TrimSpace(endpointTag),
+	)
+	endpoint, ok := rawEndpoint.(*boxTailscale.Endpoint)
+	if !found || !ok {
+		l.mu.Unlock()
+		return "", fmt.Errorf("prepared Tailscale endpoint is unavailable")
+	}
+	transportManager := service.FromContext[adapter.DNSTransportManager](
+		candidate.runtimeCtx,
+	)
+	if transportManager == nil {
+		l.mu.Unlock()
+		return "", fmt.Errorf(
+			"prepared Tailscale DNS memory transport is unavailable",
+		)
+	}
+	rawTransport, found := transportManager.Transport(
+		strings.TrimSpace(dnsServerTag),
+	)
+	if !found {
+		l.mu.Unlock()
+		return "", fmt.Errorf(
+			"prepared Tailscale DNS memory transport is unavailable",
+		)
+	}
+	routingProbe := candidate.routingProbe
+	l.switchCandidateUsers.Add(1)
+	l.mu.Unlock()
+	defer l.switchCandidateUsers.Done()
+
+	snapshot, err := endpoint.DNSMemorySnapshot()
+	if err != nil {
+		return "", err
+	}
+	metadata, err := installTailscaleDNSMemorySnapshot(snapshot, rawTransport)
+	if err != nil {
+		return "", err
+	}
+	if routingProbe != nil {
+		routingProbe.replaceDNSSnapshotAddresses(snapshot.Hosts)
 	}
 	return metadata, nil
 }
@@ -342,10 +430,11 @@ func installTailscaleDNSMemorySnapshot(snapshot boxTailscale.DNSMemorySnapshot, 
 // class, latency and a bounded error class; public endpoints, DERP regions,
 // node names and identity material never cross the platform boundary.
 func (l *Libbox) ProbeTailscalePeer(endpointTag string, peerIP string, timeoutMS int) (string, error) {
-	_, client, runtimeCtx, err := l.tailscaleRuntime(endpointTag)
+	_, client, runtimeCtx, release, err := l.tailscaleRuntime(endpointTag)
 	if err != nil {
 		return "", err
 	}
+	defer release()
 	address, err := netip.ParseAddr(strings.TrimSpace(peerIP))
 	if err != nil || !address.IsValid() {
 		return "", fmt.Errorf("Tailscale peer address is invalid")
@@ -368,15 +457,63 @@ func (l *Libbox) ProbeTailscalePeer(endpointTag string, peerIP string, timeoutMS
 	return string(encoded), nil
 }
 
+// ProbePreparedSwitchTailscalePeer runs the authenticated peer checks against
+// only the unpublished candidate endpoint.
+func (l *Libbox) ProbePreparedSwitchTailscalePeer(
+	endpointTag,
+	peerIP string,
+	timeoutMS int,
+) (string, error) {
+	_, client, runtimeCtx, release, err :=
+		l.preparedSwitchTailscaleRuntime(endpointTag)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	address, err := netip.ParseAddr(strings.TrimSpace(peerIP))
+	if err != nil || !address.IsValid() {
+		return "", fmt.Errorf("Tailscale peer address is invalid")
+	}
+	if timeoutMS < 500 {
+		timeoutMS = 500
+	}
+	if timeoutMS > 5_000 {
+		timeoutMS = 5_000
+	}
+	timeout := time.Duration(timeoutMS) * time.Millisecond
+	payload := tailscalePeerProbePayload{
+		Disco: probeTailscalePeerLayer(
+			runtimeCtx,
+			client,
+			address,
+			tailcfg.PingDisco,
+			timeout,
+		),
+		TSMP: probeTailscalePeerLayer(
+			runtimeCtx,
+			client,
+			address,
+			tailcfg.PingTSMP,
+			timeout,
+		),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("Tailscale peer probe encoding failed")
+	}
+	return string(encoded), nil
+}
+
 // ReselectTailscaleHomeDERP performs one bounded, protocol-native HomeDERP
 // change for a running endpoint. It changes no identity, login state,
 // preference, route, DNS, or system network configuration. The returned JSON
 // exposes only bounded relations; real egress remains the sole success gate.
 func (l *Libbox) ReselectTailscaleHomeDERP(endpointTag string, timeoutMS int) (string, error) {
-	endpoint, _, runtimeCtx, err := l.tailscaleRuntime(endpointTag)
+	endpoint, _, runtimeCtx, release, err := l.tailscaleRuntime(endpointTag)
 	if err != nil {
 		return "", err
 	}
+	defer release()
 	if timeoutMS < 2_000 {
 		timeoutMS = 2_000
 	}
@@ -474,10 +611,11 @@ func probeTailscalePeerLayer(
 // starts this flow automatically on first boot, but an explicit entry point is
 // required when that URL has expired or was not yet available to the app.
 func (l *Libbox) BeginTailscaleLogin(endpointTag string) (string, error) {
-	client, runtimeCtx, err := l.tailscaleLocalClient(endpointTag)
+	client, runtimeCtx, release, err := l.tailscaleLocalClient(endpointTag)
 	if err != nil {
 		return "", err
 	}
+	defer release()
 	ctx, cancel := context.WithTimeout(runtimeCtx, tailscaleStatusTimeout)
 	defer cancel()
 	if err := client.StartLoginInteractive(ctx); err != nil {
@@ -516,10 +654,11 @@ func (l *Libbox) BeginTailscaleLogin(endpointTag string) (string, error) {
 
 // TailscaleLogout 清除指定 endpoint 的登录状态，并保留 LocalAPI 返回的错误原因。
 func (l *Libbox) TailscaleLogout(endpointTag string) error {
-	client, runtimeCtx, err := l.tailscaleLocalClient(endpointTag)
+	client, runtimeCtx, release, err := l.tailscaleLocalClient(endpointTag)
 	if err != nil {
 		return err
 	}
+	defer release()
 	ctx, cancel := context.WithTimeout(runtimeCtx, tailscaleStatusTimeout)
 	defer cancel()
 	if err := client.Logout(ctx); err != nil {
@@ -528,30 +667,92 @@ func (l *Libbox) TailscaleLogout(endpointTag string) error {
 	return nil
 }
 
-func (l *Libbox) tailscaleRuntime(endpointTag string) (*boxTailscale.Endpoint, *tailLocal.Client, context.Context, error) {
+func (l *Libbox) tailscaleRuntime(
+	endpointTag string,
+) (
+	*boxTailscale.Endpoint,
+	*tailLocal.Client,
+	context.Context,
+	func(),
+	error,
+) {
 	l.mu.Lock()
-	if !l.running || l.box == nil || l.runtimeCtx == nil {
+	if !l.running || l.box == nil || l.runtimeCtx == nil ||
+		l.runtimeCtx.Err() != nil || l.switchCommitInProgress {
 		l.mu.Unlock()
-		return nil, nil, nil, fmt.Errorf("connection is not running")
+		return nil, nil, nil, nil, fmt.Errorf("connection is not running")
 	}
 	endpoint, found := l.box.Endpoint().Get(strings.TrimSpace(endpointTag))
 	runtimeCtx := l.runtimeCtx
+	// Commit sets switchCommitInProgress while holding l.mu before it waits.
+	// Therefore this Add can never race a zero-counter Wait, and the source
+	// endpoint remains borrowed until this bounded LocalAPI operation returns.
+	l.runtimeUsers.Add(1)
 	l.mu.Unlock()
+	release := func() { l.runtimeUsers.Done() }
 
 	tailscaleEndpoint, ok := endpoint.(*boxTailscale.Endpoint)
 	if !found || !ok {
-		return nil, nil, nil, fmt.Errorf("Tailscale endpoint is unavailable")
+		release()
+		return nil, nil, nil, nil, fmt.Errorf("Tailscale endpoint is unavailable")
 	}
 	client, err := tailscaleEndpoint.Server().LocalClient()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("Tailscale status is unavailable")
+		release()
+		return nil, nil, nil, nil, fmt.Errorf("Tailscale status is unavailable")
 	}
-	return tailscaleEndpoint, client, runtimeCtx, nil
+	return tailscaleEndpoint, client, runtimeCtx, release, nil
 }
 
-func (l *Libbox) tailscaleLocalClient(endpointTag string) (*tailLocal.Client, context.Context, error) {
-	_, client, runtimeCtx, err := l.tailscaleRuntime(endpointTag)
-	return client, runtimeCtx, err
+func (l *Libbox) preparedSwitchTailscaleRuntime(
+	endpointTag string,
+) (
+	*boxTailscale.Endpoint,
+	*tailLocal.Client,
+	context.Context,
+	func(),
+	error,
+) {
+	l.mu.Lock()
+	candidate := l.preparedSwitch
+	if candidate == nil || candidate.box == nil ||
+		candidate.runtimeCtx == nil || candidate.runtimeCtx.Err() != nil ||
+		l.switchCommitInProgress {
+		l.mu.Unlock()
+		return nil, nil, nil, nil, fmt.Errorf(
+			"switch candidate is not prepared",
+		)
+	}
+	rawEndpoint, found := candidate.box.Endpoint().Get(
+		strings.TrimSpace(endpointTag),
+	)
+	runtimeCtx := candidate.runtimeCtx
+	l.switchCandidateUsers.Add(1)
+	l.mu.Unlock()
+	release := func() { l.switchCandidateUsers.Done() }
+
+	endpoint, ok := rawEndpoint.(*boxTailscale.Endpoint)
+	if !found || !ok {
+		release()
+		return nil, nil, nil, nil, fmt.Errorf(
+			"prepared Tailscale endpoint is unavailable",
+		)
+	}
+	client, err := endpoint.Server().LocalClient()
+	if err != nil {
+		release()
+		return nil, nil, nil, nil, fmt.Errorf(
+			"prepared Tailscale status is unavailable",
+		)
+	}
+	return endpoint, client, runtimeCtx, release, nil
+}
+
+func (l *Libbox) tailscaleLocalClient(
+	endpointTag string,
+) (*tailLocal.Client, context.Context, func(), error) {
+	_, client, runtimeCtx, release, err := l.tailscaleRuntime(endpointTag)
+	return client, runtimeCtx, release, err
 }
 
 func tailscaleRuntimeReadiness(endpoint *boxTailscale.Endpoint) tailscaleReadinessPayload {

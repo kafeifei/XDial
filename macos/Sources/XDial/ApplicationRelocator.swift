@@ -23,6 +23,44 @@ enum ApplicationRelocator {
         _ = try validateDistributionBundle(at: Bundle.main.bundleURL)
     }
 
+    /// 开发重启先在无 UI、无 AppState 的进程中完成原子替换，再只启动
+    /// /Applications 中的最终 bundle。这样不会先启动构建目录副本、建立一次
+    /// 网络事务，随后又因自动安装被终止并建立第二次事务。
+    static func installCurrentBundleWithoutRelaunch() throws {
+        if isRunningFromApplications {
+            try validateCurrentBundle()
+            return
+        }
+
+        let sourceURL = Bundle.main.bundleURL
+        let sourceIdentity = try validateDistributionBundle(at: sourceURL)
+        let destinationExists = FileManager.default.fileExists(
+            atPath: destinationURL.path
+        )
+        var replacedIdentity: SigningIdentity?
+        if destinationExists {
+            let identity = try existingApplicationIdentity(
+                at: destinationURL
+            )
+            guard XDialApplicationIdentifierPolicy.permitsReplacement(
+                existingIdentifier: identity.identifier,
+                incomingIdentifier: sourceIdentity.identifier,
+                teamIdentifiersMatch:
+                    identity.teamIdentifier == sourceIdentity.teamIdentifier
+            ) else {
+                throw InstallationError.existingApplicationNotReplaceable
+            }
+            replacedIdentity = identity
+        }
+
+        try install(
+            sourceURL: sourceURL,
+            sourceIdentity: sourceIdentity,
+            replacedIdentity: replacedIdentity,
+            replaceExisting: destinationExists
+        )
+    }
+
     static func moveInstalledApplicationToTrash() throws {
         guard isRunningFromApplications else {
             throw InstallationError.applicationNotInstalled
@@ -420,6 +458,7 @@ enum ApplicationRelocator {
         case signatureMetadataMissing(String)
         case relaunchFailed
         case existingApplicationDidNotTerminate
+        case existingApplicationNotReplaceable
         case applicationNotInstalled
 
         var canRetry: Bool {
@@ -467,6 +506,9 @@ enum ApplicationRelocator {
                 "旧版 XDial 仍在运行，无法安全替换。"
                     + "XDial 不会强制结束它；请稍等后重试，"
                     + "或从菜单栏退出旧版后再重试。"
+            case .existingApplicationNotReplaceable:
+                "“应用程序”中的 XDial 与当前构建签名或标识不一致，"
+                    + "已拒绝覆盖"
             case .applicationNotInstalled:
                 "XDial 不在“应用程序”目录，无法完成卸载"
             }

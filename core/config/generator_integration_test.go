@@ -159,7 +159,7 @@ func TestGenerate_DesktopUserSplitCombination(t *testing.T) {
 	p := &Profile{
 		Lines:    []Line{directLine(), vpnLine(), trojanLine()},
 		RuleSets: []RuleSet{internalRuleSet(), gfwRuleSet()},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "split", Name: "分流",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
@@ -167,7 +167,7 @@ func TestGenerate_DesktopUserSplitCombination(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "split",
+		ActiveScenarioID: "split",
 	}
 
 	data, err := GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10"}, "en0")
@@ -185,11 +185,11 @@ func TestGenerate_DesktopTailscale(t *testing.T) {
 	tailnet.TailscaleMagicDNS = true
 	p := &Profile{
 		Lines: []Line{directLine(), tailnet},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "tailnet", Name: "Tailnet", DefaultLineID: "tailscale-1",
 		}},
-		ActiveModeID: "tailnet",
-		Tailscale:    tailscaleIdentity(),
+		ActiveScenarioID: "tailnet",
+		Tailscale:        tailscaleIdentity(),
 	}
 	data, err := GenerateSingBoxDesktop(p, 0, "", t.TempDir(), nil, "en0")
 	if err != nil {
@@ -206,11 +206,11 @@ func TestGenerate_TransparentProxyTailscaleMemoryHosts(t *testing.T) {
 	tailnet.TailscaleMagicDNS = true
 	p := &Profile{
 		Lines: []Line{directLine(), tailnet},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "tailnet", Name: "Tailnet", DefaultLineID: "tailscale-1",
 		}},
-		ActiveModeID: "tailnet",
-		Tailscale:    tailscaleIdentity(),
+		ActiveScenarioID: "tailnet",
+		Tailscale:        tailscaleIdentity(),
 	}
 	data, err := GenerateSingBoxTransparentProxy(
 		p,
@@ -232,11 +232,11 @@ func TestGenerate_NETailscale(t *testing.T) {
 	tailnet.TailscaleMagicDNS = true
 	p := &Profile{
 		Lines: []Line{directLine(), tailnet},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "tailnet", Name: "Tailnet", DefaultLineID: "tailscale-1",
 		}},
-		ActiveModeID: "tailnet",
-		Tailscale:    tailscaleIdentity(),
+		ActiveScenarioID: "tailnet",
+		Tailscale:        tailscaleIdentity(),
 	}
 	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir())
 	if err != nil {
@@ -268,7 +268,7 @@ func TestGenerate_ManualOnly(t *testing.T) {
 	p := &Profile{
 		Lines:    []Line{directLine(), vpnLine(), trojanLine()},
 		RuleSets: []RuleSet{internalRuleSet(), gfwRuleSet(), cnipRuleSet()},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "海外",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
@@ -277,7 +277,7 @@ func TestGenerate_ManualOnly(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 	singboxCheck(t, p, "manual-only")
 }
@@ -287,7 +287,7 @@ func TestGenerate_ManualOnlyVMess(t *testing.T) {
 	p := &Profile{
 		Lines:    []Line{directLine(), vpnLine(), vmessLine()},
 		RuleSets: []RuleSet{internalRuleSet(), gfwRuleSet(), cnipRuleSet()},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "国内",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
@@ -296,18 +296,18 @@ func TestGenerate_ManualOnlyVMess(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 	singboxCheck(t, p, "manual-vmess")
 }
 
-// 2. 模式 binding 指向订阅整体
+// 2. 场景 binding 指向订阅整体
 func TestGenerate_BindingToSubscription(t *testing.T) {
 	p := &Profile{
 		Lines:         []Line{directLine(), vpnLine()},
 		RuleSets:      []RuleSet{internalRuleSet(), gfwRuleSet()},
 		Subscriptions: []Subscription{testSubscription()},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "国内",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
@@ -315,7 +315,7 @@ func TestGenerate_BindingToSubscription(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 	singboxCheck(t, p, "binding-to-sub")
 }
@@ -326,14 +326,14 @@ func TestGenerate_DefaultToSubscription(t *testing.T) {
 		Lines:         []Line{directLine(), vpnLine()},
 		RuleSets:      []RuleSet{internalRuleSet()},
 		Subscriptions: []Subscription{testSubscription()},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "全走订阅",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
 			},
 			DefaultSubscriptionID: "sub-test",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 	singboxCheck(t, p, "default-to-sub")
 }
@@ -344,7 +344,7 @@ func TestGenerate_Mixed(t *testing.T) {
 		Lines:         []Line{directLine(), vpnLine(), trojanLine()},
 		RuleSets:      []RuleSet{internalRuleSet(), gfwRuleSet(), cnipRuleSet()},
 		Subscriptions: []Subscription{testSubscription()},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "混合",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},         // 手动
@@ -353,7 +353,7 @@ func TestGenerate_Mixed(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 	singboxCheck(t, p, "mixed")
 }
@@ -364,14 +364,14 @@ func TestGenerate_PlainSubscription(t *testing.T) {
 		Lines:         []Line{directLine()},
 		RuleSets:      []RuleSet{gfwRuleSet()},
 		Subscriptions: []Subscription{testSubscriptionNoGroups()},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "Plain",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", SubscriptionID: "sub-plain"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 	singboxCheck(t, p, "plain-sub")
 }
@@ -385,7 +385,7 @@ func TestGenerate_DisabledSubscription(t *testing.T) {
 		Lines:         []Line{directLine(), vpnLine()},
 		RuleSets:      []RuleSet{internalRuleSet(), gfwRuleSet()},
 		Subscriptions: []Subscription{sub},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "Disabled",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
@@ -393,7 +393,7 @@ func TestGenerate_DisabledSubscription(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 	singboxCheck(t, p, "disabled-sub")
 }
@@ -409,14 +409,14 @@ func TestGenerate_EmptySubscriptionFailsClosed(t *testing.T) {
 		Lines:         []Line{directLine()},
 		RuleSets:      []RuleSet{gfwRuleSet()},
 		Subscriptions: []Subscription{sub},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "Empty",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", SubscriptionID: "sub-empty"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 	if data, err := GenerateSingBox(p, 10800, ""); err == nil {
 		t.Fatalf(
@@ -448,14 +448,14 @@ func TestGenerate_MultipleSubscriptions(t *testing.T) {
 		Lines:         []Line{directLine(), vpnLine()},
 		RuleSets:      []RuleSet{internalRuleSet()},
 		Subscriptions: []Subscription{sub1, sub2},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "Multi",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 	singboxCheck(t, p, "multi-sub")
 }
@@ -469,7 +469,7 @@ func TestGenerate_DisabledPortReferences(t *testing.T) {
 	p := &Profile{
 		Lines:    []Line{directLine(), vpnLine(), disabledTrojan},
 		RuleSets: []RuleSet{internalRuleSet(), gfwRuleSet()},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "Disabled-Refs",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
@@ -477,7 +477,7 @@ func TestGenerate_DisabledPortReferences(t *testing.T) {
 			},
 			DefaultLineID: "trojan-disabled", // 默认出口禁用，应 fallback 到 direct
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 
 	data, err := GenerateSingBox(p, 10800, "")
@@ -509,7 +509,7 @@ func TestGenerate_DisabledPortReferences(t *testing.T) {
 		t.Errorf("final should fallback to direct, got %q", final)
 	}
 
-	// 模式规则里不应出现引用禁用 line 的规则
+	// 场景规则里不应出现引用禁用 line 的规则
 	for _, r := range route["rules"].([]interface{}) {
 		rm := r.(map[string]interface{})
 		if outTag, ok := rm["outbound"].(string); ok && outTag == "proxy-trojan-disabled" {
@@ -545,14 +545,14 @@ func TestGenerate_DanglingGroupReferences(t *testing.T) {
 		Lines:         []Line{directLine(), vpnLine()},
 		RuleSets:      []RuleSet{internalRuleSet()},
 		Subscriptions: []Subscription{sub},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "Dangle",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
 			},
 			DefaultSubscriptionID: "sub-dangle",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 
 	data, err := GenerateSingBox(p, 10800, "")
@@ -627,14 +627,14 @@ func TestGenerate_ContentVerification(t *testing.T) {
 		Lines:         []Line{directLine(), vpnLine()},
 		RuleSets:      []RuleSet{internalRuleSet()},
 		Subscriptions: []Subscription{sub},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "c1", Name: "Verify",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
 			},
 			DefaultSubscriptionID: "sub-test",
 		}},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 
 	data, err := GenerateSingBox(p, 10800, "")
@@ -678,8 +678,8 @@ func TestGenerate_ContentVerification(t *testing.T) {
 		t.Errorf("final = %q, want sub-sub-test-proxies", final)
 	}
 
-	// 验证模式规则在订阅自带规则之前。
-	// 架构约束：Mode 是唯一裁决者，订阅只是供给源（D28）—— 用户在模式里显式绑定的
+	// 验证场景规则在订阅自带规则之前。
+	// 架构约束：Scenario 是唯一裁决者，订阅只是供给源（D28）—— 用户在场景里显式绑定的
 	// 规则必须先匹配，订阅自带的宽匹配（GEOIP,CN 之类）只能当兜底，否则订阅
 	// 一更新就能把用户的显式分流整片遮蔽掉。
 	rules := route["rules"].([]interface{})
@@ -706,7 +706,7 @@ func TestGenerate_ContentVerification(t *testing.T) {
 		t.Error("netflix subscription rule not found")
 	}
 	if internalIdx > netflixIdx {
-		t.Errorf("mode rule (idx=%d) should come before subscription rule (idx=%d)", internalIdx, netflixIdx)
+		t.Errorf("scenario rule (idx=%d) should come before subscription rule (idx=%d)", internalIdx, netflixIdx)
 	}
 
 	t.Logf("Content verification: %d outbounds, %d rules, final=%s", len(outbounds), len(rules), final)
@@ -730,10 +730,10 @@ func TestGenerate_RejectRuleTranslated(t *testing.T) {
 		},
 	}
 	p := &Profile{
-		Lines:         []Line{directLine(), vpnLine()},
-		Subscriptions: []Subscription{sub},
-		Modes:         []Mode{{ID: "m1", Name: "M", DefaultSubscriptionID: "sub-rj"}},
-		ActiveModeID:  "m1",
+		Lines:            []Line{directLine(), vpnLine()},
+		Subscriptions:    []Subscription{sub},
+		Scenarios:        []Scenario{{ID: "m1", Name: "M", DefaultSubscriptionID: "sub-rj"}},
+		ActiveScenarioID: "m1",
 	}
 	data, err := GenerateSingBox(p, 1080, "")
 	if err != nil {
@@ -787,10 +787,10 @@ func TestGenerate_PureRejectGroup(t *testing.T) {
 		},
 	}
 	p := &Profile{
-		Lines:         []Line{directLine(), vpnLine()},
-		Subscriptions: []Subscription{sub},
-		Modes:         []Mode{{ID: "m1", Name: "M", DefaultSubscriptionID: "sub-adblock"}},
-		ActiveModeID:  "m1",
+		Lines:            []Line{directLine(), vpnLine()},
+		Subscriptions:    []Subscription{sub},
+		Scenarios:        []Scenario{{ID: "m1", Name: "M", DefaultSubscriptionID: "sub-adblock"}},
+		ActiveScenarioID: "m1",
 	}
 	data, err := GenerateSingBox(p, 1080, "")
 	if err != nil {
@@ -850,10 +850,10 @@ func TestGenerate_DuplicateChineseGroupTags(t *testing.T) {
 		},
 	}
 	p := &Profile{
-		Lines:         []Line{directLine(), vpnLine()},
-		Subscriptions: []Subscription{sub},
-		Modes:         []Mode{{ID: "m1", Name: "M", DefaultSubscriptionID: "sub-cn"}},
-		ActiveModeID:  "m1",
+		Lines:            []Line{directLine(), vpnLine()},
+		Subscriptions:    []Subscription{sub},
+		Scenarios:        []Scenario{{ID: "m1", Name: "M", DefaultSubscriptionID: "sub-cn"}},
+		ActiveScenarioID: "m1",
 	}
 	data, err := GenerateSingBox(p, 1080, "")
 	if err != nil {

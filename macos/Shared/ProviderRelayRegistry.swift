@@ -127,6 +127,15 @@ struct ProviderRelayDrain: @unchecked Sendable {
         }
         return true
     }
+
+    /// Ends relays which did not finish inside the handoff grace period.
+    /// Cancellation is idempotent, so a concurrent natural finish or Provider
+    /// stop cannot turn this into a double-close.
+    func cancel(
+        with error: Error = AppProxyFlowCloseError.aborted
+    ) {
+        handles.forEach { $0.cancel(with: error) }
+    }
 }
 
 final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
@@ -200,6 +209,56 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
         staleHandles.forEach { $0.cancel(with: error) }
         return ProviderRelayDrain(
             handles: staleHandles,
+            generation: replacedGeneration
+        )
+    }
+
+    /// Atomically publishes a new endpoint for future flows while allowing
+    /// already-attached relays from the previous generation to finish on their
+    /// original endpoint. This is the Switch commit primitive: no flow can be
+    /// claimed between the old and new generations, and an old flow never
+    /// changes its SOCKS destination midway through its lifetime.
+    ///
+    /// Reservations which have not attached yet lose the race and are removed;
+    /// their caller observes `attach == false` and closes that claimed flow
+    /// fail-closed. Attached handles stay registered until they finish, or until
+    /// the caller cancels the returned bounded drain.
+    @discardableResult
+    func handoff(
+        generation: String,
+        endpoint: Endpoint
+    ) -> ProviderRelayDrain {
+        lock.lock()
+        let replacedGeneration: String?
+        switch state {
+        case .inactive:
+            replacedGeneration = nil
+        case let .active(currentGeneration, _),
+             let .rejecting(currentGeneration):
+            replacedGeneration = currentGeneration
+        }
+
+        var drainingHandles: [ProviderRelayHandle] = []
+        var unattachedReservationIDs: [UUID] = []
+        for (id, entry) in entries {
+            guard entry.generation == replacedGeneration else {
+                continue
+            }
+            switch entry {
+            case .reserved:
+                unattachedReservationIDs.append(id)
+            case let .attached(_, handle):
+                drainingHandles.append(handle)
+            }
+        }
+        for id in unattachedReservationIDs {
+            entries.removeValue(forKey: id)
+        }
+        state = .active(generation: generation, endpoint: endpoint)
+        lock.unlock()
+
+        return ProviderRelayDrain(
+            handles: drainingHandles,
             generation: replacedGeneration
         )
     }
@@ -289,12 +348,11 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
         // that interval new flows are claimed and aborted, never passed to the
         // Underlay.
         state = .rejecting(generation: generation)
-        let matchingEntries = entries.filter {
-            $0.value.generation == generation
-        }
-        for id in matchingEntries.keys {
-            entries.removeValue(forKey: id)
-        }
+        // A stop during Switch drain owns every relay still registered, not
+        // only the newest generation. Leaving an older generation alive after
+        // the system takeover is removed would leak both its Box and its flow.
+        let matchingEntries = entries
+        entries.removeAll()
         let handles: [ProviderRelayHandle] =
             matchingEntries.values.compactMap { entry in
             guard case let .attached(_, handle) = entry else {

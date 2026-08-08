@@ -72,16 +72,16 @@ final class MobileConfigurationSupportTests: XCTestCase {
 
     func testImportAcceptsRawProfileAndKeepsStructure() throws {
         var profile = Profile.bootstrap()
-        profile.modes = [Mode(id: "mode-1", name: "Mode", defaultLineID: "direct")]
-        profile.activeModeID = "mode-1"
+        profile.scenarios = [Scenario(id: "scenario-1", name: "Scenario", defaultLineID: "direct")]
+        profile.activeScenarioID = "scenario-1"
         let data = try JSONEncoder().encode(profile)
 
         let imported = try MobileConfigurationService.importProfile(from: data)
 
         XCTAssertEqual(imported.lines.count, profile.lines.count)
         XCTAssertEqual(imported.ruleSets.count, profile.ruleSets.count)
-        XCTAssertEqual(imported.modes.first?.id, "mode-1")
-        XCTAssertEqual(imported.activeModeID, "mode-1")
+        XCTAssertEqual(imported.scenarios.first?.id, "scenario-1")
+        XCTAssertEqual(imported.activeScenarioID, "scenario-1")
     }
 
     func testImportRejectsMissingStructure() throws {
@@ -102,22 +102,22 @@ final class MobileConfigurationSupportTests: XCTestCase {
         }
     }
 
-    func testImportRejectsDanglingActiveMode() throws {
+    func testImportRejectsDanglingActiveScenario() throws {
         var profile = Profile.bootstrap()
-        profile.activeModeID = "missing-mode"
+        profile.activeScenarioID = "missing-scenario"
         let data = try JSONEncoder().encode(profile)
 
         XCTAssertThrowsError(try MobileConfigurationService.importProfile(from: data)) { error in
-            XCTAssertEqual(error as? MobileConfigurationError, .invalidActiveMode)
+            XCTAssertEqual(error as? MobileConfigurationError, .invalidActiveScenario)
         }
     }
 
     func testImportRejectsAmbiguousBindingTarget() throws {
         var profile = Profile.bootstrap()
-        profile.modes = [
-            Mode(
-                id: "mode-1",
-                name: "Mode",
+        profile.scenarios = [
+            Scenario(
+                id: "scenario-1",
+                name: "Scenario",
                 bindings: [
                     RuleBinding(ruleSetID: "internal", lineID: "direct", subscriptionID: "sub-1")
                 ],
@@ -127,7 +127,7 @@ final class MobileConfigurationSupportTests: XCTestCase {
         profile.subscriptions = [
             Subscription(id: "sub-1", name: "Subscription", url: "https://example.com/sub")
         ]
-        profile.activeModeID = "mode-1"
+        profile.activeScenarioID = "scenario-1"
         let data = try JSONEncoder().encode(profile)
 
         XCTAssertThrowsError(try MobileConfigurationService.importProfile(from: data)) { error in
@@ -221,7 +221,7 @@ final class MobileConfigurationSupportTests: XCTestCase {
         XCTAssertTrue(report.contains("Version: 1.2.3 (45)"))
         XCTAssertTrue(report.contains("Status: Not connected"))
         XCTAssertTrue(report.contains("System profile: Installed"))
-        XCTAssertTrue(report.contains("Object counts: lines 3, rules 5, modes 0, subscriptions 1"))
+        XCTAssertTrue(report.contains("Object counts: lines 3, rules 5, scenarios 0, subscriptions 1"))
         XCTAssertTrue(report.contains("Egress probe: Direct: 203.0.113.1; AnyConnect: 198.51.100.2"))
         XCTAssertTrue(report.contains("Last error:"))
         XCTAssertFalse(report.contains("private-user"))
