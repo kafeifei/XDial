@@ -30,6 +30,7 @@ MACOS_ICON_SOURCE := macos/Sources/XDial/AppIcon.swift
 # 系统会把重编后的 daemon 当新程序、要求重新批准。默认用开发者证书
 # （partial match，本机唯一），无证书环境可 SIGN_IDENTITY=- 回落 ad-hoc。
 SIGN_IDENTITY ?= Apple Development
+MACOS_TEST_XCODEBUILD_FLAGS ?=
 
 .PHONY: all cli app ci-macos-build release restart inspector clean prepare-patched-go go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
 
@@ -120,7 +121,8 @@ test-macos-transaction:
 	cd macos && xcodegen generate
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTests \
 		-configuration Debug -destination 'platform=macOS,arch=arm64' \
-		-derivedDataPath $(BUILD_DIR)/macos-tests test
+		-derivedDataPath $(BUILD_DIR)/macos-tests \
+		$(MACOS_TEST_XCODEBUILD_FLAGS) test
 
 test-smoke: $(PATCHED_WORKFILE) sing-box-test-validator
 	PATH="$(dir $(SING_BOX_TEST_BINARY)):$(PATH)" $(PATCHED_GO_ENV) go test ./core/config/ -run TestSmoke -v -count=1 -timeout 120s
