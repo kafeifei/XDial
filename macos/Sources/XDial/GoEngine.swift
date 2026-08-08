@@ -41,6 +41,8 @@ final class GoEngine: ObservableObject {
     @Published var lastError: String?
     @Published private(set) var connectedAt: Date?
     @Published private(set) var connectionReport: ConnectionReport?
+    @Published private(set) var scenarioSwitchProjection:
+        HostScenarioSwitchProjection?
     private var coldLaunchSettledTransactionID: String?
     private var explicitlyStoppedTransactionID: String?
     private var pendingStatusSyncCompletions: [() -> Void] = []
@@ -54,10 +56,6 @@ final class GoEngine: ObservableObject {
             explicitlyStoppedTransactionID:
                 explicitlyStoppedTransactionID
         )
-    }
-
-    var scenarioSwitchProjection: HostScenarioSwitchProjection? {
-        transparentProxy.scenarioSwitchProjection
     }
 
     struct ParseResult: Decodable {
@@ -82,6 +80,8 @@ final class GoEngine: ObservableObject {
 
     private init() {
         connectionReport = ConnectionReportJournal.read()
+        scenarioSwitchProjection =
+            transparentProxy.scenarioSwitchProjection
         if let connectionReport,
            ConnectionReportLiveProjection.isSafelySettledTerminal(
                connectionReport
@@ -97,6 +97,12 @@ final class GoEngine: ObservableObject {
         transparentProxy.reportHandler = { [weak self] report in
             Task { @MainActor in
                 self?.applyConnectionReport(report)
+            }
+        }
+        transparentProxy.scenarioSwitchHandler = {
+            [weak self] projection in
+            Task { @MainActor in
+                self?.scenarioSwitchProjection = projection
             }
         }
         transparentProxy.underlayChangeHandler = { [weak self] fingerprint in

@@ -1081,6 +1081,18 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 && activeSwitch?.request.targetTransactionID
                     == request.targetTransactionID
                 && activeSwitch?.isPreCommit == true
+            let candidateReportJSON: String? = {
+                guard
+                    switchInProgress,
+                    let candidateReport = activeSwitch?.candidateReport(),
+                    let candidateData = try? ConnectionReportCodec.encode(
+                        candidateReport
+                    )
+                else {
+                    return nil
+                }
+                return String(data: candidateData, encoding: .utf8)
+            }()
             completionHandler(Self.encodeScenarioSwitchResponse(
                 ProviderScenarioSwitchResponse(
                     v: ProviderScenarioSwitchCodec.version,
@@ -1092,6 +1104,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     code: nil,
                     message: nil,
                     reportJSON: reportJSON,
+                    candidateReportJSON: candidateReportJSON,
                     switchInProgress: switchInProgress
                 )
             ))
@@ -1184,6 +1197,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             return
         }
         guard let candidateReporter else { return }
+        operation.attachCandidateReporter(candidateReporter)
 
         scenarioSwitchPreparationQueue.async { [weak self] in
             let result: Result<EmbeddedSingBoxRuntime.PreparedSwitch, Error>
@@ -2598,6 +2612,7 @@ private final class ProviderScenarioSwitchOperation:
     private let lock = NSLock()
     private var phase: Phase = .queued
     private weak var runtime: EmbeddedSingBoxRuntime?
+    private var candidateReporter: ConnectionTransactionReporter?
 
     init(
         request: ProviderScenarioSwitchRequest,
@@ -2618,6 +2633,23 @@ private final class ProviderScenarioSwitchOperation:
         self.runtime = runtime
         phase = .preparing
         return true
+    }
+
+    func attachCandidateReporter(
+        _ reporter: ConnectionTransactionReporter
+    ) {
+        lock.lock()
+        if phase == .preparing {
+            candidateReporter = reporter
+        }
+        lock.unlock()
+    }
+
+    func candidateReport() -> ConnectionReport? {
+        lock.lock()
+        let reporter = candidateReporter
+        lock.unlock()
+        return reporter?.currentReport()
     }
 
     /// Returns the runtime only while Go Prepare can still be blocked. The

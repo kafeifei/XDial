@@ -120,6 +120,10 @@ struct ProviderScenarioSwitchResponse: Codable, Equatable {
     let code: String?
     let message: String?
     let reportJSON: String?
+    /// Read-only snapshot of the still-uncommitted candidate. This never
+    /// replaces `reportJSON`, which remains the authoritative committed
+    /// generation used by reconciliation.
+    let candidateReportJSON: String?
     /// Present only for `reconcile-switch`. `true` means the source report is
     /// still authoritative but the candidate has not crossed a terminal
     /// outcome, so the host must keep the result unknown and poll again.
@@ -135,6 +139,7 @@ struct ProviderScenarioSwitchResponse: Codable, Equatable {
         case code
         case message
         case reportJSON = "report_json"
+        case candidateReportJSON = "candidate_report_json"
         case switchInProgress = "switch_in_progress"
     }
 
@@ -148,6 +153,7 @@ struct ProviderScenarioSwitchResponse: Codable, Equatable {
         code: String?,
         message: String?,
         reportJSON: String?,
+        candidateReportJSON: String? = nil,
         switchInProgress: Bool? = nil
     ) {
         self.v = v
@@ -159,6 +165,7 @@ struct ProviderScenarioSwitchResponse: Codable, Equatable {
         self.code = code
         self.message = message
         self.reportJSON = reportJSON
+        self.candidateReportJSON = candidateReportJSON
         self.switchInProgress = switchInProgress
     }
 }
@@ -350,7 +357,7 @@ enum ProviderScenarioSwitchCodec {
         let allowedKeys: Set<String> = [
             "v", "cmd", "request_id", "ok", "source_transaction_id",
             "active_transaction_id", "code", "message", "report_json",
-            "switch_in_progress",
+            "candidate_report_json", "switch_in_progress",
         ]
         guard Set(object.keys).isSubset(of: allowedKeys) else {
             throw ProviderScenarioSwitchCodecError.malformed
@@ -364,6 +371,7 @@ enum ProviderScenarioSwitchCodec {
                 guard
                     let reportJSON = response.reportJSON,
                     isJSONObject(reportJSON),
+                    response.candidateReportJSON == nil,
                     response.switchInProgress == nil,
                     response.activeTransactionID
                         != response.sourceTransactionID
@@ -373,6 +381,7 @@ enum ProviderScenarioSwitchCodec {
             case .cancelSwitch:
                 guard
                     response.reportJSON == nil,
+                    response.candidateReportJSON == nil,
                     response.switchInProgress == nil,
                     response.activeTransactionID
                         == response.sourceTransactionID
@@ -383,7 +392,10 @@ enum ProviderScenarioSwitchCodec {
                 guard
                     let reportJSON = response.reportJSON,
                     isJSONObject(reportJSON),
-                    response.switchInProgress != nil
+                    let switchInProgress = response.switchInProgress,
+                    !(!switchInProgress &&
+                        response.candidateReportJSON != nil),
+                    response.candidateReportJSON.map(isJSONObject) ?? true
                 else {
                     throw ProviderScenarioSwitchCodecError.malformed
                 }
@@ -393,6 +405,7 @@ enum ProviderScenarioSwitchCodec {
                 let code = response.code,
                 isSafeCode(code),
                 response.reportJSON == nil,
+                response.candidateReportJSON == nil,
                 response.switchInProgress == nil
             else {
                 throw ProviderScenarioSwitchCodecError.malformed

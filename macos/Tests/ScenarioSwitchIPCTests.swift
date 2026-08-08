@@ -259,6 +259,8 @@ final class ScenarioSwitchIPCTests: XCTestCase {
             code: nil,
             message: nil,
             reportJSON: "{\"transaction_id\":\"source-1\"}",
+            candidateReportJSON:
+                "{\"transaction_id\":\"target-1\"}",
             switchInProgress: true
         )
 
@@ -267,6 +269,29 @@ final class ScenarioSwitchIPCTests: XCTestCase {
                 ProviderScenarioSwitchCodec.encodeResponse(response)
             ),
             response
+        )
+    }
+
+    func testSettledReconcileResponseCannotCarryCandidateProgress() {
+        let response = ProviderScenarioSwitchResponse(
+            v: 1,
+            cmd: .reconcileSwitch,
+            requestID: "request-1",
+            ok: true,
+            sourceTransactionID: "source-1",
+            activeTransactionID: "target-1",
+            code: nil,
+            message: nil,
+            reportJSON: "{\"transaction_id\":\"target-1\"}",
+            candidateReportJSON:
+                "{\"transaction_id\":\"target-1\"}",
+            switchInProgress: false
+        )
+
+        XCTAssertThrowsError(
+            try ProviderScenarioSwitchCodec.decodeResponse(
+                ProviderScenarioSwitchCodec.encodeResponse(response)
+            )
         )
     }
 

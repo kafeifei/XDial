@@ -16,6 +16,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
 
     typealias StatusHandler = (_ status: String, _ error: String?) -> Void
     typealias ReportHandler = (_ report: ConnectionReport) -> Void
+    typealias ScenarioSwitchHandler =
+        (_ projection: HostScenarioSwitchProjection?) -> Void
     typealias ActivationStatusHandler =
         (_ event: SystemExtensionInstallationEvent) -> Void
 
@@ -32,6 +34,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
 
     var statusHandler: StatusHandler?
     var reportHandler: ReportHandler?
+    var scenarioSwitchHandler: ScenarioSwitchHandler?
     var activationStatusHandler: ActivationStatusHandler?
     var underlayChangeHandler: ((String) -> Void)?
     var activeTransactionID: String? {
@@ -81,9 +84,13 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var stableConnectionResetWorkItem: DispatchWorkItem?
     private var stableConnectionResetAt: Date?
     private var connectedSessionTransactionID: String?
-    private var activeScenarioSwitch: HostScenarioSwitch?
+    private var activeScenarioSwitch: HostScenarioSwitch? {
+        didSet { publishScenarioSwitchProjection() }
+    }
     private var lastScenarioSwitchProjection:
-        HostScenarioSwitchProjection?
+        HostScenarioSwitchProjection? {
+        didSet { publishScenarioSwitchProjection() }
+    }
     private var activeReconnectIncidentID: String?
     private var stableResetIncidentID: String?
     private var lastPublishedRuntimeStatus = "disconnected"
@@ -142,6 +149,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         )
     }
 
+    private func publishScenarioSwitchProjection() {
+        scenarioSwitchHandler?(scenarioSwitchProjection)
+    }
+
     deinit {
         if let statusObserver {
             NotificationCenter.default.removeObserver(statusObserver)
@@ -152,6 +163,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         stableConnectionResetWorkItem?.cancel()
         activeScenarioSwitch?.timeoutWorkItem?.cancel()
         activeScenarioSwitch?.reconciliationWorkItem?.cancel()
+        activeScenarioSwitch?.progressWorkItem?.cancel()
     }
 
     func start(
@@ -296,6 +308,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 plan.configurationFingerprint,
             profileJSON: profileJSON,
             targetReportJSON: targetReportJSON,
+            candidateReport: targetReport,
             completionGate: HostCompletionGate(completion),
             cancellationRequested: false,
             requestSent: false,
@@ -303,6 +316,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             reconciling: false,
             reconciliationError: nil,
             reconciliationWorkItem: nil,
+            progressWorkItem: nil,
             underlay: nil,
             timeoutWorkItem: nil
         )
@@ -476,6 +490,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 result: switchResult
             )
         }
+        scheduleScenarioSwitchProgressPoll(
+            requestID: requestID,
+            delay: 0.1
+        )
         DispatchQueue.main.asyncAfter(
             deadline: .now() + 90,
             execute: timeoutWorkItem
@@ -1459,6 +1477,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         active.timeoutWorkItem?.cancel()
         active.timeoutWorkItem = nil
+        active.progressWorkItem?.cancel()
+        active.progressWorkItem = nil
         active.reconciling = true
         if active.reconciliationError == nil {
             active.reconciliationError = error
@@ -1467,6 +1487,92 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         scheduleScenarioSwitchReconciliation(
             requestID: requestID,
             delay: 0
+        )
+    }
+
+    /// Polls only the Provider's in-memory candidate sidecar. The committed
+    /// source report remains authoritative until the original Switch response
+    /// publishes the target transaction.
+    private func scheduleScenarioSwitchProgressPoll(
+        requestID: String,
+        delay: TimeInterval
+    ) {
+        guard var active = activeScenarioSwitch,
+              active.requestID == requestID,
+              !active.reconciling,
+              active.progressWorkItem == nil else {
+            return
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.performScenarioSwitchProgressPoll(
+                requestID: requestID
+            )
+        }
+        active.progressWorkItem = workItem
+        activeScenarioSwitch = active
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + delay,
+            execute: workItem
+        )
+    }
+
+    private func performScenarioSwitchProgressPoll(
+        requestID: String
+    ) {
+        guard var active = activeScenarioSwitch,
+              active.requestID == requestID,
+              !active.reconciling else {
+            return
+        }
+        active.progressWorkItem = nil
+        activeScenarioSwitch = active
+        guard active.requestSent else {
+            scheduleScenarioSwitchProgressPoll(
+                requestID: requestID,
+                delay: 0.1
+            )
+            return
+        }
+        let request = ProviderScenarioSwitchRequest.reconcileSwitch(
+            requestID: active.requestID,
+            expectedTransactionID: active.sourceTransactionID,
+            targetTransactionID: active.targetTransactionID
+        )
+        sendScenarioSwitchMessage(request) { [weak self] result in
+            self?.finishScenarioSwitchProgressPoll(
+                requestID: requestID,
+                result: result
+            )
+        }
+    }
+
+    private func finishScenarioSwitchProgressPoll(
+        requestID: String,
+        result: Result<ProviderScenarioSwitchResponse, Error>
+    ) {
+        guard var active = activeScenarioSwitch,
+              active.requestID == requestID,
+              !active.reconciling else {
+            return
+        }
+        if
+            case let .success(response) = result,
+            response.ok,
+            response.switchInProgress == true,
+            let reportJSON = response.candidateReportJSON,
+            let reportData = reportJSON.data(using: .utf8),
+            let report = try? ConnectionReportCodec.decode(reportData),
+            report.transactionID == active.targetTransactionID,
+            report.scenario.id == active.targetScenarioID,
+            report.configurationFingerprint ==
+                active.targetConfigurationFingerprint
+        {
+            active.candidateReport = report
+        }
+        activeScenarioSwitch = active
+        scheduleScenarioSwitchProgressPoll(
+            requestID: requestID,
+            delay: 0.15
         )
     }
 
@@ -1724,6 +1830,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             candidateTransactionID: active.targetTransactionID,
             activeCommittedTransactionID: activeTransactionID,
             inFlight: inFlight,
+            candidateReport: active.candidateReport,
             reusedLineIDs: reusedLineIDs,
             code: code,
             message: message
@@ -3419,6 +3526,9 @@ struct HostScenarioSwitchProjection: Equatable {
     let candidateTransactionID: String
     let activeCommittedTransactionID: String
     let inFlight: Bool
+    /// Credential-free task state for the candidate generation. It is a
+    /// presentation sidecar, never the committed runtime fact.
+    let candidateReport: ConnectionReport
     /// Public Line IDs only. Opaque runtime identities never leave Provider
     /// memory or enter this host/Debug projection.
     let reusedLineIDs: [String]
@@ -3435,6 +3545,7 @@ private struct HostScenarioSwitch {
     let targetConfigurationFingerprint: String
     let profileJSON: String
     let targetReportJSON: String
+    var candidateReport: ConnectionReport
     let completionGate: HostCompletionGate<ConnectionReport>
     var cancellationRequested: Bool
     var requestSent: Bool
@@ -3442,6 +3553,7 @@ private struct HostScenarioSwitch {
     var reconciling: Bool
     var reconciliationError: Error?
     var reconciliationWorkItem: DispatchWorkItem?
+    var progressWorkItem: DispatchWorkItem?
     var underlay: HostUnderlaySnapshot?
     var timeoutWorkItem: DispatchWorkItem?
 }
