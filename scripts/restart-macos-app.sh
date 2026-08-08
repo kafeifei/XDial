@@ -104,20 +104,11 @@ if [[ -n "${old_pid}" ]]; then
 		&& fail "old XDial did not complete graceful shutdown"
 fi
 
-# 旧事务回滚后，先证明原网络恢复；否则不把一次必然失败的自动连接叫重启。
-underlay_ready=0
-for _ in {1..40}; do
-	if curl -fsS --max-time 3 -o /dev/null "${probe_url}"; then
-		underlay_ready=1
-		break
-	fi
-	sleep 0.5
-done
-if [[ "${underlay_ready}" != "1" ]]; then
-	[[ -d "${destination_bundle}" ]] && open -n "${destination_bundle}"
-	fail "original network did not recover; reopened the installed app"
-fi
-
+# 旧事务一旦回滚，必须立即安装并启动新 App。不得在两个
+# 实例之间用外网探针做门禁：当开发会话本身依赖 XDial 时，
+# 那会把“重启”变成最长两分多钟的人为断网。真实 HTTPS 只能在
+# 新事务提交后验收。
+#
 # 仅安装：该进程不创建 AppState、Debug Server 或网络连接。
 if ! "${source_bundle}/Contents/MacOS/XDial" --install-only; then
 	[[ -d "${destination_bundle}" ]] && open -n "${destination_bundle}"

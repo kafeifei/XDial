@@ -155,8 +155,9 @@ release: libbox-macos-xcframework
 	@echo "release bundle: $(RELEASE_BUNDLE) (version $(PLIST_VERSION))"
 
 # 一键重启：先完整构建并签名新版本，成功后才让旧实例完成网络回滚并退出。
-# 构建目录中的进程只执行无 UI 的原子安装，不启动 AppState 或连接事务；随后只
-# 启动 /Applications 中的最终版本，并以事务提交和真实 HTTPS 作为成功门禁。
+# 构建目录中的进程紧接着执行无 UI 的原子安装，然后只启动
+# /Applications 中的最终版本。外网验收必须放在新事务提交之后，
+# 不得在旧实例退出与新实例启动之间扩大断网窗口。
 # 构建失败不得影响正在运行的旧实例。
 restart:
 	@$(MAKE) app DEBUG_BUILD_VERSION=$(DEBUG_BUILD_VERSION)
