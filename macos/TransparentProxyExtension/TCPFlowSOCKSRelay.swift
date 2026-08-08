@@ -119,8 +119,10 @@ enum TCPFlowSOCKSRelay {
                 return "dns-\(code)"
             case let .tls(code):
                 return "tls-\(code)"
+#if compiler(>=6.2)
             case .wifiAware:
                 return "wifi-aware"
+#endif
             @unknown default:
                 return "network-unknown"
             }
