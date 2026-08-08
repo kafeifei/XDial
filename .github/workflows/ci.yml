@@ -54,4 +54,4 @@ jobs:
       - name: compile Debug and Release without distribution signing
         run: make ci-macos-build
       - name: connection transaction tests
-        run: make test-macos-transaction
+        run: make test-macos-transaction MACOS_TEST_XCODEBUILD_FLAGS=CODE_SIGNING_ALLOWED=NO
