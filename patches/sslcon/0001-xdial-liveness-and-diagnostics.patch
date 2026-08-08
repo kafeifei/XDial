@@ -1,0 +1,1101 @@
+diff --git a/base/config.go b/base/config.go
+index 670c8eb..3d2f8a6 100644
+--- a/base/config.go
++++ b/base/config.go
+@@ -14,6 +14,21 @@ type ClientConfig struct {
+ 	NoTUN              bool   `json:"no_tun"`
+ 	AgentName          string `json:"agent_name"`
+ 	AgentVersion       string `json:"agent_version"`
++	xdialForceDPD      int
++}
++
++// SetXDialForceDPD sets the client-owned dead-peer interval before a session
++// is created. A positive value overrides the intervals advertised by the
++// server, matching OpenConnect's force-dpd policy boundary.
++func (c *ClientConfig) SetXDialForceDPD(seconds int) {
++	if seconds < 0 {
++		seconds = 0
++	}
++	c.xdialForceDPD = seconds
++}
++
++func (c *ClientConfig) XDialForceDPD() int {
++	return c.xdialForceDPD
+ }
+ 
+ // Interface 应该由外部接口设置
+diff --git a/session/session.go b/session/session.go
+index b102efc..22da665 100644
+--- a/session/session.go
++++ b/session/session.go
+@@ -76,14 +76,19 @@ type ConnSession struct {
+ 
+ 	ResetTLSReadDead  *atomic.Bool `json:"-"`
+ 	ResetDTLSReadDead *atomic.Bool `json:"-"`
++
++	sessionCloseChan chan struct{}
++	xdial            *xdialLiveness
+ }
+ 
+ type DtlsSession struct {
+ 	closeOnce sync.Once
+ 	CloseChan chan struct{}
++	parent    *ConnSession
+ }
+ 
+ func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
++	sessionCloseChan := make(chan struct{})
+ 	cSess := &ConnSession{
+ 		Sess:              sess,
+ 		LocalAddress:      base.LocalInterface.Ip4,
+@@ -97,15 +102,17 @@ func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
+ 		DtlsConnected:     atomic.NewBool(false),
+ 		ResetTLSReadDead:  atomic.NewBool(true),
+ 		ResetDTLSReadDead: atomic.NewBool(true),
++		sessionCloseChan:  sessionCloseChan,
+ 		DSess: &DtlsSession{
+ 			closeOnce: sync.Once{},
+ 			CloseChan: make(chan struct{}),
+ 		},
+ 	}
++	cSess.DSess.parent = cSess
+ 	sess.CSess = cSess
+ 
+ 	sess.ActiveClose = false
+-	sess.CloseChan = make(chan struct{})
++	sess.CloseChan = sessionCloseChan
+ 
+ 	cSess.VPNAddress = header.Get("X-CSTP-Address")
+ 	cSess.VPNMask = header.Get("X-CSTP-Netmask")
+@@ -151,10 +158,15 @@ func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
+ 		}
+ 	}
+ 
++	cSess.xdial = newXDialLiveness(cSess)
+ 	return cSess
+ }
+ 
+ func (cSess *ConnSession) DPDTimer() {
++	if base.Cfg.XDialForceDPD() > 0 {
++		cSess.XDialStartLiveness()
++		return
++	}
+ 	go func() {
+ 		defer func() {
+ 			base.Info("dead peer detection timer exit")
+@@ -209,6 +221,9 @@ func (cSess *ConnSession) DPDTimer() {
+ }
+ 
+ func (cSess *ConnSession) ReadDeadTimer() {
++	if base.Cfg.XDialForceDPD() > 0 {
++		return
++	}
+ 	go func() {
+ 		defer func() {
+ 			base.Info("read dead timer exit")
+@@ -231,22 +246,55 @@ func (cSess *ConnSession) ReadDeadTimer() {
+ 
+ func (cSess *ConnSession) Close() {
+ 	cSess.closeOnce.Do(func() {
++		if cSess.Sess != nil && cSess.Sess.ActiveClose &&
++			cSess.xdial != nil {
++			cSess.xdial.mu.Lock()
++			if cSess.xdial.closeReason == nil {
++				cSess.xdial.closeReason = &xdialCloseReason{
++					Code:         "local-stop",
++					Channel:      "session",
++					Operation:    "stop",
++					ErrorClass:   "local",
++					OccurredAtMS: cSess.xdial.now().UnixMilli(),
++				}
++			}
++			cSess.xdial.mu.Unlock()
++		}
+ 		if cSess.DtlsConnected.Load() {
+ 			cSess.DSess.Close()
+ 		}
+ 		close(cSess.CloseChan)
+-		Sess.CSess = nil
+-
+-		close(Sess.CloseChan)
++		if cSess.Sess != nil && cSess.Sess.CSess == cSess {
++			cSess.Sess.CSess = nil
++			if cSess.sessionCloseChan != nil {
++				close(cSess.sessionCloseChan)
++			}
++		}
+ 	})
+ }
+ 
+ func (dSess *DtlsSession) Close() {
+ 	dSess.closeOnce.Do(func() {
+ 		close(dSess.CloseChan)
+-		if Sess.CSess != nil {
+-			Sess.CSess.DtlsConnected.Store(false)
+-			Sess.CSess.DTLSCipherSuite = ""
++		if dSess.parent != nil && dSess.parent.DSess == dSess {
++			dSess.parent.DtlsConnected.Store(false)
++			dSess.parent.DTLSCipherSuite = ""
++			dSess.parent.xdialRecordTransportFailure(
++				xdialDTLS,
++				dSess.parent.xdialDTLSFailureCode(),
++			)
+ 		}
+ 	})
+ }
++
++func (cSess *ConnSession) xdialDTLSFailureCode() string {
++	if cSess.xdial == nil {
++		return ""
++	}
++	cSess.xdial.mu.Lock()
++	defer cSess.xdial.mu.Unlock()
++	if cSess.xdial.dtls.lastFailureCode != "" {
++		return cSess.xdial.dtls.lastFailureCode
++	}
++	return "dtls-closed"
++}
+diff --git a/session/xdial_liveness.go b/session/xdial_liveness.go
+new file mode 100644
+index 0000000..6345f52
+--- /dev/null
++++ b/session/xdial_liveness.go
+@@ -0,0 +1,488 @@
++package session
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"net"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++
++	"sslcon/base"
++	"sslcon/proto"
++)
++
++const (
++	xdialTLS  = "tls"
++	xdialDTLS = "dtls"
++)
++
++type xdialTransportLiveness struct {
++	negotiatedDPD       int
++	negotiatedKeepalive int
++	effectiveDPD        time.Duration
++	active              bool
++	everConnected       bool
++	lastFrame           time.Time
++	lastWrite           time.Time
++	lastDPDWritten      time.Time
++	lastDPDResponse     time.Time
++	dpdQueued           bool
++	dpdRequestsQueued   uint64
++	dpdRequestsDropped  uint64
++	dpdRequestsWritten  uint64
++	dpdResponsesRead    uint64
++	peerDPDRequestsRead uint64
++	keepalivesRead      uint64
++	lastFailureCode     string
++}
++
++type xdialCloseReason struct {
++	Code         string `json:"code"`
++	Channel      string `json:"channel"`
++	Operation    string `json:"operation"`
++	ErrorClass   string `json:"error_class"`
++	OccurredAtMS int64  `json:"occurred_at_unix_milli"`
++}
++
++type xdialLiveness struct {
++	mu          sync.Mutex
++	forceDPD    time.Duration
++	tls         xdialTransportLiveness
++	dtls        xdialTransportLiveness
++	closeReason *xdialCloseReason
++	now         func() time.Time
++}
++
++type xdialNegotiatedSnapshot struct {
++	TLSDPDSeconds        int `json:"tls_dpd_seconds"`
++	TLSKeepaliveSeconds  int `json:"tls_keepalive_seconds"`
++	DTLSDPDSeconds       int `json:"dtls_dpd_seconds"`
++	DTLSKeepaliveSeconds int `json:"dtls_keepalive_seconds"`
++}
++
++type xdialTransportSnapshot struct {
++	EffectiveDPDSeconds     int    `json:"effective_dpd_seconds"`
++	DPDRequestsQueued       uint64 `json:"dpd_requests_queued"`
++	DPDRequestsDropped      uint64 `json:"dpd_requests_dropped"`
++	DPDRequestsWritten      uint64 `json:"dpd_requests_written"`
++	DPDResponsesReceived    uint64 `json:"dpd_responses_received"`
++	PeerDPDRequestsReceived uint64 `json:"peer_dpd_requests_received"`
++	KeepalivesReceived      uint64 `json:"keepalives_received"`
++	LastFrameAgeMS          *int64 `json:"last_frame_age_ms,omitempty"`
++	LastDPDWrittenAgeMS     *int64 `json:"last_dpd_written_age_ms,omitempty"`
++	LastDPDResponseAgeMS    *int64 `json:"last_dpd_response_age_ms,omitempty"`
++	LastFailureCode         string `json:"last_failure_code,omitempty"`
++	EverConnected           bool   `json:"ever_connected"`
++	CurrentlyConnected      bool   `json:"currently_connected"`
++}
++
++type xdialDiagnosticsSnapshot struct {
++	SchemaVersion   int                     `json:"schema_version"`
++	ForceDPDSeconds int                     `json:"force_dpd_seconds"`
++	Negotiated      xdialNegotiatedSnapshot `json:"negotiated"`
++	TLS             xdialTransportSnapshot  `json:"tls"`
++	DTLS            xdialTransportSnapshot  `json:"dtls"`
++	Close           *xdialCloseReason       `json:"close,omitempty"`
++}
++
++type xdialAction struct {
++	channel string
++	kind    byte
++}
++
++type xdialStepResult struct {
++	actions  []xdialAction
++	tlsDead  bool
++	dtlsDead bool
++}
++
++func newXDialLiveness(cSess *ConnSession) *xdialLiveness {
++	now := time.Now()
++	forceSeconds := base.Cfg.XDialForceDPD()
++	forceDPD := time.Duration(forceSeconds) * time.Second
++	tlsDPD := effectiveXDialDPD(forceDPD, cSess.TLSDpdTime)
++	dtlsDPD := effectiveXDialDPD(forceDPD, cSess.DTLSDpdTime)
++	return &xdialLiveness{
++		forceDPD: forceDPD,
++		tls: xdialTransportLiveness{
++			negotiatedDPD:       cSess.TLSDpdTime,
++			negotiatedKeepalive: cSess.TLSKeepaliveTime,
++			effectiveDPD:        tlsDPD,
++			active:              true,
++			everConnected:       true,
++			lastFrame:           now,
++		},
++		dtls: xdialTransportLiveness{
++			negotiatedDPD:       cSess.DTLSDpdTime,
++			negotiatedKeepalive: cSess.DTLSKeepaliveTime,
++			effectiveDPD:        dtlsDPD,
++		},
++		now: time.Now,
++	}
++}
++
++func effectiveXDialDPD(force time.Duration, negotiatedSeconds int) time.Duration {
++	if force > 0 {
++		return force
++	}
++	if negotiatedSeconds > 0 {
++		return time.Duration(negotiatedSeconds) * time.Second
++	}
++	return 0
++}
++
++func (cSess *ConnSession) XDialStartLiveness() {
++	if cSess.xdial == nil {
++		return
++	}
++	go cSess.xdialLivenessLoop()
++}
++
++func (cSess *ConnSession) xdialLivenessLoop() {
++	tick := time.Second
++	if force := cSess.xdial.forceDPD; force > 0 && force < tick {
++		tick = force
++	}
++	ticker := time.NewTicker(tick)
++	defer ticker.Stop()
++	for {
++		select {
++		case now := <-ticker.C:
++			result := cSess.xdial.step(now)
++			for _, action := range result.actions {
++				cSess.enqueueXDialControl(action)
++			}
++			if result.dtlsDead {
++				cSess.xdialRecordTransportFailure(
++					xdialDTLS,
++					"dtls-dpd-timeout",
++				)
++				if cSess.DSess != nil {
++					cSess.DSess.Close()
++				}
++			}
++			if result.tlsDead {
++				cSess.XDialCloseWithReason(
++					"tls-dpd-timeout",
++					xdialTLS,
++					"liveness",
++					"timeout",
++				)
++				return
++			}
++		case <-cSess.CloseChan:
++			return
++		}
++	}
++}
++
++func (l *xdialLiveness) step(now time.Time) xdialStepResult {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++
++	var result xdialStepResult
++	tlsAction, tlsDead := stepXDialTransport(now, &l.tls, xdialTLS)
++	if tlsAction != nil {
++		result.actions = append(result.actions, *tlsAction)
++	}
++	result.tlsDead = tlsDead
++
++	dtlsAction, dtlsDead := stepXDialTransport(now, &l.dtls, xdialDTLS)
++	if dtlsAction != nil {
++		result.actions = append(result.actions, *dtlsAction)
++	}
++	result.dtlsDead = dtlsDead
++	if dtlsDead {
++		l.dtls.active = false
++		l.dtls.lastFailureCode = "dtls-dpd-timeout"
++	}
++	return result
++}
++
++func stepXDialTransport(
++	now time.Time,
++	state *xdialTransportLiveness,
++	channel string,
++) (*xdialAction, bool) {
++	if !state.active || state.effectiveDPD <= 0 || state.lastFrame.IsZero() {
++		return nil, false
++	}
++	sinceFrame := now.Sub(state.lastFrame)
++	if sinceFrame >= 2*state.effectiveDPD {
++		return nil, true
++	}
++	if sinceFrame < state.effectiveDPD || state.dpdQueued {
++		return nil, false
++	}
++	retry := time.Duration(int64(state.effectiveDPD/time.Second)/2) * time.Second
++	if retry < time.Second {
++		retry = time.Second
++	}
++	if !state.lastDPDWritten.IsZero() &&
++		now.Sub(state.lastDPDWritten) < retry {
++		return nil, false
++	}
++	state.dpdQueued = true
++	return &xdialAction{channel: channel, kind: 0x03}, false
++}
++
++func (cSess *ConnSession) enqueueXDialControl(action xdialAction) {
++	var out chan<- *proto.Payload
++	capacity := 8
++	if action.channel == xdialDTLS {
++		out = cSess.PayloadOutDTLS
++		capacity = 1
++	} else {
++		out = cSess.PayloadOutTLS
++	}
++	payload := &proto.Payload{Type: action.kind, Data: make([]byte, 0, capacity)}
++	select {
++	case out <- payload:
++		cSess.xdialRecordQueued(action.channel)
++	default:
++		cSess.xdialRecordDropped(action.channel)
++	}
++}
++
++func (cSess *ConnSession) xdialRecordQueued(channel string) {
++	if cSess.xdial == nil {
++		return
++	}
++	cSess.xdial.mu.Lock()
++	state := cSess.xdial.transport(channel)
++	state.dpdRequestsQueued++
++	cSess.xdial.mu.Unlock()
++}
++
++func (cSess *ConnSession) xdialRecordDropped(channel string) {
++	if cSess.xdial == nil {
++		return
++	}
++	cSess.xdial.mu.Lock()
++	state := cSess.xdial.transport(channel)
++	state.dpdQueued = false
++	state.dpdRequestsDropped++
++	cSess.xdial.mu.Unlock()
++}
++
++func (cSess *ConnSession) XDialRecordWrite(
++	channel string,
++	payloadType byte,
++	err error,
++) {
++	if cSess.xdial == nil {
++		return
++	}
++	now := cSess.xdial.now()
++	if err != nil {
++		if channel == xdialDTLS {
++			cSess.xdialRecordTransportFailure(
++				channel,
++				channel+"-write-"+xdialErrorClass(err),
++			)
++			return
++		}
++		cSess.XDialCloseWithReason(
++			channel+"-write-"+xdialErrorClass(err),
++			channel,
++			"write",
++			xdialErrorClass(err),
++		)
++		return
++	}
++	cSess.xdial.mu.Lock()
++	state := cSess.xdial.transport(channel)
++	state.lastWrite = now
++	if payloadType == 0x03 {
++		state.dpdQueued = false
++		state.dpdRequestsWritten++
++		state.lastDPDWritten = now
++	}
++	cSess.xdial.mu.Unlock()
++}
++
++func (cSess *ConnSession) XDialRecordFrame(channel string, payloadType byte) {
++	if cSess.xdial == nil {
++		return
++	}
++	now := cSess.xdial.now()
++	cSess.xdial.mu.Lock()
++	state := cSess.xdial.transport(channel)
++	state.lastFrame = now
++	switch payloadType {
++	case 0x03:
++		state.peerDPDRequestsRead++
++	case 0x04:
++		state.dpdResponsesRead++
++		state.lastDPDResponse = now
++	case 0x07:
++		state.keepalivesRead++
++	}
++	cSess.xdial.mu.Unlock()
++}
++
++func (cSess *ConnSession) XDialRecordTransportReady(channel string) {
++	if cSess.xdial == nil {
++		return
++	}
++	now := cSess.xdial.now()
++	cSess.xdial.mu.Lock()
++	state := cSess.xdial.transport(channel)
++	state.active = true
++	state.everConnected = true
++	state.lastFrame = now
++	state.lastFailureCode = ""
++	cSess.xdial.mu.Unlock()
++}
++
++func (cSess *ConnSession) xdialRecordTransportFailure(channel, code string) {
++	if cSess.xdial == nil {
++		return
++	}
++	cSess.xdial.mu.Lock()
++	state := cSess.xdial.transport(channel)
++	state.active = false
++	state.lastFailureCode = code
++	cSess.xdial.mu.Unlock()
++}
++
++func (cSess *ConnSession) XDialRecordReadFailure(channel string, err error) {
++	class := xdialErrorClass(err)
++	if channel == xdialDTLS {
++		cSess.xdialRecordTransportFailure(
++			channel,
++			channel+"-read-"+class,
++		)
++		return
++	}
++	cSess.XDialCloseWithReason(
++		channel+"-read-"+class,
++		channel,
++		"read",
++		class,
++	)
++}
++
++func (cSess *ConnSession) XDialRecordPeerClose(channel, code string) {
++	if channel == xdialDTLS {
++		cSess.xdialRecordTransportFailure(channel, code)
++		return
++	}
++	cSess.XDialCloseWithReason(code, channel, "peer", "peer")
++}
++
++func (cSess *ConnSession) XDialCloseWithReason(
++	code, channel, operation, errorClass string,
++) {
++	if cSess.xdial != nil {
++		cSess.xdial.mu.Lock()
++		if cSess.xdial.closeReason == nil {
++			cSess.xdial.closeReason = &xdialCloseReason{
++				Code:         code,
++				Channel:      channel,
++				Operation:    operation,
++				ErrorClass:   errorClass,
++				OccurredAtMS: cSess.xdial.now().UnixMilli(),
++			}
++		}
++		cSess.xdial.mu.Unlock()
++	}
++	cSess.Close()
++}
++
++func (cSess *ConnSession) XDialDiagnosticsJSON() string {
++	if cSess == nil || cSess.xdial == nil {
++		return ""
++	}
++	now := cSess.xdial.now()
++	cSess.xdial.mu.Lock()
++	snapshot := xdialDiagnosticsSnapshot{
++		SchemaVersion:   1,
++		ForceDPDSeconds: int(cSess.xdial.forceDPD / time.Second),
++		Negotiated: xdialNegotiatedSnapshot{
++			TLSDPDSeconds:        cSess.xdial.tls.negotiatedDPD,
++			TLSKeepaliveSeconds:  cSess.xdial.tls.negotiatedKeepalive,
++			DTLSDPDSeconds:       cSess.xdial.dtls.negotiatedDPD,
++			DTLSKeepaliveSeconds: cSess.xdial.dtls.negotiatedKeepalive,
++		},
++		TLS:  snapshotXDialTransport(now, cSess.xdial.tls, false),
++		DTLS: snapshotXDialTransport(now, cSess.xdial.dtls, true),
++	}
++	if cSess.xdial.closeReason != nil {
++		reason := *cSess.xdial.closeReason
++		snapshot.Close = &reason
++	}
++	cSess.xdial.mu.Unlock()
++	data, err := json.Marshal(snapshot)
++	if err != nil {
++		return ""
++	}
++	return string(data)
++}
++
++func snapshotXDialTransport(
++	now time.Time,
++	state xdialTransportLiveness,
++	includeConnection bool,
++) xdialTransportSnapshot {
++	result := xdialTransportSnapshot{
++		EffectiveDPDSeconds:     int(state.effectiveDPD / time.Second),
++		DPDRequestsQueued:       state.dpdRequestsQueued,
++		DPDRequestsDropped:      state.dpdRequestsDropped,
++		DPDRequestsWritten:      state.dpdRequestsWritten,
++		DPDResponsesReceived:    state.dpdResponsesRead,
++		PeerDPDRequestsReceived: state.peerDPDRequestsRead,
++		KeepalivesReceived:      state.keepalivesRead,
++		LastFrameAgeMS:          xdialAge(now, state.lastFrame),
++		LastDPDWrittenAgeMS:     xdialAge(now, state.lastDPDWritten),
++		LastDPDResponseAgeMS:    xdialAge(now, state.lastDPDResponse),
++		LastFailureCode:         state.lastFailureCode,
++	}
++	if includeConnection {
++		result.EverConnected = state.everConnected
++		result.CurrentlyConnected = state.active
++	}
++	return result
++}
++
++func xdialAge(now, then time.Time) *int64 {
++	if then.IsZero() {
++		return nil
++	}
++	age := now.Sub(then).Milliseconds()
++	if age < 0 {
++		age = 0
++	}
++	return &age
++}
++
++func (l *xdialLiveness) transport(channel string) *xdialTransportLiveness {
++	if channel == xdialDTLS {
++		return &l.dtls
++	}
++	return &l.tls
++}
++
++func xdialErrorClass(err error) string {
++	if err == nil {
++		return "none"
++	}
++	var netError net.Error
++	if errors.As(err, &netError) && netError.Timeout() {
++		return "timeout"
++	}
++	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
++		return "eof"
++	}
++	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
++		return "reset"
++	}
++	if errors.Is(err, net.ErrClosed) ||
++		strings.Contains(strings.ToLower(err.Error()), "closed network connection") {
++		return "closed"
++	}
++	return "other"
++}
+diff --git a/session/xdial_liveness_test.go b/session/xdial_liveness_test.go
+new file mode 100644
+index 0000000..17e2114
+--- /dev/null
++++ b/session/xdial_liveness_test.go
+@@ -0,0 +1,222 @@
++package session
++
++import (
++	"encoding/json"
++	"errors"
++	"net/http"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	"sslcon/base"
++)
++
++func newXDialTestSession(t *testing.T) *ConnSession {
++	t.Helper()
++	base.Cfg.SetXDialForceDPD(5)
++	header := http.Header{}
++	header.Set("X-CSTP-DPD", "120")
++	header.Set("X-CSTP-Keepalive", "30")
++	header.Set("X-DTLS-DPD", "60")
++	header.Set("X-DTLS-Keepalive", "20")
++	return (&Session{}).NewConnSession(&header)
++}
++
++func TestXDialForceDPDUsesIdleAndRetryWindows(t *testing.T) {
++	cSess := newXDialTestSession(t)
++	liveness := cSess.xdial
++	started := liveness.tls.lastFrame
++	liveness.now = func() time.Time { return started.Add(5 * time.Second) }
++
++	if result := liveness.step(started.Add(4 * time.Second)); len(result.actions) != 0 {
++		t.Fatalf("DPD sent before idle interval: %#v", result)
++	}
++	first := liveness.step(started.Add(5 * time.Second))
++	if len(first.actions) != 1 || first.actions[0].channel != xdialTLS {
++		t.Fatalf("first idle step = %#v, want one TLS DPD", first)
++	}
++	cSess.xdialRecordQueued(xdialTLS)
++	cSess.XDialRecordWrite(xdialTLS, 0x03, nil)
++
++	if result := liveness.step(started.Add(6 * time.Second)); len(result.actions) != 0 {
++		t.Fatalf("DPD retried too early: %#v", result)
++	}
++	retry := liveness.step(started.Add(7 * time.Second))
++	if len(retry.actions) != 1 || retry.actions[0].channel != xdialTLS {
++		t.Fatalf("retry step = %#v, want one TLS DPD", retry)
++	}
++
++	if result := liveness.step(started.Add(10 * time.Second)); !result.tlsDead {
++		t.Fatalf("peer not declared dead after two DPD intervals: %#v", result)
++	}
++}
++
++func TestXDialAnyInboundFrameResetsDeadPeerWindow(t *testing.T) {
++	cSess := newXDialTestSession(t)
++	liveness := cSess.xdial
++	started := liveness.tls.lastFrame
++	frameAt := started.Add(9 * time.Second)
++	liveness.now = func() time.Time { return frameAt }
++	cSess.XDialRecordFrame(xdialTLS, 0x07)
++
++	if result := liveness.step(started.Add(13 * time.Second)); result.tlsDead ||
++		len(result.actions) != 0 {
++		t.Fatalf("frame did not reset idle window: %#v", result)
++	}
++	result := liveness.step(started.Add(14 * time.Second))
++	if result.tlsDead || len(result.actions) != 1 {
++		t.Fatalf("DPD not scheduled from reset frame: %#v", result)
++	}
++}
++
++func TestXDialDPDCountsQueueWriteAndResponseSeparately(t *testing.T) {
++	cSess := newXDialTestSession(t)
++	liveness := cSess.xdial
++	now := liveness.tls.lastFrame.Add(5 * time.Second)
++	liveness.now = func() time.Time { return now }
++
++	cSess.xdialRecordQueued(xdialTLS)
++	cSess.XDialRecordWrite(xdialTLS, 0x03, nil)
++	now = now.Add(time.Second)
++	cSess.XDialRecordFrame(xdialTLS, 0x04)
++
++	var snapshot xdialDiagnosticsSnapshot
++	if err := json.Unmarshal(
++		[]byte(cSess.XDialDiagnosticsJSON()),
++		&snapshot,
++	); err != nil {
++		t.Fatal(err)
++	}
++	if snapshot.TLS.DPDRequestsQueued != 1 ||
++		snapshot.TLS.DPDRequestsWritten != 1 ||
++		snapshot.TLS.DPDResponsesReceived != 1 {
++		t.Fatalf("unexpected DPD counters: %#v", snapshot.TLS)
++	}
++}
++
++func TestXDialFullWriterQueueDropsWithoutBlocking(t *testing.T) {
++	cSess := newXDialTestSession(t)
++	for len(cSess.PayloadOutTLS) < cap(cSess.PayloadOutTLS) {
++		cSess.PayloadOutTLS <- nil
++	}
++	liveness := cSess.xdial
++	now := liveness.tls.lastFrame.Add(5 * time.Second)
++	result := liveness.step(now)
++	if len(result.actions) != 1 {
++		t.Fatalf("idle step = %#v, want one queued action", result)
++	}
++	cSess.enqueueXDialControl(result.actions[0])
++	if liveness.tls.dpdRequestsDropped != 1 ||
++		liveness.tls.dpdQueued {
++		t.Fatalf(
++			"full queue state: dropped=%d queued=%v",
++			liveness.tls.dpdRequestsDropped,
++			liveness.tls.dpdQueued,
++		)
++	}
++}
++
++func TestXDialDiagnosticsKeepFalseDTLSState(t *testing.T) {
++	cSess := newXDialTestSession(t)
++	var snapshot map[string]any
++	if err := json.Unmarshal(
++		[]byte(cSess.XDialDiagnosticsJSON()),
++		&snapshot,
++	); err != nil {
++		t.Fatal(err)
++	}
++	dtls := snapshot["dtls"].(map[string]any)
++	if _, ok := dtls["ever_connected"]; !ok {
++		t.Fatal("DTLS ever_connected was omitted when false")
++	}
++	if _, ok := dtls["currently_connected"]; !ok {
++		t.Fatal("DTLS currently_connected was omitted when false")
++	}
++}
++
++func TestXDialDTLSFailureDoesNotCloseMainSession(t *testing.T) {
++	cSess := newXDialTestSession(t)
++	cSess.XDialRecordTransportReady(xdialDTLS)
++	cSess.XDialRecordReadFailure(
++		xdialDTLS,
++		&timeoutError{},
++	)
++	select {
++	case <-cSess.CloseChan:
++		t.Fatal("DTLS failure closed the TLS session")
++	default:
++	}
++	if cSess.xdial.dtls.lastFailureCode != "dtls-read-timeout" {
++		t.Fatalf(
++			"DTLS failure = %q, want dtls-read-timeout",
++			cSess.xdial.dtls.lastFailureCode,
++		)
++	}
++}
++
++func TestXDialCloseReasonFirstWriterWins(t *testing.T) {
++	cSess := newXDialTestSession(t)
++	var ready sync.WaitGroup
++	ready.Add(2)
++	start := make(chan struct{})
++	for _, reason := range []string{"tls-read-eof", "tls-write-reset"} {
++		reason := reason
++		go func() {
++			ready.Done()
++			<-start
++			cSess.XDialCloseWithReason(reason, xdialTLS, "test", "test")
++		}()
++	}
++	ready.Wait()
++	close(start)
++	<-cSess.CloseChan
++
++	var snapshot xdialDiagnosticsSnapshot
++	if err := json.Unmarshal(
++		[]byte(cSess.XDialDiagnosticsJSON()),
++		&snapshot,
++	); err != nil {
++		t.Fatal(err)
++	}
++	if snapshot.Close == nil ||
++		(snapshot.Close.Code != "tls-read-eof" &&
++			snapshot.Close.Code != "tls-write-reset") {
++		t.Fatalf("invalid first close reason: %#v", snapshot.Close)
++	}
++}
++
++func TestXDialLateOldSessionCloseCannotClearNewSession(t *testing.T) {
++	base.Cfg.SetXDialForceDPD(5)
++	owner := &Session{}
++	first := owner.NewConnSession(&http.Header{})
++	second := owner.NewConnSession(&http.Header{})
++
++	first.Close()
++	if owner.CSess != second {
++		t.Fatal("old session close cleared the current session")
++	}
++	select {
++	case <-second.sessionCloseChan:
++		t.Fatal("old session close notified the current generation")
++	default:
++	}
++}
++
++func TestXDialErrorClassification(t *testing.T) {
++	if got := xdialErrorClass(&timeoutError{}); got != "timeout" {
++		t.Fatalf("timeout class = %q", got)
++	}
++	if got := xdialErrorClass(syscall.ECONNRESET); got != "reset" {
++		t.Fatalf("reset class = %q", got)
++	}
++	if got := xdialErrorClass(errors.New("opaque")); got != "other" {
++		t.Fatalf("other class = %q", got)
++	}
++}
++
++type timeoutError struct{}
++
++func (*timeoutError) Error() string   { return "timeout" }
++func (*timeoutError) Timeout() bool   { return true }
++func (*timeoutError) Temporary() bool { return true }
+diff --git a/vpn/dtls.go b/vpn/dtls.go
+index 2885110..28e59fc 100644
+--- a/vpn/dtls.go
++++ b/vpn/dtls.go
+@@ -79,6 +79,7 @@ func dtlsChannel(cSess *session.ConnSession) {
+ 	}
+ 
+ 	cSess.DtlsConnected.Store(true)
++	cSess.XDialRecordTransportReady("dtls")
+ 	dSess = cSess.DSess
+ 	close(cSess.DtlsSetupChan) // 成功建立 DTLS 隧道
+ 
+@@ -99,12 +100,17 @@ func dtlsChannel(cSess *session.ConnSession) {
+ 	for {
+ 		// 重置超时限制
+ 		if cSess.ResetDTLSReadDead.Load() {
+-			_ = conn.SetReadDeadline(time.Now().Add(dead))
++			if base.Cfg.XDialForceDPD() > 0 {
++				_ = conn.SetReadDeadline(time.Time{})
++			} else {
++				_ = conn.SetReadDeadline(time.Now().Add(dead))
++			}
+ 			cSess.ResetDTLSReadDead.Store(false)
+ 		}
+ 
+ 		bytesReceived, keepRunning, readErr := readDTLSPayload(conn, dSess, cSess)
+ 		if readErr != nil {
++			cSess.XDialRecordReadFailure("dtls", readErr)
+ 			base.Error("dtls server to payloadIn error:", readErr)
+ 			return
+ 		}
+@@ -134,11 +140,15 @@ func readDTLSPayload(reader io.Reader, dSess *session.DtlsSession, cSess *sessio
+ 		return bytesReceived, false, fmt.Errorf("empty DTLS payload")
+ 	}
+ 
++	payloadType := pl.Data[0]
++	cSess.XDialRecordFrame("dtls", payloadType)
++
+ 	// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-02#section-2.3
+ 	// UDP 数据包的头部只有 1 字节。
+-	switch pl.Data[0] {
++	switch payloadType {
+ 	case 0x07: // KEEPALIVE
+ 	case 0x05: // DISCONNECT
++		cSess.XDialRecordPeerClose("dtls", "dtls-peer-disconnect")
+ 		return bytesReceived, false, nil
+ 	case 0x03: // DPD-REQ
+ 		pl.Type = 0x04
+@@ -186,7 +196,9 @@ func payloadOutDTLSToServer(conn *dtls.Conn, dSess *session.DtlsSession, cSess *
+ 			return
+ 		}
+ 
++		payloadType := pl.Type
+ 		bytesSent, err = writeDTLSPayload(conn, pl)
++		cSess.XDialRecordWrite("dtls", payloadType, err)
+ 		if err != nil {
+ 			base.Error("dtls payloadOut to server error:", err)
+ 			return
+diff --git a/vpn/tls.go b/vpn/tls.go
+index 974a921..dee0695 100644
+--- a/vpn/tls.go
++++ b/vpn/tls.go
+@@ -23,6 +23,9 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession,
+ 		cSess.Close()
+ 	}()
+ 	dead := time.Duration(cSess.TLSDpdTime+5) * time.Second
++	if base.Cfg.XDialForceDPD() > 0 {
++		dead = 0
++	}
+ 
+ 	go payloadOutTLSToServer(conn, cSess)
+ 
+@@ -30,13 +33,14 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession,
+ 	// 读取服务器返回的数据，调整格式，放入 cSess.PayloadIn
+ 	for {
+ 		// 重置超时限制
+-		if cSess.ResetTLSReadDead.Load() {
++		if dead > 0 && cSess.ResetTLSReadDead.Load() {
+ 			_ = conn.SetReadDeadline(time.Now().Add(dead))
+ 			cSess.ResetTLSReadDead.Store(false)
+ 		}
+ 
+ 		bytesReceived, keepRunning, readErr := readTLSPayload(bufR, cSess)
+ 		if readErr != nil {
++			cSess.XDialRecordReadFailure("tls", readErr)
+ 			base.Error("tls server to payloadIn error:", readErr)
+ 			return
+ 		}
+@@ -75,8 +79,11 @@ func readTLSPayload(reader io.Reader, cSess *session.ConnSession) (bytesReceived
+ 		return bytesReceived, false, err
+ 	}
+ 
++	payloadType := pl.Data[6]
++	cSess.XDialRecordFrame("tls", payloadType)
++
+ 	// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-03#section-2.2
+-	switch pl.Data[6] {
++	switch payloadType {
+ 	case 0x00: // DATA
+ 		copy(pl.Data, pl.Data[headerSize:headerSize+dataLen])
+ 		pl.Data = pl.Data[:dataLen]
+@@ -101,6 +108,12 @@ func readTLSPayload(reader io.Reader, cSess *session.ConnSession) (bytesReceived
+ 		}
+ 	case 0x07: // KEEPALIVE
+ 		// 收到保活包，无需处理，读操作本身已重置超时。
++	case 0x05: // DISCONNECT
++		cSess.XDialRecordPeerClose("tls", "peer-disconnect")
++		return bytesReceived, false, nil
++	case 0x09: // TERMINATE
++		cSess.XDialRecordPeerClose("tls", "peer-terminate")
++		return bytesReceived, false, nil
+ 	}
+ 	return bytesReceived, true, nil
+ }
+@@ -126,7 +139,9 @@ func payloadOutTLSToServer(conn *tls.Conn, cSess *session.ConnSession) {
+ 			return
+ 		}
+ 
++		payloadType := pl.Type
+ 		bytesSent, err = writeTLSPayload(conn, pl)
++		cSess.XDialRecordWrite("tls", payloadType, err)
+ 		if err != nil {
+ 			base.Error("tls payloadOut to server error:", err)
+ 			return
+diff --git a/vpn/xdial_liveness_test.go b/vpn/xdial_liveness_test.go
+new file mode 100644
+index 0000000..19e6f23
+--- /dev/null
++++ b/vpn/xdial_liveness_test.go
+@@ -0,0 +1,92 @@
++package vpn
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/json"
++	"net/http"
++	"testing"
++
++	"sslcon/base"
++	"sslcon/proto"
++	"sslcon/session"
++)
++
++type xdialSessionSnapshot struct {
++	TLS struct {
++		DPDResponsesReceived uint64 `json:"dpd_responses_received"`
++	} `json:"tls"`
++	Close *struct {
++		Code string `json:"code"`
++	} `json:"close"`
++}
++
++func newVPNXDialSession() *session.ConnSession {
++	base.Cfg.SetXDialForceDPD(5)
++	return (&session.Session{}).NewConnSession(&http.Header{})
++}
++
++func cstpFrame(payloadType byte, payload []byte) []byte {
++	frame := append([]byte(nil), proto.Header...)
++	binary.BigEndian.PutUint16(frame[4:6], uint16(len(payload)))
++	frame[6] = payloadType
++	return append(frame, payload...)
++}
++
++func xdialSnapshot(t *testing.T, cSess *session.ConnSession) xdialSessionSnapshot {
++	t.Helper()
++	var snapshot xdialSessionSnapshot
++	if err := json.Unmarshal(
++		[]byte(cSess.XDialDiagnosticsJSON()),
++		&snapshot,
++	); err != nil {
++		t.Fatal(err)
++	}
++	return snapshot
++}
++
++func TestReadTLSPayloadRecordsPeerDisconnectAndTerminate(t *testing.T) {
++	for _, test := range []struct {
++		name        string
++		payloadType byte
++		wantCode    string
++	}{
++		{name: "disconnect", payloadType: 0x05, wantCode: "peer-disconnect"},
++		{name: "terminate", payloadType: 0x09, wantCode: "peer-terminate"},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			cSess := newVPNXDialSession()
++			_, keepRunning, err := readTLSPayload(
++				bytes.NewReader(cstpFrame(test.payloadType, []byte("private reason"))),
++				cSess,
++			)
++			if err != nil || keepRunning {
++				t.Fatalf("read result keep=%v err=%v", keepRunning, err)
++			}
++			snapshot := xdialSnapshot(t, cSess)
++			if snapshot.Close == nil || snapshot.Close.Code != test.wantCode {
++				t.Fatalf("close = %#v, want %q", snapshot.Close, test.wantCode)
++			}
++			if bytes.Contains(
++				[]byte(cSess.XDialDiagnosticsJSON()),
++				[]byte("private reason"),
++			) {
++				t.Fatal("peer-provided text leaked into diagnostics")
++			}
++		})
++	}
++}
++
++func TestReadTLSPayloadRecordsDPDResponse(t *testing.T) {
++	cSess := newVPNXDialSession()
++	_, keepRunning, err := readTLSPayload(
++		bytes.NewReader(cstpFrame(0x04, nil)),
++		cSess,
++	)
++	if err != nil || !keepRunning {
++		t.Fatalf("read result keep=%v err=%v", keepRunning, err)
++	}
++	if got := xdialSnapshot(t, cSess).TLS.DPDResponsesReceived; got != 1 {
++		t.Fatalf("DPD responses = %d, want 1", got)
++	}
++}

@@ -1,18 +1,30 @@
+import Darwin
 import Foundation
 
+/// 一次 Provider 出口探测的易失观察。
+///
+/// 它只装饰 `ConnectionReport` 已经给出的运行状态，不参与连接裁决，也不能跨事务复用。
 struct LineNetInfo: Codable, Equatable {
-    var ip: String = ""
-    var region: String = ""
-    var probedAt: Date?
-    var error: String = ""
+    let transactionID: String
+    let lineID: String
+    let observedAt: Date
+    var ip: String
+    var region: String
+    var errorCode: String
 
     var summary: String {
-        if !ip.isEmpty {
-            let r = region.isEmpty ? "" : " (\(region))"
-            return "\(ip)\(r)"
-        }
-        if !error.isEmpty { return error }
-        return ""
+        guard !ip.isEmpty else { return "" }
+        let suffix = region.isEmpty ? "" : " (\(region))"
+        return "\(ip)\(suffix)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case transactionID = "transaction_id"
+        case lineID = "line_id"
+        case observedAt = "observed_at"
+        case ip
+        case region
+        case errorCode = "error_code"
     }
 }
 
@@ -20,264 +32,145 @@ struct LineNetInfo: Codable, Equatable {
 final class NetworkInfo: ObservableObject {
     static let shared = NetworkInfo()
 
-    @Published private(set) var localIP: String = ""
+    @Published private(set) var transactionID: String?
     @Published private(set) var perLine: [String: LineNetInfo] = [:]
-    @Published private(set) var probing: Bool = false
 
-    /// 由 AppState 同步语言
-    var language: Lang = .system
+    private var activeLineIDs = Set<String>()
+    private var requestedLineIDs = Set<String>()
 
-    private let clashAPI = "http://127.0.0.1:9090"
-    private var probeTask: Task<Void, Never>?
-
-    /// 启动一次完整探测：本地 IP + 每条活动线路的 IP 信息 + 活动订阅主策略组。
-    func probeAll(lines: [Line], subscriptions: [Subscription] = [], helperConnected: Bool) {
-        probeTask?.cancel()
-        localIP = Self.getLocalIP() ?? ""
-        appLog("NetworkInfo: localIP=\(localIP) helperConnected=\(helperConnected)")
-
-        probeTask = Task { [weak self] in
-            guard let self else { return }
-            self.probing = true
-            defer { self.probing = false }
-
-            guard helperConnected, await self.waitForClashAPI() else { return }
-
-            for line in lines where line.enabled {
-                if Task.isCancelled { return }
-                await probeLine(line: line)
-            }
-            for sub in subscriptions where sub.enabled && !sub.lines.isEmpty {
-                if Task.isCancelled { return }
-                await probeSub(sub: sub)
-            }
+    /// 对齐当前已提交事务，并返回本次尚未向 Provider 请求过的 Line。
+    ///
+    /// 调用方只能传入 `ConnectionReport` 中的 Line task，不能从当前编辑中的 Profile
+    /// 猜测运行对象。
+    func begin(
+        transactionID: String,
+        lineIDs: [String]
+    ) -> [String] {
+        let active = Set(lineIDs)
+        if self.transactionID != transactionID {
+            clearStorage()
+            self.transactionID = transactionID
         }
+        activeLineIDs = active
+        perLine = perLine.filter { active.contains($0.key) }
+        requestedLineIDs.formIntersection(active)
+
+        let pending = lineIDs.filter {
+            !requestedLineIDs.contains($0) && perLine[$0] == nil
+        }
+        requestedLineIDs.formUnion(pending)
+        return pending
     }
 
-    private func probeSub(sub: Subscription) async {
-        let mainTag: String
-        if let first = sub.proxyGroups.first {
-            mainTag = "sub-" + sub.id + "-" + slugify(first.name)
-        } else {
-            mainTag = "sub-" + sub.id
+    func clear() {
+        guard transactionID != nil || !perLine.isEmpty
+                || !requestedLineIDs.isEmpty else {
+            return
         }
-        appLog("NetworkInfo: probing sub \(sub.name) tag=\(mainTag)")
-        perLine[sub.id] = await probe(tag: mainTag)
+        clearStorage()
+        transactionID = nil
     }
 
-    private func probeLine(line: Line) async {
-        let tag = outboundTag(for: line)
-        appLog("NetworkInfo: probing \(line.name) tag=\(tag)")
-        perLine[line.id] = await probe(tag: tag)
-    }
-
-    private func probe(tag: String) async -> LineNetInfo {
-        var info = LineNetInfo()
-        info.probedAt = Date()
-
-        guard await switchSelector(to: tag) else {
-            info.error = "无法切换出口"
-            return info
+    func observation(
+        for lineID: String,
+        transactionID: String?
+    ) -> LineNetInfo? {
+        guard
+            let transactionID,
+            self.transactionID == transactionID,
+            let info = perLine[lineID],
+            info.transactionID == transactionID
+        else {
+            return nil
         }
-        try? await Task.sleep(nanoseconds: 200_000_000)
-
-        let result = await fetchIPInfo()
-        info.ip = result.ip
-        info.region = result.region
-        info.error = result.error
         return info
     }
 
-    /// 必须与 Go 端 core/config/generator.go 的 slugify 完全一致。
-    private func slugify(_ value: String) -> String {
-        var mapped = ""
-        mapped.reserveCapacity(value.count)
-        for scalar in value.unicodeScalars {
-            let v = scalar.value
-            if (v >= 0x61 && v <= 0x7A)
-                || (v >= 0x41 && v <= 0x5A)
-                || (v >= 0x30 && v <= 0x39) {
-                mapped.unicodeScalars.append(scalar)
-            } else {
-                mapped.append("-")
-            }
+    func recordAddress(
+        _ address: String,
+        lineID: String,
+        transactionID: String,
+        observedAt: Date = Date()
+    ) {
+        guard accepts(lineID: lineID, transactionID: transactionID) else {
+            return
         }
-        let truncated = mapped.count > 16 ? String(mapped.prefix(16)) : mapped
-        return truncated.lowercased()
+        guard Self.numericAddress(address) != nil else {
+            recordFailure(
+                code: "invalid-outbound-address",
+                lineID: lineID,
+                transactionID: transactionID,
+                observedAt: observedAt
+            )
+            return
+        }
+        perLine[lineID] = LineNetInfo(
+            transactionID: transactionID,
+            lineID: lineID,
+            observedAt: observedAt,
+            ip: address,
+            region: "",
+            errorCode: ""
+        )
     }
 
-    private func waitForClashAPI() async -> Bool {
-        guard let url = URL(string: "\(clashAPI)/proxies/test-out") else { return false }
-        for i in 0..<25 {
-            if Task.isCancelled { return false }
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 1
-            do {
-                let (_, response) = try await URLSession.shared.data(for: request)
-                if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                    appLog("NetworkInfo: Clash API ready after \(i * 200)ms")
-                    return true
-                }
-            } catch {
-                // 数据面还没就绪，继续在总预算内轮询。
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
+    func recordFailure(
+        code: String,
+        lineID: String,
+        transactionID: String,
+        observedAt: Date = Date()
+    ) {
+        guard accepts(lineID: lineID, transactionID: transactionID) else {
+            return
         }
-        appLog("NetworkInfo: Clash API not ready after 5s")
-        return false
+        perLine[lineID] = LineNetInfo(
+            transactionID: transactionID,
+            lineID: lineID,
+            observedAt: observedAt,
+            ip: "",
+            region: "",
+            errorCode: code.isEmpty
+                ? "line-outbound-probe-failed"
+                : code
+        )
     }
 
-    /// PUT /proxies/test-out {"name": tag}
-    private func switchSelector(to tag: String) async -> Bool {
-        guard let url = URL(string: "\(clashAPI)/proxies/test-out") else { return false }
-        var request = URLRequest(url: url)
-        request.httpMethod = "PUT"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 3
-        guard let body = try? JSONSerialization.data(withJSONObject: ["name": tag]) else {
-            return false
-        }
-        do {
-            let (_, response) = try await URLSession.shared.upload(for: request, from: body)
-            if let http = response as? HTTPURLResponse {
-                appLog("NetworkInfo: selector → \(tag), HTTP \(http.statusCode)")
-                return http.statusCode == 204 || http.statusCode == 200
-            }
-        } catch {
-            appLog("NetworkInfo: switchSelector failed: \(error.localizedDescription)")
-        }
-        return false
+    private func accepts(
+        lineID: String,
+        transactionID: String
+    ) -> Bool {
+        self.transactionID == transactionID
+            && activeLineIDs.contains(lineID)
+            && requestedLineIDs.contains(lineID)
     }
 
-    private func fetchIPInfo() async -> (ip: String, region: String, error: String) {
-        // 每次新建会话，避免复用切换 selector 前的连接。
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        configuration.urlCache = nil
-        configuration.httpShouldUsePipelining = false
-        configuration.httpMaximumConnectionsPerHost = 1
-        let session = URLSession(configuration: configuration)
-        defer { session.finishTasksAndInvalidate() }
+    private func clearStorage() {
+        activeLineIDs.removeAll()
+        requestedLineIDs.removeAll()
+        perLine.removeAll()
+    }
 
-        let services: [(String, (Data) -> (String, String)?)] = [
-            ("https://api.ip.sb/geoip", parseIPSB),
-            (
-                "http://ip-api.com/json/?lang=\(language.ipAPILang)&fields=status,query,country,regionName,city",
-                parseIPAPI
-            ),
-        ]
-        var lastError = "无法获取 IP"
-        for (urlString, parser) in services {
-            guard let url = URL(string: urlString) else { continue }
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 6
-            request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-            request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-            do {
-                let (data, _) = try await session.data(for: request)
-                if let (ip, region) = parser(data) {
-                    return (ip, region, "")
-                }
-            } catch {
-                lastError = error.localizedDescription
-            }
+    nonisolated private static func numericAddress(
+        _ value: String
+    ) -> (family: Int32, bytes: Data)? {
+        var ipv4 = in_addr()
+        if value.withCString({
+            inet_pton(AF_INET, $0, &ipv4)
+        }) == 1 {
+            return (
+                AF_INET,
+                withUnsafeBytes(of: ipv4) { Data($0) }
+            )
         }
-        return ("", "", lastError)
-    }
-
-    private func parseIPAPI(_ data: Data) -> (String, String)? {
-        guard let info = try? JSONDecoder().decode(IPAPIResp.self, from: data),
-              info.status == "success" else { return nil }
-        var parts: [String] = []
-        if !info.country.isEmpty { parts.append(info.country) }
-        if !info.regionName.isEmpty && info.regionName != info.country {
-            parts.append(info.regionName)
-        }
-        if !info.city.isEmpty && info.city != info.regionName { parts.append(info.city) }
-        return (info.query, parts.joined(separator: " "))
-    }
-
-    private func parseIPSB(_ data: Data) -> (String, String)? {
-        guard let info = try? JSONDecoder().decode(IPSBResp.self, from: data),
-              !info.ip.isEmpty else { return nil }
-        var parts: [String] = []
-        if let country = info.country { parts.append(country) }
-        if let region = info.region, region != info.country { parts.append(region) }
-        if let city = info.city, city != info.region { parts.append(city) }
-        return (info.ip, parts.joined(separator: " "))
-    }
-
-    /// 与 Go 侧 resolveOutboundTag 保持一致。
-    private func outboundTag(for line: Line) -> String {
-        switch line.type {
-        case "direct": return "direct"
-        case "vpn": return "vpn"
-        default: return "proxy-" + line.id
-        }
-    }
-
-    /// 通过 getifaddrs 获取活跃 IPv4 接口地址（非 loopback / 非 utun）。
-    static func getLocalIP() -> String? {
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
-        defer { freeifaddrs(ifaddr) }
-
-        var ptr = first
-        while true {
-            let interface = ptr.pointee
-            let flags = Int32(interface.ifa_flags)
-            if let addrPtr = interface.ifa_addr {
-                let addr = addrPtr.pointee
-                if (flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING),
-                   (flags & IFF_LOOPBACK) == 0,
-                   addr.sa_family == UInt8(AF_INET) {
-                    let name = String(cString: interface.ifa_name)
-                    if !name.hasPrefix("utun"), !name.hasPrefix("awdl"),
-                       !name.hasPrefix("bridge"), !name.hasPrefix("llw"),
-                       !name.hasPrefix("anpi") {
-                        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                        let result = addrPtr.withMemoryRebound(
-                            to: sockaddr.self,
-                            capacity: 1
-                        ) { socketAddress in
-                            getnameinfo(
-                                socketAddress,
-                                socklen_t(addr.sa_len),
-                                &hostname,
-                                socklen_t(NI_MAXHOST),
-                                nil,
-                                0,
-                                NI_NUMERICHOST
-                            )
-                        }
-                        if result == 0 {
-                            let ip = String(cString: hostname)
-                            if !ip.isEmpty { return ip }
-                        }
-                    }
-                }
-            }
-            if let next = interface.ifa_next {
-                ptr = next
-            } else {
-                break
-            }
+        var ipv6 = in6_addr()
+        if value.withCString({
+            inet_pton(AF_INET6, $0, &ipv6)
+        }) == 1 {
+            return (
+                AF_INET6,
+                withUnsafeBytes(of: ipv6) { Data($0) }
+            )
         }
         return nil
     }
-}
-
-private struct IPAPIResp: Decodable {
-    let status: String
-    let query: String
-    let country: String
-    let regionName: String
-    let city: String
-}
-
-private struct IPSBResp: Decodable {
-    let ip: String
-    let country: String?
-    let region: String?
-    let city: String?
 }

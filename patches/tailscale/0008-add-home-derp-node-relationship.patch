@@ -1,0 +1,93 @@
+From ea3712f32b6d9ab0c324119f3257f10824e65da4 Mon Sep 17 00:00:00 2001
+From: XDial Patch Builder <xdial-patch-builder@invalid>
+Date: Thu, 30 Jul 2026 15:34:09 +0800
+Subject: [PATCH] add home derp node relationship
+
+---
+ wgengine/magicsock/derp.go                   | 29 +++++++++++++++-----
+ wgengine/magicsock/xdial_diagnostics_test.go | 19 +++++++++++++
+ 2 files changed, 41 insertions(+), 7 deletions(-)
+
+diff --git a/wgengine/magicsock/derp.go b/wgengine/magicsock/derp.go
+index 32c0447..501581c 100644
+--- a/wgengine/magicsock/derp.go
++++ b/wgengine/magicsock/derp.go
+@@ -1094,11 +1094,25 @@ func (c *Conn) setDERPProtocolReady(regionID int, dc *derphttp.Client, ready boo
+ // XDialDERPConnectionDiagnostics is a bounded snapshot of DERP lifecycle
+ // state. It contains no region IDs, endpoints or public keys.
+ type XDialDERPConnectionDiagnostics struct {
+-	ClientCount        int
+-	ProtocolReadyCount int
+-	HomeConfigured     bool
+-	HomeState          string
+-	HomeKeyRelation    string
++	ClientCount              int
++	ProtocolReadyCount       int
++	HomeConfigured           bool
++	HomeState                string
++	HomeKeyRelation          string
++	HomeIdealKnown           bool
++	HomeIdeal                bool
++	HomeConnectionGeneration int
++	HomeServerChangeSequence uint64
++}
++
++func xdialApplyHomeDERPConnectionDiagnostics(
++	result *XDialDERPConnectionDiagnostics,
++	client derphttp.XDialConnectionDiagnostics,
++) {
++	result.HomeIdealKnown = client.IdealKnown
++	result.HomeIdeal = client.Ideal
++	result.HomeConnectionGeneration = client.Generation
++	result.HomeServerChangeSequence = client.ServerChangeSequence
+ }
+ 
+ func xdialDERPHomeState(
+@@ -1153,14 +1167,15 @@ func (c *Conn) XDialDERPConnectionState() XDialDERPConnectionDiagnostics {
+ 		if active.c == nil {
+ 			continue
+ 		}
+-		transportConnected, closed := active.c.XDialConnectionState()
+ 		if active.protocolReady {
+ 			result.ProtocolReadyCount++
+ 		}
+ 		if regionID != c.myDerp {
+ 			continue
+ 		}
+-		result.HomeState = xdialDERPHomeState(transportConnected, closed, active.protocolReady)
++		client := active.c.XDialConnectionDiagnostics()
++		xdialApplyHomeDERPConnectionDiagnostics(&result, client)
++		result.HomeState = xdialDERPHomeState(client.Connected, client.Closed, active.protocolReady)
+ 		if !c.privateKey.IsZero() {
+ 			if active.c.SelfPublicKey().Compare(c.privateKey.Public()) == 0 {
+ 				result.HomeKeyRelation = "match"
+diff --git a/wgengine/magicsock/xdial_diagnostics_test.go b/wgengine/magicsock/xdial_diagnostics_test.go
+index d102e5c..9b235c2 100644
+--- a/wgengine/magicsock/xdial_diagnostics_test.go
++++ b/wgengine/magicsock/xdial_diagnostics_test.go
+@@ -101,6 +101,25 @@ func TestXDialDERPHomeState(t *testing.T) {
+ 	}
+ }
+ 
++func TestXDialHomeDERPConnectionDiagnosticsProjection(t *testing.T) {
++	var got XDialDERPConnectionDiagnostics
++	xdialApplyHomeDERPConnectionDiagnostics(
++		&got,
++		derphttp.XDialConnectionDiagnostics{
++			Generation:           4,
++			IdealKnown:           true,
++			Ideal:                true,
++			ServerChangeSequence: 9,
++		},
++	)
++	if !got.HomeIdealKnown ||
++		!got.HomeIdeal ||
++		got.HomeConnectionGeneration != 4 ||
++		got.HomeServerChangeSequence != 9 {
++		t.Fatalf("home client relationship = %+v", got)
++	}
++}
++
+ func TestXDialDERPConnectionDiagnosticsKeyRelation(t *testing.T) {
+ 	c := newConn(t.Logf)
+ 	c.mu.Lock()

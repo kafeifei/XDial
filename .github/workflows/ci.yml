@@ -22,20 +22,21 @@ jobs:
           if [ -n "$unformatted" ]; then
             echo "以下文件未 gofmt:" && echo "$unformatted" && exit 1
           fi
+      - name: prepare patched Go dependencies
+        run: make prepare-patched-go
       - name: go vet
-        run: go vet ./...
+        run: make go-vet
       - name: go build
-        run: go build ./...
+        run: make go-build
       - name: install sing-box test validator
         run: |
-          version=$(go list -m -f '{{.Version}}' github.com/sagernet/sing-box)
-          go install -tags with_gvisor,with_clash_api,with_tailscale \
-            "github.com/sagernet/sing-box/cmd/sing-box@${version}"
+          make sing-box-test-validator
+          echo "$PWD/build/tools" >> "$GITHUB_PATH"
       - name: go test
-        run: go test -tags with_gvisor ./core/... -count=1 -timeout 10m
+        run: make test
 
   macos:
-    name: macOS (swift build + bundle)
+    name: macOS (swift compile + tests)
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -44,7 +45,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: make app (debug)
-        run: make app
-      - name: make release
-        run: make release
+      - name: install macOS build tools
+        run: |
+          brew install xcodegen
+          go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
+          go install github.com/sagernet/gomobile/cmd/gobind@v0.1.13
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: compile Debug and Release without distribution signing
+        run: make ci-macos-build
+      - name: connection transaction tests
+        run: make test-macos-transaction

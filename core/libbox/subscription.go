@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/kafeifei/xdial/core/config"
 	"github.com/kafeifei/xdial/core/subscription"
 )
@@ -119,13 +118,8 @@ func subscriptionNodeUsable(line config.Line) bool {
 		return false
 	}
 	switch line.Type {
-	case config.LineTypeTrojan:
-		return line.TrojanServer != "" && line.TrojanPort > 0 && line.TrojanPort <= 65535 && line.TrojanPassword != ""
-	case config.LineTypeShadowsocks:
-		return line.SSServer != "" && line.SSPort > 0 && line.SSPort <= 65535 && line.SSMethod != "" && line.SSPass != ""
-	case config.LineTypeVMess:
-		_, err := uuid.Parse(line.VMessUUID)
-		return line.VMessServer != "" && line.VMessPort > 0 && line.VMessPort <= 65535 && err == nil
+	case config.LineTypeTrojan, config.LineTypeShadowsocks, config.LineTypeVMess, config.LineTypeAnyTLS:
+		return config.LineHasUsableOutbound(&line)
 	default:
 		return false
 	}

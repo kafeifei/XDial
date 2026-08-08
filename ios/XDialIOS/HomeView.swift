@@ -4,7 +4,7 @@ struct HomeView: View {
     @EnvironmentObject private var app: AppState
     @Environment(\.openURL) private var openURL
     @Binding var selectedTab: MobileTab
-    @State private var showingModes = false
+    @State private var showingScenarios = false
     @State private var showingConfigurationIssues = false
     @State private var tailscaleLoginLineID: String?
     @State private var tailscaleLoginError: String?
@@ -15,7 +15,7 @@ struct HomeView: View {
                 VStack(spacing: 24) {
                     statusHero
                     powerButton
-                    modeCard
+                    scenarioCard
 
                     if app.requiresUserAction {
                         tailscaleSignInCard
@@ -38,8 +38,8 @@ struct HomeView: View {
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle("XDial")
-            .sheet(isPresented: $showingModes) {
-                QuickModePicker()
+            .sheet(isPresented: $showingScenarios) {
+                QuickScenarioPicker()
                     .presentationDetents([.medium, .large])
             }
         }
@@ -57,7 +57,7 @@ struct HomeView: View {
                 .font(.title2.bold())
                 .multilineTextAlignment(.center)
 
-            Text(app.activeMode?.name ?? app.tr("未选择模式", "No mode selected"))
+            Text(app.activeScenario?.name ?? app.tr("未选择场景", "No scenario selected"))
                 .foregroundStyle(.secondary)
 
             if app.hasFormalTunnel, let connectedAt = app.engine.connectedAt {
@@ -116,19 +116,19 @@ struct HomeView: View {
         .accessibilityIdentifier("connection-toggle")
     }
 
-    private var modeCard: some View {
-        Button { showingModes = true } label: {
+    private var scenarioCard: some View {
+        Button { showingScenarios = true } label: {
             HStack(spacing: 14) {
-                Image(systemName: "shuffle")
+                Image(systemName: "square.grid.2x2.fill")
                     .font(.title3)
                     .frame(width: 34, height: 34)
                     .background(Color.accentColor.opacity(0.12))
                     .clipShape(RoundedRectangle(cornerRadius: 9))
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(app.tr("当前模式", "Current mode"))
+                    Text(app.tr("当前场景", "Current scenario"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text(app.activeMode?.name ?? app.tr("请选择", "Select"))
+                    Text(app.activeScenario?.name ?? app.tr("请选择", "Select"))
                         .font(.headline)
                         .foregroundStyle(.primary)
                 }
@@ -239,7 +239,7 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text(
                 app.isConnected
-                    ? app.tr("本模式活动出口", "Active routes in this mode")
+                    ? app.tr("本场景活动出口", "Active routes in this scenario")
                     : app.tr("连接后使用的出口", "Routes used after connecting")
             )
                 .font(.headline)
@@ -291,8 +291,8 @@ struct HomeView: View {
     }
 
     private var activeTargets: [ActiveRouteTargetSummary] {
-        guard let mode = app.activeMode else { return [] }
-        return app.profile.activeRouteTargetSummaries(for: mode)
+        guard let scenario = app.activeScenario else { return [] }
+        return app.profile.activeRouteTargetSummaries(for: scenario)
     }
 
     private var statusIcon: String {
@@ -356,29 +356,29 @@ struct PendingRuntimeChangesBanner: View {
     }
 }
 
-private struct QuickModePicker: View {
+private struct QuickScenarioPicker: View {
     @EnvironmentObject private var app: AppState
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
-            List(app.profile.modes) { mode in
+            List(app.profile.scenarios) { scenario in
                 Button {
                     guard app.canMutateConfiguration else { return }
-                    app.profile.activeModeID = mode.id
+                    app.profile.activeScenarioID = scenario.id
                     app.save()
                     dismiss()
                 } label: {
                     HStack {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(mode.name)
+                            Text(scenario.name)
                                 .foregroundStyle(.primary)
-                            Text(app.tr("\(mode.bindings.count) 条分流绑定", "\(mode.bindings.count) bindings"))
+                            Text(app.tr("\(scenario.bindings.count) 条分流绑定", "\(scenario.bindings.count) bindings"))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        if mode.id == app.profile.activeModeID {
+                        if scenario.id == app.profile.activeScenarioID {
                             Image(systemName: "checkmark.circle.fill")
                                 .foregroundStyle(.green)
                         }
@@ -386,7 +386,7 @@ private struct QuickModePicker: View {
                 }
                 .disabled(app.hasActiveTunnel || app.isBusy)
             }
-            .navigationTitle(app.tr("选择模式", "Select mode"))
+            .navigationTitle(app.tr("选择场景", "Select scenario"))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(app.tr("完成", "Done")) { dismiss() }

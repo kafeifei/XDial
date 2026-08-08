@@ -380,7 +380,7 @@ func TestSmoke_BasicSplit(t *testing.T) {
 			{ID: "social", Name: "社交", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"twitter.com", "facebook.com"}},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "corp", LineID: "my-vpn"},
@@ -388,7 +388,7 @@ func TestSmoke_BasicSplit(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -398,7 +398,7 @@ func TestSmoke_BasicSplit(t *testing.T) {
 	r.requestAndAssert("internal.example.com", "vpn")
 	r.requestAndAssert("twitter.com", "proxy-my-trojan")
 	r.requestAndAssert("facebook.com", "proxy-my-trojan")
-	r.requestAndAssert("baidu.com", "direct")
+	r.requestAndAssert("unmatched.test", "direct")
 }
 
 func TestSmoke_DefaultVPN(t *testing.T) {
@@ -410,14 +410,14 @@ func TestSmoke_DefaultVPN(t *testing.T) {
 			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", LineID: "my-vpn"},
 			},
 			DefaultLineID: "my-vpn",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -440,7 +440,7 @@ func TestSmoke_MultipleRuleSets(t *testing.T) {
 			{ID: "gfw", Name: "GFW", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com", "youtube.com"}},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "corp", LineID: "my-vpn"},
@@ -448,7 +448,7 @@ func TestSmoke_MultipleRuleSets(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -468,14 +468,14 @@ func TestSmoke_OnlyCIDR(t *testing.T) {
 			{ID: "private", Name: "私有网段", Type: RuleSetTypeManual, Enabled: true,
 				CIDRs: []string{"172.16.0.0/12"}},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "private", LineID: "my-vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -492,14 +492,14 @@ func TestSmoke_EmptyRuleSet(t *testing.T) {
 		RuleSets: []RuleSet{
 			{ID: "empty", Name: "空的", Type: RuleSetTypeManual, Enabled: true},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "empty", LineID: "my-vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -517,14 +517,14 @@ func TestSmoke_DisabledRuleSet(t *testing.T) {
 			{ID: "disabled", Name: "禁用的", Type: RuleSetTypeManual, Enabled: false,
 				Domains: []string{"should-not-match.com"}},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "disabled", LineID: "my-vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -552,14 +552,14 @@ func TestSmoke_URLJsonRuleSet(t *testing.T) {
 			{ID: "gfw", Name: "GFW", Type: RuleSetTypeURL, Enabled: true,
 				URL: "file://" + localRuleFile, Format: "json"},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", LineID: "my-vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -580,14 +580,14 @@ func TestSmoke_URLSrsRuleSet(t *testing.T) {
 				URL:    "https://raw.githubusercontent.com/lyc8503/sing-box-rules/rule-set-geosite/geosite-gfw.srs",
 				Format: "srs"},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", LineID: "my-vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -605,14 +605,14 @@ func TestSmoke_URLJsonFormat(t *testing.T) {
 			{ID: "cnip", Name: "国内IP", Type: RuleSetTypeURL, Enabled: true,
 				URL: "https://example.com/rule.json", Format: "json"},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "cnip", LineID: "my-vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	raw, err := GenerateSingBox(profile, 0, "")
@@ -671,14 +671,14 @@ func TestSmoke_URLRuleSetDedup(t *testing.T) {
 			{ID: "gfw", Name: "GFW", Type: RuleSetTypeURL, Enabled: true,
 				URL: "https://example.com/geosite-gfw.srs", Format: "srs"},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", LineID: "my-vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	raw, err := GenerateSingBox(profile, 0, "")
@@ -709,23 +709,23 @@ func TestSmoke_DirectBinding(t *testing.T) {
 		},
 		RuleSets: []RuleSet{
 			{ID: "china", Name: "国内", Type: RuleSetTypeManual, Enabled: true,
-				Domains: []string{"baidu.com", "qq.com"}},
+				Domains: []string{"cn-one.test", "cn-two.test"}},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "china", LineID: "direct"},
 			},
 			DefaultLineID: "my-vpn",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
 	defer r.stop()
 
-	r.requestAndAssert("baidu.com", "direct")
-	r.requestAndAssert("qq.com", "direct")
+	r.requestAndAssert("cn-one.test", "direct")
+	r.requestAndAssert("cn-two.test", "direct")
 	r.requestAndAssert("google.com", "vpn")
 }
 
@@ -741,12 +741,12 @@ func TestSmoke_NonexistentBinding(t *testing.T) {
 				{ID: "real", Name: "真实", Type: RuleSetTypeManual, Enabled: true,
 					Domains: []string{"real.local"}},
 			},
-			Modes: []Mode{{
+			Scenarios: []Scenario{{
 				ID:            "main",
 				Bindings:      []RuleBinding{{RuleSetID: "real", LineID: "my-vpn"}},
 				DefaultLineID: "direct",
 			}},
-			ActiveModeID: "main",
+			ActiveScenarioID: "main",
 		}
 	}
 
@@ -756,22 +756,22 @@ func TestSmoke_NonexistentBinding(t *testing.T) {
 		wantSub string
 	}{
 		{"missing rule set", func(p *Profile) {
-			p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+			p.Scenarios[0].Bindings = append(p.Scenarios[0].Bindings,
 				RuleBinding{RuleSetID: "nonexistent-ruleset", LineID: "my-vpn"})
 		}, "nonexistent-ruleset"},
 		{"missing line", func(p *Profile) {
-			p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+			p.Scenarios[0].Bindings = append(p.Scenarios[0].Bindings,
 				RuleBinding{RuleSetID: "real", LineID: "nonexistent-line"})
 		}, "nonexistent-line"},
 		{"missing subscription", func(p *Profile) {
-			p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+			p.Scenarios[0].Bindings = append(p.Scenarios[0].Bindings,
 				RuleBinding{RuleSetID: "real", SubscriptionID: "nonexistent-sub"})
 		}, "nonexistent-sub"},
 		{"missing default line", func(p *Profile) {
-			p.Modes[0].DefaultLineID = "nonexistent-default"
+			p.Scenarios[0].DefaultLineID = "nonexistent-default"
 		}, "nonexistent-default"},
 		{"binding without outbound", func(p *Profile) {
-			p.Modes[0].Bindings = append(p.Modes[0].Bindings, RuleBinding{RuleSetID: "real"})
+			p.Scenarios[0].Bindings = append(p.Scenarios[0].Bindings, RuleBinding{RuleSetID: "real"})
 		}, "neither a line nor a subscription"},
 	}
 
@@ -819,14 +819,14 @@ func TestSmoke_SubscribeBasic(t *testing.T) {
 					TrojanPassword: "p2", TrojanSNI: "us1.example.com"},
 			},
 		}},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -835,7 +835,7 @@ func TestSmoke_SubscribeBasic(t *testing.T) {
 	// 订阅 group 默认为 selector，默认选第一个节点
 	r.requestAndAssert("google.com", "proxy-sub1-n1")
 	r.requestAndAssert("youtube.com", "proxy-sub1-n1")
-	r.requestAndAssert("baidu.com", "direct")
+	r.requestAndAssert("unmatched.test", "direct")
 }
 
 func TestSmoke_SubscribeWithGroups(t *testing.T) {
@@ -871,29 +871,29 @@ func TestSmoke_SubscribeWithGroups(t *testing.T) {
 				{Type: "DOMAIN-SUFFIX", Value: "google.com", Group: "Proxies"},
 			},
 		}},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
 	defer r.stop()
 
-	// google → 模式显式绑定到订阅 → 订阅主策略组 Proxies → 默认第一个节点 HK 01
+	// google → 场景显式绑定到订阅 → 订阅主策略组 Proxies → 默认第一个节点 HK 01
 	r.requestAndAssert("google.com", "proxy-sub1-n1")
-	// netflix 没有模式绑定，落到订阅自带规则（兜底层）→ Streaming 策略组 → US 01。
-	// 顺序语义：模式规则在前、订阅自带规则在后，见 TestSmokeModeRuleOverridesSubscriptionRule。
+	// netflix 没有场景绑定，落到订阅自带规则（兜底层）→ Streaming 策略组 → US 01。
+	// 顺序语义：场景规则在前、订阅自带规则在后，见 TestSmokeScenarioRuleOverridesSubscriptionRule。
 	r.requestAndAssert("netflix.com", "proxy-sub1-n2")
 }
 
-// 同一个域名既被模式显式绑定、又被订阅自带规则命中时，必须由模式裁决。
-// 架构约束：Mode 是唯一裁决者，订阅只是供给源（D28），订阅规则不得抢在模式规则之前。
-func TestSmokeModeRuleOverridesSubscriptionRule(t *testing.T) {
+// 同一个域名既被场景显式绑定、又被订阅自带规则命中时，必须由场景裁决。
+// 架构约束：Scenario 是唯一裁决者，订阅只是供给源（D28），订阅规则不得抢在场景规则之前。
+func TestSmokeScenarioRuleOverridesSubscriptionRule(t *testing.T) {
 	profile := &Profile{
 		Lines: []Line{
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
@@ -910,19 +910,19 @@ func TestSmokeModeRuleOverridesSubscriptionRule(t *testing.T) {
 					TrojanServer: "hk1.example.com", TrojanPort: 443,
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
 			},
-			// 订阅自带规则把 netflix.com 判给 DIRECT，模式里用户把它绑到了订阅节点。
+			// 订阅自带规则把 netflix.com 判给 DIRECT，场景里用户把它绑到了订阅节点。
 			Rules: []SubscriptionRule{
 				{Type: "DOMAIN-SUFFIX", Value: "netflix.com", Group: "DIRECT"},
 			},
 		}},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "streaming", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -932,7 +932,7 @@ func TestSmokeModeRuleOverridesSubscriptionRule(t *testing.T) {
 }
 
 func TestSmoke_SubscribeMixed(t *testing.T) {
-	// 同一模式混用手动线路和订阅
+	// 同一场景混用手动线路和订阅
 	profile := &Profile{
 		Lines: []Line{
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
@@ -954,7 +954,7 @@ func TestSmoke_SubscribeMixed(t *testing.T) {
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
 			},
 		}},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "corp", LineID: "my-vpn"},      // 手动线路
@@ -962,7 +962,7 @@ func TestSmoke_SubscribeMixed(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -973,7 +973,7 @@ func TestSmoke_SubscribeMixed(t *testing.T) {
 	// gfw 走订阅节点
 	r.requestAndAssert("google.com", "proxy-sub1-n1")
 	// 未匹配走 direct
-	r.requestAndAssert("baidu.com", "direct")
+	r.requestAndAssert("unmatched.test", "direct")
 }
 
 func TestSmoke_SubscribeDefault(t *testing.T) {
@@ -995,14 +995,14 @@ func TestSmoke_SubscribeDefault(t *testing.T) {
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
 			},
 		}},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "corp", LineID: "my-vpn"},
 			},
 			DefaultSubscriptionID: "sub1",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -1034,14 +1034,14 @@ func TestSmoke_SubscribeDisabled(t *testing.T) {
 					TrojanPassword: "p1", TrojanSNI: "hk1.example.com"},
 			},
 		}},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -1052,7 +1052,8 @@ func TestSmoke_SubscribeDisabled(t *testing.T) {
 }
 
 func TestSmoke_SubscribeEmptyNodes(t *testing.T) {
-	// 订阅无有效节点时回退到 direct
+	// active enabled 订阅无有效节点时必须 fail-closed，不能把声明的
+	// 订阅出口静默改成 direct。
 	profile := &Profile{
 		Lines: []Line{
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
@@ -1065,20 +1066,24 @@ func TestSmoke_SubscribeEmptyNodes(t *testing.T) {
 			ID: "sub1", Name: "EmptySub", URL: "https://example.com/sub",
 			Format: "surge", Enabled: true, Strategy: "urltest",
 		}},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
-	r := newSmokeRunner(t, profile)
-	defer r.stop()
-
-	r.requestAndAssert("google.com", "direct")
+	_, err := GenerateSingBox(profile, 0, "")
+	if err == nil ||
+		!strings.Contains(err.Error(), "cannot generate an outbound") {
+		t.Fatalf(
+			"active empty Subscription must fail closed, got %v",
+			err,
+		)
+	}
 }
 
 func TestSmoke_SubscribeMultiSubscription(t *testing.T) {
@@ -1113,7 +1118,7 @@ func TestSmoke_SubscribeMultiSubscription(t *testing.T) {
 				},
 			},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", SubscriptionID: "sub-a"},
@@ -1121,7 +1126,7 @@ func TestSmoke_SubscribeMultiSubscription(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -1129,7 +1134,7 @@ func TestSmoke_SubscribeMultiSubscription(t *testing.T) {
 
 	r.requestAndAssert("google.com", "proxy-sub-a-n1")
 	r.requestAndAssert("netflix.com", "proxy-sub-b-n1")
-	r.requestAndAssert("baidu.com", "direct")
+	r.requestAndAssert("unmatched.test", "direct")
 }
 
 func TestSmoke_SubscribeUrltest(t *testing.T) {
@@ -1155,14 +1160,14 @@ func TestSmoke_SubscribeUrltest(t *testing.T) {
 					TrojanPassword: "p2", TrojanSNI: "us1.example.com"},
 			},
 		}},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "gfw", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)
@@ -1202,14 +1207,14 @@ func TestSmoke_SubscribeMultipleGroups(t *testing.T) {
 				{Name: "Auto", Type: "url-test", Proxies: []string{"AI", "Proxies"}},
 			},
 		}},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "ai", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "main",
+		ActiveScenarioID: "main",
 	}
 
 	r := newSmokeRunner(t, profile)

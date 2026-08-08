@@ -4,18 +4,30 @@ package libbox
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	tun "github.com/sagernet/sing-tun"
 	N "github.com/sagernet/sing/common/network"
 )
 
-const routingProbeZeroJSON = `{"direct_target_direct":0,"direct_target_vpn":0,"direct_target_other":0,"anyconnect_target_direct":0,"anyconnect_target_vpn":0,"anyconnect_target_other":0,"direct_target_tags":{},"anyconnect_target_tags":{}}`
+const routingProbeZeroJSON = `{"direct_target_direct":0,"direct_target_vpn":0,"direct_target_other":0,"anyconnect_target_direct":0,"anyconnect_target_vpn":0,"anyconnect_target_other":0,"direct_target_tags":{},"anyconnect_target_tags":{},"probe_id":"","match_count":0,"outbound_tag_counts":{}}`
+
+const (
+	transparentProxyInboundTag = "transparent-proxy-in"
+	maxRouteProbeHostnameBytes = 253
+	maxRouteProbeTimeoutMS     = 15_000
+)
 
 var (
 	directProbeTarget     = netip.MustParseAddr("1.0.0.1")
@@ -32,6 +44,9 @@ type routingProbeTracker struct {
 	tagCountsMu            sync.Mutex
 	directTargetTags       map[string]uint64
 	anyConnectTargetTags   map[string]uint64
+	experimentMu           sync.Mutex
+	experiment             *routingProbeExperiment
+	dnsSnapshotAddresses   map[string]map[netip.Addr]struct{}
 }
 
 type routingProbeSnapshot struct {
@@ -43,23 +58,75 @@ type routingProbeSnapshot struct {
 	AnyConnectTargetOther  uint64            `json:"anyconnect_target_other"`
 	DirectTargetTags       map[string]uint64 `json:"direct_target_tags"`
 	AnyConnectTargetTags   map[string]uint64 `json:"anyconnect_target_tags"`
+	ProbeID                string            `json:"probe_id"`
+	MatchCount             uint64            `json:"match_count"`
+	CandidateAddressCount  int               `json:"candidate_address_count,omitempty"`
+	OutboundTagCounts      map[string]uint64 `json:"outbound_tag_counts"`
+	RuleSetTag             string            `json:"rule_set_tag,omitempty"`
+}
+
+type routingProbeExperiment struct {
+	id                   string
+	hostname             string
+	hostnames            map[string]struct{}
+	addresses            map[netip.Addr]struct{}
+	matchCount           uint64
+	outboundTagCounts    map[string]uint64
+	ruleSetTag           string
+	ruleSetTagConsistent bool
+	timer                *time.Timer
 }
 
 func newRoutingProbeTracker() *routingProbeTracker {
 	return &routingProbeTracker{
 		directTargetTags:     make(map[string]uint64),
 		anyConnectTargetTags: make(map[string]uint64),
+		dnsSnapshotAddresses: make(map[string]map[netip.Addr]struct{}),
 	}
+}
+
+// replaceDNSSnapshotAddresses keeps only the address side of the same
+// in-memory Tailscale DNS snapshot used by the data plane. macOS resolves a
+// hostname before NETransparentProxyProvider receives the flow, so the public
+// remoteEndpoint often contains only an IP even though the system still knows
+// the original name. The debug route probe needs this bounded correlation to
+// attribute that real flow; it does not participate in routing decisions.
+func (t *routingProbeTracker) replaceDNSSnapshotAddresses(
+	hosts map[string][]netip.Addr,
+) {
+	next := make(map[string]map[netip.Addr]struct{}, len(hosts))
+	for rawHostname, addresses := range hosts {
+		hostname := strings.TrimSuffix(
+			strings.ToLower(strings.TrimSpace(rawHostname)),
+			".",
+		)
+		if hostname == "" {
+			continue
+		}
+		for _, address := range addresses {
+			if !address.IsValid() || address.Zone() != "" {
+				continue
+			}
+			if next[hostname] == nil {
+				next[hostname] = make(map[netip.Addr]struct{})
+			}
+			next[hostname][address.Unmap()] = struct{}{}
+		}
+	}
+
+	t.experimentMu.Lock()
+	t.dnsSnapshotAddresses = next
+	t.experimentMu.Unlock()
 }
 
 func (t *routingProbeTracker) RoutedConnection(
 	_ context.Context,
 	conn net.Conn,
 	metadata adapter.InboundContext,
-	_ adapter.Rule,
+	matchedRule adapter.Rule,
 	matchOutbound adapter.Outbound,
 ) net.Conn {
-	t.record(metadata, matchOutbound)
+	t.record(metadata, matchedRule, matchOutbound)
 	return conn
 }
 
@@ -67,29 +134,53 @@ func (t *routingProbeTracker) RoutedPacketConnection(
 	_ context.Context,
 	conn N.PacketConn,
 	metadata adapter.InboundContext,
-	_ adapter.Rule,
+	matchedRule adapter.Rule,
 	matchOutbound adapter.Outbound,
 ) N.PacketConn {
 	// URLSession may negotiate HTTP/3, so UDP/443 is equally valid route
 	// evidence. This callback is separate from RoutedConnection and therefore
 	// cannot double-count one transport.
-	t.record(metadata, matchOutbound)
+	t.record(metadata, matchedRule, matchOutbound)
 	return conn
 }
 
-func (t *routingProbeTracker) record(metadata adapter.InboundContext, matchOutbound adapter.Outbound) {
-	if metadata.Inbound != "tun-in" ||
-		metadata.InboundType != C.TypeTun ||
-		metadata.Destination.Port != 443 ||
+func (t *routingProbeTracker) RoutedFlow(
+	_ context.Context,
+	metadata adapter.InboundContext,
+	matchedRule adapter.Rule,
+	matchOutbound adapter.Outbound,
+) tun.FlowTracker {
+	t.record(metadata, matchedRule, matchOutbound)
+	return nil
+}
+
+func (t *routingProbeTracker) record(
+	metadata adapter.InboundContext,
+	matchedRule adapter.Rule,
+	matchOutbound adapter.Outbound,
+) {
+	tunIngress := metadata.Inbound == "tun-in" &&
+		metadata.InboundType == C.TypeTun
+	transparentProxyIngress :=
+		metadata.Inbound == transparentProxyInboundTag &&
+			metadata.InboundType == C.TypeSOCKS
+	if !tunIngress && !transparentProxyIngress {
+		return
+	}
+
+	outboundTag := ""
+	if matchOutbound != nil {
+		outboundTag = matchOutbound.Tag()
+	}
+	if transparentProxyIngress {
+		t.recordExperiment(metadata, matchedRule, outboundTag)
+	}
+	if metadata.Destination.Port != 443 ||
 		!metadata.Destination.Addr.IsValid() {
 		return
 	}
 
 	target := metadata.Destination.Addr.Unmap()
-	outboundTag := ""
-	if matchOutbound != nil {
-		outboundTag = matchOutbound.Tag()
-	}
 	switch target {
 	case directProbeTarget:
 		t.incrementTag(t.directTargetTags, outboundTag)
@@ -114,6 +205,72 @@ func (t *routingProbeTracker) record(metadata adapter.InboundContext, matchOutbo
 	}
 }
 
+func (t *routingProbeTracker) recordExperiment(
+	metadata adapter.InboundContext,
+	matchedRule adapter.Rule,
+	outboundTag string,
+) {
+	if metadata.Destination.Port != 443 {
+		return
+	}
+
+	t.experimentMu.Lock()
+	defer t.experimentMu.Unlock()
+	experiment := t.experiment
+	if experiment == nil || experiment.hostname == "" {
+		return
+	}
+	canonicalDestination := strings.TrimSuffix(
+		strings.ToLower(metadata.Destination.Fqdn),
+		".",
+	)
+	_, matchesHostname := experiment.hostnames[canonicalDestination]
+	matchesHostname = metadata.Destination.IsFqdn() && matchesHostname
+	_, matchesAddress := experiment.addresses[metadata.Destination.Addr.Unmap()]
+	if !matchesHostname &&
+		(!metadata.Destination.Addr.IsValid() || !matchesAddress) {
+		return
+	}
+	experiment.matchCount++
+	if outboundTag != "" {
+		experiment.outboundTagCounts[outboundTag]++
+	}
+	ruleSetTag := extractRoutingProbeRuleSetTag(matchedRule)
+	if ruleSetTag == "" {
+		experiment.ruleSetTagConsistent = false
+	} else if experiment.ruleSetTag == "" {
+		experiment.ruleSetTag = ruleSetTag
+	} else if experiment.ruleSetTag != ruleSetTag {
+		experiment.ruleSetTagConsistent = false
+	}
+}
+
+func extractRoutingProbeRuleSetTag(matchedRule adapter.Rule) string {
+	if matchedRule == nil || matchedRule.Type() != C.RuleTypeDefault {
+		return ""
+	}
+	const prefix = "rule_set="
+	raw := matchedRule.String()
+	if !strings.HasPrefix(raw, prefix) {
+		return ""
+	}
+	tag := strings.TrimPrefix(raw, prefix)
+	if tag == "" || len(tag) > 128 {
+		return ""
+	}
+	for _, character := range tag {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			character == '-' || character == '_' ||
+			character == '.' || character == ':' {
+			continue
+		}
+		return ""
+	}
+	return tag
+}
+
 func (t *routingProbeTracker) incrementTag(target map[string]uint64, tag string) {
 	t.tagCountsMu.Lock()
 	target[tag]++
@@ -131,6 +288,28 @@ func (t *routingProbeTracker) snapshot() routingProbeSnapshot {
 		anyConnectTargetTags[tag] = count
 	}
 	t.tagCountsMu.Unlock()
+	t.experimentMu.Lock()
+	probeID := ""
+	matchCount := uint64(0)
+	candidateAddressCount := 0
+	outboundTagCounts := make(map[string]uint64)
+	ruleSetTag := ""
+	if experiment := t.experiment; experiment != nil {
+		probeID = experiment.id
+		matchCount = experiment.matchCount
+		candidateAddressCount = len(experiment.addresses)
+		outboundTagCounts = make(
+			map[string]uint64,
+			len(experiment.outboundTagCounts),
+		)
+		for tag, count := range experiment.outboundTagCounts {
+			outboundTagCounts[tag] = count
+		}
+		if experiment.ruleSetTagConsistent {
+			ruleSetTag = experiment.ruleSetTag
+		}
+	}
+	t.experimentMu.Unlock()
 	return routingProbeSnapshot{
 		DirectTargetDirect:     t.directTargetDirect.Load(),
 		DirectTargetVPN:        t.directTargetVPN.Load(),
@@ -140,7 +319,128 @@ func (t *routingProbeTracker) snapshot() routingProbeSnapshot {
 		AnyConnectTargetOther:  t.anyConnectTargetOther.Load(),
 		DirectTargetTags:       directTargetTags,
 		AnyConnectTargetTags:   anyConnectTargetTags,
+		ProbeID:                probeID,
+		MatchCount:             matchCount,
+		CandidateAddressCount:  candidateAddressCount,
+		OutboundTagCounts:      outboundTagCounts,
+		RuleSetTag:             ruleSetTag,
 	}
+}
+
+func (t *routingProbeTracker) begin(
+	rawHostname string,
+	timeoutMS int,
+) (string, error) {
+	hostname, err := normalizeRoutingProbeHostname(rawHostname)
+	if err != nil {
+		return "", err
+	}
+	if timeoutMS <= 0 || timeoutMS > maxRouteProbeTimeoutMS {
+		return "", fmt.Errorf("route probe timeout is invalid")
+	}
+	var randomID [16]byte
+	if _, err := rand.Read(randomID[:]); err != nil {
+		return "", fmt.Errorf("create route probe ID: %w", err)
+	}
+	probeID := hex.EncodeToString(randomID[:])
+	addresses := make(map[netip.Addr]struct{})
+	hostnames := map[string]struct{}{hostname: {}}
+	t.experimentMu.Lock()
+	for address := range t.dnsSnapshotAddresses[hostname] {
+		addresses[address] = struct{}{}
+	}
+	// The system resolver may canonicalize a short SearchDomains alias before
+	// the flow reaches NETransparentProxyProvider. Correlate only full names
+	// whose complete address set is identical to the requested alias; an
+	// overlapping or different record remains deliberately unmatched.
+	if !strings.Contains(hostname, ".") && len(addresses) > 0 {
+		prefix := hostname + "."
+		for candidateHostname, candidateAddresses := range t.dnsSnapshotAddresses {
+			if strings.HasPrefix(candidateHostname, prefix) &&
+				equalRoutingProbeAddressSets(addresses, candidateAddresses) {
+				hostnames[candidateHostname] = struct{}{}
+			}
+		}
+	}
+	t.experimentMu.Unlock()
+	experiment := &routingProbeExperiment{
+		id:                   probeID,
+		hostname:             hostname,
+		hostnames:            hostnames,
+		addresses:            addresses,
+		outboundTagCounts:    make(map[string]uint64),
+		ruleSetTagConsistent: true,
+	}
+
+	t.experimentMu.Lock()
+	if t.experiment != nil && t.experiment.timer != nil {
+		t.experiment.timer.Stop()
+	}
+	t.experiment = experiment
+	experiment.timer = time.AfterFunc(
+		time.Duration(timeoutMS)*time.Millisecond,
+		func() {
+			t.experimentMu.Lock()
+			defer t.experimentMu.Unlock()
+			if t.experiment != experiment {
+				return
+			}
+			// The probe ID is the capability for this one observation window.
+			// Discard the whole experiment at the deadline so a later request
+			// cannot mistake an expired aggregate for current evidence.
+			t.experiment = nil
+		},
+	)
+	t.experimentMu.Unlock()
+	return probeID, nil
+}
+
+func equalRoutingProbeAddressSets(
+	left map[netip.Addr]struct{},
+	right map[netip.Addr]struct{},
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for address := range left {
+		if _, found := right[address]; !found {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeRoutingProbeHostname(rawHostname string) (string, error) {
+	if rawHostname == "" ||
+		len(rawHostname) > maxRouteProbeHostnameBytes ||
+		rawHostname != strings.TrimSpace(rawHostname) {
+		return "", fmt.Errorf("route probe hostname is invalid")
+	}
+	for index := range len(rawHostname) {
+		if rawHostname[index] > 0x7f {
+			return "", fmt.Errorf("route probe hostname is invalid")
+		}
+	}
+	hostname := strings.ToLower(rawHostname)
+	if _, err := netip.ParseAddr(hostname); err == nil {
+		return "", fmt.Errorf("route probe hostname is invalid")
+	}
+	for _, label := range strings.Split(hostname, ".") {
+		if label == "" || len(label) > 63 ||
+			label[0] == '-' || label[len(label)-1] == '-' {
+			return "", fmt.Errorf("route probe hostname is invalid")
+		}
+		for index := range len(label) {
+			character := label[index]
+			if (character >= 'a' && character <= 'z') ||
+				(character >= '0' && character <= '9') ||
+				character == '-' {
+				continue
+			}
+			return "", fmt.Errorf("route probe hostname is invalid")
+		}
+	}
+	return hostname, nil
 }
 
 func (t *routingProbeTracker) snapshotJSON() string {
@@ -161,4 +461,19 @@ func (l *Libbox) RoutingProbeSnapshot() string {
 		return routingProbeZeroJSON
 	}
 	return l.routingProbe.snapshotJSON()
+}
+
+// BeginRoutingProbe opens one bounded, in-memory observation window for a
+// caller-selected ASCII hostname on TCP/UDP 443. It never initiates traffic;
+// only the authenticated macOS Transparent Proxy ingress can satisfy it.
+func (l *Libbox) BeginRoutingProbe(
+	hostname string,
+	timeoutMS int,
+) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.running || l.routingProbe == nil {
+		return "", fmt.Errorf("connection is not running")
+	}
+	return l.routingProbe.begin(hostname, timeoutMS)
 }

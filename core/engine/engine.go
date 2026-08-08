@@ -51,6 +51,9 @@ type Engine struct {
 	statePath        string
 	profile          *config.Profile
 	reconnectCount   int
+	// detectDataPlaneUnderlay 可注入，确保单测能证明不兼容 Underlay 在任何线路启动前
+	// 被拒绝。零值回落到平台实现。
+	detectDataPlaneUnderlay func(context.Context) (string, error)
 
 	// 周期 DNS 自愈的句柄（见 StartDNSSelfHeal）。Close 时取消并等它真正退出。
 	dnsSelfHealCancel context.CancelFunc
@@ -62,11 +65,12 @@ type Engine struct {
 
 func New(basePath, statePath string, cb StatusCallback) *Engine {
 	return &Engine{
-		vpn:       NewVPNClient(),
-		dns:       newDNSTakeover(statePath),
-		callback:  cb,
-		basePath:  basePath,
-		statePath: statePath,
+		vpn:                     NewVPNClient(),
+		dns:                     newDNSTakeover(statePath),
+		callback:                cb,
+		basePath:                basePath,
+		statePath:               statePath,
+		detectDataPlaneUnderlay: detectDataPlaneUnderlayInterface,
 	}
 }
 
@@ -227,6 +231,14 @@ func (e *Engine) connect(ctx context.Context, profile *config.Profile) {
 }
 
 func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) error {
+	// D34 的入口能力检查必须是本次连接的第一个外部动作。AnyConnect 虽然不改系统
+	// 路由，但它会发起认证并持有会话；已知无法密封的入口不该先建立任何 Line。
+	underlayInterface, err := e.snapshotDataPlaneUnderlay(ctx)
+	if err != nil {
+		return fmt.Errorf("Underlay 不兼容: %w", err)
+	}
+	slog.Info("captured system Underlay", "interface", underlayInterface)
+
 	vpnLine := profile.ActiveVPNLine()
 	var bridge *VPNBridge
 	var socksAddr string
@@ -320,15 +332,17 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 		}
 	}
 
-	// 只转交操作系统在 XDial TUN 启动前已经选定的默认接口。不能等 sing-box
-	// auto_route 落地后再查，也不能让 sing-tun 的 darwin auto_detect_interface
-	// 代查：后者会跳过无网关 utun，破坏 Tailscale 等既有网络层。
-	underlayInterface, err := detectUnderlayInterface(ctx)
+	// Line 建立和规则预取期间 Underlay 可能变化。TUN 启动前重新读取一次；变化时整次
+	// 连接失败，不能拿一个过期接口快照启动数据面。
+	confirmedUnderlay, err := e.snapshotDataPlaneUnderlay(ctx)
 	if err != nil {
 		releasePartial()
-		return fmt.Errorf("Underlay 接口不可用: %w", err)
+		return fmt.Errorf("Underlay 不兼容: %w", err)
 	}
-	slog.Info("captured system Underlay", "interface", underlayInterface)
+	if confirmedUnderlay != underlayInterface {
+		releasePartial()
+		return fmt.Errorf("Underlay 在连接期间发生变化（%s → %s），请重试", underlayInterface, confirmedUnderlay)
+	}
 
 	singbox := NewSingBoxProcess(e.basePath, e.statePath, e.handleSingBoxExit)
 	if err := singbox.Start(prepared, socksAddr, vpnServerIP, enterpriseDNS, underlayInterface); err != nil {
@@ -336,30 +350,50 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 		return fmt.Errorf("sing-box 启动失败: %w", err)
 	}
 
+	// startConfig 只证明子进程已 spawn；内置 Tailscale endpoint 还要用同一份持久
+	// identity 重新启动自己的 tsnet runtime。它恢复 overlay 地址和 Exit Node 前，
+	// 所有命中该 Line 的请求都会失败。保持 Connecting，直到 sing-box 自己通过
+	// 结构化 Clash API 证明这条 outbound 能承载真实流量。
+	//
+	// 这段等待发生在资源正式提交到 Engine 之前，所以任何失败/用户取消都必须同时
+	// 停掉刚 spawn 的 sing-box。否则 Stop 看不到局部变量里的进程，会留下一个仍在
+	// 接管 TUN 的孤儿数据面。
+	resourcesCommitted := false
+	defer func() {
+		if !resourcesCommitted {
+			singbox.Stop()
+			releasePartial()
+		}
+	}()
+	if err := waitForActiveTailscaleEgress(ctx, prepared); err != nil {
+		return err
+	}
+
 	e.mu.Lock()
-	e.bridge = bridge
-	e.singbox = singbox
 	// 提交前在锁内复查取消信号：连接建立期间用户可能已点断开（Stop 持锁 cancel(ctx)
 	// 并把 status 置 Disconnected）。若不复查就 setStatus(Connected)，会把状态踩回已连接，
-	// 进而触发 monitorVPN 自动重连——表现为"用户断开后 VPN 自己又连上"。setStatus 也一并
-	// 移进锁内，保证"复查 ctx + 写 Connected"相对 Stop 原子。
+	// 进而触发 monitorVPN 自动重连——表现为"用户断开后 VPN 自己又连上"。
 	if ctx.Err() != nil {
-		e.cleanupLocked() // 清理刚建立的 bridge/singbox/socks，避免泄漏
 		e.mu.Unlock()
-		e.vpn.Disconnect()
 		return ctx.Err()
 	}
-	e.setStatus(StatusConnected)
+
 	// 接管系统 DNS。位置有两个约束：
-	//  1. 必须在状态提交为 Connected 之后——此刻 tun 已在转发，指过去的查询能被
-	//     hijack-dns 接住。"能不能接住"由 Takeover 内部的路由就绪探测再确认一遍
-	//     （最多 3 秒，之后跳过接管），所以这里最坏会多持锁几秒，是有上限的；
+	//  1. 必须在提交 Connected 之前。此刻 sing-box 已通过出口就绪探测，但用户态闭环
+	//     尚未宣告成立；Takeover 再确认系统 DNS 确实能进入 tun。DNS 仍在盒外就把状态
+	//     标成 Connected，会制造“看起来连接成功，域名规则实际未生效”的假连接；
 	//  2. 必须仍在 e.mu 之内——放到锁外的话，正好在此刻点断开会让 Stop 的恢复先跑完，
 	//     接管随后才落地，系统 DNS 就永久留在已消失的 tun 上。持锁让 Stop 必然排在
 	//     接管之后，它的 cleanupLocked 一定能恢复。
-	// 失败不是致命错：退回的正是接管前的现状（查询绕过 tun、结果可能被污染、按域名
-	// 分流不准），连接必须保持，绝不能因此断开。
-	e.takeoverDNSLocked()
+	if err := e.takeoverDNSLocked(); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+
+	e.bridge = bridge
+	e.singbox = singbox
+	resourcesCommitted = true
+	e.setStatus(StatusConnected)
 	e.mu.Unlock()
 
 	if closeCh != nil {
@@ -368,18 +402,28 @@ func (e *Engine) connectInternal(ctx context.Context, profile *config.Profile) e
 	return nil
 }
 
+func (e *Engine) snapshotDataPlaneUnderlay(ctx context.Context) (string, error) {
+	detect := e.detectDataPlaneUnderlay
+	if detect == nil {
+		detect = detectDataPlaneUnderlayInterface
+	}
+	return detect(ctx)
+}
+
 // takeoverDNSLocked 在开关允许时接管系统 DNS。调用方必须持 e.mu（见 connectInternal
 // 里那段关于"必须仍在锁内"的说明）。开关关闭时一条命令都不发。
-func (e *Engine) takeoverDNSLocked() {
+//
+// daemon 打开接管开关后，失败就是数据面未密封：域名解析仍在盒外，Scenario 的域名规则
+// 无法保证生效。必须让本次连接失败，不能只发警告后继续显示 Connected。
+func (e *Engine) takeoverDNSLocked() error {
 	if !e.allowDNSTakeover {
-		return
+		return nil
 	}
 	if err := e.dns.Takeover(); err != nil {
 		slog.Warn("system DNS takeover failed", "err", err)
-		if e.callback != nil {
-			e.callback.OnError(2, "系统 DNS 接管失败，按域名分流可能不准："+err.Error())
-		}
+		return fmt.Errorf("系统 DNS 接管失败，已取消连接以避免错误分流: %w", err)
 	}
+	return nil
 }
 
 // handleSingBoxExit 处理 sing-box 子进程的非正常退出。`sing-box check` 只做

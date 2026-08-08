@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/kafeifei/xdial/core/engine"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
@@ -108,12 +107,12 @@ func newMobileDNSTransport(
 		transportManager: transportManager,
 		options:          options,
 	}
-	if bridge := service.FromContext[*engine.VPNBridge](ctx); bridge != nil {
+	if line := service.FromContext[*anyConnectLineRuntime](ctx); line != nil {
 		// Bridge 存在就保持企业 DNS 的 fail-closed 语义。即便服务端没有
 		// 下发 resolver，也安装一个空 exchanger，让查询在运行时明确失败；
 		// 不能因为 resolver 列表为空而旁路到公共 DNS。
 		transport.enterpriseRequired = true
-		transport.enterprise = newBridgeDNSExchanger(bridge, snapshotTunnelDNS())
+		transport.enterprise = line
 	}
 	return transport, nil
 }
@@ -188,6 +187,17 @@ func (t *mobileDNSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*
 		return nil, errMobileDNSFailed
 	}
 	return response, nil
+}
+
+func (t *mobileDNSTransport) ExchangeAsync(
+	ctx context.Context,
+	message *mDNS.Msg,
+	callback func(response *mDNS.Msg, err error),
+) {
+	go func() {
+		response, err := t.Exchange(ctx, message)
+		callback(response, err)
+	}()
 }
 
 func selectMobileDNSTransport(

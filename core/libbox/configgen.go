@@ -3,6 +3,9 @@
 package libbox
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,16 +14,140 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/kafeifei/xdial/core/config"
 	"github.com/kafeifei/xdial/core/subscription"
+	"github.com/sagernet/sing-box/common/srs"
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/option"
 )
 
 const maxNEConfigBytes = 2 * 1024 * 1024
 const maxNERuleSetBytes int64 = 1 * 1024 * 1024
+const neRuleSetCacheFreshFor = 24 * time.Hour
 
 type neRuleSetFetcher func(string, int64) ([]byte, error)
+
+// ConnectionPreparationCallback is the gomobile-safe structured progress
+// channel used while Go prepares active RuleSets. Events contain stable task IDs
+// from ConnectionPlan and never contain URLs, credentials, or rule contents.
+type ConnectionPreparationCallback interface {
+	OnPreparationEvent(eventJSON string)
+}
+
+type connectionPreparationEvent struct {
+	TaskID  string `json:"task_id"`
+	State   string `json:"state"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+type connectionPreparationSink func(connectionPreparationEvent)
+
+type transparentProxySession struct {
+	ConfigJSON string                 `json:"config_json"`
+	Plan       *config.ConnectionPlan `json:"plan"`
+	// ApplicationProcessCredentials is the active Scenario's ordered Surge-style
+	// process selector → derived SOCKS username list. It is session-only and
+	// lets the Provider pick the matching native SOCKS user without reproducing
+	// Go's derivation.
+	ApplicationProcessCredentials []config.ApplicationSOCKSCredential `json:"application_process_credentials,omitempty"`
+	// LineOutbounds is a capability map for this exact active ConnectionPlan.
+	// It contains no endpoint or credential material and intentionally excludes
+	// enabled Lines that the active Scenario did not reference.
+	LineOutbounds map[string]string `json:"line_outbounds"`
+	// LineRuntimeIdentities is a Provider-memory-only capability identity map.
+	// Values are opaque hashes over effective connection parameters (including
+	// credentials) and intentionally exclude Line ID/name. They never enter the
+	// credential-free ConnectionPlan/ConnectionReport or any diagnostics API.
+	LineRuntimeIdentities map[string]string `json:"line_runtime_identities"`
+	// SubscriptionOutbounds carries the exact route-visible outbound tags
+	// returned by the same generator catalog that built this session's data
+	// plane. It is restricted to subscription tasks in this exact
+	// ConnectionPlan.
+	SubscriptionOutbounds map[string][]string         `json:"subscription_outbounds"`
+	RuleSetTags           []string                    `json:"rule_set_tags"`
+	AnyConnect            *transparentProxyAnyConnect `json:"anyconnect,omitempty"`
+	Tailscale             *transparentProxyTailscale  `json:"tailscale,omitempty"`
+}
+
+type transparentProxyRuleSetRefresh struct {
+	RuleSetID    string `json:"rule_set_id"`
+	URL          string `json:"url"`
+	LocalPath    string `json:"local_path"`
+	InputFormat  string `json:"input_format"`
+	StoredFormat string `json:"stored_format"`
+	OutboundTag  string `json:"outbound_tag"`
+	ResolverTag  string `json:"resolver_tag"`
+}
+
+type pendingNERuleSetRefresh struct {
+	RuleSetID    string
+	URL          string
+	LocalPath    string
+	InputFormat  string
+	StoredFormat string
+	FetchLineID  string
+}
+
+type transparentProxyRuleSetBootstrap struct {
+	PreflightSessions  []transparentProxyRuleSetBootstrapSession `json:"preflight_sessions,omitempty"`
+	BackgroundSessions []transparentProxyRuleSetBootstrapSession `json:"background_sessions,omitempty"`
+}
+
+type transparentProxyRuleSetBootstrapSession struct {
+	ConfigJSON  string                           `json:"config_json"`
+	LineID      string                           `json:"line_id"`
+	OutboundTag string                           `json:"outbound_tag"`
+	Refreshes   []transparentProxyRuleSetRefresh `json:"refreshes"`
+	ReuseActive bool                             `json:"reuse_active"`
+	AnyConnect  *transparentProxyAnyConnect      `json:"anyconnect,omitempty"`
+	Tailscale   *transparentProxyTailscale       `json:"tailscale,omitempty"`
+}
+
+type transparentProxyRuleSetBootstrapGroup struct {
+	LineID    string
+	Preflight bool
+	Refreshes []pendingNERuleSetRefresh
+}
+
+type transparentProxyAnyConnect struct {
+	LineID        string `json:"line_id"`
+	Server        string `json:"server"`
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	AllowInsecure bool   `json:"allow_insecure"`
+}
+
+type transparentProxyTailscale struct {
+	EndpointTag     string `json:"endpoint_tag"`
+	ExitNode        string `json:"exit_node"`
+	MagicDNSEnabled bool   `json:"magic_dns_enabled"`
+	DNSServerTag    string `json:"dns_server_tag,omitempty"`
+}
+
+// GenerateConnectionPlan compiles the active Scenario into a side-effect-free,
+// credential-free connection checklist. The host calls it before starting the
+// Network Extension so planning failures cannot leave session resources behind.
+func GenerateConnectionPlan(profileJSON string) (string, error) {
+	profile, err := config.ParseProfile([]byte(profileJSON))
+	if err != nil {
+		return "", err
+	}
+	plan, err := config.BuildConnectionPlan(profile)
+	if err != nil {
+		return "", err
+	}
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		return "", fmt.Errorf("encode connection plan: %w", err)
+	}
+	return string(encoded), nil
+}
 
 // GenerateNEConfig 供 Swift App 侧调用:把当前 Profile(JSON,字段与 core/config.Profile
 // 兼容 —— 即 macOS 版 AppState.buildProfileJSON() 同款格式)转换成 NE 模式的 sing-box
@@ -37,6 +164,762 @@ type neRuleSetFetcher func(string, int64) ([]byte, error)
 // cache_file 的绝对路径,必须是扩展进程可写的目录。
 func GenerateNEConfig(profileJSON string, vpnServerIP string, basePath string) (string, error) {
 	return generateNEConfig(profileJSON, vpnServerIP, basePath, config.PlatformNE)
+}
+
+// GenerateTransparentProxySession 供 macOS Transparent Proxy 扩展调用。
+// 返回值只存在于本次 NE start options / 扩展内存中；其中的 AnyConnect 凭据不得写入
+// NETunnelProviderProtocol.providerConfiguration、日志或诊断接口。
+func GenerateTransparentProxySession(
+	profileJSON string,
+	basePath string,
+	listenPort int,
+	socksUsername string,
+	socksPassword string,
+	underlayInterface string,
+	systemDNSJSON string,
+) (string, error) {
+	return generateTransparentProxySession(
+		profileJSON,
+		basePath,
+		listenPort,
+		socksUsername,
+		socksPassword,
+		underlayInterface,
+		systemDNSJSON,
+		nil,
+	)
+}
+
+// GenerateTransparentProxySessionWithCallback is identical to
+// GenerateTransparentProxySession, but reports exact RuleSet preparation
+// transitions to the Network Extension transaction journal.
+func GenerateTransparentProxySessionWithCallback(
+	profileJSON string,
+	basePath string,
+	listenPort int,
+	socksUsername string,
+	socksPassword string,
+	underlayInterface string,
+	systemDNSJSON string,
+	callback ConnectionPreparationCallback,
+) (string, error) {
+	var sink connectionPreparationSink
+	if callback != nil {
+		sink = func(event connectionPreparationEvent) {
+			encoded, err := json.Marshal(event)
+			if err == nil {
+				callback.OnPreparationEvent(string(encoded))
+			}
+		}
+	}
+	return generateTransparentProxySession(
+		profileJSON,
+		basePath,
+		listenPort,
+		socksUsername,
+		socksPassword,
+		underlayInterface,
+		systemDNSJSON,
+		sink,
+	)
+}
+
+// GenerateTransparentProxyRuleSetBootstrap returns isolated acquisition
+// sessions for active URL RuleSets. Missing caches are fetched before system
+// takeover; stale validated caches are refreshed only after the formal traffic
+// session commits. A session carries no Scenario bindings, so its Line can never
+// become a user-traffic policy by accident.
+func GenerateTransparentProxyRuleSetBootstrap(
+	profileJSON string,
+	basePath string,
+	listenPort int,
+	socksUsername string,
+	socksPassword string,
+	underlayInterface string,
+	systemDNSJSON string,
+) (string, error) {
+	profile, err := config.ParseProfile([]byte(profileJSON))
+	if err != nil {
+		return "", err
+	}
+	scenario := profile.ActiveScenario()
+	if scenario == nil {
+		return "", fmt.Errorf("no active scenario")
+	}
+	trafficPlan, err := config.BuildConnectionPlan(profile)
+	if err != nil {
+		return "", err
+	}
+	trafficLineOutbounds, err := activeLineOutbounds(profile, trafficPlan)
+	if err != nil {
+		return "", err
+	}
+	ruleDir, err := prepareNERuleSetDirectory(basePath)
+	if err != nil {
+		return "", err
+	}
+	var systemDNS []string
+	if err := json.Unmarshal([]byte(systemDNSJSON), &systemDNS); err != nil {
+		return "", fmt.Errorf("decode system DNS snapshot: %w", err)
+	}
+
+	groups := make(map[string]*transparentProxyRuleSetBootstrapGroup)
+	var groupOrder []string
+	seenRules := make(map[string]bool)
+	for _, binding := range scenario.Bindings {
+		rule := profile.FindRuleSet(binding.RuleSetID)
+		if rule == nil || !rule.Enabled || rule.Type != config.RuleSetTypeURL || seenRules[rule.ID] {
+			continue
+		}
+		seenRules[rule.ID] = true
+		inputFormat := neRuleSetFormat(rule)
+		storedFormat := inputFormat
+		if storedFormat == "text" {
+			storedFormat = "source"
+		}
+		localPath := neRuleSetCachePath(
+			ruleDir,
+			"profile",
+			rule.ID,
+			rule.URL,
+			inputFormat,
+			storedFormat,
+		)
+		_, _, cacheInfo, cacheErr := readValidatedNERuleSet(
+			localPath,
+			storedFormat,
+			maxNERuleSetBytes,
+		)
+		if cacheErr == nil && time.Since(cacheInfo.ModTime()) <= neRuleSetCacheFreshFor {
+			continue
+		}
+		lineID := rule.EffectiveFetchLineID()
+		preflight := cacheErr != nil
+		key := fmt.Sprintf("%t\x00%s", preflight, lineID)
+		group := groups[key]
+		if group == nil {
+			group = &transparentProxyRuleSetBootstrapGroup{
+				LineID:    lineID,
+				Preflight: preflight,
+			}
+			groups[key] = group
+			groupOrder = append(groupOrder, key)
+		}
+		group.Refreshes = append(group.Refreshes, pendingNERuleSetRefresh{
+			RuleSetID:    rule.ID,
+			URL:          rule.URL,
+			LocalPath:    localPath,
+			InputFormat:  inputFormat,
+			StoredFormat: storedFormat,
+			FetchLineID:  lineID,
+		})
+	}
+
+	bootstrap := transparentProxyRuleSetBootstrap{}
+	for _, key := range groupOrder {
+		group := groups[key]
+		lineID := group.LineID
+		encodedProfile, err := json.Marshal(profile)
+		if err != nil {
+			return "", fmt.Errorf("encode RuleSet bootstrap profile: %w", err)
+		}
+		var isolated config.Profile
+		if err := json.Unmarshal(encodedProfile, &isolated); err != nil {
+			return "", fmt.Errorf("clone RuleSet bootstrap profile: %w", err)
+		}
+		isolatedScenario := isolated.ActiveScenario()
+		if isolatedScenario == nil {
+			return "", fmt.Errorf("RuleSet bootstrap scenario is unavailable")
+		}
+		isolatedScenario.Bindings = nil
+		isolatedScenario.DefaultLineID = lineID
+		isolatedScenario.DefaultSubscriptionID = ""
+		isolated.RuleSets = nil
+		isolated.Subscriptions = nil
+		plan, err := config.BuildConnectionPlan(&isolated)
+		if err != nil {
+			return "", err
+		}
+		data, err := config.GenerateSingBoxTransparentProxy(
+			&isolated,
+			listenPort,
+			socksUsername,
+			socksPassword,
+			basePath,
+			underlayInterface,
+			systemDNS,
+		)
+		if err != nil {
+			return "", err
+		}
+		data, err = removeTransparentProxyBootstrapIngress(data)
+		if err != nil {
+			return "", err
+		}
+		lineOutbounds, err := activeLineOutbounds(&isolated, plan)
+		if err != nil {
+			return "", err
+		}
+		outboundTag := lineOutbounds[lineID]
+		if outboundTag == "" {
+			return "", fmt.Errorf("RuleSet bootstrap Line has no runtime outbound")
+		}
+		refreshes, err := transparentProxyRuleSetRefreshes(group.Refreshes, lineOutbounds)
+		if err != nil {
+			return "", err
+		}
+		session := transparentProxyRuleSetBootstrapSession{
+			ConfigJSON:  string(data),
+			LineID:      lineID,
+			OutboundTag: outboundTag,
+			Refreshes:   refreshes,
+			ReuseActive: lineID == "direct" ||
+				trafficLineOutbounds[lineID] == outboundTag,
+		}
+		if line := isolated.ActiveVPNLine(); line != nil {
+			if strings.TrimSpace(line.VPNServer) == "" ||
+				strings.TrimSpace(line.VPNUsername) == "" ||
+				line.VPNPassword == "" {
+				return "", fmt.Errorf("RuleSet acquisition AnyConnect credentials are missing")
+			}
+			session.AnyConnect = &transparentProxyAnyConnect{
+				LineID:        line.ID,
+				Server:        line.VPNServer,
+				Username:      line.VPNUsername,
+				Password:      line.VPNPassword,
+				AllowInsecure: line.AllowInsecure,
+			}
+		}
+		tailscaleLine, err := config.ActiveTailscaleLine(&isolated)
+		if err != nil {
+			return "", err
+		}
+		if tailscaleLine != nil {
+			exitNode := strings.TrimSpace(tailscaleLine.TailscaleExitNode)
+			if exitNode == "" {
+				return "", fmt.Errorf("RuleSet acquisition Tailscale exit node is missing")
+			}
+			endpointTag := ""
+			for _, member := range config.BuildLineRuntimeCatalog(&isolated).Lines {
+				if member.ID == tailscaleLine.ID {
+					endpointTag = member.Tag
+					break
+				}
+			}
+			if endpointTag == "" {
+				return "", fmt.Errorf("RuleSet acquisition Tailscale endpoint is missing")
+			}
+			dnsServerTag := ""
+			if tailscaleLine.TailscaleMagicDNS {
+				dnsServerTag = config.TailscaleMagicDNSDNSServerTag(endpointTag)
+			}
+			session.Tailscale = &transparentProxyTailscale{
+				EndpointTag:     endpointTag,
+				ExitNode:        exitNode,
+				MagicDNSEnabled: tailscaleLine.TailscaleMagicDNS,
+				DNSServerTag:    dnsServerTag,
+			}
+		}
+		if group.Preflight {
+			bootstrap.PreflightSessions = append(bootstrap.PreflightSessions, session)
+		} else {
+			bootstrap.BackgroundSessions = append(bootstrap.BackgroundSessions, session)
+		}
+	}
+	encoded, err := json.Marshal(bootstrap)
+	if err != nil {
+		return "", fmt.Errorf("encode RuleSet bootstrap sessions: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func removeTransparentProxyBootstrapIngress(data []byte) ([]byte, error) {
+	var document map[string]interface{}
+	if err := json.Unmarshal(data, &document); err != nil {
+		return nil, fmt.Errorf("decode RuleSet acquisition config: %w", err)
+	}
+	document["inbounds"] = []interface{}{}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode RuleSet acquisition config: %w", err)
+	}
+	return encoded, nil
+}
+
+func generateTransparentProxySession(
+	profileJSON string,
+	basePath string,
+	listenPort int,
+	socksUsername string,
+	socksPassword string,
+	underlayInterface string,
+	systemDNSJSON string,
+	progress connectionPreparationSink,
+) (string, error) {
+	profile, err := config.ParseProfile([]byte(profileJSON))
+	if err != nil {
+		return "", err
+	}
+	plan, err := config.BuildConnectionPlan(profile)
+	if err != nil {
+		return "", err
+	}
+	ruleDir, err := prepareNERuleSetDirectory(basePath)
+	if err != nil {
+		return "", err
+	}
+	_, err = materializeNERuleSetsWithRefreshEvents(
+		profile,
+		basePath,
+		nil,
+		progress,
+	)
+	if err != nil {
+		return "", err
+	}
+	var systemDNS []string
+	if err := json.Unmarshal([]byte(systemDNSJSON), &systemDNS); err != nil {
+		return "", fmt.Errorf("decode system DNS snapshot: %w", err)
+	}
+	data, err := config.GenerateSingBoxTransparentProxy(
+		profile,
+		listenPort,
+		socksUsername,
+		socksPassword,
+		basePath,
+		underlayInterface,
+		systemDNS,
+	)
+	if err != nil {
+		return "", err
+	}
+	data, err = materializeGeneratedNERuleSetsWithEvents(
+		data,
+		ruleDir,
+		subscription.FetchStrictBytes,
+		progress,
+	)
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxNEConfigBytes {
+		return "", fmt.Errorf("generated NetworkExtension config exceeds %d-byte limit", maxNEConfigBytes)
+	}
+	applicationProcessCredentials, err := config.ActiveApplicationSOCKSCredentials(profile, socksUsername)
+	if err != nil {
+		return "", err
+	}
+
+	session := transparentProxySession{
+		ConfigJSON:                    string(data),
+		Plan:                          plan,
+		ApplicationProcessCredentials: applicationProcessCredentials,
+	}
+	session.LineOutbounds, err = activeLineOutbounds(profile, plan)
+	if err != nil {
+		return "", err
+	}
+	session.LineRuntimeIdentities, err = activeLineRuntimeIdentities(
+		profile,
+		plan,
+	)
+	if err != nil {
+		return "", err
+	}
+	session.SubscriptionOutbounds, err = activeSubscriptionOutbounds(profile, plan)
+	if err != nil {
+		return "", err
+	}
+	session.RuleSetTags, err = activeRouteRuleSetTags(data)
+	if err != nil {
+		return "", err
+	}
+	if line := profile.ActiveVPNLine(); line != nil {
+		if strings.TrimSpace(line.VPNServer) == "" {
+			return "", fmt.Errorf("AnyConnect server is missing")
+		}
+		if strings.TrimSpace(line.VPNUsername) == "" || line.VPNPassword == "" {
+			return "", fmt.Errorf("AnyConnect credentials are missing")
+		}
+		session.AnyConnect = &transparentProxyAnyConnect{
+			LineID:        line.ID,
+			Server:        line.VPNServer,
+			Username:      line.VPNUsername,
+			Password:      line.VPNPassword,
+			AllowInsecure: line.AllowInsecure,
+		}
+	}
+	tailscaleLine, err := config.ActiveTailscaleLine(profile)
+	if err != nil {
+		return "", err
+	}
+	if tailscaleLine != nil {
+		exitNode := strings.TrimSpace(tailscaleLine.TailscaleExitNode)
+		if exitNode == "" {
+			return "", fmt.Errorf("Tailscale exit node is missing")
+		}
+		var endpointTag string
+		for _, member := range config.BuildLineRuntimeCatalog(profile).Lines {
+			if member.ID == tailscaleLine.ID {
+				endpointTag = member.Tag
+				break
+			}
+		}
+		if endpointTag == "" {
+			return "", fmt.Errorf("Tailscale runtime endpoint is missing")
+		}
+		dnsServerTag := ""
+		if tailscaleLine.TailscaleMagicDNS {
+			dnsServerTag = config.TailscaleMagicDNSDNSServerTag(endpointTag)
+		}
+		session.Tailscale = &transparentProxyTailscale{
+			EndpointTag:     endpointTag,
+			ExitNode:        exitNode,
+			MagicDNSEnabled: tailscaleLine.TailscaleMagicDNS,
+			DNSServerTag:    dnsServerTag,
+		}
+	}
+	encoded, err := json.Marshal(session)
+	if err != nil {
+		return "", fmt.Errorf("encode Transparent Proxy session: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func activeLineOutbounds(
+	profile *config.Profile,
+	plan *config.ConnectionPlan,
+) (map[string]string, error) {
+	runtimeTags := make(map[string]string)
+	for _, member := range config.BuildLineRuntimeCatalog(profile).Lines {
+		runtimeTags[member.ID] = member.Tag
+	}
+
+	active := make(map[string]string)
+	for _, task := range plan.Tasks {
+		if task.Kind != config.ConnectionTaskLine {
+			continue
+		}
+		lineID := strings.TrimSpace(task.ResourceID)
+		if lineID == "" {
+			return nil, fmt.Errorf("active Line capability is missing an ID")
+		}
+		tag := runtimeTags[lineID]
+		if task.ResourceType == string(config.LineTypeDirect) {
+			// BuildConnectionPlan may synthesize the built-in Direct Line when
+			// the Profile omits it, so it is not necessarily in the full catalog.
+			tag = "direct"
+		}
+		if tag == "" {
+			return nil, fmt.Errorf("active Line %q has no runtime outbound", lineID)
+		}
+		if existing, loaded := active[lineID]; loaded && existing != tag {
+			return nil, fmt.Errorf("active Line %q has conflicting runtime outbounds", lineID)
+		}
+		active[lineID] = tag
+	}
+	return active, nil
+}
+
+const lineRuntimeIdentityPrefix = "line-runtime-v1:"
+
+var (
+	lineRuntimeIdentityKeyOnce sync.Once
+	lineRuntimeIdentityKey     [sha256.Size]byte
+	lineRuntimeIdentityKeyErr  error
+)
+
+type lineRuntimeIdentityMaterial struct {
+	Type          config.LineType `json:"type"`
+	Configuration interface{}     `json:"configuration,omitempty"`
+}
+
+// activeLineRuntimeIdentities derives reuse identities from the same active
+// Line task closure used by ConnectionPlan. The digest is keyed by a random
+// process-local secret, so even accidental disclosure cannot be used as a
+// stable credential verifier outside the Provider process. It does not use
+// Line ID as input:
+// renaming/reordering a Line or moving identical connection parameters to a new
+// ID must not force a protocol reconnect. Conversely, every effective dial,
+// authentication and transport field is included so a changed capability can
+// never borrow the old live session.
+func activeLineRuntimeIdentities(
+	profile *config.Profile,
+	plan *config.ConnectionPlan,
+) (map[string]string, error) {
+	identities := make(map[string]string)
+	for _, task := range plan.Tasks {
+		if task.Kind != config.ConnectionTaskLine {
+			continue
+		}
+		lineID := strings.TrimSpace(task.ResourceID)
+		if lineID == "" {
+			return nil, fmt.Errorf("active Line identity is missing an ID")
+		}
+		line := profile.FindLine(lineID)
+		if task.ResourceType == string(config.LineTypeDirect) && line == nil {
+			line = &config.Line{Type: config.LineTypeDirect, Enabled: true}
+		}
+		if line == nil || !line.Enabled {
+			return nil, fmt.Errorf(
+				"active Line %q has no runtime identity",
+				lineID,
+			)
+		}
+		identity, err := lineRuntimeIdentity(profile, line)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"active Line %q runtime identity: %w",
+				lineID,
+				err,
+			)
+		}
+		identities[lineID] = identity
+	}
+	return identities, nil
+}
+
+func lineRuntimeIdentity(
+	profile *config.Profile,
+	line *config.Line,
+) (string, error) {
+	if profile == nil || line == nil {
+		return "", fmt.Errorf("Line is unavailable")
+	}
+	material := lineRuntimeIdentityMaterial{Type: line.Type}
+	switch line.Type {
+	case config.LineTypeDirect:
+		material.Configuration = struct{}{}
+	case config.LineTypeVPN:
+		material.Configuration = struct {
+			Server        string `json:"server"`
+			Username      string `json:"username"`
+			Password      string `json:"password"`
+			AllowInsecure bool   `json:"allow_insecure"`
+		}{
+			Server:        line.VPNServer,
+			Username:      line.VPNUsername,
+			Password:      line.VPNPassword,
+			AllowInsecure: line.AllowInsecure,
+		}
+	case config.LineTypeTrojan:
+		material.Configuration = struct {
+			Server        string `json:"server"`
+			Port          int    `json:"port"`
+			Password      string `json:"password"`
+			SNI           string `json:"sni"`
+			AllowInsecure bool   `json:"allow_insecure"`
+			TFO           bool   `json:"tfo"`
+			UDP           bool   `json:"udp"`
+		}{
+			Server:        line.TrojanServer,
+			Port:          line.TrojanPort,
+			Password:      line.TrojanPassword,
+			SNI:           line.TrojanSNI,
+			AllowInsecure: line.AllowInsecure,
+			TFO:           line.TFO,
+			UDP:           line.UDP,
+		}
+	case config.LineTypeShadowsocks:
+		material.Configuration = struct {
+			Server   string `json:"server"`
+			Port     int    `json:"port"`
+			Method   string `json:"method"`
+			Password string `json:"password"`
+			TFO      bool   `json:"tfo"`
+			UDP      bool   `json:"udp"`
+		}{
+			Server:   line.SSServer,
+			Port:     line.SSPort,
+			Method:   line.SSMethod,
+			Password: line.SSPass,
+			TFO:      line.TFO,
+			UDP:      line.UDP,
+		}
+	case config.LineTypeVMess:
+		material.Configuration = struct {
+			Server string `json:"server"`
+			Port   int    `json:"port"`
+			UUID   string `json:"uuid"`
+			AltID  int    `json:"alter_id"`
+			TFO    bool   `json:"tfo"`
+			UDP    bool   `json:"udp"`
+		}{
+			Server: line.VMessServer,
+			Port:   line.VMessPort,
+			UUID:   line.VMessUUID,
+			AltID:  line.VMessAltID,
+			TFO:    line.TFO,
+			UDP:    line.UDP,
+		}
+	case config.LineTypeAnyTLS:
+		material.Configuration = struct {
+			Server                   string   `json:"server"`
+			Port                     int      `json:"port"`
+			Password                 string   `json:"password"`
+			SNI                      string   `json:"sni"`
+			ClientFingerprint        string   `json:"client_fingerprint"`
+			ALPN                     []string `json:"alpn"`
+			IdleSessionCheckInterval int      `json:"idle_session_check_interval"`
+			IdleSessionTimeout       int      `json:"idle_session_timeout"`
+			MinIdleSession           int      `json:"min_idle_session"`
+			AllowInsecure            bool     `json:"allow_insecure"`
+		}{
+			Server:                   line.AnyTLSServer,
+			Port:                     line.AnyTLSPort,
+			Password:                 line.AnyTLSPassword,
+			SNI:                      line.AnyTLSSNI,
+			ClientFingerprint:        line.AnyTLSClientFingerprint,
+			ALPN:                     line.AnyTLSALPN,
+			IdleSessionCheckInterval: line.AnyTLSIdleSessionCheckInterval,
+			IdleSessionTimeout:       line.AnyTLSIdleSessionTimeout,
+			MinIdleSession:           line.AnyTLSMinIdleSession,
+			AllowInsecure:            line.AllowInsecure,
+		}
+	case config.LineTypeTailscale:
+		material.Configuration = struct {
+			Hostname string `json:"hostname"`
+			ExitNode string `json:"exit_node"`
+			MagicDNS bool   `json:"magic_dns"`
+		}{
+			Hostname: profile.Tailscale.Hostname,
+			ExitNode: line.TailscaleExitNode,
+			MagicDNS: line.TailscaleMagicDNS,
+		}
+	default:
+		return "", fmt.Errorf("unsupported Line type %q", line.Type)
+	}
+	encoded, err := json.Marshal(material)
+	if err != nil {
+		return "", err
+	}
+	lineRuntimeIdentityKeyOnce.Do(func() {
+		_, lineRuntimeIdentityKeyErr = rand.Read(lineRuntimeIdentityKey[:])
+	})
+	if lineRuntimeIdentityKeyErr != nil {
+		return "", fmt.Errorf("initialize Line runtime identity key: %w", lineRuntimeIdentityKeyErr)
+	}
+	digest := hmac.New(sha256.New, lineRuntimeIdentityKey[:])
+	_, _ = digest.Write(encoded)
+	return lineRuntimeIdentityPrefix + hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func transparentProxyRuleSetRefreshes(
+	pending []pendingNERuleSetRefresh,
+	lineOutbounds map[string]string,
+) ([]transparentProxyRuleSetRefresh, error) {
+	refreshes := make([]transparentProxyRuleSetRefresh, 0, len(pending))
+	for _, item := range pending {
+		outboundTag := lineOutbounds[item.FetchLineID]
+		if outboundTag == "" {
+			return nil, fmt.Errorf(
+				"rule set %q update Line has no runtime outbound",
+				item.RuleSetID,
+			)
+		}
+		resolverTag := "proxy-dns-" + outboundTag
+		if outboundTag == "direct" {
+			resolverTag = "xdial-system-dns"
+		}
+		refreshes = append(refreshes, transparentProxyRuleSetRefresh{
+			RuleSetID:    item.RuleSetID,
+			URL:          item.URL,
+			LocalPath:    item.LocalPath,
+			InputFormat:  item.InputFormat,
+			StoredFormat: item.StoredFormat,
+			OutboundTag:  outboundTag,
+			ResolverTag:  resolverTag,
+		})
+	}
+	return refreshes, nil
+}
+
+func activeSubscriptionOutbounds(
+	profile *config.Profile,
+	plan *config.ConnectionPlan,
+) (map[string][]string, error) {
+	if profile == nil {
+		return nil, fmt.Errorf("active Subscription capability profile is missing")
+	}
+	if plan == nil {
+		return nil, fmt.Errorf("active Subscription capability plan is missing")
+	}
+
+	runtimeTags := make(map[string][]string)
+	conflictingRuntimeTags := make(map[string]bool)
+	for _, subscription := range config.BuildSubscriptionRuntimeCatalog(
+		profile,
+		config.PlatformTransparentProxy,
+	).Subscriptions {
+		subscriptionID := strings.TrimSpace(subscription.ID)
+		if subscriptionID == "" {
+			continue
+		}
+		tags := append([]string(nil), subscription.ReadinessTags...)
+		if existing, loaded := runtimeTags[subscriptionID]; loaded &&
+			!reflect.DeepEqual(existing, tags) {
+			conflictingRuntimeTags[subscriptionID] = true
+			continue
+		}
+		runtimeTags[subscriptionID] = tags
+	}
+
+	active := make(map[string][]string)
+	for _, task := range plan.Tasks {
+		if task.Kind != config.ConnectionTaskSubscription {
+			continue
+		}
+		subscriptionID := strings.TrimSpace(task.ResourceID)
+		if subscriptionID == "" {
+			return nil, fmt.Errorf("active Subscription capability is missing an ID")
+		}
+		if conflictingRuntimeTags[subscriptionID] {
+			return nil, fmt.Errorf(
+				"active Subscription %q has conflicting runtime outbounds",
+				subscriptionID,
+			)
+		}
+		tags := runtimeTags[subscriptionID]
+		if len(tags) == 0 {
+			return nil, fmt.Errorf(
+				"active Subscription %q has no runtime outbound",
+				subscriptionID,
+			)
+		}
+		if existing, loaded := active[subscriptionID]; loaded &&
+			!reflect.DeepEqual(existing, tags) {
+			return nil, fmt.Errorf(
+				"active Subscription %q has conflicting runtime outbounds",
+				subscriptionID,
+			)
+		}
+		active[subscriptionID] = append([]string(nil), tags...)
+	}
+	return active, nil
+}
+
+func activeRouteRuleSetTags(configJSON []byte) ([]string, error) {
+	var document struct {
+		Route struct {
+			RuleSets []struct {
+				Tag string `json:"tag"`
+			} `json:"rule_set"`
+		} `json:"route"`
+	}
+	if err := json.Unmarshal(configJSON, &document); err != nil {
+		return nil, fmt.Errorf("decode active rule-set capabilities: %w", err)
+	}
+	tags := make([]string, 0, len(document.Route.RuleSets))
+	seen := make(map[string]bool)
+	for _, ruleSet := range document.Route.RuleSets {
+		tag := strings.TrimSpace(ruleSet.Tag)
+		if tag == "" || seen[tag] {
+			continue
+		}
+		seen[tag] = true
+		tags = append(tags, tag)
+	}
+	return tags, nil
 }
 
 func generateNEConfig(profileJSON string, vpnServerIP string, basePath string, platform config.Platform) (string, error) {
@@ -70,6 +953,12 @@ func generateNEConfig(profileJSON string, vpnServerIP string, basePath string, p
 // GenerateTailscaleSetupConfig 生成主 App 登录和发现节点所需的最小配置。
 // 它只启动指定 Tailscale endpoint，不创建 TUN，也不启用该线路的出口节点或路由。
 func GenerateTailscaleSetupConfig(profileJSON string, lineID string, basePath string) (string, error) {
+	return GenerateTailscaleSetupConfigWithAuthKey(profileJSON, lineID, basePath, "")
+}
+
+// GenerateTailscaleSetupConfigWithAuthKey 只为一次显式注册请求加入瞬时 Auth Key。
+// 调用方不得把 key 写回 Profile；返回配置也只能存在于限时 setup session 的内存中。
+func GenerateTailscaleSetupConfigWithAuthKey(profileJSON string, lineID string, basePath string, authKey string) (string, error) {
 	profile, err := config.ParseProfile([]byte(profileJSON))
 	if err != nil {
 		return "", err
@@ -88,18 +977,27 @@ func GenerateTailscaleSetupConfig(profileJSON string, lineID string, basePath st
 	if basePath == "" || !filepath.IsAbs(basePath) {
 		return "", fmt.Errorf("shared Tailscale state directory is unavailable")
 	}
+	authKey = strings.TrimSpace(authKey)
+	if len(authKey) > 4096 {
+		return "", fmt.Errorf("Tailscale Auth Key is too long")
+	}
 	setupLine := *line
 	setupLine.Enabled = true
 
 	endpoint := map[string]interface{}{
-		"type":            "tailscale",
-		"tag":             "tailscale-" + setupLine.ID,
-		"state_directory": config.TailscaleStateDirectory(basePath),
+		"type":             "tailscale",
+		"tag":              "tailscale-" + setupLine.ID,
+		"state_directory":  config.TailscaleStateDirectory(basePath),
+		"system_interface": false,
+		"accept_routes":    false,
 		// 与 buildTailscaleEndpoint 保持同一身份语义：state 全局单份、
 		// 设备名来自全局身份、常驻节点（ephemeral 会在会话切换时丢身份）。
 	}
 	if profile.Tailscale.Hostname != "" {
 		endpoint["hostname"] = profile.Tailscale.Hostname
+	}
+	if authKey != "" {
+		endpoint["auth_key"] = authKey
 	}
 	document := map[string]interface{}{
 		"log": map[string]interface{}{
@@ -107,12 +1005,10 @@ func GenerateTailscaleSetupConfig(profileJSON string, lineID string, basePath st
 		},
 		"dns": map[string]interface{}{
 			"servers": []map[string]interface{}{{
-				"type":        "udp",
-				"tag":         "xdial-public-dns",
-				"server":      "1.1.1.1",
-				"server_port": 53,
+				"type": "local",
+				"tag":  "xdial-setup-system-dns",
 			}},
-			"final": "xdial-public-dns",
+			"final": "xdial-setup-system-dns",
 		},
 		"endpoints": []map[string]interface{}{endpoint},
 		"inbounds":  []interface{}{},
@@ -122,7 +1018,7 @@ func GenerateTailscaleSetupConfig(profileJSON string, lineID string, basePath st
 		}},
 		"route": map[string]interface{}{
 			"final":                   "direct",
-			"default_domain_resolver": "xdial-public-dns",
+			"default_domain_resolver": "xdial-setup-system-dns",
 		},
 	}
 	data, err := json.Marshal(document)
@@ -137,92 +1033,400 @@ func prepareNERuleSetDirectory(basePath string) (string, error) {
 		return "", fmt.Errorf("shared rule-set directory is unavailable")
 	}
 	ruleDir := filepath.Join(basePath, "xdial-rule-sets")
-	// 每次生成从空目录开始，避免上一次配置遗留的文件或链接参与本次启动。
-	if err := os.RemoveAll(ruleDir); err != nil {
-		return "", fmt.Errorf("prepare local rule-set directory: %w", err)
-	}
+	// 这里保存的是按“规则身份 + 原始 URL + 格式”寻址、且已经完成语义校验的
+	// last-known-good 副本。不能在每次生成前清空：Underlay 变化时，当前网络可能正好
+	// 无法访问远程规则源；若启动强依赖再次下载，XDial 会在接管流量前自锁。
+	//
+	// 旧文件不会自动参与配置。只有本次活动 Scenario 明确引用、缓存键完全匹配并再次通过
+	// 内容校验的文件才会被写进生成结果。
 	if err := os.MkdirAll(ruleDir, 0o700); err != nil {
 		return "", fmt.Errorf("prepare local rule-set directory: %w", err)
 	}
 	return ruleDir, nil
 }
 
-// materializeNERuleSets 在系统路由切入扩展前，由 App 进程严格下载活动模式引用的
+// materializeNERuleSets 在系统路由切入扩展前，由 App 进程严格下载活动场景引用的
 // 远程规则并写入 App Group。扩展只读本地文件，不再让 sing-box 自行跟随未校验的
 // URL/重定向，从而封住 localhost、内网地址和 DNS rebinding 通道。
 func materializeNERuleSets(profile *config.Profile, basePath string, fetch neRuleSetFetcher) error {
-	mode := profile.ActiveMode()
-	if mode == nil {
-		return fmt.Errorf("no active mode")
+	_, err := materializeNERuleSetsWithRefreshEvents(profile, basePath, fetch, nil)
+	return err
+}
+
+func materializeNERuleSetsWithEvents(
+	profile *config.Profile,
+	basePath string,
+	fetch neRuleSetFetcher,
+	progress connectionPreparationSink,
+) error {
+	_, err := materializeNERuleSetsWithRefreshEvents(profile, basePath, fetch, progress)
+	return err
+}
+
+func materializeNERuleSetsWithRefreshEvents(
+	profile *config.Profile,
+	basePath string,
+	fetch neRuleSetFetcher,
+	progress connectionPreparationSink,
+) ([]pendingNERuleSetRefresh, error) {
+	scenario := profile.ActiveScenario()
+	if scenario == nil {
+		return nil, fmt.Errorf("no active scenario")
 	}
 
-	var rules []*config.RuleSet
+	type activeRuleSet struct {
+		rule    *config.RuleSet
+		binding config.RuleBinding
+	}
+	var rules []activeRuleSet
 	seen := make(map[string]bool)
-	for _, binding := range mode.Bindings {
+	for _, binding := range scenario.Bindings {
 		rule := profile.FindRuleSet(binding.RuleSetID)
 		if rule == nil || !rule.Enabled || rule.Type != config.RuleSetTypeURL || seen[rule.ID] {
 			continue
 		}
 		seen[rule.ID] = true
-		rules = append(rules, rule)
+		rules = append(rules, activeRuleSet{rule: rule, binding: binding})
 	}
 	if len(rules) == 0 {
-		return nil
+		return nil, nil
 	}
 	if basePath == "" || !filepath.IsAbs(basePath) {
-		return fmt.Errorf("shared rule-set directory is unavailable")
+		return nil, fmt.Errorf("shared rule-set directory is unavailable")
 	}
 
 	ruleDir := filepath.Join(basePath, "xdial-rule-sets")
 	if err := os.MkdirAll(ruleDir, 0o700); err != nil {
-		return fmt.Errorf("prepare local rule-set directory: %w", err)
+		return nil, fmt.Errorf("prepare local rule-set directory: %w", err)
 	}
 
 	remaining := maxNERuleSetBytes
-	for _, rule := range rules {
+	var pendingRefreshes []pendingNERuleSetRefresh
+	for _, active := range rules {
+		rule := active.rule
+		taskID := "rule-set:" + rule.ID
+		emitConnectionPreparation(
+			progress,
+			connectionPreparationEvent{
+				TaskID: taskID,
+				State:  "running",
+			},
+		)
 		if strings.TrimSpace(rule.URL) == "" {
-			return fmt.Errorf("remote rule set is missing an address")
+			emitConnectionPreparationFailure(
+				progress,
+				taskID,
+				"rule-set-address-missing",
+			)
+			return nil, fmt.Errorf("remote rule set is missing an address")
 		}
-		content, err := fetch(rule.URL, remaining)
-		if err != nil {
-			return fmt.Errorf("remote rule set could not be prepared")
+		originalURL := rule.URL
+		originalFormat := neRuleSetFormat(rule)
+		storedFormat := originalFormat
+		if storedFormat == "text" {
+			storedFormat = "source"
 		}
-		if len(content) == 0 || int64(len(content)) > remaining {
-			return fmt.Errorf("remote rule sets exceed the total size limit")
+		localPath := neRuleSetCachePath(
+			ruleDir,
+			"profile",
+			rule.ID,
+			originalURL,
+			originalFormat,
+			storedFormat,
+		)
+		content, matchKind, cachedInfo, cachedErr := readValidatedNERuleSet(
+			localPath,
+			storedFormat,
+			remaining,
+		)
+		if cachedErr == nil && time.Since(cachedInfo.ModTime()) > neRuleSetCacheFreshFor {
+			pendingRefreshes = append(pendingRefreshes, pendingNERuleSetRefresh{
+				RuleSetID:    rule.ID,
+				URL:          originalURL,
+				LocalPath:    localPath,
+				InputFormat:  originalFormat,
+				StoredFormat: storedFormat,
+				FetchLineID:  rule.EffectiveFetchLineID(),
+			})
+		}
+		if cachedErr != nil {
+			if fetch == nil {
+				emitConnectionPreparationFailure(
+					progress,
+					taskID,
+					"rule-set-unavailable",
+				)
+				return nil, fmt.Errorf(
+					"rule set %q is unavailable and has no valid local copy",
+					rule.ID,
+				)
+			}
+			var fetchErr error
+			content, matchKind, fetchErr = loadOrFetchNERuleSet(
+				localPath,
+				storedFormat,
+				remaining,
+				func(limit int64) ([]byte, error) {
+					fetched, fetchErr := fetch(originalURL, limit)
+					if fetchErr != nil {
+						return nil, fetchErr
+					}
+					if originalFormat == "text" {
+						converted, convertErr := convertTextRuleSet(fetched)
+						if convertErr != nil {
+							return nil, fmt.Errorf("remote text rule set is invalid")
+						}
+						return converted, nil
+					}
+					return fetched, nil
+				},
+			)
+			if fetchErr != nil {
+				emitConnectionPreparationFailure(
+					progress,
+					taskID,
+					"rule-set-unavailable",
+				)
+				return nil, fmt.Errorf("rule set %q is unavailable and has no valid local copy", rule.ID)
+			}
+		}
+		if cachedErr != nil && len(content) == 0 {
+			emitConnectionPreparationFailure(
+				progress,
+				taskID,
+				"rule-set-unavailable",
+			)
+			return nil, fmt.Errorf("rule set %q is unavailable and has no valid local copy", rule.ID)
 		}
 		remaining -= int64(len(content))
-
-		format := neRuleSetFormat(rule)
-		if format == "text" {
-			content, err = convertTextRuleSet(content)
-			if err != nil {
-				return fmt.Errorf("remote text rule set is invalid")
-			}
-			format = "source"
-		}
-		if format == "source" && !json.Valid(content) {
-			return fmt.Errorf("remote rule set contains invalid JSON")
-		}
-		digest := sha256.Sum256([]byte(rule.ID))
-		extension := ".srs"
-		if format == "source" {
-			extension = ".json"
-		}
-		filename := hex.EncodeToString(digest[:12]) + extension
-		localPath := filepath.Join(ruleDir, filename)
-		if err := os.WriteFile(localPath, content, 0o600); err != nil {
-			return fmt.Errorf("store local rule set: %w", err)
-		}
 		rule.URL = "file://" + localPath
-		rule.Format = format
+		rule.Format = storedFormat
+		rule.RuntimeMatchKind = matchKind
+		emitConnectionPreparation(
+			progress,
+			connectionPreparationEvent{
+				TaskID: taskID,
+				State:  "ready",
+			},
+		)
+	}
+	return pendingRefreshes, nil
+}
+
+// loadOrFetchNERuleSet is the cold-cache primitive. Warm-cache startup is handled
+// before this function so even an expired validated copy never blocks connection.
+func loadOrFetchNERuleSet(
+	localPath string,
+	format string,
+	limit int64,
+	fetch func(int64) ([]byte, error),
+) ([]byte, config.RuleSetMatchKind, error) {
+	cached, cachedKind, _, cachedErr := readValidatedNERuleSet(localPath, format, limit)
+	if cachedErr == nil {
+		return cached, cachedKind, nil
+	}
+
+	content, fetchErr := fetch(limit)
+	if fetchErr == nil {
+		matchKind, validateErr := validateNERuleSet(content, format, limit)
+		if validateErr == nil {
+			if writeErr := writeNERuleSetCache(localPath, content); writeErr != nil {
+				return nil, config.RuleSetMatchUnknown, writeErr
+			}
+			return content, matchKind, nil
+		}
+		fetchErr = validateErr
+	}
+
+	return nil, config.RuleSetMatchUnknown, fetchErr
+}
+
+func readValidatedNERuleSet(
+	localPath string,
+	format string,
+	limit int64,
+) ([]byte, config.RuleSetMatchKind, os.FileInfo, error) {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return nil, config.RuleSetMatchUnknown, nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit {
+		return nil, config.RuleSetMatchUnknown, nil, fmt.Errorf("cached rule set is invalid")
+	}
+	content, err := os.ReadFile(localPath)
+	if err != nil {
+		return nil, config.RuleSetMatchUnknown, nil, err
+	}
+	matchKind, err := validateNERuleSet(content, format, limit)
+	if err != nil {
+		return nil, config.RuleSetMatchUnknown, nil, err
+	}
+	return content, matchKind, info, nil
+}
+
+func validateNERuleSet(
+	content []byte,
+	format string,
+	limit int64,
+) (config.RuleSetMatchKind, error) {
+	if len(content) == 0 || int64(len(content)) > limit {
+		return config.RuleSetMatchUnknown, fmt.Errorf("remote rule sets exceed the total size limit")
+	}
+	if format == "source" && !json.Valid(content) {
+		return config.RuleSetMatchUnknown, fmt.Errorf("remote rule set contains invalid JSON")
+	}
+	matchKind, err := classifyNERuleSet(content, format)
+	if err != nil {
+		return config.RuleSetMatchUnknown, fmt.Errorf("remote rule set semantics are invalid")
+	}
+	return matchKind, nil
+}
+
+func writeNERuleSetCache(localPath string, content []byte) error {
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o700); err != nil {
+		return fmt.Errorf("prepare local rule-set directory: %w", err)
+	}
+	temp, err := os.CreateTemp(filepath.Dir(localPath), ".xdial-rule-set-*")
+	if err != nil {
+		return fmt.Errorf("store local rule set: %w", err)
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(0o600); err != nil {
+		temp.Close()
+		return fmt.Errorf("store local rule set: %w", err)
+	}
+	if _, err := temp.Write(content); err != nil {
+		temp.Close()
+		return fmt.Errorf("store local rule set: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return fmt.Errorf("store local rule set: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("store local rule set: %w", err)
+	}
+	if err := os.Rename(tempPath, localPath); err != nil {
+		return fmt.Errorf("store local rule set: %w", err)
 	}
 	return nil
+}
+
+func neRuleSetCachePath(
+	ruleDir string,
+	namespace string,
+	identity string,
+	rawURL string,
+	inputFormat string,
+	storedFormat string,
+) string {
+	digest := sha256.Sum256([]byte(strings.Join(
+		[]string{namespace, identity, rawURL, inputFormat},
+		"\x00",
+	)))
+	extension := ".srs"
+	if storedFormat == "source" {
+		extension = ".json"
+	}
+	return filepath.Join(ruleDir, hex.EncodeToString(digest[:12])+extension)
+}
+
+func classifyNERuleSet(content []byte, format string) (config.RuleSetMatchKind, error) {
+	var compat option.PlainRuleSetCompat
+	var err error
+	switch format {
+	case "binary":
+		compat, err = srs.Read(bytes.NewReader(content), true)
+	case "source":
+		err = json.Unmarshal(content, &compat)
+	default:
+		return config.RuleSetMatchUnknown, fmt.Errorf("unsupported rule set format")
+	}
+	if err != nil {
+		return config.RuleSetMatchUnknown, err
+	}
+	plain, err := compat.Upgrade()
+	if err != nil {
+		return config.RuleSetMatchUnknown, err
+	}
+	hasDomain, hasIP, ambiguous := classifyHeadlessRules(plain.Rules)
+	switch {
+	case hasDomain && !hasIP && !ambiguous:
+		return config.RuleSetMatchDomain, nil
+	case hasIP && !hasDomain && !ambiguous:
+		return config.RuleSetMatchIP, nil
+	default:
+		return config.RuleSetMatchMixed, nil
+	}
+}
+
+func classifyHeadlessRules(rules []option.HeadlessRule) (hasDomain, hasIP, ambiguous bool) {
+	for _, rule := range rules {
+		switch rule.Type {
+		case "", C.RuleTypeDefault:
+			options := rule.DefaultOptions
+			domain := len(options.Domain) > 0 ||
+				len(options.DomainSuffix) > 0 ||
+				len(options.DomainKeyword) > 0 ||
+				len(options.DomainRegex) > 0 ||
+				len(options.AdGuardDomain) > 0 ||
+				options.DomainMatcher != nil ||
+				options.AdGuardDomainMatcher != nil
+			ip := len(options.IPCIDR) > 0 || options.IPSet != nil
+			hasDomain = hasDomain || domain
+			hasIP = hasIP || ip
+			if options.Invert || hasNonDestinationRuleConditions(options) || (!domain && !ip) {
+				ambiguous = true
+			}
+		case C.RuleTypeLogical:
+			domain, ip, nestedAmbiguous := classifyHeadlessRules(rule.LogicalOptions.Rules)
+			hasDomain = hasDomain || domain
+			hasIP = hasIP || ip
+			ambiguous = ambiguous || nestedAmbiguous || rule.LogicalOptions.Invert
+		default:
+			ambiguous = true
+		}
+	}
+	if len(rules) == 0 {
+		ambiguous = true
+	}
+	return
+}
+
+func hasNonDestinationRuleConditions(options option.DefaultHeadlessRule) bool {
+	remaining := options
+	remaining.Domain = nil
+	remaining.DomainSuffix = nil
+	remaining.DomainKeyword = nil
+	remaining.DomainRegex = nil
+	remaining.IPCIDR = nil
+	remaining.DomainMatcher = nil
+	remaining.IPSet = nil
+	remaining.AdGuardDomain = nil
+	remaining.AdGuardDomainMatcher = nil
+	remaining.Invert = false
+	return !reflect.DeepEqual(remaining, option.DefaultHeadlessRule{})
 }
 
 // materializeGeneratedNERuleSets catches remote resources introduced during generation
 // (currently Clash GEOIP compatibility). They are fetched by the App process through the
 // same strict transport and rewritten to local files before the extension ever sees config.
 func materializeGeneratedNERuleSets(data []byte, ruleDir string, fetch neRuleSetFetcher) ([]byte, error) {
+	return materializeGeneratedNERuleSetsWithEvents(
+		data,
+		ruleDir,
+		fetch,
+		nil,
+	)
+}
+
+func materializeGeneratedNERuleSetsWithEvents(
+	data []byte,
+	ruleDir string,
+	fetch neRuleSetFetcher,
+	progress connectionPreparationSink,
+) ([]byte, error) {
 	var document map[string]interface{}
 	if err := json.Unmarshal(data, &document); err != nil {
 		return nil, fmt.Errorf("generated configuration is invalid")
@@ -234,18 +1438,26 @@ func materializeGeneratedNERuleSets(data []byte, ruleDir string, fetch neRuleSet
 	}
 
 	remaining := maxNERuleSetBytes
-	entries, err := os.ReadDir(ruleDir)
-	if err != nil {
-		return nil, fmt.Errorf("read local rule-set directory: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.Type().IsRegular() {
-			info, statErr := entry.Info()
-			if statErr != nil {
-				return nil, fmt.Errorf("read local rule-set: %w", statErr)
-			}
-			remaining -= info.Size()
+	countedPaths := make(map[string]bool)
+	for _, rawSet := range rawSets {
+		set, _ := rawSet.(map[string]interface{})
+		if set == nil || set["type"] != "local" {
+			continue
 		}
+		localPath, _ := set["path"].(string)
+		if localPath == "" || countedPaths[localPath] {
+			continue
+		}
+		relative, relativeErr := filepath.Rel(ruleDir, localPath)
+		if relativeErr != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			continue
+		}
+		info, statErr := os.Stat(localPath)
+		if statErr != nil {
+			return nil, fmt.Errorf("read local rule-set: %w", statErr)
+		}
+		countedPaths[localPath] = true
+		remaining -= info.Size()
 	}
 	if remaining < 0 {
 		return nil, fmt.Errorf("remote rule sets exceed the total size limit")
@@ -263,40 +1475,81 @@ func materializeGeneratedNERuleSets(data []byte, ruleDir string, fetch neRuleSet
 		if rawURL == "" || tag == "" || (format != "source" && format != "binary") {
 			return nil, fmt.Errorf("generated remote rule set is invalid")
 		}
-		content, fetchErr := fetch(rawURL, remaining)
+		taskID := "rule-set:generated:" + tag
+		emitConnectionPreparation(
+			progress,
+			connectionPreparationEvent{
+				TaskID: taskID,
+				State:  "running",
+			},
+		)
+		localPath := neRuleSetCachePath(
+			ruleDir,
+			"generated",
+			tag,
+			rawURL,
+			format,
+			format,
+		)
+		content, _, fetchErr := loadOrFetchNERuleSet(
+			localPath,
+			format,
+			remaining,
+			func(limit int64) ([]byte, error) {
+				return fetch(rawURL, limit)
+			},
+		)
 		if fetchErr != nil {
-			return nil, fmt.Errorf("remote rule set could not be prepared")
-		}
-		if len(content) == 0 || int64(len(content)) > remaining {
-			return nil, fmt.Errorf("remote rule sets exceed the total size limit")
-		}
-		if format == "source" && !json.Valid(content) {
-			return nil, fmt.Errorf("remote rule set contains invalid JSON")
+			emitConnectionPreparationFailure(
+				progress,
+				taskID,
+				"generated-rule-set-unavailable",
+			)
+			return nil, fmt.Errorf("generated rule set %q is unavailable and has no valid local copy", tag)
 		}
 		remaining -= int64(len(content))
-
-		digest := sha256.Sum256([]byte("generated:" + tag))
-		extension := ".srs"
-		if format == "source" {
-			extension = ".json"
-		}
-		localPath := filepath.Join(ruleDir, hex.EncodeToString(digest[:12])+extension)
-		if err := os.WriteFile(localPath, content, 0o600); err != nil {
-			return nil, fmt.Errorf("store local rule set: %w", err)
-		}
-		if err := os.Chmod(localPath, 0o600); err != nil {
-			return nil, fmt.Errorf("secure local rule set: %w", err)
-		}
 		set["type"] = "local"
 		set["path"] = localPath
 		delete(set, "url")
 		delete(set, "download_detour")
 		changed = true
+		emitConnectionPreparation(
+			progress,
+			connectionPreparationEvent{
+				TaskID: taskID,
+				State:  "ready",
+			},
+		)
 	}
 	if !changed {
 		return data, nil
 	}
 	return json.MarshalIndent(document, "", "  ")
+}
+
+func emitConnectionPreparation(
+	progress connectionPreparationSink,
+	event connectionPreparationEvent,
+) {
+	if progress != nil {
+		progress(event)
+	}
+}
+
+func emitConnectionPreparationFailure(
+	progress connectionPreparationSink,
+	taskID string,
+	code string,
+) {
+	emitConnectionPreparation(
+		progress,
+		connectionPreparationEvent{
+			TaskID:  taskID,
+			State:   "failed",
+			Code:    code,
+			Message: "规则准备失败",
+		},
+	)
 }
 
 func neRuleSetFormat(rule *config.RuleSet) string {

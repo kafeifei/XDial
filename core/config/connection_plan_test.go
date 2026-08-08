@@ -1,0 +1,296 @@
+package config
+
+import (
+	"encoding/json"
+	"reflect"
+	"testing"
+)
+
+func TestBuildConnectionPlanUsesOnlyActiveScenarioDependenciesInBindingOrder(t *testing.T) {
+	profile := invBaseProfile()
+	profile.Lines = append(profile.Lines, invUnusedTrojanLine(), invTailscaleLine())
+	profile.RuleSets = append(profile.RuleSets, invUnusedRuleSet())
+	profile.Subscriptions = append(profile.Subscriptions, invUnusedSubscription())
+
+	plan, err := BuildConnectionPlan(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := connectionPlanTaskIDs(plan)
+	want := []string{
+		"underlay:system",
+		"line:corp",
+		"rule-set:intranet",
+		"line:px",
+		"rule-set:remote",
+		"line:direct",
+		"dns:scenario",
+		"data-plane:sing-box",
+		"ingress:transparent-proxy",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("tasks = %#v, want %#v", got, want)
+	}
+	for _, forbidden := range []string{
+		"line:ghost",
+		"line:ts",
+		"rule-set:ghost-rs",
+		"subscription:ghost-sub",
+	} {
+		if containsString(got, forbidden) {
+			t.Fatalf("unreferenced task leaked into plan: %s", forbidden)
+		}
+	}
+}
+
+func TestConnectionPlanJSONUsesScenarioContract(t *testing.T) {
+	plan, err := BuildConnectionPlan(invBaseProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.SchemaVersion != 3 {
+		t.Fatalf("schema_version = %d, want 3", plan.SchemaVersion)
+	}
+	if plan.Scenario.ID == "" {
+		t.Fatal("scenario is missing from connection plan")
+	}
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := document["scenario"]; !ok {
+		t.Fatalf("scenario key is missing: %s", encoded)
+	}
+	for _, obsoleteKey := range []string{"mode", "scheme"} {
+		if _, ok := document[obsoleteKey]; ok {
+			t.Fatalf("obsolete key %q is present: %s", obsoleteKey, encoded)
+		}
+	}
+
+	warningJSON, err := json.Marshal(ProfileWarning{ScenarioID: "scenario-1", Message: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var warning map[string]json.RawMessage
+	if err := json.Unmarshal(warningJSON, &warning); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := warning["scenario_id"]; !ok {
+		t.Fatalf("scenario_id is missing: %s", warningJSON)
+	}
+	for _, obsoleteKey := range []string{"mode_id", "scheme_id"} {
+		if _, ok := warning[obsoleteKey]; ok {
+			t.Fatalf("obsolete key %q is present: %s", obsoleteKey, warningJSON)
+		}
+	}
+}
+
+func TestBuildConnectionPlanReportsDisabledBindingWithoutPreparingIt(t *testing.T) {
+	profile := invBaseProfile()
+	profile.RuleSets[1].Enabled = false
+
+	plan, err := BuildConnectionPlan(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := connectionPlanTaskIDs(plan)
+	if containsString(got, "rule-set:remote") || containsString(got, "line:px") {
+		t.Fatalf("disabled binding leaked into prepare plan: %#v", got)
+	}
+	if len(plan.Warnings) != 1 || plan.Warnings[0].Kind != WarningDisabledRuleSet {
+		t.Fatalf("warnings = %#v", plan.Warnings)
+	}
+}
+
+func TestBuildConnectionPlanIncludesDynamicTailscaleAndGeneratedSubscriptionRuleSet(t *testing.T) {
+	profile := invBaseProfile()
+	profile.Lines = append(profile.Lines, invTailscaleLine())
+	profile.Subscriptions = append(profile.Subscriptions, Subscription{
+		ID:       "sub",
+		Name:     "Surge",
+		Enabled:  true,
+		Strategy: "select",
+		Lines: []Line{{
+			ID: "us", Name: "US", Type: LineTypeTrojan, Enabled: true,
+			TrojanServer: "us.example.com", TrojanPort: 443,
+			TrojanPassword: "secret",
+		}},
+		Rules: []SubscriptionRule{{
+			Type: "GEOIP", Value: "JP", Group: "__default__",
+		}},
+	})
+	profile.Scenarios[0] = Scenario{
+		ID: "m", Name: "动态场景",
+		Bindings: []RuleBinding{
+			{RuleSetID: "intranet", LineID: "ts"},
+			{RuleSetID: "remote", SubscriptionID: "sub"},
+		},
+		DefaultLineID: "direct",
+	}
+
+	plan, err := BuildConnectionPlan(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := connectionPlanTaskIDs(plan)
+	for _, required := range []string{
+		"line:ts",
+		"subscription:sub",
+		"rule-set:generated:sub-geoip-sub-jp",
+	} {
+		if !containsString(got, required) {
+			t.Fatalf("missing dynamic task %q in %#v", required, got)
+		}
+	}
+}
+
+func TestBuildConnectionPlanKeepsRuleSetFetchLineOutOfTrafficTasks(t *testing.T) {
+	profile := invBaseProfile()
+	profile.Lines = append(profile.Lines, invUnusedTrojanLine())
+	profile.RuleSets[1].FetchLineID = "ghost"
+
+	plan, err := BuildConnectionPlan(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ruleTask *ConnectionPlanTask
+	for index := range plan.Tasks {
+		if plan.Tasks[index].ID == "rule-set:remote" {
+			ruleTask = &plan.Tasks[index]
+			break
+		}
+	}
+	if ruleTask == nil {
+		t.Fatal("rule-set task is missing")
+	}
+	if containsString(ruleTask.Dependencies, "line:ghost") {
+		t.Fatalf("background fetch Line leaked into traffic dependencies: %+v", ruleTask.Dependencies)
+	}
+	if containsString(connectionPlanTaskIDs(plan), "line:ghost") {
+		t.Fatalf("background fetch Line leaked into traffic tasks: %+v", plan.Tasks)
+	}
+	if ruleTask.Detail != "远程规则；经校验缓存立即启动，连接后更新 → 海外中转" {
+		t.Fatalf("RuleSet fetch source polluted traffic policy: %q", ruleTask.Detail)
+	}
+}
+
+func TestBuildConnectionPlanRejectsBrokenReferencesBeforeSideEffects(t *testing.T) {
+	profile := invBaseProfile()
+	profile.Scenarios[0].Bindings[0].LineID = "missing"
+	if _, err := BuildConnectionPlan(profile); err == nil {
+		t.Fatal("expected broken reference to fail planning")
+	}
+}
+
+func TestBuildConnectionPlanRejectsScenarioWithoutDefaultOutbound(t *testing.T) {
+	profile := invBaseProfile()
+	profile.Scenarios[0].DefaultLineID = ""
+	profile.Scenarios[0].DefaultSubscriptionID = ""
+
+	if plan, err := BuildConnectionPlan(profile); err == nil {
+		t.Fatalf("blank Scenario silently generated a plan: %+v", plan)
+	}
+}
+
+func TestBuildConnectionPlanUnavailableSubscriptionOnlyFailsWhenEffective(t *testing.T) {
+	unavailable := Subscription{
+		ID:       "empty-sub",
+		Name:     "Empty",
+		Enabled:  true,
+		Strategy: "selector",
+	}
+
+	t.Run("active binding", func(t *testing.T) {
+		profile := invBaseProfile()
+		profile.Subscriptions = append(profile.Subscriptions, unavailable)
+		profile.Scenarios[0].Bindings[0] = RuleBinding{
+			RuleSetID:      "intranet",
+			SubscriptionID: unavailable.ID,
+		}
+		if plan, err := BuildConnectionPlan(profile); err == nil {
+			t.Fatalf("unavailable active subscription generated a plan: %+v", plan)
+		}
+	})
+
+	t.Run("active default", func(t *testing.T) {
+		profile := invBaseProfile()
+		profile.Subscriptions = append(profile.Subscriptions, unavailable)
+		profile.Scenarios[0].DefaultLineID = ""
+		profile.Scenarios[0].DefaultSubscriptionID = unavailable.ID
+		if plan, err := BuildConnectionPlan(profile); err == nil {
+			t.Fatalf("unavailable default subscription generated a plan: %+v", plan)
+		}
+	})
+
+	t.Run("disabled rule reference", func(t *testing.T) {
+		profile := invBaseProfile()
+		profile.Subscriptions = append(profile.Subscriptions, unavailable)
+		profile.RuleSets[0].Enabled = false
+		profile.Scenarios[0].Bindings[0] = RuleBinding{
+			RuleSetID:      "intranet",
+			SubscriptionID: unavailable.ID,
+		}
+		plan, err := BuildConnectionPlan(profile)
+		if err != nil {
+			t.Fatalf("disabled rule must keep the subscription ineffective: %v", err)
+		}
+		if containsString(connectionPlanTaskIDs(plan), "subscription:"+unavailable.ID) {
+			t.Fatalf("ineffective subscription leaked into plan: %+v", plan.Tasks)
+		}
+	})
+
+	t.Run("explicitly disabled", func(t *testing.T) {
+		profile := invBaseProfile()
+		disabled := unavailable
+		disabled.Enabled = false
+		profile.Subscriptions = append(profile.Subscriptions, disabled)
+		profile.Scenarios[0].Bindings[0] = RuleBinding{
+			RuleSetID:      "intranet",
+			SubscriptionID: disabled.ID,
+		}
+		plan, err := BuildConnectionPlan(profile)
+		if err != nil {
+			t.Fatalf("explicitly disabled subscription must keep warning semantics: %v", err)
+		}
+		if containsString(connectionPlanTaskIDs(plan), "subscription:"+disabled.ID) {
+			t.Fatalf("disabled subscription leaked into plan: %+v", plan.Tasks)
+		}
+		if len(plan.Warnings) == 0 ||
+			plan.Warnings[0].Kind != WarningDisabledSubscription {
+			t.Fatalf("disabled subscription warning is missing: %+v", plan.Warnings)
+		}
+	})
+
+	t.Run("unreferenced", func(t *testing.T) {
+		profile := invBaseProfile()
+		profile.Subscriptions = append(profile.Subscriptions, unavailable)
+		plan, err := BuildConnectionPlan(profile)
+		if err != nil {
+			t.Fatalf("unreferenced subscription must have no effect: %v", err)
+		}
+		if containsString(connectionPlanTaskIDs(plan), "subscription:"+unavailable.ID) {
+			t.Fatalf("unreferenced subscription leaked into plan: %+v", plan.Tasks)
+		}
+	})
+}
+
+func connectionPlanTaskIDs(plan *ConnectionPlan) []string {
+	ids := make([]string, 0, len(plan.Tasks))
+	for _, task := range plan.Tasks {
+		ids = append(ids, task.ID)
+	}
+	return ids
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}

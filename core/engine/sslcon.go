@@ -10,6 +10,16 @@ import (
 	"sslcon/session"
 )
 
+const forcedAnyConnectDPDSeconds = 5
+
+type anyConnectDPDConfigurator interface {
+	SetXDialForceDPD(seconds int)
+}
+
+type anyConnectSessionDiagnostics interface {
+	XDialDiagnosticsJSON() string
+}
+
 type VPNConfig struct {
 	Server        string
 	DialAddress   string // optional numeric socket target; Server remains TLS SNI / HTTP identity
@@ -43,6 +53,13 @@ func (c *VPNClient) Connect(cfg VPNConfig) (*VPNInfo, error) {
 	base.Cfg.InsecureSkipVerify = cfg.AllowInsecure // 默认 false=验证证书，自签需显式 opt-in
 	base.Cfg.CiscoCompat = true
 	base.Cfg.LogLevel = "Info"
+	dpdConfig, ok := any(base.Cfg).(anyConnectDPDConfigurator)
+	if !ok {
+		return nil, fmt.Errorf(
+			"AnyConnect runtime does not support the required DPD policy",
+		)
+	}
+	dpdConfig.SetXDialForceDPD(forcedAnyConnectDPDSeconds)
 	base.InitLog()
 
 	auth.Prof.Host = cfg.Server
@@ -82,4 +99,19 @@ func (c *VPNClient) Disconnect() {
 		cSess.Close()
 	}
 	c.info = nil
+}
+
+// AnyConnectSessionDiagnostics returns a credential-free, structured snapshot
+// from the patched sslcon I/O boundary. Keeping the capability behind a narrow
+// interface lets ordinary source inspection still compile against the pristine
+// vendored module, while production Make targets require the staged patch.
+func AnyConnectSessionDiagnostics(cSess *session.ConnSession) string {
+	if cSess == nil {
+		return ""
+	}
+	diagnostics, ok := any(cSess).(anyConnectSessionDiagnostics)
+	if !ok {
+		return ""
+	}
+	return diagnostics.XDialDiagnosticsJSON()
 }

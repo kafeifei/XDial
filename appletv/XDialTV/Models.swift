@@ -27,8 +27,9 @@ struct Line: Codable, Identifiable, Hashable {
     var vmessAltID: Int = 0
 
     // Tailscale 身份（设备名、登录态）是 Profile 全局唯一的一份，见 TailscaleIdentity。
-    // 线路上只留「这条线路走哪个出口」。
+    // 线路上只留「这条线路怎么使用 tailnet」。
     var tailscaleExitNode: String = ""
+    var tailscaleMagicDNS: Bool = false
     var tailscaleAuthenticated: Bool = false
 
     var allowInsecure: Bool = false
@@ -52,6 +53,7 @@ struct Line: Codable, Identifiable, Hashable {
         case vmessUUID = "vmess_uuid"
         case vmessAltID = "vmess_alt_id"
         case tailscaleExitNode = "tailscale_exit_node"
+        case tailscaleMagicDNS = "tailscale_magic_dns"
         case tailscaleAuthenticated = "tailscale_authenticated"
     }
 
@@ -60,7 +62,8 @@ struct Line: Codable, Identifiable, Hashable {
          trojanServer: String = "", trojanPort: Int = 443, trojanPassword: String = "", trojanSNI: String = "",
          ssServer: String = "", ssPort: Int = 8388, ssMethod: String = "aes-256-gcm", ssPassword: String = "",
          vmessServer: String = "", vmessPort: Int = 443, vmessUUID: String = "", vmessAltID: Int = 0,
-         tailscaleExitNode: String = "", tailscaleAuthenticated: Bool = false,
+         tailscaleExitNode: String = "", tailscaleMagicDNS: Bool = false,
+         tailscaleAuthenticated: Bool = false,
          allowInsecure: Bool = false) {
         self.id = id; self.name = name; self.type = type; self.enabled = enabled; self.verified = verified
         self.vpnServer = vpnServer; self.vpnUsername = vpnUsername; self.vpnPassword = vpnPassword
@@ -68,6 +71,7 @@ struct Line: Codable, Identifiable, Hashable {
         self.ssServer = ssServer; self.ssPort = ssPort; self.ssMethod = ssMethod; self.ssPassword = ssPassword
         self.vmessServer = vmessServer; self.vmessPort = vmessPort; self.vmessUUID = vmessUUID; self.vmessAltID = vmessAltID
         self.tailscaleExitNode = tailscaleExitNode
+        self.tailscaleMagicDNS = tailscaleMagicDNS
         self.tailscaleAuthenticated = tailscaleAuthenticated
         self.allowInsecure = allowInsecure
     }
@@ -95,6 +99,10 @@ struct Line: Codable, Identifiable, Hashable {
         vmessUUID = try c.decodeIfPresent(String.self, forKey: .vmessUUID) ?? ""
         vmessAltID = try c.decodeIfPresent(Int.self, forKey: .vmessAltID) ?? 0
         tailscaleExitNode = try c.decodeIfPresent(String.self, forKey: .tailscaleExitNode) ?? ""
+        tailscaleMagicDNS = try c.decodeIfPresent(
+            Bool.self,
+            forKey: .tailscaleMagicDNS
+        ) ?? false
         tailscaleAuthenticated = try c.decodeIfPresent(
             Bool.self,
             forKey: .tailscaleAuthenticated
@@ -116,7 +124,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
     static let connectivityDirectID = "xdial-connectivity-direct"
     static let connectivityAnyConnectID = "xdial-connectivity-anyconnect"
     /// 保留旧持久化 ID，避免升级时短暂出现第三条规则；语义已经从
-    /// “AnyConnect”迁移为当前模式中确定选出的非 Direct 验收出口。
+    /// “AnyConnect”迁移为当前场景中确定选出的非 Direct 验收出口。
     static let connectivityOutboundID = connectivityAnyConnectID
 
     static func isConnectivityTestRuleID(_ id: String) -> Bool {
@@ -275,9 +283,12 @@ struct Subscription: Codable, Identifiable, Hashable {
     }
 }
 
-struct Mode: Codable, Identifiable, Hashable {
+struct Scenario: Codable, Identifiable, Hashable {
     var id: String
     var name: String
+    /// 跨平台保存语义 Key，而不是某个平台的 SF Symbol 名；nil 表示自动。
+    var iconOverride: String?
+    var matchSSIDs: [String] = []
     var bindings: [RuleBinding] = []
     var defaultLineID: String = ""
     var defaultSubscriptionID: String = ""
@@ -296,12 +307,16 @@ struct Mode: Codable, Identifiable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, bindings
+        case iconOverride = "icon"
+        case matchSSIDs = "match_ssids"
         case defaultLineID = "default_line_id"
         case defaultSubscriptionID = "default_subscription_id"
     }
 
-    init(id: String, name: String, bindings: [RuleBinding] = [], defaultLineID: String = "", defaultSubscriptionID: String = "") {
-        self.id = id; self.name = name; self.bindings = bindings
+    init(id: String, name: String, matchSSIDs: [String] = [], bindings: [RuleBinding] = [], defaultLineID: String = "", defaultSubscriptionID: String = "", iconOverride: String? = nil) {
+        self.id = id; self.name = name; self.iconOverride = iconOverride
+        self.matchSSIDs = matchSSIDs
+        self.bindings = bindings
         self.defaultLineID = defaultLineID; self.defaultSubscriptionID = defaultSubscriptionID
     }
 
@@ -309,6 +324,12 @@ struct Mode: Codable, Identifiable, Hashable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
+        iconOverride = try c.decodeIfPresent(String.self, forKey: .iconOverride)
+        if iconOverride?.isEmpty == true { iconOverride = nil }
+        matchSSIDs = try c.decodeIfPresent(
+            [String].self,
+            forKey: .matchSSIDs
+        ) ?? []
         bindings = try c.decodeIfPresent([RuleBinding].self, forKey: .bindings) ?? []
         defaultLineID = try c.decodeIfPresent(String.self, forKey: .defaultLineID) ?? ""
         defaultSubscriptionID = try c.decodeIfPresent(String.self, forKey: .defaultSubscriptionID) ?? ""
@@ -336,17 +357,17 @@ struct TailscaleIdentity: Codable, Equatable, Hashable {
 struct Profile: Codable, Equatable {
     var lines: [Line] = []
     var ruleSets: [RuleSet] = []
-    var modes: [Mode] = []
+    var scenarios: [Scenario] = []
     var subscriptions: [Subscription] = []
-    var activeModeID: String = ""
+    var activeScenarioID: String = ""
     var tailscale = TailscaleIdentity()
 
     enum CodingKeys: String, CodingKey {
         case lines = "lines"
         case ruleSets = "rule_sets"
-        case modes = "modes"
+        case scenarios = "scenarios"
         case subscriptions
-        case activeModeID = "active_mode_id"
+        case activeScenarioID = "active_scenario_id"
         case tailscale
     }
 
@@ -356,10 +377,26 @@ struct Profile: Codable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         lines = try c.decodeIfPresent([Line].self, forKey: .lines) ?? []
         ruleSets = try c.decodeIfPresent([RuleSet].self, forKey: .ruleSets) ?? []
-        modes = try c.decodeIfPresent([Mode].self, forKey: .modes) ?? []
+        scenarios = try c.decodeIfPresent(
+            [Scenario].self,
+            forKey: .scenarios
+        ) ?? []
         subscriptions = try c.decodeIfPresent([Subscription].self, forKey: .subscriptions) ?? []
-        activeModeID = try c.decodeIfPresent(String.self, forKey: .activeModeID) ?? ""
+        activeScenarioID = try c.decodeIfPresent(
+            String.self,
+            forKey: .activeScenarioID
+        ) ?? ""
         tailscale = try c.decodeIfPresent(TailscaleIdentity.self, forKey: .tailscale) ?? TailscaleIdentity()
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(lines, forKey: .lines)
+        try c.encode(ruleSets, forKey: .ruleSets)
+        try c.encode(scenarios, forKey: .scenarios)
+        try c.encode(subscriptions, forKey: .subscriptions)
+        try c.encode(activeScenarioID, forKey: .activeScenarioID)
+        try c.encode(tailscale, forKey: .tailscale)
     }
 }
 
@@ -405,10 +442,10 @@ extension Profile {
         return bindings
     }
 
-    /// 返回模式中用于双出口路由验收的非 Direct 目标。选择顺序是协议的一部分：
+    /// 返回场景中用于双出口路由验收的非 Direct 目标。选择顺序是协议的一部分：
     /// 非 Direct 默认出口优先；否则按普通、已启用规则绑定的原始顺序取首个。
     /// 锁定验收规则自身不会参与选择，避免旧错误绑定把迁移继续带错。
-    func connectivityOutboundBinding(for mode: Mode) -> RuleBinding? {
+    func connectivityOutboundBinding(for scenario: Scenario) -> RuleBinding? {
         func isAvailableNonDirect(_ binding: RuleBinding) -> Bool {
             if !binding.subscriptionID.isEmpty {
                 return subscriptions.contains {
@@ -432,14 +469,14 @@ extension Profile {
 
         let defaultBinding = RuleBinding(
             ruleSetID: RuleSet.connectivityOutboundID,
-            lineID: mode.defaultLineID,
-            subscriptionID: mode.defaultSubscriptionID
+            lineID: scenario.defaultLineID,
+            subscriptionID: scenario.defaultSubscriptionID
         )
         if isAvailableNonDirect(defaultBinding) {
             return defaultBinding
         }
 
-        for binding in mode.bindings where !binding.ruleSetID.isEmpty {
+        for binding in scenario.bindings where !binding.ruleSetID.isEmpty {
             guard !RuleSet.isConnectivityTestRuleID(binding.ruleSetID),
             ruleSets.first(where: { $0.id == binding.ruleSetID })?.enabled == true,
             isAvailableNonDirect(binding) else {
@@ -455,9 +492,9 @@ extension Profile {
     }
 
     /// 与生成器的活动目标语义一致：默认出口始终计入；只有 enabled 规则的绑定
-    /// 计入；线路和订阅统一去重。主页使用这一份摘要，避免订阅模式被误显示成
+    /// 计入；线路和订阅统一去重。主页使用这一份摘要，避免订阅场景被误显示成
     /// “没有线路”，也避免 disabled 规则把未运行目标带进来。
-    func activeRouteTargetSummaries(for mode: Mode) -> [ActiveRouteTargetSummary] {
+    func activeRouteTargetSummaries(for scenario: Scenario) -> [ActiveRouteTargetSummary] {
         var result: [ActiveRouteTargetSummary] = []
         var seen = Set<String>()
 
@@ -491,10 +528,10 @@ extension Profile {
         }
 
         append(
-            lineID: mode.defaultLineID,
-            subscriptionID: mode.defaultSubscriptionID
+            lineID: scenario.defaultLineID,
+            subscriptionID: scenario.defaultSubscriptionID
         )
-        for binding in mode.bindings {
+        for binding in scenario.bindings {
             guard ruleSets.first(where: { $0.id == binding.ruleSetID })?.enabled == true else {
                 continue
             }
@@ -505,7 +542,7 @@ extension Profile {
 
     /// 连接验收规则是真实 profile 的一部分，会在配置页展示，而不是生成器
     /// 暗中注入的路由。旧 profile 升级时会恢复两条精确 CIDR；第二条只绑定
-    /// 确定选出的非 Direct 活动目标。纯 Direct 模式不伪造第二个出口。
+    /// 确定选出的非 Direct 活动目标。纯 Direct 场景不伪造第二个出口。
     @discardableResult
     mutating func ensureConnectivityTestConfiguration() -> Bool {
         let before = self
@@ -519,14 +556,14 @@ extension Profile {
         }
 
         let directLineID = lines.first(where: { $0.type == "direct" && $0.enabled })?.id ?? ""
-        for index in modes.indices {
-            let ordinaryBindings = modes[index].bindings.filter {
+        for index in scenarios.indices {
+            let ordinaryBindings = scenarios[index].bindings.filter {
                 $0.ruleSetID != RuleSet.connectivityDirectID
                     && $0.ruleSetID != RuleSet.connectivityOutboundID
             }
-            var selectionMode = modes[index]
-            selectionMode.bindings = ordinaryBindings
-            let outboundBinding = connectivityOutboundBinding(for: selectionMode)
+            var selectionScenario = scenarios[index]
+            selectionScenario.bindings = ordinaryBindings
+            let outboundBinding = connectivityOutboundBinding(for: selectionScenario)
             var acceptanceBindings: [RuleBinding] = []
             if !directLineID.isEmpty {
                 acceptanceBindings.append(RuleBinding(
@@ -537,7 +574,7 @@ extension Profile {
             if let outboundBinding {
                 acceptanceBindings.append(outboundBinding)
             }
-            modes[index].bindings = acceptanceBindings + ordinaryBindings
+            scenarios[index].bindings = acceptanceBindings + ordinaryBindings
         }
 
         return self != before
@@ -563,8 +600,8 @@ extension Profile {
         return p
     }
 
-    static func templateOverseas(ruleSetIDs: [String], vpnLineID: String, directLineID: String) -> Mode {
-        Mode(
+    static func templateOverseas(ruleSetIDs: [String], vpnLineID: String, directLineID: String) -> Scenario {
+        Scenario(
             id: UUID().uuidString,
             name: "海外",
             bindings: connectivityBindings(outboundLineID: vpnLineID, directLineID: directLineID)
@@ -575,7 +612,7 @@ extension Profile {
         )
     }
 
-    static func templateDomestic(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, directLineID: String) -> Mode {
+    static func templateDomestic(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, directLineID: String) -> Scenario {
         var bindings = connectivityBindings(outboundLineID: vpnLineID, directLineID: directLineID)
             + ruleSetIDs.filter { id in
                 id != RuleSet.connectivityDirectID && id != RuleSet.connectivityAnyConnectID
@@ -583,7 +620,7 @@ extension Profile {
         if !gfwRuleSetID.isEmpty {
             bindings.append(RuleBinding(ruleSetID: gfwRuleSetID, lineID: vpnLineID))
         }
-        return Mode(
+        return Scenario(
             id: UUID().uuidString,
             name: "国内",
             bindings: bindings,
@@ -591,7 +628,7 @@ extension Profile {
         )
     }
 
-    static func templateDomesticSS(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, ssLineID: String, directLineID: String) -> Mode {
+    static func templateDomesticSS(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, ssLineID: String, directLineID: String) -> Scenario {
         var bindings = connectivityBindings(outboundLineID: ssLineID, directLineID: directLineID)
             + ruleSetIDs.filter { id in
                 id != RuleSet.connectivityDirectID && id != RuleSet.connectivityAnyConnectID
@@ -599,7 +636,7 @@ extension Profile {
         if !gfwRuleSetID.isEmpty {
             bindings.append(RuleBinding(ruleSetID: gfwRuleSetID, lineID: ssLineID))
         }
-        return Mode(
+        return Scenario(
             id: UUID().uuidString,
             name: "国内+SS",
             bindings: bindings,

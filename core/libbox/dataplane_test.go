@@ -205,14 +205,14 @@ func buildNEConfigRoutingToVPN(t *testing.T, basePath string) []byte {
 			{ID: "intranet", Name: "内网", Type: config.RuleSetTypeManual, Enabled: true,
 				CIDRs: []string{vpnTargetCIDR}},
 		},
-		Modes: []config.Mode{
+		Scenarios: []config.Scenario{
 			{
 				ID: "c1", Name: "默认",
 				Bindings:      []config.RuleBinding{{RuleSetID: "intranet", LineID: "vpn"}},
 				DefaultLineID: "direct",
 			},
 		},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 
 	raw, err := config.GenerateSingBoxFor(profile, 10800, "1.2.3.4", config.PlatformNE, basePath)
@@ -331,7 +331,10 @@ func startBoxOffline(t *testing.T, configJSON []byte, bridge *engine.VPNBridge) 
 	platform.setDefaultInterface(interfaces[0].Name, interfaces[0].Index)
 
 	ctx := boxContext(context.Background())
-	ctx = service.ContextWith[*engine.VPNBridge](ctx, bridge)
+	ctx = service.ContextWith[*anyConnectLineRuntime](
+		ctx,
+		newAnyConnectLineRuntime(bridge, nil),
+	)
 	ctx = service.ContextWith[adapter.PlatformInterface](ctx, adapter.PlatformInterface(platform))
 
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, configJSON)

@@ -18,9 +18,6 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	"golang.org/x/net/dns/dnsmessage"
-
-	"github.com/kafeifei/xdial/core/engine"
-	"sslcon/session"
 )
 
 const typeVPN = "vpn"
@@ -38,11 +35,7 @@ const dnsQueryTimeout = 3 * time.Second
 // 内部域名，或把公共 DNS 的 NXDOMAIN 当作企业域名不存在。
 type vpnOutbound struct {
 	outbound.Adapter
-	bridge *engine.VPNBridge
-	// tunnelDNS 是 AnyConnect 握手下发的隧道内 DNS 服务器(仅取 IPv4,
-	// 因为 VPNBridge 目前是 IPv4-only 的 gVisor 栈)。连接建立时快照一次,
-	// 避免每次拨号都去读 sslcon 的全局可变状态。
-	tunnelDNS []netip.Addr
+	line *anyConnectLineRuntime
 }
 
 var (
@@ -55,37 +48,14 @@ func registerVPNOutbound(registry *outbound.Registry) {
 }
 
 func newVPNOutbound(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ option.StubOptions) (adapter.Outbound, error) {
-	bridge := service.FromContext[*engine.VPNBridge](ctx)
-	if bridge == nil {
+	line := service.FromContext[*anyConnectLineRuntime](ctx)
+	if line == nil {
 		return nil, E.New("AnyConnect outbound: no active tunnel bridge in context (engine must connect before starting sing-box)")
 	}
 	return &vpnOutbound{
-		Adapter:   outbound.NewAdapter(typeVPN, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil),
-		bridge:    bridge,
-		tunnelDNS: snapshotTunnelDNS(),
+		Adapter: outbound.NewAdapter(typeVPN, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil),
+		line:    line,
 	}, nil
-}
-
-// snapshotTunnelDNS 读取当前 AnyConnect 会话下发的 DNS 服务器地址。
-// DNS server 地址来源:sslcon 从 X-CSTP-DNS 响应头解析后存入
-// session.Sess.CSess.DNS([]string,裸 IP),这里过滤出可用的 IPv4。
-func snapshotTunnelDNS() []netip.Addr {
-	cSess := session.Sess.CSess
-	if cSess == nil {
-		return nil
-	}
-	var out []netip.Addr
-	for _, s := range cSess.DNS {
-		addr, err := netip.ParseAddr(s)
-		if err != nil {
-			continue
-		}
-		// gVisor 栈当前只挂了 IPv4 地址/路由,IPv6 DNS 无法经隧道送达。
-		if addr.Is4() {
-			out = append(out, addr)
-		}
-	}
-	return out
 }
 
 func (o *vpnOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -110,7 +80,7 @@ func (o *vpnOutbound) DialContext(ctx context.Context, network string, destinati
 		addr = netip.AddrFrom4(addr.As4())
 	}
 
-	return o.bridge.DialTCP(ctx, net.JoinHostPort(addr.String(), strconv.Itoa(int(destination.Port))))
+	return o.line.DialTCP(ctx, net.JoinHostPort(addr.String(), strconv.Itoa(int(destination.Port))))
 }
 
 func (o *vpnOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -135,7 +105,7 @@ func (o *vpnOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	// 连接到解析后的目标:读方向只会收到该 peer 的包(源地址天然正确),
 	// 写方向即便 sing-box 传来的是 FQDN(空 IP)的 UDPAddr,也由 vpnPacketConn
 	// 重定向到 raddr。ListenPacket 语义是"每个目标一条流",连接式最贴合。
-	conn, err := o.bridge.DialUDP(nil, raddr)
+	conn, err := o.line.DialUDP(nil, raddr)
 	if err != nil {
 		return nil, E.Cause(err, "AnyConnect outbound: listen packet to ", destination)
 	}
@@ -169,7 +139,8 @@ func (c *vpnPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 
 // resolve 只经隧道内 DNS 把 FQDN 解析成 IPv4；失败时 fail closed。
 func (o *vpnOutbound) resolve(ctx context.Context, fqdn string) (netip.Addr, error) {
-	for _, server := range o.tunnelDNS {
+	_, tunnelDNS := o.line.snapshot()
+	for _, server := range tunnelDNS {
 		if addr, ok := o.resolveViaTunnel(ctx, server, fqdn); ok {
 			return addr, nil
 		}
@@ -192,7 +163,7 @@ func (o *vpnOutbound) resolveViaTunnel(ctx context.Context, server netip.Addr, f
 	}
 
 	raddr := &net.UDPAddr{IP: net.IP(server.AsSlice()), Port: 53}
-	conn, err := o.bridge.DialUDP(nil, raddr)
+	conn, err := o.line.DialUDP(nil, raddr)
 	if err != nil {
 		return netip.Addr{}, false
 	}

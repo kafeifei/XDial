@@ -1,0 +1,143 @@
+diff --git a/protocol/tailscale/endpoint.go b/protocol/tailscale/endpoint.go
+--- a/protocol/tailscale/endpoint.go
++++ b/protocol/tailscale/endpoint.go
+@@ -12,6 +12,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"reflect"
++	"sort"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -103,6 +104,7 @@ type Endpoint struct {
+-	cfg           *wgcfg.Config
+-	dnsCfg        *tsDNS.Config
+-	routeDomains  common.TypedValue[map[string]bool]
+-	routePrefixes atomic.Pointer[netipx.IPSet]
++	cfg               *wgcfg.Config
++	dnsCfg            *tsDNS.Config
++	routeDomains      common.TypedValue[map[string]bool]
++	dnsCaptureDomains common.TypedValue[[]string]
++	routePrefixes     atomic.Pointer[netipx.IPSet]
+ 
+ 	acceptRoutes               bool
+@@ -914,6 +916,12 @@ func (t *Endpoint) Server() *tsnet.Server {
+ 	return t.server
+ }
+ 
++// DNSCaptureDomains returns the DNS suffixes, exact hosts and single-label
++// aliases currently owned by this endpoint's Tailscale DNS configuration.
++func (t *Endpoint) DNSCaptureDomains() []string {
++	return append([]string(nil), t.dnsCaptureDomains.Load()...)
++}
++
+ func (t *Endpoint) onReconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *tsDNS.Config) {
+ 	if cfg == nil || dnsCfg == nil {
+ 		return
+@@ -933,6 +941,7 @@ func (t *Endpoint) onReconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg
+ 		routeDomains[fqdn.WithoutTrailingDot()] = true
+ 	}
+ 	t.routeDomains.Store(routeDomains)
++	t.dnsCaptureDomains.Store(tailscaleDNSCaptureDomains(dnsCfg))
+ 
+ 	t.routePrefixes.Store(tailscalePreferredRouteSet(cfg.Peers))
+ 
+@@ -963,6 +972,44 @@ func tailscalePreferredRouteSet(peers []wgcfg.Peer) *netipx.IPSet {
+ 	return common.Must1(builder.IPSet())
+ }
+ 
++func tailscaleDNSCaptureDomains(dnsCfg *tsDNS.Config) []string {
++	if dnsCfg == nil {
++		return nil
++	}
++	seen := make(map[string]bool)
++	add := func(domain string) {
++		domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
++		if domain != "" {
++			seen[domain] = true
++		}
++	}
++	searchDomains := make([]string, 0, len(dnsCfg.SearchDomains))
++	for _, fqdn := range dnsCfg.SearchDomains {
++		domain := fqdn.WithoutTrailingDot()
++		add(domain)
++		searchDomains = append(searchDomains, strings.ToLower(domain))
++	}
++	for fqdn := range dnsCfg.Routes {
++		add(fqdn.WithoutTrailingDot())
++	}
++	for fqdn := range dnsCfg.Hosts {
++		host := strings.ToLower(fqdn.WithoutTrailingDot())
++		add(host)
++		for _, searchDomain := range searchDomains {
++			relative, found := strings.CutSuffix(host, "."+searchDomain)
++			if found && relative != "" && !strings.Contains(relative, ".") {
++				add(relative)
++			}
++		}
++	}
++	domains := make([]string, 0, len(seen))
++	for domain := range seen {
++		domains = append(domains, domain)
++	}
++	sort.Strings(domains)
++	return domains
++}
++
+ func addressFromAddr(destination netip.Addr) tcpip.Address {
+ 	if destination.Is6() {
+ 		return tcpip.AddrFrom16(destination.As16())
+diff --git a/protocol/tailscale/endpoint_dns_capture_xdial_test.go b/protocol/tailscale/endpoint_dns_capture_xdial_test.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/tailscale/endpoint_dns_capture_xdial_test.go
+@@ -0,0 +1,49 @@
++package tailscale
++
++import (
++	"net/netip"
++	"reflect"
++	"testing"
++
++	tsDNS "github.com/sagernet/tailscale/net/dns"
++	"github.com/sagernet/tailscale/types/dnstype"
++	"github.com/sagernet/tailscale/util/dnsname"
++)
++
++func TestXDialDNSCaptureDomainsFollowTailscaleConfig(t *testing.T) {
++	tailnet := mustXDialFQDN(t, "example-tailnet.ts.net")
++	member := mustXDialFQDN(t, "mba32k.example-tailnet.ts.net")
++	shared := mustXDialFQDN(t, "shared.other-tailnet.ts.net")
++	corp := mustXDialFQDN(t, "corp.example.com")
++
++	got := tailscaleDNSCaptureDomains(&tsDNS.Config{
++		SearchDomains: []dnsname.FQDN{tailnet},
++		Routes: map[dnsname.FQDN][]*dnstype.Resolver{
++			tailnet: nil,
++			corp:    nil,
++		},
++		Hosts: map[dnsname.FQDN][]netip.Addr{
++			member: {netip.MustParseAddr("100.64.0.8")},
++			shared: {netip.MustParseAddr("100.64.0.9")},
++		},
++	})
++	want := []string{
++		"corp.example.com",
++		"example-tailnet.ts.net",
++		"mba32k",
++		"mba32k.example-tailnet.ts.net",
++		"shared.other-tailnet.ts.net",
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("capture domains = %v, want %v", got, want)
++	}
++}
++
++func mustXDialFQDN(t *testing.T, value string) dnsname.FQDN {
++	t.Helper()
++	fqdn, err := dnsname.ToFQDN(value)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return fqdn
++}

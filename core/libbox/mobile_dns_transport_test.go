@@ -49,6 +49,15 @@ func (t *fakeMobileDNSTransport) Exchange(_ context.Context, request *mDNS.Msg) 
 	return mobileDNSTestResponse(request, mDNS.RcodeSuccess), nil
 }
 
+func (t *fakeMobileDNSTransport) ExchangeAsync(
+	ctx context.Context,
+	request *mDNS.Msg,
+	callback func(response *mDNS.Msg, err error),
+) {
+	response, err := t.Exchange(ctx, request)
+	callback(response, err)
+}
+
 type fakeMobileDNSExchanger struct {
 	response *mDNS.Msg
 	err      error

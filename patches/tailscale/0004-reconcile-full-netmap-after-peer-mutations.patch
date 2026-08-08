@@ -1,0 +1,177 @@
+From: XDial maintainers
+Subject: [PATCH] magicsock: reconcile full netmap after peer mutations
+
+A per-field peer mutation updates the live endpoint but deliberately does not
+update Conn.peers. If the next full network map returns the snapshot value,
+updateNodes can compare it with the stale Conn.peers snapshot, conclude that
+nothing changed, and leave the live endpoint at the mutation value.
+
+Remember that an endpoint mutation was applied and force the next full update
+through endpoint reconciliation. Report that reconciliation as a peer change
+so dependent relay state is rebuilt too.
+
+---
+ wgengine/magicsock/magicsock.go                    | 19 ++++++++++++++-----
+ wgengine/magicsock/xdial_netmap_reconcile_test.go | 68 ++++++++++++++++++++++
+ 2 files changed, 82 insertions(+), 5 deletions(-)
+ create mode 100644 wgengine/magicsock/xdial_netmap_reconcile_test.go
+
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -369,5 +369,6 @@ type Conn struct {
+	derpMap            *tailcfg.DERPMap              // nil (or zero regions/nodes) means DERP is disabled
+	self               tailcfg.NodeView              // from last onNodeViewsUpdate
+	peers              views.Slice[tailcfg.NodeView] // from last onNodeViewsUpdate, sorted by Node.ID; Note: [netmap.NodeMutation]'s rx'd in onNodeMutationsUpdate are never applied
++	peerDeltaDirty     bool                          // live endpoint mutation must be reconciled by the next full update
+ 	filt               *filter.Filter                // from last onFilterUpdate
+ 	relayClientEnabled bool                          // whether we can allocate UDP relay endpoints on UDP relay servers or receive CallMeMaybeVia messages from peers
+@@ -3074,8 +3075,9 @@ func (c *candidatePeerRelay) isValid() bool {
+ }
+ 
+ // updateNodes updates [Conn] to reflect the [tailcfg.NodeView]'s contained
+-// in update. It returns true if update.Peers was unequal to c.peers, otherwise
+-// false.
++// in update. It returns true if update.Peers was unequal to c.peers or the
++// update reconciled live endpoint state changed by an earlier
++// [NodeMutationsUpdate], otherwise false.
+ func (c *Conn) updateNodes(update NodeViewsUpdate) (peersChanged bool) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+@@ -3085,6 +3087,7 @@ func (c *Conn) updateNodes(update NodeViewsUpdate) (peersChanged bool) {
+ 	}
+ 
+ 	priorPeers := c.peers
++	reconcileMutations := c.peerDeltaDirty
+ 	metricNumPeers.Set(int64(len(update.Peers)))
+ 
+ 	// Update c.self & c.peers regardless, before the following early return.
+@@ -3103,7 +3106,7 @@ func (c *Conn) updateNodes(update NodeViewsUpdate) (peersChanged bool) {
+ 	// TODO: mutate [debugFlags] here instead of in various [Conn] setters.
+ 	flags := c.debugFlagsLocked()
+ 
+-	peersChanged = !nodesEqual(priorPeers, curPeers)
++	peersChanged = reconcileMutations || !nodesEqual(priorPeers, curPeers)
+ 	if !peersChanged && c.lastFlags == flags {
+ 		// The rest of this function is all adjusting state for peers that have
+ 		// changed. But if the set of peers is equal and the debug flags (for
+@@ -3227,6 +3230,7 @@ func (c *Conn) updateNodes(update NodeViewsUpdate) (peersChanged bool) {
+ 		}
+ 	}
+ 
++	c.peerDeltaDirty = false
+ 	return peersChanged
+ }
+ 
+@@ -3775,6 +3779,7 @@ func simpleDur(d time.Duration) time.Duration {
+ // onNodeMutationsUpdate is called when a [NodeMutationsUpdate] is received over
+ // the [eventbus.Bus]. Note: It does not apply these mutations to c.peers.
+ func (c *Conn) onNodeMutationsUpdate(update NodeMutationsUpdate) {
++	applied := false
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 
+@@ -3787,11 +3792,14 @@ func (c *Conn) onNodeMutationsUpdate(update NodeMutationsUpdate) {
+ 		switch m := m.(type) {
+ 		case netmap.NodeMutationDERPHome:
+ 			ep.setDERPHome(uint16(m.DERPRegion))
++			applied = true
+ 		case netmap.NodeMutationEndpoints:
+ 			ep.mu.Lock()
+ 			ep.setEndpointsLocked(views.SliceOf(m.Endpoints))
+ 			ep.mu.Unlock()
++			applied = true
+ 		}
+ 	}
++	c.peerDeltaDirty = c.peerDeltaDirty || applied
+ }
+ 
+ // UpdateStatus implements the interface needed by ipnstate.StatusBuilder.
+diff --git a/wgengine/magicsock/xdial_netmap_reconcile_test.go b/wgengine/magicsock/xdial_netmap_reconcile_test.go
+new file mode 100644
+--- /dev/null
++++ b/wgengine/magicsock/xdial_netmap_reconcile_test.go
+@@ -0,0 +1,83 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"testing"
++
++	"github.com/sagernet/tailscale/tailcfg"
++	"github.com/sagernet/tailscale/types/key"
++	"github.com/sagernet/tailscale/types/netmap"
++)
++
++func TestXDialFullNetmapReconcilesDERPHomeMutation(t *testing.T) {
++	c := newConn(t.Logf)
++	peer := &tailcfg.Node{
++		ID:       1,
++		Key:      key.NewNode().Public(),
++		DiscoKey: key.NewDisco().Public(),
++		HomeDERP: 2,
++	}
++	fullUpdate := NodeViewsUpdate{Peers: []tailcfg.NodeView{peer.View()}}
++	if changed := c.updateNodes(fullUpdate); !changed {
++		t.Fatal("initial full update was not reported as changed")
++	}
++
++	derpHome := func() uint16 {
++		t.Helper()
++		c.mu.Lock()
++		defer c.mu.Unlock()
++		ep, ok := c.peerMap.endpointForNodeID(peer.ID)
++		if !ok {
++			t.Fatalf("peer %d has no live endpoint", peer.ID)
++		}
++		ep.mu.Lock()
++		defer ep.mu.Unlock()
++		return ep.derpAddr.Port()
++	}
++	if got := derpHome(); got != 2 {
++		t.Fatalf("initial live endpoint DERP = %d, want 2", got)
++	}
++
++	mutations, ok := netmap.NodeMutationsFromPatch(&tailcfg.PeerChange{
++		NodeID:     peer.ID,
++		DERPRegion: 3,
++	})
++	if !ok || len(mutations) != 1 {
++		t.Fatalf("DERP mutation = (%v, %v), want one supported mutation", mutations, ok)
++	}
++	c.onNodeMutationsUpdate(NodeMutationsUpdate{Mutations: mutations})
++	c.mu.Lock()
++	snapshotDERP := c.peers.At(0).HomeDERP()
++	mutationDirty := c.peerDeltaDirty
++	c.mu.Unlock()
++	if snapshotDERP != 2 || !mutationDirty {
++		t.Fatalf("post-mutation snapshot DERP = %d, dirty = %v; want 2, true", snapshotDERP, mutationDirty)
++	}
++	if got := derpHome(); got != 3 {
++		t.Fatalf("post-mutation live endpoint DERP = %d, want 3", got)
++	}
++
++	// The full snapshot still contains DERP 2. Conn.peers also contains DERP
++	// 2 because mutations deliberately update only the live endpoint. Without
++	// the reconciliation gate this update compares equal, takes the fast path,
++	// and incorrectly leaves the endpoint at DERP 3.
++	if changed := c.updateNodes(fullUpdate); !changed {
++		t.Fatal("post-mutation full update skipped endpoint reconciliation")
++	}
++	if got := derpHome(); got != 2 {
++		t.Fatalf("reconciled live endpoint DERP = %d, want 2", got)
++	}
++	c.mu.Lock()
++	reconciledDirty := c.peerDeltaDirty
++	c.mu.Unlock()
++	if reconciledDirty {
++		t.Fatal("full update did not clear peer mutation reconciliation state")
++	}
++
++	// Once reconciled, an identical full update should regain the fast path.
++	if changed := c.updateNodes(fullUpdate); changed {
++		t.Fatal("identical full update remained dirty after reconciliation")
++	}
++}

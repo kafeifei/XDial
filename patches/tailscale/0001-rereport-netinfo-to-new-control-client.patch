@@ -1,0 +1,138 @@
+From 6a709216b9465e716a938de4fc7adb1d4309156f Mon Sep 17 00:00:00 2001
+From: Mike O'Driscoll <mikeo@tailscale.com>
+Date: Fri, 5 Jun 2026 13:36:00 -0400
+Subject: [PATCH] ipn/ipnlocal,wgengine/magicsock: re-report NetInfo to new
+ control client (#20025)
+
+Backport of:
+https://github.com/tailscale/tailscale/commit/6a709216b9465e716a938de4fc7adb1d4309156f
+
+The SagerNet module archive omits Tailscale's nested test files and tstest
+package. The upstream TestResetNetInfoLast body is therefore carried in a
+standalone test file, with only tstest.PanicOnLog removed; the production
+assertions are unchanged.
+---
+ ipn/ipnlocal/local.go                         |  6 +++
+ wgengine/magicsock/magicsock.go               | 20 ++++++++++
+ wgengine/magicsock/netinfo_reset_test.go       | 65 ++++++++++++++++++++++++++
+ 3 files changed, 91 insertions(+)
+ create mode 100644 wgengine/magicsock/netinfo_reset_test.go
+
+diff --git a/ipn/ipnlocal/local.go b/ipn/ipnlocal/local.go
+--- a/ipn/ipnlocal/local.go
++++ b/ipn/ipnlocal/local.go
+@@ -5761,6 +5761,12 @@ func (b *LocalBackend) setControlClientLocked(cc controlclient.Client) {
+ 	b.cc = cc
+ 	b.ccAuto, _ = cc.(*controlclient.Auto)
+ 	b.ignoreControlClientUpdates.Store(cc == nil)
++
++	// magicsock de-dupes NetInfo against a cache that outlives the control
++	// client; clear it on (re)install so the next netcheck re-reports our
++	// NetInfo (notably PreferredDERP, our home DERP) to the new client rather
++	// than suppressing it as unchanged.
++	b.MagicConn().ResetNetInfoLast()
+ }
+ 
+ // resetControlClientLocked sets b.cc to nil and returns the old value. If the
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -1153,6 +1153,26 @@ func (c *Conn) callNetInfoCallbackLocked(ni *tailcfg.NetInfo) {
+ 	}
+ }
+ 
++// ResetNetInfoLast clears the cached NetInfo used to de-duplicate NetInfo
++// callbacks, so that the next NetInfo is delivered to the registered callback
++// (see [Conn.SetNetInfoCallback]) even if it's structurally identical to the
++// previously delivered one.
++//
++// It must be called whenever the downstream consumer of NetInfo updates is
++// replaced, notably when [ipnlocal.LocalBackend] installs a new control client
++// after an interactive login or a profile switch.
++//
++// TODO(tailscale/tailscale#17887): remove once NetInfo updates move to the
++// eventbus, where a newly-installed consumer can fetch current state on
++// subscribe instead of magicsock exposing this de-dup-cache reset hook.
++//
++// c.mu must NOT be held.
++func (c *Conn) ResetNetInfoLast() {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.netInfoLast = nil
++}
++
+ // addValidDiscoPathForTest makes addr a validated disco address for
+ // discoKey. It's used in tests to enable receiving of packets from
+ // addr without having to spin up the entire active discovery
+diff --git a/wgengine/magicsock/netinfo_reset_test.go b/wgengine/magicsock/netinfo_reset_test.go
+new file mode 100644
+--- /dev/null
++++ b/wgengine/magicsock/netinfo_reset_test.go
+@@ -0,0 +1,65 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"testing"
++	"time"
++
++	"github.com/sagernet/tailscale/tailcfg"
++)
++
++// TestResetNetInfoLast verifies that ResetNetInfoLast clears the NetInfo
++// de-duplication cache, so the next NetInfo is delivered to the callback even
++// when it's structurally unchanged (which callNetInfoCallback would normally
++// suppress). This is what lets a node re-advertise its home DERP
++// (NetInfo.PreferredDERP) to a freshly-installed control client after an
++// interactive login or profile switch; without it, peers can't reach the node
++// over DERP until some unrelated NetInfo field changes.
++func TestResetNetInfoLast(t *testing.T) {
++	c := newConn(t.Logf)
++
++	got := make(chan *tailcfg.NetInfo, 8)
++	c.SetNetInfoCallback(func(ni *tailcfg.NetInfo) {
++		got <- ni
++	})
++
++	wantCall := func(why string, wantDERP int) {
++		t.Helper()
++		select {
++		case ni := <-got:
++			if ni.PreferredDERP != wantDERP {
++				t.Fatalf("%s: got PreferredDERP=%d, want %d", why, ni.PreferredDERP, wantDERP)
++			}
++		case <-time.After(5 * time.Second):
++			t.Fatalf("%s: timed out waiting for NetInfo callback", why)
++		}
++	}
++	wantNoCall := func(why string) {
++		t.Helper()
++		select {
++		case ni := <-got:
++			t.Fatalf("%s: unexpected NetInfo callback: %+v", why, ni)
++		case <-time.After(200 * time.Millisecond):
++		}
++	}
++
++	ni := &tailcfg.NetInfo{PreferredDERP: 7, WorkingUDP: "true", LinkType: "wired"}
++
++	// First delivery fires the callback.
++	c.callNetInfoCallback(ni.Clone())
++	wantCall("initial", 7)
++
++	// An identical NetInfo is de-duplicated: no callback. This is exactly the
++	// behavior that, on a control-client swap, drops the home DERP.
++	c.callNetInfoCallback(ni.Clone())
++	wantNoCall("duplicate suppressed")
++
++	// Simulate a new control client being installed: clearing the de-dup cache
++	// must let the next (otherwise-identical) NetInfo through, modeling the
++	// post-login netcheck that re-reports derp-7 to the new session.
++	c.ResetNetInfoLast()
++	c.callNetInfoCallback(ni.Clone())
++	wantCall("after ResetNetInfoLast", 7)
++}
+-- 
+2.50.1

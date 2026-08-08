@@ -88,14 +88,18 @@ func randomHexSuffix() string {
 
 // buildTailscaleEndpoint 生成 sing-box 的 tailscale endpoint。
 //
-// 刻意不设的字段：
-//   - accept_routes：XDial 里 Tailscale 只是一条出口线路，只有模式显式绑定的流量
+// 显式关闭的字段：
+//   - accept_routes：XDial 里 Tailscale 只是一条出口线路，只有场景显式绑定的流量
 //     才走它。接受 peer 广播的子网路由会把一堆用户没要求的网段拉进来，
 //     还可能和本地网段撞上（例如公司和家里都是 192.168.1.0/24）。
+//   - system_interface：Tailscale 只是一条 sing-box 盒内 Line，不能创建第二个
+//     系统网络叠加层。
+//
+// 刻意不设的字段：
 //   - advertise_routes / advertise_exit_node：XDial 是工具，不提供网络出口。
 //     一旦能 advertise 就变成在分发线路了，性质完全不同。
 //     （sing-box 本身也禁止同时 advertise 和使用 exit node。）
-func buildTailscaleEndpoint(line *Line, identity TailscaleIdentity, basePath string) (map[string]interface{}, error) {
+func buildTailscaleEndpoint(line *Line, identity TailscaleIdentity, basePath, authKey string) (map[string]interface{}, error) {
 	if line == nil || line.Type != LineTypeTailscale {
 		return nil, fmt.Errorf("line is not a Tailscale line")
 	}
@@ -104,9 +108,11 @@ func buildTailscaleEndpoint(line *Line, identity TailscaleIdentity, basePath str
 	}
 
 	endpoint := map[string]interface{}{
-		"type":            "tailscale",
-		"tag":             tailscaleEndpointTag(line),
-		"state_directory": TailscaleStateDirectory(basePath),
+		"type":             "tailscale",
+		"tag":              tailscaleEndpointTag(line),
+		"state_directory":  TailscaleStateDirectory(basePath),
+		"system_interface": false,
+		"accept_routes":    false,
 		// 常驻节点。ephemeral 恒不设（sing-box 默认 false）：登录会话关闭后控制面
 		// 会立刻回收 node key，连接时复用 state 会被要求重新登录。设备不堆积由
 		// 全局唯一 state + 固定 hostname 保证；退出登录走 Logout 显式删除设备记录。
@@ -114,10 +120,10 @@ func buildTailscaleEndpoint(line *Line, identity TailscaleIdentity, basePath str
 	if identity.Hostname != "" {
 		endpoint["hostname"] = identity.Hostname
 	}
-	// auth_key：D29 的无特权登录路径。有它 tsnet 首次启动即可自助注册节点，
-	// 没有它就退回 sing-box 自己的交互式授权 URL 流程（配置形态不变）。
-	if line.TailscaleAuthKey != "" {
-		endpoint["auth_key"] = line.TailscaleAuthKey
+	// auth_key 由调用方显式提供。桌面 D33 只允许 setup session 把一次性请求
+	// 瞬时传进来，日常 Profile 生成路径永远传空；旧移动端 Profile 暂时兼容。
+	if authKey != "" {
+		endpoint["auth_key"] = authKey
 	}
 	if line.TailscaleExitNode != "" {
 		endpoint["exit_node"] = line.TailscaleExitNode

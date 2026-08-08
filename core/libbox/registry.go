@@ -6,6 +6,7 @@ import (
 	"context"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter/certificate"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -14,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/dns/transport"
 	"github.com/sagernet/sing-box/dns/transport/hosts"
 	"github.com/sagernet/sing-box/dns/transport/local"
+	"github.com/sagernet/sing-box/protocol/anytls"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
@@ -31,7 +33,15 @@ import (
 func boxContext(ctx context.Context) context.Context {
 	endpointRegistry := endpoint.NewRegistry()
 	registerTailscaleEndpoint(endpointRegistry)
-	return box.Context(ctx, inboundRegistry(), outboundRegistry(), endpointRegistry, dnsTransportRegistry(), boxservice.NewRegistry())
+	return box.Context(
+		ctx,
+		inboundRegistry(),
+		outboundRegistry(),
+		endpointRegistry,
+		dnsTransportRegistry(),
+		boxservice.NewRegistry(),
+		certificate.NewRegistry(),
+	)
 }
 
 func inboundRegistry() *inbound.Registry {
@@ -52,6 +62,7 @@ func outboundRegistry() *outbound.Registry {
 	trojan.RegisterOutbound(registry)
 	shadowsocks.RegisterOutbound(registry)
 	vmess.RegisterOutbound(registry)
+	anytls.RegisterOutbound(registry)
 	registerVPNOutbound(registry)
 
 	return registry
@@ -66,5 +77,6 @@ func dnsTransportRegistry() *dns.TransportRegistry {
 	local.RegisterTransport(registry)
 	registerTailscaleDNSTransport(registry)
 	registerMobileDNSTransport(registry)
+	registerAnyConnectDNSTransport(registry)
 	return registry
 }

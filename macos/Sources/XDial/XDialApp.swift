@@ -14,17 +14,36 @@ extension Notification.Name {
 /// openWindow 环境值的地方（popover 的内容只在展开时才存在）。
 private struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
+    let connected: Bool
 
     var body: some View {
-        let icon = Image(nsImage: AppIcon.menuBar())
+        Image(nsImage: AppIcon.menuBar(connected: connected))
+            .resizable()
+            .interpolation(.high)
+            .frame(width: 18, height: 18)
+            // 系统 status item 还会增加自身左右 inset；缩窄
+            // label 布局宽度，但不裁剪 18pt 的月球。
+            .frame(width: 13, height: 18)
             .accessibilityLabel("XDial")
+            .onAppear {
+                AppIcon.applyDockState(connected: connected)
+            }
+            .onChange(of: connected) { _, isConnected in
+                AppIcon.applyDockState(connected: isConnected)
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: .xdialOpenInstallation
+                )
+            ) { _ in
+                openWindow(id: "installation")
+                NSApp.activate(ignoringOtherApps: true)
+            }
         #if DEBUG
-        icon.onReceive(NotificationCenter.default.publisher(for: .xdialDebugOpenSettings)) { _ in
-            openWindow(id: "settings")
-            NSApp.activate(ignoringOtherApps: true)
-        }
-        #else
-        icon
+            .onReceive(NotificationCenter.default.publisher(for: .xdialDebugOpenSettings)) { _ in
+                openWindow(id: "settings")
+                NSApp.activate(ignoringOtherApps: true)
+            }
         #endif
     }
 }
@@ -37,51 +56,132 @@ struct XDialApp: App {
         MenuBarExtra {
             MainPopover()
                 .environmentObject(state)
+                .tint(XDialPalette.accent)
+                .preferredColorScheme(state.appearance.colorScheme)
         } label: {
-            MenuBarLabel()
+            MenuBarLabel(connected: state.isConnected)
         }
         .menuBarExtraStyle(.window)
 
         Window("XDial 设置", id: "settings") {
             SettingsView()
                 .environmentObject(state)
+                .tint(XDialPalette.accent)
+                .preferredColorScheme(state.appearance.colorScheme)
         }
         .defaultSize(width: 540, height: 540)
+        .windowResizability(.contentSize)
+
+        Window("XDial 安装与卸载", id: "installation") {
+            InstallationView(
+                coordinator: InstallationCoordinator.shared
+            )
+            .environmentObject(state)
+            .tint(XDialPalette.accent)
+            .preferredColorScheme(state.appearance.colorScheme)
+        }
+        .defaultSize(width: 480, height: 420)
         .windowResizability(.contentSize)
     }
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    private var terminationTask: Task<Void, Never>?
+    private var terminationApproved = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
+
         // 设置窗口：不随失焦隐藏 + 出现在 Cmd+Tab
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { n in
-            guard let w = n.object as? NSWindow,
-                  w.title.contains("设置") || w.title.contains("Settings") else { return }
-            w.hidesOnDeactivate = false
-            NSApp.applicationIconImage = AppIcon.dock(size: 256)
-            NSApp.setActivationPolicy(.regular)
+            MainActor.assumeIsolated {
+                guard let w = n.object as? NSWindow,
+                      w.title.contains("设置")
+                        || w.title.contains("Settings")
+                        || w.title.contains("安装")
+                        || w.title.contains("Installation") else { return }
+                w.hidesOnDeactivate = false
+                AppIcon.applyDockState(
+                    connected: GoEngine.shared.isConnected
+                )
+                NSApp.setActivationPolicy(.regular)
+            }
         }
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { n in
             guard let w = n.object as? NSWindow,
-                  w.title.contains("设置") || w.title.contains("Settings") else { return }
+                  w.title.contains("设置")
+                    || w.title.contains("Settings")
+                    || w.title.contains("安装")
+                    || w.title.contains("Installation") else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 let hasSettings = NSApp.windows.contains {
-                    $0.isVisible && ($0.title.contains("设置") || $0.title.contains("Settings"))
+                    $0.isVisible && (
+                        $0.title.contains("设置")
+                            || $0.title.contains("Settings")
+                            || $0.title.contains("安装")
+                            || $0.title.contains("Installation")
+                    )
                 }
                 if !hasSettings { NSApp.setActivationPolicy(.accessory) }
             }
         }
     }
 
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let engine = GoEngine.shared
-        guard engine.status == "connected" || engine.status == "connecting" || engine.status == "reconnecting" else {
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        appLog("application termination: delegate entered")
+        if terminationApproved {
+            appLog("application termination: final exit approved")
             return .terminateNow
         }
-        Task { @MainActor in
-            engine.stop()
-            sender.reply(toApplicationShouldTerminate: true)
+        if terminationTask != nil {
+            return .terminateCancel
         }
-        return .terminateLater
+        let engine = GoEngine.shared
+        guard Self.requiresTerminationDrain(engine) else {
+            appLog("application termination: no active network transaction")
+            return .terminateNow
+        }
+
+        // terminateLater 会让 NSApplication.terminate() 进入嵌套 RunLoop；
+        // NE 的 completion 与 MainActor 投影在这个状态下都可能无法推进。先
+        // cancel 本轮退出，让主事件循环继续跑；回滚闭合后再发起第二轮退出。
+        appLog("application termination: draining active network transaction")
+        engine.stop(userInitiated: true)
+        let deadline = Date().addingTimeInterval(12)
+        terminationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while Date() < deadline,
+                  Self.requiresTerminationDrain(engine) {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            if Self.requiresTerminationDrain(engine) {
+                let report = engine.connectionReport
+                let reportState = report?.state.rawValue ?? "none"
+                appLog(
+                    "application termination: network drain timed out; "
+                        + "status=\(engine.status) "
+                        + "report=\(reportState) "
+                        + "rollback_complete="
+                        + "\(report?.rollbackComplete ?? false) "
+                        + "system_takeover_removed="
+                        + "\(report?.systemTakeoverRemoved ?? false)"
+                )
+            } else {
+                appLog("application termination: network drain completed")
+            }
+            self.terminationApproved = true
+            self.terminationTask = nil
+            NSApp.terminate(nil)
+        }
+        return .terminateCancel
+    }
+
+    @MainActor
+    private static func requiresTerminationDrain(
+        _ engine: GoEngine
+    ) -> Bool {
+        engine.requiresTerminationDrain()
     }
 }

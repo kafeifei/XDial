@@ -297,12 +297,21 @@ struct ConfigurationView: View {
     }
 
     private func addRuleButton(type: String) -> some View {
-        Button(type == "url" ? app.tr("URL 规则", "URL rule") : app.tr("手工规则", "Manual rule")) {
+        let label: String = switch type {
+        case "url":
+            app.tr("URL 规则", "URL rule")
+        default:
+            app.tr("手工规则", "Manual rule")
+        }
+        return Button(label) {
             guard !app.hasActiveTunnel, !app.isBusy else { return }
             let id = "rule-" + String(UUID().uuidString.prefix(8)).lowercased()
-            let name = type == "url"
-                ? app.tr("新 URL 规则", "New URL Rule")
-                : app.tr("新手工规则", "New Manual Rule")
+            let name: String = switch type {
+            case "url":
+                app.tr("新 URL 规则", "New URL Rule")
+            default:
+                app.tr("新手工规则", "New Manual Rule")
+            }
             app.profile.ruleSets.append(RuleSet(id: id, name: name, type: type))
             app.save()
         }
@@ -311,15 +320,15 @@ struct ConfigurationView: View {
     private func deleteLine(_ line: Line) {
         guard !app.hasActiveTunnel, !app.isBusy, line.type != "direct" else { return }
         app.profile.lines.removeAll { $0.id == line.id }
-        // 保留模式里的悬空引用；连接前校验会阻止启动并要求用户明确选择替代目标。
+        // 保留场景里的悬空引用；连接前校验会阻止启动并要求用户明确选择替代目标。
         app.save()
     }
 
     private func deleteRule(_ ruleSet: RuleSet) {
         guard !app.hasActiveTunnel, !app.isBusy else { return }
         app.profile.ruleSets.removeAll { $0.id == ruleSet.id }
-        for index in app.profile.modes.indices {
-            app.profile.modes[index].bindings.removeAll { $0.ruleSetID == ruleSet.id }
+        for index in app.profile.scenarios.indices {
+            app.profile.scenarios[index].bindings.removeAll { $0.ruleSetID == ruleSet.id }
         }
         app.save()
     }
@@ -586,12 +595,17 @@ private struct LineEditorView: View {
                         .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
+                Toggle(
+                    app.tr("启用 MagicDNS", "Enable MagicDNS"),
+                    isOn: lineBinding(index, \.tailscaleMagicDNS)
+                )
+                .accessibilityIdentifier("tailscale-magic-dns-toggle")
             } header: {
                 Text("Tailscale")
             } footer: {
                 Text(app.tr(
-                    "登录在 XDial 内独立完成，不会启动系统线路。正式连接后，MagicDNS/.ts.net 会按域名交给对应 Tailscale 线路。",
-                    "Sign-in is completed inside XDial without starting a system line. During a normal connection, MagicDNS/.ts.net queries use the matching Tailscale line."
+                    "勾选后可解析并访问 Tailnet 节点；只有当前 Scenario 使用这条线路时才生效，Scenario 中已有的显式域名规则优先。",
+                    "When enabled, Tailnet peers can be resolved and reached only while the current Scenario uses this line. Explicit domain rules in the Scenario take priority."
                 ))
             }
             .disabled(app.hasActiveTunnel)
@@ -1087,7 +1101,7 @@ private struct LineEditorView: View {
         guard app.canMutateConfiguration,
               let index = lineIndex, app.profile.lines[index].type != "direct" else { return }
         app.profile.lines.remove(at: index)
-        // 模式引用故意保留，避免静默改变路由语义。
+        // 场景引用故意保留，避免静默改变路由语义。
         app.save()
         dismiss()
     }
@@ -1112,7 +1126,7 @@ private struct RuleEditorView: View {
                     TextField(app.tr("名称", "Name"), text: ruleBinding(index, \.name))
                     LabeledContent(
                         app.tr("类型", "Type"),
-                        value: app.profile.ruleSets[index].type == "url" ? "URL" : app.tr("手工", "Manual")
+                        value: ruleTypeLabel(app.profile.ruleSets[index].type)
                     )
                     Toggle(app.tr("启用", "Enabled"), isOn: ruleBinding(index, \.enabled))
                 }
@@ -1149,7 +1163,7 @@ private struct RuleEditorView: View {
                 if isConnectivityTestRule {
                     Section {
                         Label(
-                            app.tr("分别验证 Direct 与当前模式选中的非 Direct 出口绑定。", "Verifies the Direct route and the selected non-Direct route independently."),
+                            app.tr("分别验证 Direct 与当前场景选中的非 Direct 出口绑定。", "Verifies the Direct route and the selected non-Direct route independently."),
                             systemImage: "checkmark.shield"
                         )
                     } footer: {
@@ -1189,6 +1203,15 @@ private struct RuleEditorView: View {
 
     private var ruleIndex: Int? {
         app.profile.ruleSets.firstIndex { $0.id == ruleSetID }
+    }
+
+    private func ruleTypeLabel(_ type: String) -> String {
+        switch type {
+        case "url":
+            return "URL"
+        default:
+            return app.tr("手工", "Manual")
+        }
     }
 
     private var isConnectivityTestRule: Bool {
@@ -1295,8 +1318,8 @@ private struct RuleEditorView: View {
         pendingSaveTask = nil
         let id = app.profile.ruleSets[index].id
         app.profile.ruleSets.remove(at: index)
-        for modeIndex in app.profile.modes.indices {
-            app.profile.modes[modeIndex].bindings.removeAll { $0.ruleSetID == id }
+        for scenarioIndex in app.profile.scenarios.indices {
+            app.profile.scenarios[scenarioIndex].bindings.removeAll { $0.ruleSetID == id }
         }
         app.save()
         dismiss()

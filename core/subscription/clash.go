@@ -142,6 +142,71 @@ func clashProxyToLine(p map[string]interface{}) (config.Line, bool) {
 		base.AllowInsecure = getBool(p, "skip-cert-verify")
 		return base, true
 
+	case "anytls":
+		base.Type = config.LineTypeAnyTLS
+		base.AnyTLSServer = server
+		base.AnyTLSPort = port
+		base.AnyTLSPassword = getString(p, "password")
+		sni := getString(p, "sni")
+		if sni == "" {
+			sni = getString(p, "servername")
+		}
+		if sni == "" {
+			sni = server
+		}
+		base.AnyTLSSNI = sni
+		base.AnyTLSClientFingerprint = normalizeAnyTLSFingerprint(
+			getString(p, "client-fingerprint"),
+		)
+
+		alpn, ok := clashAnyTLSALPN(p)
+		if !ok {
+			return config.Line{}, false
+		}
+		base.AnyTLSALPN = alpn
+
+		if value, exists := p["idle-session-check-interval"]; exists {
+			seconds, valid := parseAnyTLSSessionSeconds(value)
+			if !valid {
+				return config.Line{}, false
+			}
+			base.AnyTLSIdleSessionCheckInterval = seconds
+		}
+		if value, exists := p["idle-session-timeout"]; exists {
+			seconds, valid := parseAnyTLSSessionSeconds(value)
+			if !valid {
+				return config.Line{}, false
+			}
+			base.AnyTLSIdleSessionTimeout = seconds
+		}
+		if value, exists := p["min-idle-session"]; exists {
+			count, valid := parseAnyTLSMinIdleSession(value)
+			if !valid {
+				return config.Line{}, false
+			}
+			base.AnyTLSMinIdleSession = count
+		}
+
+		base.AllowInsecure, ok = clashOptionalBool(p, "skip-cert-verify")
+		if !ok {
+			return config.Line{}, false
+		}
+		base.UDP, ok = clashOptionalBool(p, "udp", "udp-relay")
+		if !ok {
+			return config.Line{}, false
+		}
+		// 协议选项边界与实际 outbound 生成共用一个事实源。TFO 在后面解析：
+		// 即使订阅声明了不受支持的 tfo=true，也要先完整导入该事实，再由
+		// 运行时能力检查 fail-closed，不能在解析时偷偷改成 false。
+		if !config.LineHasUsableOutbound(&base) {
+			return config.Line{}, false
+		}
+		base.TFO, ok = clashOptionalBool(p, "tfo")
+		if !ok {
+			return config.Line{}, false
+		}
+		return base, true
+
 	default:
 		return config.Line{}, false
 	}
@@ -183,4 +248,44 @@ func getBool(m map[string]interface{}, key string) bool {
 		return v == "true" || v == "1"
 	}
 	return false
+}
+
+func clashOptionalBool(m map[string]interface{}, keys ...string) (bool, bool) {
+	for _, key := range keys {
+		if value, exists := m[key]; exists {
+			return parseOptionalBool(value)
+		}
+	}
+	return false, true
+}
+
+func clashAnyTLSALPN(m map[string]interface{}) ([]string, bool) {
+	value, exists := m["alpn"]
+	if !exists {
+		return nil, true
+	}
+
+	var protocols []string
+	switch typed := value.(type) {
+	case string:
+		var ok bool
+		protocols, ok = splitAnyTLSALPN(typed)
+		if !ok {
+			return nil, false
+		}
+	case []string:
+		protocols = append(protocols, typed...)
+	case []interface{}:
+		protocols = make([]string, 0, len(typed))
+		for _, item := range typed {
+			protocol, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			protocols = append(protocols, protocol)
+		}
+	default:
+		return nil, false
+	}
+	return normalizeAnyTLSALPN(protocols), true
 }

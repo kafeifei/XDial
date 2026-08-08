@@ -1,0 +1,1382 @@
+From fc25c0937796a9bb1622a505c9d5eb7991145da5 Mon Sep 17 00:00:00 2001
+From: XDial Patch Builder <xdial-patch-builder@invalid>
+Date: Thu, 30 Jul 2026 15:15:26 +0800
+Subject: [PATCH] add peer derp path diagnostics
+
+---
+ derp/derphttp/derphttp_client.go              |  93 ++-
+ derp/derphttp/xdial_diagnostics_test.go       |  84 +++
+ wgengine/magicsock/derp.go                    | 132 ++++-
+ wgengine/magicsock/magicsock.go               |  23 +-
+ .../magicsock/xdial_peer_derp_diagnostics.go  | 537 ++++++++++++++++++
+ .../xdial_peer_derp_diagnostics_test.go       | 232 ++++++++
+ 6 files changed, 1063 insertions(+), 38 deletions(-)
+ create mode 100644 derp/derphttp/xdial_diagnostics_test.go
+ create mode 100644 wgengine/magicsock/xdial_peer_derp_diagnostics.go
+ create mode 100644 wgengine/magicsock/xdial_peer_derp_diagnostics_test.go
+
+diff --git a/derp/derphttp/derphttp_client.go b/derp/derphttp/derphttp_client.go
+index 52b938b..14b0489 100644
+--- a/derp/derphttp/derphttp_client.go
++++ b/derp/derphttp/derphttp_client.go
+@@ -100,9 +100,16 @@ type Client struct {
+ 	client       *derp.Client
+ 	connGen      int // incremented once per new connection; valid values are >0
+ 	serverPubKey key.NodePublic
+-	tlsState     *tls.ConnectionState
+-	pingOut      map[derp.PingMessage]chan<- bool // chan to send to on pong
+-	clock        tstime.Clock
++	// The XDial-only fields below expose bounded connection relationships
++	// without returning a DERP server identity or address.
++	xdialIdealKnown          bool
++	xdialIdeal               bool
++	xdialServerIdentityKnown bool
++	xdialServerIdentity      key.NodePublic
++	xdialServerChangeSeq     uint64
++	tlsState                 *tls.ConnectionState
++	pingOut                  map[derp.PingMessage]chan<- bool // chan to send to on pong
++	clock                    tstime.Clock
+ }
+ 
+ // ConnectedState describes the state of a derphttp Client.
+@@ -120,6 +127,59 @@ func (c *Client) XDialConnectionState() (connected, closed bool) {
+ 	return state.Connected, state.Closed
+ }
+ 
++// XDialConnectionDiagnostics returns only bounded DERP transport facts. It
++// intentionally omits addresses, region identifiers, and server identities.
++type XDialConnectionDiagnostics struct {
++	Connected            bool
++	Closed               bool
++	Generation           int
++	IdealKnown           bool
++	Ideal                bool
++	ServerChangeSequence uint64
++}
++
++func (c *Client) XDialConnectionDiagnostics() XDialConnectionDiagnostics {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	state := c.atomicState.Load()
++	return XDialConnectionDiagnostics{
++		Connected:            state.Connected,
++		Closed:               state.Closed,
++		Generation:           c.connGen,
++		IdealKnown:           c.xdialIdealKnown,
++		Ideal:                c.xdialIdeal,
++		ServerChangeSequence: c.xdialServerChangeSeq,
++	}
++}
++
++// XDialConnectionGeneration safely returns the current DERP connection
++// generation without exposing the selected server.
++func (c *Client) XDialConnectionGeneration() int {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.connGen
++}
++
++// xdialRecordConnectionLocked records bounded properties of a newly
++// established connection. c.mu must be held.
++func (c *Client) xdialRecordConnectionLocked(
++	serverKey key.NodePublic,
++	idealKnown bool,
++	ideal bool,
++) {
++	if !serverKey.IsZero() {
++		if c.xdialServerIdentityKnown &&
++			c.xdialServerIdentity != serverKey {
++			c.xdialServerChangeSeq++
++		}
++		c.xdialServerIdentityKnown = true
++		c.xdialServerIdentity = serverKey
++	}
++	c.xdialIdealKnown = idealKnown
++	c.xdialIdeal = idealKnown && ideal
++}
++
+ func (c *Client) String() string {
+ 	return fmt.Sprintf("<derphttp_client.Client %s url=%s>", c.ServerPublicKey().ShortString(), c.url)
+ }
+@@ -395,6 +455,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
+ 
+ 	var node *tailcfg.DERPNode // nil when using c.url to dial
+ 	var idealNodeInRegion bool
++	var idealNodeKnown bool
+ 	switch {
+ 	case canWebsockets && useWebsockets():
+ 		var urlStr string
+@@ -402,6 +463,8 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
+ 			urlStr = c.url.String()
+ 		} else {
+ 			urlStr = c.urlString(reg.Nodes[0])
++			idealNodeKnown = true
++			idealNodeInRegion = true
+ 		}
+ 		c.logf("%s: connecting websocket to %v", caller, urlStr)
+ 		conn, err := dialWebsocketFunc(ctx, urlStr)
+@@ -424,7 +487,9 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
+ 				return nil, 0, err
+ 			}
+ 		}
+-		c.serverPubKey = derpClient.ServerPublicKey()
++		serverKey := derpClient.ServerPublicKey()
++		c.xdialRecordConnectionLocked(serverKey, idealNodeKnown, idealNodeInRegion)
++		c.serverPubKey = serverKey
+ 		c.client = derpClient
+ 		c.netConn = conn
+ 		c.connGen++
+@@ -435,6 +500,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
+ 	default:
+ 		c.logf("%s: connecting to derp-%d (%v)", caller, reg.RegionID, reg.RegionCode)
+ 		tcpConn, node, err = c.dialRegion(ctx, reg)
++		idealNodeKnown = err == nil
+ 		idealNodeInRegion = err == nil && reg.Nodes[0] == node
+ 	}
+ 	if err != nil {
+@@ -577,7 +643,9 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
+ 		}
+ 	}
+ 
+-	c.serverPubKey = derpClient.ServerPublicKey()
++	serverKey := derpClient.ServerPublicKey()
++	c.xdialRecordConnectionLocked(serverKey, idealNodeKnown, idealNodeInRegion)
++	c.serverPubKey = serverKey
+ 	c.client = derpClient
+ 	c.netConn = tcpConn
+ 	c.tlsState = tlsState
+@@ -916,14 +984,22 @@ func (c *Client) dialNodeUsingProxy(ctx context.Context, n *tailcfg.DERPNode, pr
+ }
+ 
+ func (c *Client) Send(dstKey key.NodePublic, b []byte) error {
+-	client, _, err := c.connect(c.newContext(), "derphttp.Client.Send")
++	_, err := c.XDialSendWithGeneration(dstKey, b)
++	return err
++}
++
++// XDialSendWithGeneration sends a packet and returns the exact connection
++// generation used by the send. The generation contains no server identity.
++func (c *Client) XDialSendWithGeneration(dstKey key.NodePublic, b []byte) (int, error) {
++	client, generation, err := c.connect(c.newContext(), "derphttp.Client.Send")
+ 	if err != nil {
+-		return err
++		return 0, err
+ 	}
+ 	if err := client.Send(dstKey, b); err != nil {
+ 		c.closeForReconnect(client)
++		return generation, err
+ 	}
+-	return err
++	return generation, nil
+ }
+ 
+ func (c *Client) registerPing(m derp.PingMessage, ch chan<- bool) {
+@@ -1170,6 +1246,7 @@ func (c *Client) closeForReconnect(brokenClient *derp.Client) {
+ 		c.netConn = nil
+ 	}
+ 	c.client = nil
++	c.atomicState.Store(ConnectedState{})
+ }
+ 
+ var ErrClientClosed = errors.New("derphttp.Client closed")
+diff --git a/derp/derphttp/xdial_diagnostics_test.go b/derp/derphttp/xdial_diagnostics_test.go
+new file mode 100644
+index 0000000..78022a4
+--- /dev/null
++++ b/derp/derphttp/xdial_diagnostics_test.go
+@@ -0,0 +1,84 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++package derphttp
++
++import (
++	"net/netip"
++	"testing"
++
++	"github.com/sagernet/tailscale/derp"
++	"github.com/sagernet/tailscale/types/key"
++)
++
++type xdialTestCloser struct {
++	closed bool
++}
++
++func (c *xdialTestCloser) Close() error {
++	c.closed = true
++	return nil
++}
++
++func TestXDialCloseForReconnectClearsConnectedState(t *testing.T) {
++	broken := new(derp.Client)
++	closer := new(xdialTestCloser)
++	c := new(Client)
++	c.client = broken
++	c.netConn = closer
++	c.connGen = 3
++	c.atomicState.Store(ConnectedState{
++		Connected: true,
++		LocalAddr: netip.MustParseAddrPort("192.0.2.1:1234"),
++	})
++
++	c.closeForReconnect(broken)
++
++	got := c.XDialConnectionDiagnostics()
++	if got.Connected || got.Closed || got.Generation != 3 {
++		t.Fatalf("diagnostics after reconnect close = %+v", got)
++	}
++	if c.client != nil || c.netConn != nil || !closer.closed {
++		t.Fatalf(
++			"reconnect close did not clear transport: client=%v conn=%v closed=%v",
++			c.client,
++			c.netConn,
++			closer.closed,
++		)
++	}
++}
++
++func TestXDialConnectionGenerationAndServerChange(t *testing.T) {
++	firstServer := key.NewNode().Public()
++	secondServer := key.NewNode().Public()
++	c := new(Client)
++
++	c.mu.Lock()
++	c.xdialRecordConnectionLocked(key.NodePublic{}, false, false)
++	c.serverPubKey = key.NodePublic{}
++	c.connGen++
++	c.xdialRecordConnectionLocked(firstServer, true, true)
++	c.serverPubKey = firstServer
++	c.connGen++
++	c.xdialRecordConnectionLocked(firstServer, true, false)
++	c.serverPubKey = firstServer
++	c.connGen++
++	c.xdialRecordConnectionLocked(secondServer, true, false)
++	c.serverPubKey = secondServer
++	c.connGen++
++	c.mu.Unlock()
++
++	got := c.XDialConnectionDiagnostics()
++	if got.Generation != 4 {
++		t.Fatalf("same Client reconnect generation = %d, want 4", got.Generation)
++	}
++	if !got.IdealKnown || got.Ideal {
++		t.Fatalf("last ideal-node relationship = %+v", got)
++	}
++	if got.ServerChangeSequence != 1 {
++		t.Fatalf("server change sequence = %d, want 1", got.ServerChangeSequence)
++	}
++	if generation := c.XDialConnectionGeneration(); generation != 4 {
++		t.Fatalf("safe generation = %d, want 4", generation)
++	}
++}
+diff --git a/wgengine/magicsock/derp.go b/wgengine/magicsock/derp.go
+index c76bc35..32c0447 100644
+--- a/wgengine/magicsock/derp.go
++++ b/wgengine/magicsock/derp.go
+@@ -47,16 +47,6 @@ type derpRoute struct {
+ 	dc       *derphttp.Client // don't use directly; see comment above
+ }
+ 
+-// removeDerpPeerRoute removes a DERP route entry previously added by addDerpPeerRoute.
+-func (c *Conn) removeDerpPeerRoute(peer key.NodePublic, regionID int, dc *derphttp.Client) {
+-	c.mu.Lock()
+-	defer c.mu.Unlock()
+-	r2 := derpRoute{regionID, dc}
+-	if r, ok := c.derpRoute[peer]; ok && r == r2 {
+-		delete(c.derpRoute, peer)
+-	}
+-}
+-
+ // addDerpPeerRoute adds a DERP route entry, noting that peer was seen
+ // on DERP node derpID, at least on the connection identified by dc.
+ // See issue 150 for details.
+@@ -97,6 +87,9 @@ type activeDerp struct {
+ 	lastWrite     *time.Time
+ 	createTime    time.Time
+ 	protocolReady bool
++	// xdialServerInfoSequence is the most recent bounded lifecycle event for
++	// this active client generation.
++	xdialServerInfoSequence uint64
+ }
+ 
+ var pickDERPFallbackForTests func() int
+@@ -314,6 +307,12 @@ func (c *Conn) goDerpConnect(regionID int) {
+ // operations on those.
+ const derpWriteQueueDepth = 32
+ 
++type derpWriteRoute struct {
++	writeCh  chan derpWriteRequest
++	regionID int
++	kind     string
++}
++
+ // derpWriteChanForRegion returns a channel to which to send DERP packet write
+ // requests. It creates a new DERP connection to regionID if necessary.
+ //
+@@ -323,21 +322,28 @@ func (c *Conn) goDerpConnect(regionID int) {
+ // It returns nil if the network is down, the Conn is closed, or the regionID is
+ // not known.
+ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan derpWriteRequest {
++	return c.derpWriteRouteForRegion(regionID, peer).writeCh
++}
++
++func (c *Conn) derpWriteRouteForRegion(
++	regionID int,
++	peer key.NodePublic,
++) derpWriteRoute {
+ 	if c.networkDown() {
+-		return nil
++		return derpWriteRoute{}
+ 	}
+ 
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 	if !c.wantDerpLocked() || c.closed {
+-		return nil
++		return derpWriteRoute{}
+ 	}
+ 	if c.derpMap == nil || c.derpMap.Regions[regionID] == nil {
+-		return nil
++		return derpWriteRoute{}
+ 	}
+ 	if c.privateKey.IsZero() {
+ 		c.logf("magicsock: DERP lookup of region %v with no private key; ignoring", regionID)
+-		return nil
++		return derpWriteRoute{}
+ 	}
+ 
+ 	// See if we have a connection open to that DERP node ID
+@@ -348,7 +354,18 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
+ 	if ok {
+ 		*ad.lastWrite = time.Now()
+ 		c.setPeerLastDerpLocked(peer, regionID, regionID)
+-		return ad.writeCh
++		c.xdialNotePeerDERPWriteRouteLocked(
++			peer,
++			regionID,
++			ad.c,
++			xdialDERPRouteKindRequested,
++			ad,
++		)
++		return derpWriteRoute{
++			writeCh:  ad.writeCh,
++			regionID: regionID,
++			kind:     xdialDERPRouteKindRequested,
++		}
+ 	}
+ 
+ 	// If we don't have an open connection to the peer's home DERP
+@@ -362,7 +379,18 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
+ 			if ad, ok := c.activeDerp[r.regionID]; ok && ad.c == r.dc {
+ 				c.setPeerLastDerpLocked(peer, r.regionID, regionID)
+ 				*ad.lastWrite = time.Now()
+-				return ad.writeCh
++				c.xdialNotePeerDERPWriteRouteLocked(
++					peer,
++					r.regionID,
++					ad.c,
++					xdialDERPRouteKindReverse,
++					ad,
++				)
++				return derpWriteRoute{
++					writeCh:  ad.writeCh,
++					regionID: r.regionID,
++					kind:     xdialDERPRouteKindReverse,
++				}
+ 			}
+ 		}
+ 	}
+@@ -419,6 +447,13 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
+ 	metricNumDERPConns.Set(int64(len(c.activeDerp)))
+ 	c.logActiveDerpLocked()
+ 	c.setPeerLastDerpLocked(peer, regionID, regionID)
++	c.xdialNotePeerDERPWriteRouteLocked(
++		peer,
++		regionID,
++		ad.c,
++		xdialDERPRouteKindRequested,
++		ad,
++	)
+ 	c.scheduleCleanStaleDerpLocked()
+ 
+ 	// Build a startGate for the derp reader+writer
+@@ -446,7 +481,11 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
+ 	go c.runDerpWriter(ctx, dc, ch, wg, startGate)
+ 	go runDERPActiveAfterStartGate(ctx, startGate, c.derpActiveFunc)
+ 
+-	return ad.writeCh
++	return derpWriteRoute{
++		writeCh:  ad.writeCh,
++		regionID: regionID,
++		kind:     xdialDERPRouteKindRequested,
++	}
+ }
+ 
+ func runDERPActiveAfterStartGate(ctx context.Context, startGate <-chan struct{}, active func()) {
+@@ -546,12 +585,27 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
+ 	for {
+ 		msg, connGen, err := dc.RecvDetail()
+ 		if err != nil {
++			c.xdialNoteDERPReaderError(
++				regionID,
++				dc,
++				xdialDERPReaderErrorReason(
++					err,
++					c.networkDown(),
++					ctx.Err() != nil,
++				),
++			)
+ 			c.setDERPProtocolReady(regionID, dc, false)
+ 			c.health.SetDERPRegionConnectedState(regionID, false)
+ 			// Forget that all these peers have routes.
+ 			for peer := range peerPresent {
+ 				delete(peerPresent, peer)
+-				c.removeDerpPeerRoute(peer, regionID, dc)
++				c.xdialRemoveDERPPeerRoute(
++					peer,
++					regionID,
++					dc,
++					xdialDERPRouteInvalidationReaderError,
++					false,
++				)
+ 			}
+ 			if err == derphttp.ErrClientClosed {
+ 				return
+@@ -592,6 +646,7 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
+ 		switch m := msg.(type) {
+ 		case derp.ServerInfoMessage:
+ 			c.setDERPProtocolReady(regionID, dc, true)
++			c.xdialNoteDERPServerInfo(regionID, dc)
+ 			c.health.SetDERPRegionConnectedState(regionID, true)
+ 			c.health.SetDERPRegionHealth(regionID, "") // until declared otherwise
+ 			c.logf("magicsock: derp-%d connected; connGen=%v", regionID, connGen)
+@@ -600,6 +655,7 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
+ 			pkt = m
+ 			res.n = len(m.Data)
+ 			res.src = m.Source
++			c.xdialNotePeerDERPReceivePacket(res.src, regionID, dc)
+ 			if logDerpVerbose() {
+ 				c.logf("magicsock: got derp-%v packet: %q", regionID, m.Data)
+ 			}
+@@ -636,6 +692,7 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
+ 			c.health.SetDERPRegionHealth(regionID, m.Problem)
+ 			continue
+ 		case derp.PeerGoneMessage:
++			peer := key.NodePublic(m.Peer)
+ 			switch m.Reason {
+ 			case derp.PeerGoneReasonDisconnected:
+ 				// Do nothing.
+@@ -646,9 +703,15 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
+ 			default:
+ 				metricRecvDiscoDERPPeerGoneUnknown.Add(1)
+ 				c.logf("[unexpected] magicsock: derp-%d peer %s gone, reason %v, removing route",
+-					regionID, key.NodePublic(m.Peer).ShortString(), m.Reason)
++					regionID, peer.ShortString(), m.Reason)
+ 			}
+-			c.removeDerpPeerRoute(key.NodePublic(m.Peer), regionID, dc)
++			c.xdialRemoveDERPPeerRoute(
++				peer,
++				regionID,
++				dc,
++				xdialDERPPeerGoneReason(m.Reason),
++				true,
++			)
+ 			continue
+ 		default:
+ 			// Ignore.
+@@ -658,10 +721,12 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
+ }
+ 
+ type derpWriteRequest struct {
+-	addr    netip.AddrPort
+-	pubKey  key.NodePublic
+-	b       []byte // copied; ownership passed to receiver
+-	isDisco bool
++	addr          netip.AddrPort
++	pubKey        key.NodePublic
++	b             []byte // copied; ownership passed to receiver
++	isDisco       bool
++	routeRegionID int
++	routeKind     string
+ }
+ 
+ // runDerpWriter runs in a goroutine for the life of a DERP
+@@ -679,7 +744,23 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
+ 		case <-ctx.Done():
+ 			return
+ 		case wr := <-ch:
+-			err := dc.Send(wr.pubKey, wr.b)
++			c.xdialNotePeerDERPSendAttempt(
++				wr.pubKey,
++				wr.routeRegionID,
++				dc,
++				wr.routeKind,
++				wr.isDisco,
++			)
++			connGen, err := dc.XDialSendWithGeneration(wr.pubKey, wr.b)
++			c.xdialNotePeerDERPSendResult(
++				wr.pubKey,
++				wr.routeRegionID,
++				dc,
++				wr.routeKind,
++				wr.isDisco,
++				connGen,
++				err,
++			)
+ 			if err != nil {
+ 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
+ 				metricSendDERPError.Add(1)
+@@ -914,6 +995,7 @@ func (c *Conn) closeOrReconnectDERPLocked(regionID int, why string) {
+ func (c *Conn) closeDerpLocked(regionID int, why string) {
+ 	if ad, ok := c.activeDerp[regionID]; ok {
+ 		c.logf("magicsock: closing connection to derp-%v (%v), age %v", regionID, why, time.Since(ad.createTime).Round(time.Second))
++		c.xdialNoteDERPClientCloseLocked(regionID, ad.c, why)
+ 		go ad.c.Close()
+ 		ad.cancel()
+ 		delete(c.activeDerp, regionID)
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+index 89ba9f8..4374189 100644
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -399,6 +399,11 @@ type Conn struct {
+ 	// peer. It's only used to quiet logging, so we only log on change.
+ 	peerLastDerp map[key.NodePublic]int
+ 
++	// xdialPeerDERP is a bounded event ledger for peer-specific DERP path
++	// diagnostics. Entries are deleted together with all other peer-keyed state.
++	xdialPeerDERP         map[key.NodePublic]*xdialPeerDERPLedger
++	xdialPeerDERPSequence uint64
++
+ 	// wgPinger is the WireGuard only pinger used for latency measurements.
+ 	wgPinger lazy.SyncValue[*ping.Pinger]
+ 
+@@ -1711,8 +1716,8 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, is
+ 	}
+ 
+ 	regionID := int(addr.Port())
+-	ch := c.derpWriteChanForRegion(regionID, pubKey)
+-	if ch == nil {
++	route := c.derpWriteRouteForRegion(regionID, pubKey)
++	if route.writeCh == nil {
+ 		metricSendDERPErrorChan.Add(1)
+ 		return false, nil
+ 	}
+@@ -1724,18 +1729,25 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, is
+ 	// internal locks.
+ 	pkt := bytes.Clone(b)
+ 
+-	wr := derpWriteRequest{addr, pubKey, pkt, isDisco}
++	wr := derpWriteRequest{
++		addr:          addr,
++		pubKey:        pubKey,
++		b:             pkt,
++		isDisco:       isDisco,
++		routeRegionID: route.regionID,
++		routeKind:     route.kind,
++	}
+ 	for range 3 {
+ 		select {
+ 		case <-c.donec:
+ 			metricSendDERPErrorClosed.Add(1)
+ 			return false, errConnClosed
+-		case ch <- wr:
++		case route.writeCh <- wr:
+ 			metricSendDERPQueued.Add(1)
+ 			return true, nil
+ 		default:
+ 			select {
+-			case <-ch:
++			case <-route.writeCh:
+ 				metricSendDERPDropped.Add(1)
+ 			default:
+ 			}
+@@ -2846,6 +2858,7 @@ func (c *Conn) UpdatePeers(newPeers set.Set[key.NodePublic]) {
+ 		if !newPeers.Contains(peer) {
+ 			delete(c.derpRoute, peer)
+ 			delete(c.peerLastDerp, peer)
++			delete(c.xdialPeerDERP, peer)
+ 		}
+ 	}
+ 
+diff --git a/wgengine/magicsock/xdial_peer_derp_diagnostics.go b/wgengine/magicsock/xdial_peer_derp_diagnostics.go
+new file mode 100644
+index 0000000..802738a
+--- /dev/null
++++ b/wgengine/magicsock/xdial_peer_derp_diagnostics.go
+@@ -0,0 +1,537 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"errors"
++
++	"github.com/sagernet/tailscale/derp"
++	"github.com/sagernet/tailscale/derp/derphttp"
++	"github.com/sagernet/tailscale/types/key"
++)
++
++const (
++	xdialDERPStateAbsent  = "absent"
++	xdialDERPStateCurrent = "current"
++	xdialDERPStateStale   = "stale"
++
++	xdialDERPRouteKindNone      = "none"
++	xdialDERPRouteKindRequested = "requested"
++	xdialDERPRouteKindReverse   = "reverse"
++
++	xdialDERPClientMissing              = "missing"
++	xdialDERPClientCurrentNotReady      = "current_not_ready"
++	xdialDERPClientCurrentProtocolReady = "current_protocol_ready"
++	xdialDERPClientStale                = "stale"
++	xdialDERPClientClosed               = "closed"
++	xdialDERPClientUnknown              = "unknown"
++
++	xdialDERPReasonNone = "none"
++
++	xdialDERPRouteInvalidationPeerGoneNotHere      = "peer_gone_not_here"
++	xdialDERPRouteInvalidationPeerGoneDisconnected = "peer_gone_disconnected"
++	xdialDERPRouteInvalidationPeerGoneUnknown      = "peer_gone_unknown"
++	xdialDERPRouteInvalidationReaderError          = "reader_error"
++	xdialDERPRouteInvalidationUnknown              = "unknown"
++
++	xdialDERPReaderErrorClientClosed    = "client_closed"
++	xdialDERPReaderErrorNetworkDown     = "network_down"
++	xdialDERPReaderErrorContextCanceled = "context_cancelled"
++	xdialDERPReaderErrorTransport       = "transport_error"
++	xdialDERPReaderErrorUnknown         = "unknown"
++
++	xdialDERPClientCloseDisabled                 = "derp_disabled"
++	xdialDERPClientCloseRegionRedefined          = "derp_region_redefined"
++	xdialDERPClientCloseDebugBreak               = "debug_break"
++	xdialDERPClientCloseNetworkDown              = "network_down"
++	xdialDERPClientCloseRebindNoLocalAddr        = "rebind_no_local_addr"
++	xdialDERPClientCloseRebindDefaultRouteChange = "rebind_default_route_change"
++	xdialDERPClientCloseRebindPingFailed         = "rebind_ping_failed"
++	xdialDERPClientCloseIdle                     = "idle"
++	xdialDERPClientCloseZeroPrivateKey           = "zero_private_key"
++	xdialDERPClientCloseNewPrivateKey            = "new_private_key"
++	xdialDERPClientCloseConnClose                = "conn_close"
++	xdialDERPClientCloseSetHomeless              = "set_homeless"
++	xdialDERPClientCloseUnknown                  = "unknown"
++)
++
++// XDialPeerDERPDiagnostics is a bounded, process-local view of the DERP path
++// most recently used for one peer. It intentionally contains no peer key,
++// region identifier, endpoint, address, or DERP server identity.
++type XDialPeerDERPDiagnostics struct {
++	Observed bool
++
++	ReplyRouteState      string
++	LastWriteRouteState  string
++	LastWriteRouteKind   string
++	LastWriteClientState string
++
++	LastWriteClientIdealKnown bool
++	LastWriteClientIdeal      bool
++	ServerChangeSequence      uint64
++
++	LastSendConnectionGeneration   int
++	CurrentConnectionGeneration    int
++	ConnectionChangedSinceLastSend bool
++
++	SendAttemptSequence uint64
++	SendSuccessSequence uint64
++	SendErrorSequence   uint64
++	LastSendWasDisco    bool
++
++	ReceivePacketSequence uint64
++
++	RouteInvalidationSequence uint64
++	RouteInvalidationReason   string
++
++	ReaderErrorSequence uint64
++	ReaderErrorReason   string
++
++	ServerInfoSequence uint64
++
++	ClientCloseSequence uint64
++	ClientCloseReason   string
++}
++
++type xdialPeerDERPLedger struct {
++	lastReplyRegion int
++	lastReplyClient *derphttp.Client
++
++	lastWriteRegion int
++	lastWriteClient *derphttp.Client
++	lastWriteKind   string
++
++	lastSendConnectionGeneration int
++	lastSendWasDisco             bool
++
++	sendAttemptSequence uint64
++	sendSuccessSequence uint64
++	sendErrorSequence   uint64
++
++	receivePacketSequence uint64
++
++	routeInvalidationSequence uint64
++	routeInvalidationReason   string
++
++	readerErrorSequence uint64
++	readerErrorReason   string
++
++	serverInfoSequence uint64
++
++	clientCloseSequence uint64
++	clientCloseReason   string
++}
++
++func (c *Conn) xdialNextPeerDERPSequenceLocked() uint64 {
++	c.xdialPeerDERPSequence++
++	return c.xdialPeerDERPSequence
++}
++
++func (c *Conn) xdialPeerDERPLedgerLocked(
++	peer key.NodePublic,
++	create bool,
++) *xdialPeerDERPLedger {
++	if peer.IsZero() {
++		return nil
++	}
++	if ledger := c.xdialPeerDERP[peer]; ledger != nil || !create {
++		return ledger
++	}
++	if c.xdialPeerDERP == nil {
++		c.xdialPeerDERP = make(map[key.NodePublic]*xdialPeerDERPLedger)
++	}
++	ledger := new(xdialPeerDERPLedger)
++	c.xdialPeerDERP[peer] = ledger
++	return ledger
++}
++
++func (c *Conn) xdialNotePeerDERPWriteRouteLocked(
++	peer key.NodePublic,
++	regionID int,
++	dc *derphttp.Client,
++	kind string,
++	active activeDerp,
++) {
++	ledger := c.xdialPeerDERPLedgerLocked(peer, true)
++	if ledger == nil {
++		return
++	}
++	ledger.lastWriteRegion = regionID
++	ledger.lastWriteClient = dc
++	ledger.lastWriteKind = kind
++	if active.xdialServerInfoSequence > ledger.serverInfoSequence {
++		ledger.serverInfoSequence = active.xdialServerInfoSequence
++	}
++}
++
++func (c *Conn) xdialNotePeerDERPSendAttempt(
++	peer key.NodePublic,
++	regionID int,
++	dc *derphttp.Client,
++	kind string,
++	isDisco bool,
++) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	ledger := c.xdialPeerDERPLedgerLocked(peer, true)
++	if ledger == nil {
++		return
++	}
++	ledger.lastWriteRegion = regionID
++	ledger.lastWriteClient = dc
++	ledger.lastWriteKind = kind
++	ledger.lastSendWasDisco = isDisco
++	if active, ok := c.activeDerp[regionID]; ok && active.c == dc &&
++		active.xdialServerInfoSequence > ledger.serverInfoSequence {
++		ledger.serverInfoSequence = active.xdialServerInfoSequence
++	}
++	ledger.sendAttemptSequence = c.xdialNextPeerDERPSequenceLocked()
++}
++
++func (c *Conn) xdialNotePeerDERPSendResult(
++	peer key.NodePublic,
++	regionID int,
++	dc *derphttp.Client,
++	kind string,
++	isDisco bool,
++	generation int,
++	err error,
++) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	ledger := c.xdialPeerDERPLedgerLocked(peer, true)
++	if ledger == nil {
++		return
++	}
++	ledger.lastWriteRegion = regionID
++	ledger.lastWriteClient = dc
++	ledger.lastWriteKind = kind
++	ledger.lastSendWasDisco = isDisco
++	ledger.lastSendConnectionGeneration = generation
++	if err != nil {
++		ledger.sendErrorSequence = c.xdialNextPeerDERPSequenceLocked()
++	} else {
++		ledger.sendSuccessSequence = c.xdialNextPeerDERPSequenceLocked()
++	}
++}
++
++func (c *Conn) xdialNotePeerDERPReceivePacket(
++	peer key.NodePublic,
++	regionID int,
++	dc *derphttp.Client,
++) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	ledger := c.xdialPeerDERPLedgerLocked(peer, true)
++	if ledger == nil {
++		return
++	}
++	ledger.lastReplyRegion = regionID
++	ledger.lastReplyClient = dc
++	ledger.receivePacketSequence = c.xdialNextPeerDERPSequenceLocked()
++}
++
++func (c *Conn) xdialRemoveDERPPeerRoute(
++	peer key.NodePublic,
++	regionID int,
++	dc *derphttp.Client,
++	reason string,
++	recordIfAbsent bool,
++) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	expected := derpRoute{regionID, dc}
++	route, present := c.derpRoute[peer]
++	current := present && route == expected
++	if current {
++		delete(c.derpRoute, peer)
++	}
++	if !current && !recordIfAbsent {
++		return
++	}
++	ledger := c.xdialPeerDERPLedgerLocked(peer, true)
++	if ledger == nil {
++		return
++	}
++	ledger.routeInvalidationSequence = c.xdialNextPeerDERPSequenceLocked()
++	ledger.routeInvalidationReason =
++		xdialDERPRouteInvalidationReason(reason)
++}
++
++func xdialDERPPeerGoneReason(reason derp.PeerGoneReasonType) string {
++	switch reason {
++	case derp.PeerGoneReasonNotHere:
++		return xdialDERPRouteInvalidationPeerGoneNotHere
++	case derp.PeerGoneReasonDisconnected:
++		return xdialDERPRouteInvalidationPeerGoneDisconnected
++	default:
++		return xdialDERPRouteInvalidationPeerGoneUnknown
++	}
++}
++
++func xdialDERPRouteInvalidationReason(reason string) string {
++	switch reason {
++	case xdialDERPRouteInvalidationPeerGoneNotHere,
++		xdialDERPRouteInvalidationPeerGoneDisconnected,
++		xdialDERPRouteInvalidationPeerGoneUnknown,
++		xdialDERPRouteInvalidationReaderError:
++		return reason
++	default:
++		return xdialDERPRouteInvalidationUnknown
++	}
++}
++
++func xdialDERPReaderErrorReason(
++	err error,
++	networkDown bool,
++	contextDone bool,
++) string {
++	switch {
++	case errors.Is(err, derphttp.ErrClientClosed):
++		return xdialDERPReaderErrorClientClosed
++	case networkDown:
++		return xdialDERPReaderErrorNetworkDown
++	case contextDone:
++		return xdialDERPReaderErrorContextCanceled
++	case err != nil:
++		return xdialDERPReaderErrorTransport
++	default:
++		return xdialDERPReaderErrorUnknown
++	}
++}
++
++func xdialDERPBoundedReaderErrorReason(reason string) string {
++	switch reason {
++	case xdialDERPReaderErrorClientClosed,
++		xdialDERPReaderErrorNetworkDown,
++		xdialDERPReaderErrorContextCanceled,
++		xdialDERPReaderErrorTransport,
++		xdialDERPReaderErrorUnknown:
++		return reason
++	default:
++		return xdialDERPReaderErrorUnknown
++	}
++}
++
++func (c *Conn) xdialLedgerUsesClientLocked(
++	peer key.NodePublic,
++	ledger *xdialPeerDERPLedger,
++	regionID int,
++	dc *derphttp.Client,
++) bool {
++	if ledger.lastWriteRegion == regionID && ledger.lastWriteClient == dc {
++		return true
++	}
++	if ledger.lastReplyRegion == regionID && ledger.lastReplyClient == dc {
++		return true
++	}
++	route, ok := c.derpRoute[peer]
++	return ok && route.regionID == regionID && route.dc == dc
++}
++
++func (c *Conn) xdialNoteDERPReaderError(
++	regionID int,
++	dc *derphttp.Client,
++	reason string,
++) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	sequence := c.xdialNextPeerDERPSequenceLocked()
++	reason = xdialDERPBoundedReaderErrorReason(reason)
++	for peer, ledger := range c.xdialPeerDERP {
++		if c.xdialLedgerUsesClientLocked(peer, ledger, regionID, dc) {
++			ledger.readerErrorSequence = sequence
++			ledger.readerErrorReason = reason
++		}
++	}
++}
++
++func (c *Conn) xdialNoteDERPServerInfo(
++	regionID int,
++	dc *derphttp.Client,
++) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	active, ok := c.activeDerp[regionID]
++	if !ok || active.c != dc {
++		return
++	}
++	sequence := c.xdialNextPeerDERPSequenceLocked()
++	active.xdialServerInfoSequence = sequence
++	c.activeDerp[regionID] = active
++	for peer, ledger := range c.xdialPeerDERP {
++		if c.xdialLedgerUsesClientLocked(peer, ledger, regionID, dc) {
++			ledger.serverInfoSequence = sequence
++		}
++	}
++}
++
++func xdialDERPClientCloseReason(raw string) string {
++	switch raw {
++	case "derp-disabled":
++		return xdialDERPClientCloseDisabled
++	case "derp-region-redefined":
++		return xdialDERPClientCloseRegionRedefined
++	case "debug-break-derp":
++		return xdialDERPClientCloseDebugBreak
++	case "network-down":
++		return xdialDERPClientCloseNetworkDown
++	case "rebind-no-localaddr":
++		return xdialDERPClientCloseRebindNoLocalAddr
++	case "rebind-default-route-change":
++		return xdialDERPClientCloseRebindDefaultRouteChange
++	case "rebind-ping-fail":
++		return xdialDERPClientCloseRebindPingFailed
++	case "idle":
++		return xdialDERPClientCloseIdle
++	case "zero-private-key":
++		return xdialDERPClientCloseZeroPrivateKey
++	case "new-private-key":
++		return xdialDERPClientCloseNewPrivateKey
++	case "conn-close":
++		return xdialDERPClientCloseConnClose
++	case "set-homeless":
++		return xdialDERPClientCloseSetHomeless
++	default:
++		return xdialDERPClientCloseUnknown
++	}
++}
++
++func xdialDERPConnectionChangedSinceLastSend(last, current int) bool {
++	return last > 0 && current > 0 && last != current
++}
++
++func xdialDERPBoundedRouteKind(kind string) string {
++	switch kind {
++	case xdialDERPRouteKindRequested, xdialDERPRouteKindReverse:
++		return kind
++	default:
++		return xdialDERPRouteKindNone
++	}
++}
++
++// xdialNoteDERPClientCloseLocked records an explicit magicsock close
++// separately from a later reader error. c.mu must be held.
++func (c *Conn) xdialNoteDERPClientCloseLocked(
++	regionID int,
++	dc *derphttp.Client,
++	rawReason string,
++) {
++	sequence := c.xdialNextPeerDERPSequenceLocked()
++	reason := xdialDERPClientCloseReason(rawReason)
++	for peer, ledger := range c.xdialPeerDERP {
++		if c.xdialLedgerUsesClientLocked(peer, ledger, regionID, dc) {
++			ledger.clientCloseSequence = sequence
++			ledger.clientCloseReason = reason
++		}
++	}
++}
++
++// XDialPeerDERPState returns bounded DERP path diagnostics for peer.
++func (c *Conn) XDialPeerDERPState(
++	peer key.NodePublic,
++) XDialPeerDERPDiagnostics {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	result := XDialPeerDERPDiagnostics{
++		ReplyRouteState:         xdialDERPStateAbsent,
++		LastWriteRouteState:     xdialDERPStateAbsent,
++		LastWriteRouteKind:      xdialDERPRouteKindNone,
++		LastWriteClientState:    xdialDERPClientMissing,
++		RouteInvalidationReason: xdialDERPReasonNone,
++		ReaderErrorReason:       xdialDERPReasonNone,
++		ClientCloseReason:       xdialDERPReasonNone,
++	}
++	ledger := c.xdialPeerDERPLedgerLocked(peer, false)
++	if ledger == nil {
++		return result
++	}
++	result.Observed = true
++	result.LastWriteRouteKind =
++		xdialDERPBoundedRouteKind(ledger.lastWriteKind)
++	result.LastSendConnectionGeneration = ledger.lastSendConnectionGeneration
++	result.SendAttemptSequence = ledger.sendAttemptSequence
++	result.SendSuccessSequence = ledger.sendSuccessSequence
++	result.SendErrorSequence = ledger.sendErrorSequence
++	result.LastSendWasDisco = ledger.lastSendWasDisco
++	result.ReceivePacketSequence = ledger.receivePacketSequence
++	result.RouteInvalidationSequence = ledger.routeInvalidationSequence
++	result.RouteInvalidationReason = ledger.routeInvalidationReason
++	if result.RouteInvalidationReason == "" {
++		result.RouteInvalidationReason = xdialDERPReasonNone
++	}
++	result.ReaderErrorSequence = ledger.readerErrorSequence
++	result.ReaderErrorReason = ledger.readerErrorReason
++	if result.ReaderErrorReason == "" {
++		result.ReaderErrorReason = xdialDERPReasonNone
++	}
++	result.ServerInfoSequence = ledger.serverInfoSequence
++	result.ClientCloseSequence = ledger.clientCloseSequence
++	result.ClientCloseReason = ledger.clientCloseReason
++	if result.ClientCloseReason == "" {
++		result.ClientCloseReason = xdialDERPReasonNone
++	}
++
++	if route, ok := c.derpRoute[peer]; ok {
++		result.ReplyRouteState = xdialDERPStateStale
++		if active, ok := c.activeDerp[route.regionID]; ok &&
++			active.c == route.dc {
++			result.ReplyRouteState = xdialDERPStateCurrent
++		}
++	}
++
++	if ledger.lastWriteClient == nil {
++		return result
++	}
++
++	active, activePresent := c.activeDerp[ledger.lastWriteRegion]
++	activeMatches := activePresent && active.c == ledger.lastWriteClient
++	result.LastWriteRouteState = xdialDERPStateStale
++	switch ledger.lastWriteKind {
++	case xdialDERPRouteKindRequested:
++		if activeMatches {
++			result.LastWriteRouteState = xdialDERPStateCurrent
++		}
++	case xdialDERPRouteKindReverse:
++		reply, ok := c.derpRoute[peer]
++		if activeMatches && ok &&
++			reply.regionID == ledger.lastWriteRegion &&
++			reply.dc == ledger.lastWriteClient {
++			result.LastWriteRouteState = xdialDERPStateCurrent
++		}
++	case "", xdialDERPRouteKindNone:
++		result.LastWriteRouteState = xdialDERPStateAbsent
++	default:
++		result.LastWriteClientState = xdialDERPClientUnknown
++	}
++
++	client := ledger.lastWriteClient.XDialConnectionDiagnostics()
++	result.CurrentConnectionGeneration = client.Generation
++	result.ConnectionChangedSinceLastSend =
++		xdialDERPConnectionChangedSinceLastSend(
++			ledger.lastSendConnectionGeneration,
++			client.Generation,
++		)
++	result.LastWriteClientIdealKnown = client.IdealKnown
++	result.LastWriteClientIdeal = client.Ideal
++	result.ServerChangeSequence = client.ServerChangeSequence
++	switch {
++	case client.Closed:
++		result.LastWriteClientState = xdialDERPClientClosed
++	case !activeMatches:
++		result.LastWriteClientState = xdialDERPClientStale
++	case active.protocolReady:
++		result.LastWriteClientState = xdialDERPClientCurrentProtocolReady
++	default:
++		result.LastWriteClientState = xdialDERPClientCurrentNotReady
++	}
++	return result
++}
+diff --git a/wgengine/magicsock/xdial_peer_derp_diagnostics_test.go b/wgengine/magicsock/xdial_peer_derp_diagnostics_test.go
+new file mode 100644
+index 0000000..41414a4
+--- /dev/null
++++ b/wgengine/magicsock/xdial_peer_derp_diagnostics_test.go
+@@ -0,0 +1,232 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/sagernet/tailscale/derp"
++	"github.com/sagernet/tailscale/types/key"
++	"github.com/sagernet/tailscale/util/set"
++)
++
++func xdialTestActiveDERP(
++	t *testing.T,
++	c *Conn,
++	regionID int,
++	protocolReady bool,
++) activeDerp {
++	t.Helper()
++	lastWrite := time.Now()
++	active := activeDerp{
++		c:             newXDialTestDERPClient(t, key.NewNode()),
++		lastWrite:     &lastWrite,
++		createTime:    time.Now(),
++		protocolReady: protocolReady,
++	}
++	c.activeDerp = map[int]activeDerp{regionID: active}
++	return active
++}
++
++func TestXDialPeerDERPStateNotHereWithoutReplyRoute(t *testing.T) {
++	c := newConn(t.Logf)
++	peer := key.NewNode().Public()
++	client := newXDialTestDERPClient(t, key.NewNode())
++
++	c.xdialRemoveDERPPeerRoute(
++		peer,
++		7,
++		client,
++		xdialDERPPeerGoneReason(derp.PeerGoneReasonNotHere),
++		true,
++	)
++
++	got := c.XDialPeerDERPState(peer)
++	if !got.Observed ||
++		got.ReplyRouteState != xdialDERPStateAbsent ||
++		got.RouteInvalidationSequence == 0 ||
++		got.RouteInvalidationReason !=
++			xdialDERPRouteInvalidationPeerGoneNotHere {
++		t.Fatalf("route-absent NotHere = %+v", got)
++	}
++}
++
++func TestXDialPeerDERPStateSeparatesExplicitCloseAndReaderError(t *testing.T) {
++	c := newConn(t.Logf)
++	peer := key.NewNode().Public()
++	const regionID = 7
++
++	c.mu.Lock()
++	active := xdialTestActiveDERP(t, c, regionID, true)
++	c.xdialNotePeerDERPWriteRouteLocked(
++		peer,
++		regionID,
++		active.c,
++		xdialDERPRouteKindRequested,
++		active,
++	)
++	c.xdialNoteDERPClientCloseLocked(regionID, active.c, "idle")
++	c.mu.Unlock()
++	c.xdialNoteDERPReaderError(
++		regionID,
++		active.c,
++		xdialDERPReaderErrorTransport,
++	)
++
++	got := c.XDialPeerDERPState(peer)
++	if got.ClientCloseSequence == 0 ||
++		got.ClientCloseReason != xdialDERPClientCloseIdle {
++		t.Fatalf("explicit close = %+v", got)
++	}
++	if got.ReaderErrorSequence == 0 ||
++		got.ReaderErrorReason != xdialDERPReaderErrorTransport {
++		t.Fatalf("reader error = %+v", got)
++	}
++	if got.ClientCloseSequence >= got.ReaderErrorSequence {
++		t.Fatalf("close and reader error order collapsed: %+v", got)
++	}
++}
++
++func TestXDialPeerDERPStateTracksRoutesAndSendSequences(t *testing.T) {
++	c := newConn(t.Logf)
++	peer := key.NewNode().Public()
++	const regionID = 7
++
++	c.mu.Lock()
++	active := xdialTestActiveDERP(t, c, regionID, true)
++	c.derpRoute = map[key.NodePublic]derpRoute{
++		peer: {regionID: regionID, dc: active.c},
++	}
++	c.xdialNotePeerDERPWriteRouteLocked(
++		peer,
++		regionID,
++		active.c,
++		xdialDERPRouteKindReverse,
++		active,
++	)
++	c.mu.Unlock()
++	c.xdialNotePeerDERPSendAttempt(
++		peer,
++		regionID,
++		active.c,
++		xdialDERPRouteKindReverse,
++		false,
++	)
++	c.xdialNotePeerDERPSendResult(
++		peer,
++		regionID,
++		active.c,
++		xdialDERPRouteKindReverse,
++		false,
++		1,
++		nil,
++	)
++	c.xdialNotePeerDERPReceivePacket(peer, regionID, active.c)
++	c.xdialNoteDERPServerInfo(regionID, active.c)
++
++	got := c.XDialPeerDERPState(peer)
++	if got.ReplyRouteState != xdialDERPStateCurrent ||
++		got.LastWriteRouteState != xdialDERPStateCurrent ||
++		got.LastWriteRouteKind != xdialDERPRouteKindReverse ||
++		got.LastWriteClientState !=
++			xdialDERPClientCurrentProtocolReady {
++		t.Fatalf("current routes = %+v", got)
++	}
++	if got.SendAttemptSequence == 0 ||
++		got.SendSuccessSequence <= got.SendAttemptSequence ||
++		got.SendErrorSequence != 0 ||
++		got.ReceivePacketSequence == 0 ||
++		got.ServerInfoSequence == 0 ||
++		got.LastSendConnectionGeneration != 1 {
++		t.Fatalf("event sequences = %+v", got)
++	}
++
++	c.xdialNotePeerDERPSendResult(
++		peer,
++		regionID,
++		active.c,
++		xdialDERPRouteKindReverse,
++		false,
++		2,
++		errors.New("send failed"),
++	)
++	got = c.XDialPeerDERPState(peer)
++	if got.SendErrorSequence <= got.SendSuccessSequence ||
++		got.LastSendConnectionGeneration != 2 {
++		t.Fatalf("send error sequence = %+v", got)
++	}
++
++	c.mu.Lock()
++	delete(c.derpRoute, peer)
++	c.mu.Unlock()
++	got = c.XDialPeerDERPState(peer)
++	if got.ReplyRouteState != xdialDERPStateAbsent ||
++		got.LastWriteRouteState != xdialDERPStateStale {
++		t.Fatalf("removed reverse route = %+v", got)
++	}
++}
++
++func TestXDialPeerDERPLedgerRemovedWithPeer(t *testing.T) {
++	c := newConn(t.Logf)
++	peer := key.NewNode().Public()
++	client := newXDialTestDERPClient(t, key.NewNode())
++	c.peerSet = set.Of(peer)
++	c.xdialNotePeerDERPReceivePacket(peer, 7, client)
++	if got := c.XDialPeerDERPState(peer); !got.Observed {
++		t.Fatalf("peer was not observed: %+v", got)
++	}
++
++	c.UpdatePeers(set.Set[key.NodePublic]{})
++	if got := c.XDialPeerDERPState(peer); got.Observed {
++		t.Fatalf("removed peer retained ledger: %+v", got)
++	}
++}
++
++func TestXDialDERPReasonMappingsAreClosed(t *testing.T) {
++	closeReasons := map[string]string{
++		"derp-disabled":               xdialDERPClientCloseDisabled,
++		"derp-region-redefined":       xdialDERPClientCloseRegionRedefined,
++		"debug-break-derp":            xdialDERPClientCloseDebugBreak,
++		"network-down":                xdialDERPClientCloseNetworkDown,
++		"rebind-no-localaddr":         xdialDERPClientCloseRebindNoLocalAddr,
++		"rebind-default-route-change": xdialDERPClientCloseRebindDefaultRouteChange,
++		"rebind-ping-fail":            xdialDERPClientCloseRebindPingFailed,
++		"idle":                        xdialDERPClientCloseIdle,
++		"zero-private-key":            xdialDERPClientCloseZeroPrivateKey,
++		"new-private-key":             xdialDERPClientCloseNewPrivateKey,
++		"conn-close":                  xdialDERPClientCloseConnClose,
++		"set-homeless":                xdialDERPClientCloseSetHomeless,
++	}
++	for raw, want := range closeReasons {
++		if got := xdialDERPClientCloseReason(raw); got != want {
++			t.Fatalf("close reason %q = %q, want %q", raw, got, want)
++		}
++	}
++	if got := xdialDERPClientCloseReason("new-raw-reason"); got != xdialDERPClientCloseUnknown {
++		t.Fatalf("unknown close reason leaked as %q", got)
++	}
++	if got := xdialDERPReaderErrorReason(
++		errors.New("raw transport detail"),
++		false,
++		false,
++	); got != xdialDERPReaderErrorTransport {
++		t.Fatalf("raw reader error leaked as %q", got)
++	}
++	if got := xdialDERPRouteInvalidationReason("raw route detail"); got != xdialDERPRouteInvalidationUnknown {
++		t.Fatalf("raw route invalidation leaked as %q", got)
++	}
++	if got := xdialDERPBoundedReaderErrorReason("raw reader detail"); got != xdialDERPReaderErrorUnknown {
++		t.Fatalf("raw reader reason leaked as %q", got)
++	}
++	if got := xdialDERPBoundedRouteKind("raw route kind"); got != xdialDERPRouteKindNone {
++		t.Fatalf("raw route kind leaked as %q", got)
++	}
++	if !xdialDERPConnectionChangedSinceLastSend(1, 2) ||
++		xdialDERPConnectionChangedSinceLastSend(2, 2) ||
++		xdialDERPConnectionChangedSinceLastSend(0, 2) {
++		t.Fatal("same-client reconnect generation comparison is incorrect")
++	}
++}

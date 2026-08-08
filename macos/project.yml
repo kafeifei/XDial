@@ -1,0 +1,208 @@
+name: XDial
+options:
+  deploymentTarget:
+    macOS: "15.0"
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: UVZM439VGU
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+  configs:
+    Debug:
+      XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
+    Release:
+      XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.transparent-proxy
+
+targets:
+  XDialTransparentProxy:
+    type: system-extension
+    platform: macOS
+    sources:
+      - TransparentProxyExtension
+      - Shared
+    info:
+      path: TransparentProxyExtension/Info.plist
+      properties:
+        CFBundleDisplayName: XDial Network Extension
+        CFBundlePackageType: SYSX
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        NetworkExtension:
+          NEProviderClasses:
+            com.apple.networkextension.app-proxy: "$(PRODUCT_MODULE_NAME).TransparentProxyProvider"
+        NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。
+    settings:
+      base:
+        # Apple requires a Network Extension system extension's filename to
+        # match its bundle identifier exactly. PRODUCT_NAME controls the
+        # outer .systemextension filename.
+        PRODUCT_NAME: "$(PRODUCT_BUNDLE_IDENTIFIER)"
+        MARKETING_VERSION: "0.7.0"
+        CURRENT_PROJECT_VERSION: "94"
+        ENABLE_APP_SANDBOX: YES
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Development
+          PROVISIONING_PROFILE_SPECIFIER: XDial Debug Extension Both Macs 2026
+          CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxy.entitlements
+        Release:
+          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.transparent-proxy
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          PROVISIONING_PROFILE_SPECIFIER: XDial Developer ID Transparent Proxy
+          CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxyRelease.entitlements
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
+          ENABLE_HARDENED_RUNTIME: YES
+    dependencies:
+      - framework: ../build/frameworks/macos/Libbox.xcframework
+        embed: false
+      - sdk: libresolv.tbd
+      - sdk: NetworkExtension.framework
+      - sdk: Security.framework
+
+  XDial:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/XDial
+      - Shared
+      - path: AppIcon.icns
+        buildPhase: resources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: XDial
+        CFBundleIconFile: AppIcon
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        LSUIElement: true
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。
+        NSLocationWhenInUseUsageDescription: XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。
+        XDialTransparentProxyBundleIdentifier: "$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)"
+    settings:
+      base:
+        PRODUCT_NAME: XDial
+        MARKETING_VERSION: "0.7.0"
+        CURRENT_PROJECT_VERSION: "94"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Development
+          PROVISIONING_PROFILE_SPECIFIER: XDial Debug Host Both Macs 2026
+          CODE_SIGN_ENTITLEMENTS: XDial.entitlements
+        Release:
+          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          PROVISIONING_PROFILE_SPECIFIER: XDial Developer ID Host 2026
+          CODE_SIGN_ENTITLEMENTS: XDialRelease.entitlements
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
+          ENABLE_HARDENED_RUNTIME: YES
+    dependencies:
+      - framework: ../build/frameworks/macos/Libbox.xcframework
+        embed: false
+      - sdk: libresolv.tbd
+      - sdk: NetworkExtension.framework
+      - sdk: SystemExtensions.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: CoreLocation.framework
+      - sdk: CoreWLAN.framework
+    postBuildScripts:
+      - name: Embed private RuleSet presets
+        script: |
+          set -eu
+          preset_source="${XDIAL_RULE_SET_PRESETS_FILE:-${SRCROOT}/PrivateConfig/RuleSetPresets.json}"
+          preset_dir="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+          preset_destination="${preset_dir}/RuleSetPresets.json"
+          if [ -f "${preset_source}" ]; then
+            mkdir -p "${preset_dir}"
+            cp "${preset_source}" "${preset_destination}"
+          else
+            rm -f "${preset_destination}"
+          fi
+      - name: Embed configuration-matched System Extension
+        script: |
+          set -eu
+          extension_name="${XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER}.systemextension"
+          extension_source="${BUILT_PRODUCTS_DIR}/${extension_name}"
+          extension_dir="${TARGET_BUILD_DIR}/${SYSTEM_EXTENSIONS_FOLDER_PATH}"
+          test -d "${extension_source}"
+          mkdir -p "${extension_dir}"
+          rm -rf \
+            "${extension_dir}/XDialTransparentProxy.systemextension" \
+            "${extension_dir}/com.kafeifei.xdial.ne-probe.extension.systemextension" \
+            "${extension_dir}/com.kafeifei.xdial.transparent-proxy.systemextension"
+          /usr/bin/ditto \
+            "${extension_source}" \
+            "${extension_dir}/${extension_name}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+            "${extension_dir}/${extension_name}/Contents/Info.plist")" \
+            = "${XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER}"
+          if [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ]; then
+            /usr/bin/codesign --verify --deep --strict \
+              "${extension_dir}/${extension_name}"
+          fi
+        inputFiles:
+          - "$(BUILT_PRODUCTS_DIR)/$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER).systemextension"
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(SYSTEM_EXTENSIONS_FOLDER_PATH)/$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER).systemextension"
+      - name: Embed and sign XDial helper
+        script: |
+          set -eu
+          helper_source="${SRCROOT}/../build/xdial"
+          helper_dir="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/MacOS"
+          launchd_dir="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchDaemons"
+          test -x "${helper_source}"
+          mkdir -p "${helper_dir}" "${launchd_dir}"
+          cp "${helper_source}" "${helper_dir}/xdial-daemon"
+          cp "${SRCROOT}/com.kafeifei.xdial.helper.plist" "${launchd_dir}/"
+          if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ]; then
+            exit 0
+          fi
+          if [ "${CONFIGURATION}" = "Release" ]; then
+            /usr/bin/codesign --force --options runtime --timestamp \
+              --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
+              "${helper_dir}/xdial-daemon"
+          else
+            /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
+              "${helper_dir}/xdial-daemon"
+          fi
+        inputFiles:
+          - "$(SRCROOT)/../build/xdial"
+          - "$(SRCROOT)/com.kafeifei.xdial.helper.plist"
+          - "$(SRCROOT)/XDialDaemon.entitlements"
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/xdial-daemon"
+          - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchDaemons/com.kafeifei.xdial.helper.plist"
+
+  XDialTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests
+      - Shared
+      - Sources/XDial/Models.swift
+      - Sources/XDial/ScenarioIconCatalog.swift
+      - Sources/XDial/ScenarioGridLayout.swift
+      - TransparentProxyExtension/ConnectionTransactionReporter.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) XDIAL_TESTING"

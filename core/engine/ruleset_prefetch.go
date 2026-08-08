@@ -59,7 +59,7 @@ var srsMagic = []byte{0x53, 0x52, 0x53}
 // 已存在的 Underlay 抓。落盘后写成 file:// URL，
 // 生成器输出 {"type":"local","path":...}，与 NE 端已有做法一致。
 //
-// 抓不到时按「旧缓存 → 停用该规则」降级并回报：那条规则的流量退回模式默认出口，
+// 抓不到时按「旧缓存 → 停用该规则」降级并回报：那条规则的流量退回场景默认出口，
 // 其余照常连接。可降级、可重试、可提示，而不是整机没网。
 func prepareRuleSets(
 	ctx context.Context,
@@ -67,11 +67,11 @@ func prepareRuleSets(
 	cacheDir string,
 	fetcher *ruleSetFetcher,
 ) (*config.Profile, []string) {
-	mode := profile.ActiveMode()
-	if mode == nil {
+	scenario := profile.ActiveScenario()
+	if scenario == nil {
 		return profile, nil
 	}
-	targets := ruleSetPrefetchTargets(profile, mode)
+	targets := ruleSetPrefetchTargets(profile, scenario)
 	if len(targets) == 0 {
 		return profile, nil
 	}
@@ -118,10 +118,10 @@ type ruleSetPrefetchTarget struct {
 //
 // 遍历顺序与 config 侧生成 rule_set 资源的顺序一致（同一规则集以第一条绑定为准），
 // 保证"谁来抓"和"抓不到时停用谁"指的是同一条。
-func ruleSetPrefetchTargets(profile *config.Profile, mode *config.Mode) []ruleSetPrefetchTarget {
+func ruleSetPrefetchTargets(profile *config.Profile, scenario *config.Scenario) []ruleSetPrefetchTarget {
 	var targets []ruleSetPrefetchTarget
 	seen := map[string]bool{}
-	for _, binding := range mode.Bindings {
+	for _, binding := range scenario.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
 		if ruleSet == nil || !ruleSet.Enabled || ruleSet.Type != config.RuleSetTypeURL {
 			continue
@@ -142,7 +142,7 @@ func ruleSetPrefetchTargets(profile *config.Profile, mode *config.Mode) []ruleSe
 		line := profile.FindLine(binding.LineID)
 		if line != nil && line.Enabled {
 			switch line.Type {
-			case config.LineTypeTrojan, config.LineTypeShadowsocks, config.LineTypeVMess:
+			case config.LineTypeTrojan, config.LineTypeShadowsocks, config.LineTypeVMess, config.LineTypeAnyTLS:
 				continue
 			}
 		}

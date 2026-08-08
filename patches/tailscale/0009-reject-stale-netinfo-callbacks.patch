@@ -1,0 +1,162 @@
+From: XDial maintainers
+Subject: [PATCH] ipnlocal,magicsock: reject stale NetInfo callbacks
+
+magicsock dispatches NetInfo callbacks in independent goroutines. An older
+callback can therefore acquire LocalBackend's send lock after a newer callback,
+or even after a replacement control client has reset the NetInfo cache. In
+either case it must not overwrite the current HomeDERP publication or mark the
+replacement control generation ready.
+
+Validate callback identity against the current netInfoLast pointer at the
+control-send boundary. Accepted callbacks are cloned and normalized to the
+runtime HomeDERP observed under the same magicsock lock. Updated or reset
+callbacks are dropped before any control, tracker, or auto-exit refresh state is
+touched.
+
+diff --git a/ipn/ipnlocal/local.go b/ipn/ipnlocal/local.go
+--- a/ipn/ipnlocal/local.go
++++ b/ipn/ipnlocal/local.go
+@@ -5931,7 +5931,17 @@ func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
+ 	b.xdialNetInfoSendMu.Lock()
+ 
+ 	b.mu.Lock()
+-	ni = b.MagicConn().XDialNormalizeNetInfoForControl(ni)
++	normalized, current := b.MagicConn().
++		XDialNormalizeNetInfoForControl(ni)
++	if !current {
++		// NetInfo callbacks run in independent goroutines. An older callback
++		// must not reach a replacement control client or mark its generation
++		// ready after a newer callback (or ResetNetInfoLast) superseded it.
++		b.mu.Unlock()
++		b.xdialNetInfoSendMu.Unlock()
++		return
++	}
++	ni = normalized
+ 	cc := b.cc
+ 	ccAuto := b.ccAuto
+ 	controlGeneration := b.xdialControlNetInfo.generation
+diff --git a/wgengine/magicsock/xdial_derp_reselection.go b/wgengine/magicsock/xdial_derp_reselection.go
+--- a/wgengine/magicsock/xdial_derp_reselection.go
++++ b/wgengine/magicsock/xdial_derp_reselection.go
+@@ -60,22 +60,29 @@ func (c *Conn) xdialNormalizePinnedDERPLocked() int {
+ 	return pinnedDERP
+ }
+ 
+-// XDialNormalizeNetInfoForControl clones ni and applies the HomeDERP that is
+-// valid at the control-send boundary. A callback queued before a reselection
+-// commit must not publish its stale PreferredDERP after that commit.
++// XDialNormalizeNetInfoForControl accepts only the callback that still owns
++// netInfoLast, then clones it and applies the HomeDERP valid at the same
++// control-send boundary. NetInfo callbacks run in independent goroutines, so
++// pointer identity prevents an older callback (including one queued before a
++// control-client reset) from publishing after its replacement.
+ func (c *Conn) XDialNormalizeNetInfoForControl(
+ 	ni *tailcfg.NetInfo,
+-) *tailcfg.NetInfo {
++) (*tailcfg.NetInfo, bool) {
+ 	if ni == nil {
+-		return nil
++		return nil, false
+ 	}
+-	normalized := ni.Clone()
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+-	if pinnedDERP := c.xdialNormalizePinnedDERPLocked(); pinnedDERP != 0 {
+-		normalized.PreferredDERP = pinnedDERP
++	if c.netInfoLast != ni {
++		return nil, false
+ 	}
+-	return normalized
++	// Validate any explicit pin before sampling myDerp. Ordinary HomeDERP
++	// changes need the same normalization: a callback computed just before a
++	// home change must not publish the old value after the change.
++	c.xdialNormalizePinnedDERPLocked()
++	normalized := ni.Clone()
++	normalized.PreferredDERP = c.myDerp
++	return normalized, true
+ }
+ 
+ func xdialPickAlternateDERP(
+diff --git a/wgengine/magicsock/xdial_derp_reselection_test.go b/wgengine/magicsock/xdial_derp_reselection_test.go
+--- a/wgengine/magicsock/xdial_derp_reselection_test.go
++++ b/wgengine/magicsock/xdial_derp_reselection_test.go
+@@ -222,7 +222,13 @@ func TestXDialPinnedDERPWinsOverInflightReport(t *testing.T) {
+ 		PreferredDERP: 2,
+ 		LinkType:      "cellular",
+ 	}
+-	normalized := c.XDialNormalizeNetInfoForControl(stale)
++	c.mu.Lock()
++	c.netInfoLast = stale
++	c.mu.Unlock()
++	normalized, current := c.XDialNormalizeNetInfoForControl(stale)
++	if !current {
++		t.Fatal("current pinned NetInfo callback was rejected")
++	}
+ 	if stale.PreferredDERP != 2 {
+ 		t.Fatalf("control normalization mutated input DERP to %d", stale.PreferredDERP)
+ 	}
+@@ -235,6 +241,64 @@ func TestXDialPinnedDERPWinsOverInflightReport(t *testing.T) {
+ 	}
+ }
+ 
++func TestXDialNetInfoControlBoundaryRejectsSupersededCallbacks(
++	t *testing.T,
++) {
++	c := newConn(t.Logf)
++	first := &tailcfg.NetInfo{
++		PreferredDERP: 3,
++		LinkType:      "cellular",
++	}
++	second := &tailcfg.NetInfo{
++		PreferredDERP: 3,
++		LinkType:      "wifi",
++	}
++
++	c.mu.Lock()
++	c.myDerp = 3
++	c.netInfoLast = first
++	c.mu.Unlock()
++	accepted, current := c.XDialNormalizeNetInfoForControl(first)
++	if !current || accepted == nil {
++		t.Fatal("current NetInfo callback was rejected")
++	}
++	if accepted == first {
++		t.Fatal("current NetInfo callback was not cloned")
++	}
++
++	c.mu.Lock()
++	c.myDerp = 2
++	c.netInfoLast = second
++	c.mu.Unlock()
++	if stale, current := c.XDialNormalizeNetInfoForControl(first); current ||
++		stale != nil {
++		t.Fatal("superseded NetInfo callback was accepted")
++	}
++
++	accepted, current = c.XDialNormalizeNetInfoForControl(second)
++	if !current || accepted == nil {
++		t.Fatal("replacement NetInfo callback was rejected")
++	}
++	if accepted.PreferredDERP != 2 {
++		t.Fatalf(
++			"replacement callback published DERP %d, want runtime DERP 2",
++			accepted.PreferredDERP,
++		)
++	}
++	if second.PreferredDERP != 3 {
++		t.Fatalf(
++			"control normalization mutated replacement callback to DERP %d",
++			second.PreferredDERP,
++		)
++	}
++
++	c.ResetNetInfoLast()
++	if reset, current := c.XDialNormalizeNetInfoForControl(second); current ||
++		reset != nil {
++		t.Fatal("pre-reset NetInfo callback was accepted")
++	}
++}
++
+ func TestXDialPrepareHomeDERPReselectionRequiresFreshNetcheck(t *testing.T) {
+ 	c := newConn(t.Logf)
+ 	_, err := c.XDialPrepareHomeDERPReselection(t.Context())

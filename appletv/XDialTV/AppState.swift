@@ -458,7 +458,7 @@ final class AppState: ObservableObject {
     @Published private(set) var hasPendingRuntimeChanges = false
     /// 所有编辑入口最终都调用 save()，但不少 SwiftUI 回调无法同步展示返回值。
     /// 保留最后一次确认落盘的完整配置；任何持久化失败都统一回滚，避免 UI 看似保存、
-    /// 重启后才发现账号或模式消失。
+    /// 重启后才发现账号或场景消失。
     private var lastPersistedProfile = Profile.bootstrap()
     private var runningProfileSnapshot: Profile?
     @Published private(set) var tailscaleSetupLineID: String?
@@ -503,7 +503,7 @@ final class AppState: ObservableObject {
     var isConnectionConfigured: Bool {
         guard !persistenceRequiresRecovery else { return false }
         guard tunnelManager != nil else { return false }
-        guard activeMode != nil else { return false }
+        guard activeScenario != nil else { return false }
         return activeConfigurationIssues.isEmpty
     }
 
@@ -511,53 +511,53 @@ final class AppState: ObservableObject {
         !isBusy && !hasActiveTunnel && isConnectionConfigured
     }
 
-    /// 当前数据面只有一个 AnyConnect bridge；一个模式可以多处引用同一线路，
+    /// 当前数据面只有一个 AnyConnect bridge；一个场景可以多处引用同一线路，
     /// 但不能同时引用不同的 AnyConnect 线路，否则所有 tag 会被折叠到错误凭据上。
     var activeAnyConnectLineIDs: Set<String> {
-        guard let mode = activeMode else { return [] }
-        let referenced = effectiveReferencedLineIDs(in: mode)
+        guard let scenario = activeScenario else { return [] }
+        let referenced = effectiveReferencedLineIDs(in: scenario)
         return Set(profile.lines.compactMap { line in
             guard referenced.contains(line.id), line.enabled, line.type == "vpn" else { return nil }
             return line.id
         })
     }
 
-    /// 当前模式实际引用且已启用的 Tailscale 线路，用于识别 Tailscale-only 启动。
+    /// 当前场景实际引用且已启用的 Tailscale 线路，用于识别 Tailscale-only 启动。
     var activeTailscaleLineIDs: Set<String> {
-        guard let mode = activeMode else { return [] }
-        let referenced = effectiveReferencedLineIDs(in: mode)
+        guard let scenario = activeScenario else { return [] }
+        let referenced = effectiveReferencedLineIDs(in: scenario)
         return Set(profile.lines.compactMap { line in
             guard referenced.contains(line.id), line.enabled, line.type == "tailscale" else { return nil }
             return line.id
         })
     }
 
-    /// 当前模式不能安全启动的原因。生成器会跳过无效目标并回落到 direct，移动端必须
+    /// 当前场景不能安全启动的原因。生成器会跳过无效目标并回落到 direct，移动端必须
     /// 在启动前拦住这些配置，避免 UI 显示成功而真实流量走了意外出口。
     var activeConfigurationIssues: [String] {
         if persistenceRequiresRecovery {
             return [persistenceRecoveryMessage]
         }
-        guard let mode = activeMode else {
-            return [tr("尚未选择模式", "No mode is selected")]
+        guard let scenario = activeScenario else {
+            return [tr("尚未选择场景", "No scenario is selected")]
         }
-        return configurationIssues(for: mode)
+        return configurationIssues(for: scenario)
     }
 
-    func configurationIssues(for mode: Mode) -> [String] {
+    func configurationIssues(for scenario: Scenario) -> [String] {
         var issues: [String] = []
-        appendConnectivityAcceptanceIssues(for: mode, to: &issues)
+        appendConnectivityAcceptanceIssues(for: scenario, to: &issues)
         appendTargetIssue(
-            lineID: mode.defaultLineID,
-            subscriptionID: mode.defaultSubscriptionID,
+            lineID: scenario.defaultLineID,
+            subscriptionID: scenario.defaultSubscriptionID,
             label: tr("默认出口", "Default route"),
             requiresPublicEgress: true,
             to: &issues
         )
 
-        for binding in mode.bindings {
+        for binding in scenario.bindings {
             guard let rule = profile.ruleSets.first(where: { $0.id == binding.ruleSetID }) else {
-                issues.append(tr("模式引用了已删除的规则", "The mode references a deleted rule"))
+                issues.append(tr("场景引用了已删除的规则", "The scenario references a deleted rule"))
                 continue
             }
             guard rule.enabled else { continue }
@@ -581,8 +581,8 @@ final class AppState: ObservableObject {
             )
         }
 
-        let referencedLineIDs = effectiveReferencedLineIDs(in: mode)
-        // Tailscale endpoint 的子网路由能力是全局生成的，即使当前模式没有显式
+        let referencedLineIDs = effectiveReferencedLineIDs(in: scenario)
+        // Tailscale endpoint 的子网路由能力是全局生成的，即使当前场景没有显式
         // 绑定也会随隧道启动。所有 enabled Tailscale 因而都必须先完成登录；
         // 出口节点仍只对承担默认公网出口的那一条强制要求。
         for line in profile.lines
@@ -607,15 +607,15 @@ final class AppState: ObservableObject {
         })
         if anyConnectLineIDs.count > 1 {
             issues.append(tr(
-                "当前模式一次只能使用一条 AnyConnect 线路",
-                "This mode can use only one AnyConnect line at a time"
+                "当前场景一次只能使用一条 AnyConnect 线路",
+                "This scenario can use only one AnyConnect line at a time"
             ))
         }
         var seen = Set<String>()
         return issues.filter { seen.insert($0).inserted }
     }
 
-    private func appendConnectivityAcceptanceIssues(for mode: Mode, to issues: inout [String]) {
+    private func appendConnectivityAcceptanceIssues(for scenario: Scenario, to issues: inout [String]) {
         let directRuleIsExact = profile.ruleSets.contains {
             $0.id == RuleSet.connectivityDirectID && $0.enabled && $0.type == "manual"
                 && $0.domains.isEmpty && $0.cidrs == ["1.0.0.1/32"]
@@ -624,15 +624,15 @@ final class AppState: ObservableObject {
             $0.id == RuleSet.connectivityOutboundID && $0.enabled && $0.type == "manual"
                 && $0.domains.isEmpty && $0.cidrs == ["1.1.1.1/32"]
         }
-        let directBindingIsValid = mode.bindings.contains { binding in
+        let directBindingIsValid = scenario.bindings.contains { binding in
             guard binding.ruleSetID == RuleSet.connectivityDirectID,
                   binding.subscriptionID.isEmpty else { return false }
             return profile.lines.contains {
                 $0.id == binding.lineID && $0.type == "direct" && $0.enabled
             }
         }
-        let expectedOutboundBinding = profile.connectivityOutboundBinding(for: mode)
-        let configuredOutboundBinding = mode.bindings.first {
+        let expectedOutboundBinding = profile.connectivityOutboundBinding(for: scenario)
+        let configuredOutboundBinding = scenario.bindings.first {
             $0.ruleSetID == RuleSet.connectivityOutboundID
         }
         let outboundBindingIsValid =
@@ -641,8 +641,8 @@ final class AppState: ObservableObject {
         guard directRuleIsExact, outboundRuleIsExact,
               directBindingIsValid, outboundBindingIsValid else {
             issues.append(tr(
-                "当前模式缺少完整的 Direct / 非 Direct 出口连接验收规则与绑定",
-                "This mode is missing the complete Direct / non-Direct acceptance rules and bindings"
+                "当前场景缺少完整的 Direct / 非 Direct 出口连接验收规则与绑定",
+                "This scenario is missing the complete Direct / non-Direct acceptance rules and bindings"
             ))
             return
         }
@@ -655,10 +655,10 @@ final class AppState: ObservableObject {
         return host != "localhost" && !host.hasSuffix(".localhost") && !host.hasSuffix(".local")
     }
 
-    private func effectiveReferencedLineIDs(in mode: Mode) -> Set<String> {
+    private func effectiveReferencedLineIDs(in scenario: Scenario) -> Set<String> {
         var ids = Set<String>()
-        if !mode.defaultLineID.isEmpty { ids.insert(mode.defaultLineID) }
-        for binding in mode.bindings {
+        if !scenario.defaultLineID.isEmpty { ids.insert(scenario.defaultLineID) }
+        for binding in scenario.bindings {
             guard !binding.lineID.isEmpty,
                   profile.ruleSets.first(where: { $0.id == binding.ruleSetID })?.enabled == true else { continue }
             ids.insert(binding.lineID)
@@ -899,7 +899,7 @@ final class AppState: ObservableObject {
         return issues.filter { seen.insert($0).inserted }
     }
 
-    func canCreateMode(from template: ModeTemplate) -> Bool {
+    func canCreateScenario(from template: ScenarioTemplate) -> Bool {
         let hasDirect = profile.lines.contains { $0.type == "direct" && isUsableRouteLine($0) }
         let hasAnyConnect = profile.lines.contains { $0.type == "vpn" && isUsableRouteLine($0) }
         switch template {
@@ -997,8 +997,8 @@ final class AppState: ObservableObject {
         }
     }
 
-    var activeMode: Mode? {
-        profile.modes.first { $0.id == profile.activeModeID }
+    var activeScenario: Scenario? {
+        profile.scenarios.first { $0.id == profile.activeScenarioID }
     }
 
     init(
@@ -1081,8 +1081,8 @@ final class AppState: ObservableObject {
             autoReconnectTask?.cancel()
             autoReconnectTask = nil
             disconnectRequested = false
-            // Tailscale 配置会话运行的是隔离副本，不代表用户当前模式的数据面已通过验收。
-            // 只有正式连接成功后，才把当前模式实际使用的线路标记为已验证。
+            // Tailscale 配置会话运行的是隔离副本，不代表用户当前场景的数据面已通过验收。
+            // 只有正式连接成功后，才把当前场景实际使用的线路标记为已验证。
             markUsedLinesVerified()
             return
         }
@@ -1205,7 +1205,7 @@ final class AppState: ObservableObject {
     }
 
     private func markUsedLinesVerified() {
-        guard let s = activeMode else { return }
+        guard let s = activeScenario else { return }
 
         var usedIDs = Set(s.bindings.map { $0.lineID })
         if !s.defaultLineID.isEmpty { usedIDs.insert(s.defaultLineID) }
@@ -1268,7 +1268,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// 只有活动模式恰好引用一条可用 AnyConnect 线路时才返回凭据。
+    /// 只有活动场景恰好引用一条可用 AnyConnect 线路时才返回凭据。
     private func activeVPNCredentials() -> AnyConnectCredentials? {
         guard !persistenceRequiresRecovery else { return nil }
         guard activeAnyConnectLineIDs.count == 1,
@@ -1619,9 +1619,11 @@ final class AppState: ObservableObject {
         let rewritten = Self.hasLegacyMetaphorKeys(raw) ? Self.rewriteLegacyMetaphorKeys(raw) : raw
         // Profile 的 Codable 兼容层会把缺失字段默认为空。持久化恢复不能因此把任意
         // JSON（例如 `{}` 或一次截断写入）当成合法配置并覆盖现有数据。
-        let requiredCollections = ["lines", "rule_sets", "modes", "subscriptions"]
-        let hasCurrentShape = requiredCollections.allSatisfy { rewritten[$0] is [Any] }
-            && rewritten["active_mode_id"] is String
+        let sharedCollections = ["lines", "rule_sets", "subscriptions"]
+        let hasSharedShape = sharedCollections.allSatisfy { rewritten[$0] is [Any] }
+        let hasCurrentShape = hasSharedShape
+            && rewritten["scenarios"] is [Any]
+            && rewritten["active_scenario_id"] is String
         if hasCurrentShape,
            let rewrittenData = try? JSONSerialization.data(withJSONObject: rewritten),
            let decoded = try? JSONDecoder().decode(Profile.self, from: rewrittenData) {
@@ -1989,8 +1991,8 @@ final class AppState: ObservableObject {
     }
 
     /// 把一份比喻命名的 profile 字典按对照表精确重写成正式命名字典。
-    /// 顶层：ports→lines、cargoes→rule_sets、cruises→modes、active_cruise_id→active_mode_id。
-    /// mode 内嵌：default_port_id→default_line_id；binding 内嵌：cargo_id→rule_set_id、port_id→line_id。
+    /// 顶层：ports→lines、cargoes→rule_sets、cruises→scenarios、active_cruise_id→active_scenario_id。
+    /// scenario 内嵌：default_port_id→default_line_id；binding 内嵌：cargo_id→rule_set_id、port_id→line_id。
     /// subscription 内嵌：ports→lines（其内部 Line 字段如 trojan_port 保持不变）。
     private static func rewriteLegacyMetaphorKeys(_ dict: [String: Any]) -> [String: Any] {
         var out = dict
@@ -1999,16 +2001,16 @@ final class AppState: ObservableObject {
         if let v = out.removeValue(forKey: "ports") { out["lines"] = v }
         // 顶层 rule_sets
         if let v = out.removeValue(forKey: "cargoes") { out["rule_sets"] = v }
-        // 顶层 active_mode_id
-        if let v = out.removeValue(forKey: "active_cruise_id") { out["active_mode_id"] = v }
+        // 顶层 active_scenario_id
+        if let v = out.removeValue(forKey: "active_cruise_id") { out["active_scenario_id"] = v }
 
-        // 顶层 modes（含其内嵌 bindings / default_port_id 重写）
+        // 顶层 scenarios（含其内嵌 bindings / default_port_id 重写）
         if let cruises = out.removeValue(forKey: "cruises") as? [[String: Any]] {
-            out["modes"] = cruises.map { rewriteLegacyMode($0) }
+            out["scenarios"] = cruises.map { rewriteLegacyScenario($0) }
         } else if let cruises = out["cruises"] {
             // 类型不是 [[String:Any]]（异常数据）也搬过去，避免丢数据
             out.removeValue(forKey: "cruises")
-            out["modes"] = cruises
+            out["scenarios"] = cruises
         }
 
         // subscriptions 内嵌 ports → lines
@@ -2023,8 +2025,8 @@ final class AppState: ObservableObject {
         return out
     }
 
-    /// 重写单个 mode 字典：default_port_id → default_line_id，bindings 逐条重写。
-    private static func rewriteLegacyMode(_ dict: [String: Any]) -> [String: Any] {
+    /// 重写单个 scenario 字典：default_port_id → default_line_id，bindings 逐条重写。
+    private static func rewriteLegacyScenario(_ dict: [String: Any]) -> [String: Any] {
         var m = dict
         if let v = m.removeValue(forKey: "default_port_id") { m["default_line_id"] = v }
         if let bindings = m["bindings"] as? [[String: Any]] {
@@ -2038,7 +2040,7 @@ final class AppState: ObservableObject {
         return m
     }
 
-    /// 把旧格式 profile (v0.2: exits/rules/strategies) 迁移到新格式 (lines/rule_sets/modes)
+    /// 把旧格式 profile (v0.2: exits/rules/strategies) 迁移到新格式 (lines/rule_sets/scenarios)
     static func migrate(oldProfile: [String: Any]) -> Profile? {
         var p = Profile()
         // 旧版本的 v0.2 里是 exits/rules/strategies
@@ -2057,7 +2059,7 @@ final class AppState: ObservableObject {
             }
         }
         if let oldStrategies = oldProfile["strategies"] as? [[String: Any]] {
-            p.modes = oldStrategies.compactMap { dict -> Mode? in
+            p.scenarios = oldStrategies.compactMap { dict -> Scenario? in
                 // 旧 strategy.bindings 用 rule_id/exit_id；旧 default_exit_id
                 var fixed = dict
                 if let oldBindings = dict["bindings"] as? [[String: Any]] {
@@ -2073,14 +2075,14 @@ final class AppState: ObservableObject {
                     fixed.removeValue(forKey: "default_exit_id")
                 }
                 guard let data = try? JSONSerialization.data(withJSONObject: fixed),
-                      let c = try? JSONDecoder().decode(Mode.self, from: data) else { return nil }
+                      let c = try? JSONDecoder().decode(Scenario.self, from: data) else { return nil }
                 return c
             }
         }
         if let active = oldProfile["active_strategy_id"] as? String {
-            p.activeModeID = active
+            p.activeScenarioID = active
         }
-        return p.lines.isEmpty && p.ruleSets.isEmpty && p.modes.isEmpty ? nil : p
+        return p.lines.isEmpty && p.ruleSets.isEmpty && p.scenarios.isEmpty ? nil : p
     }
 
     func refreshTunnelProfileStatus() {
@@ -2282,7 +2284,7 @@ final class AppState: ObservableObject {
     }
 
     /// `action-required` 只说明至少一条 Tailscale endpoint 需要授权。逐条读取
-    /// LocalAPI 状态后再生成登录入口，避免把同一模式里已经 Running 的线路也误报。
+    /// LocalAPI 状态后再生成登录入口，避免把同一场景里已经 Running 的线路也误报。
     private func refreshRuntimeTailscaleAuthRequests() {
         tailscaleAuthRefreshGeneration &+= 1
         let generation = tailscaleAuthRefreshGeneration
@@ -2325,7 +2327,7 @@ final class AppState: ObservableObject {
     }
 
     /// 主 App 用无 TUN 的独立 Libbox 实例完成登录和节点发现。它只运行目标
-    /// Tailscale endpoint 与 Direct，不改变系统连接状态，也不执行正式模式。
+    /// Tailscale endpoint 与 Direct，不改变系统连接状态，也不执行正式场景。
     func prepareTailscaleLogin(
         lineID: String,
         completion: @escaping @Sendable (Result<Void, Error>) -> Void
@@ -2652,14 +2654,14 @@ final class AppState: ObservableObject {
     func deleteSubscription(_ id: String) {
         guard canMutateConfiguration else { return }
         profile.subscriptions.removeAll { $0.id == id }
-        // 保留模式里的悬空引用，让连接前校验明确报错；静默删除绑定或改为直连会改变路由语义。
+        // 保留场景里的悬空引用，让连接前校验明确报错；静默删除绑定或改为直连会改变路由语义。
         save()
     }
 
-    // MARK: - Mode Management
+    // MARK: - Scenario Management
 
-    func createMode(from template: ModeTemplate, named name: String) {
-        guard canMutateConfiguration, canCreateMode(from: template) else { return }
+    func createScenario(from template: ScenarioTemplate, named name: String) {
+        guard canMutateConfiguration, canCreateScenario(from: template) else { return }
         let direct = profile.lines.first(where: { $0.type == "direct" && isUsableRouteLine($0) })?.id ?? ""
         let vpn = profile.lines.first(where: { $0.type == "vpn" && isUsableRouteLine($0) })?.id ?? ""
         let ss = profile.lines.first(where: {
@@ -2672,7 +2674,7 @@ final class AppState: ObservableObject {
         let gfwRule = profile.ruleSets
             .first(where: { $0.type == "url" && $0.enabled })?.id ?? ""
 
-        var s: Mode
+        var s: Scenario
         switch template {
         case .overseas:
             s = Profile.templateOverseas(
@@ -2696,21 +2698,21 @@ final class AppState: ObservableObject {
                 directLineID: direct
             )
         case .blank:
-            s = Mode(id: UUID().uuidString, name: name, defaultLineID: direct)
+            s = Scenario(id: UUID().uuidString, name: name, defaultLineID: direct)
         }
         s.name = name
-        profile.modes.append(s)
-        if profile.activeModeID.isEmpty {
-            profile.activeModeID = s.id
+        profile.scenarios.append(s)
+        if profile.activeScenarioID.isEmpty {
+            profile.activeScenarioID = s.id
         }
         save()
     }
 
-    func deleteMode(_ s: Mode) {
+    func deleteScenario(_ s: Scenario) {
         guard canMutateConfiguration else { return }
-        profile.modes.removeAll { $0.id == s.id }
-        if profile.activeModeID == s.id {
-            profile.activeModeID = profile.modes.first?.id ?? ""
+        profile.scenarios.removeAll { $0.id == s.id }
+        if profile.activeScenarioID == s.id {
+            profile.activeScenarioID = profile.scenarios.first?.id ?? ""
         }
         save()
     }
@@ -2752,7 +2754,7 @@ final class NoopTunnelEngine: TunnelEngine, ObservableObject {
     }
 }
 
-enum ModeTemplate: String, CaseIterable {
+enum ScenarioTemplate: String, CaseIterable {
     case overseas, domestic, domesticSS, blank
 
     var displayName: String {

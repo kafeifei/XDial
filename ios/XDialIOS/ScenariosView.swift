@@ -1,22 +1,22 @@
 import SwiftUI
 
-struct ModesView: View {
+struct ScenariosView: View {
     @EnvironmentObject private var app: AppState
 
     var body: some View {
         NavigationStack {
             List {
-                ForEach(app.profile.modes) { mode in
-                    let issues = app.configurationIssues(for: mode)
+                ForEach(app.profile.scenarios) { scenario in
+                    let issues = app.configurationIssues(for: scenario)
                     NavigationLink {
-                        ModeDetailView(modeID: mode.id)
+                        ScenarioDetailView(scenarioID: scenario.id)
                     } label: {
                         HStack(spacing: 12) {
-                            Image(systemName: mode.id == app.profile.activeModeID ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(mode.id == app.profile.activeModeID ? .green : .secondary)
+                            Image(systemName: scenario.id == app.profile.activeScenarioID ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(scenario.id == app.profile.activeScenarioID ? .green : .secondary)
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(mode.name)
-                                Text(modeSummary(mode))
+                                Text(scenario.name)
+                                Text(scenarioSummary(scenario))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                 if !issues.isEmpty {
@@ -33,7 +33,7 @@ struct ModesView: View {
                     .swipeActions(edge: .leading, allowsFullSwipe: false) {
                         Button {
                             guard app.canMutateConfiguration else { return }
-                            app.profile.activeModeID = mode.id
+                            app.profile.activeScenarioID = scenario.id
                             app.save()
                         } label: {
                             Label(app.tr("使用", "Use"), systemImage: "checkmark")
@@ -43,7 +43,7 @@ struct ModesView: View {
                     }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         Button(role: .destructive) {
-                            app.deleteMode(mode)
+                            app.deleteScenario(scenario)
                         } label: {
                             Label(app.tr("删除", "Delete"), systemImage: "trash")
                         }
@@ -52,78 +52,78 @@ struct ModesView: View {
                 }
             }
             .overlay {
-                if app.profile.modes.isEmpty {
+                if app.profile.scenarios.isEmpty {
                     ContentUnavailableView(
-                        app.tr("暂无模式", "No modes"),
-                        systemImage: "shuffle",
-                        description: Text(app.tr("点击右上角从模板新建模式。", "Create a mode from a template."))
+                        app.tr("暂无场景", "No scenarios"),
+                        systemImage: "square.grid.2x2",
+                        description: Text(app.tr("点击右上角从模板新建场景。", "Create a scenario from a template."))
                     )
                 }
             }
-            .navigationTitle(app.tr("模式", "Modes"))
+            .navigationTitle(app.tr("场景", "Scenarios"))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        ForEach(ModeTemplate.allCases, id: \.self) { template in
+                        ForEach(ScenarioTemplate.allCases, id: \.self) { template in
                             Button(templateName(template)) {
-                                app.createMode(from: template, named: templateName(template))
+                                app.createScenario(from: template, named: templateName(template))
                             }
-                            .disabled(!app.canCreateMode(from: template)
+                            .disabled(!app.canCreateScenario(from: template)
                                 || app.hasActiveTunnel || app.isBusy)
                         }
                     } label: {
                         Image(systemName: "plus")
                     }
-                    .accessibilityLabel(app.tr("添加模式", "Add mode"))
+                    .accessibilityLabel(app.tr("添加场景", "Add scenario"))
                     .disabled(!app.canMutateConfiguration || app.hasActiveTunnel || app.isBusy)
                 }
             }
         }
     }
 
-    private func modeSummary(_ mode: Mode) -> String {
+    private func scenarioSummary(_ scenario: Scenario) -> String {
         let defaultName: String
-        if !mode.defaultSubscriptionID.isEmpty {
-            defaultName = app.profile.subscriptions.first { $0.id == mode.defaultSubscriptionID }?.name
+        if !scenario.defaultSubscriptionID.isEmpty {
+            defaultName = app.profile.subscriptions.first { $0.id == scenario.defaultSubscriptionID }?.name
                 ?? app.tr("订阅已删除", "Missing subscription")
-        } else if !mode.defaultLineID.isEmpty {
-            defaultName = app.profile.lines.first { $0.id == mode.defaultLineID }?.name
+        } else if !scenario.defaultLineID.isEmpty {
+            defaultName = app.profile.lines.first { $0.id == scenario.defaultLineID }?.name
                 ?? app.tr("线路已删除", "Missing line")
         } else {
             defaultName = app.tr("未设置出口", "No default route")
         }
         return app.tr(
-            "默认：\(defaultName) · \(mode.bindings.count) 条规则",
-            "Default: \(defaultName) · \(mode.bindings.count) rules"
+            "默认：\(defaultName) · \(scenario.bindings.count) 条规则",
+            "Default: \(defaultName) · \(scenario.bindings.count) rules"
         )
     }
 
-    private func templateName(_ template: ModeTemplate) -> String {
+    private func templateName(_ template: ScenarioTemplate) -> String {
         switch template {
         case .overseas: return app.tr("海外", "Overseas")
         case .domestic: return app.tr("国内", "Domestic")
         case .domesticSS: return app.tr("国内 + SS", "Domestic + SS")
-        case .blank: return app.tr("空白模式", "Blank Mode")
+        case .blank: return app.tr("空白场景", "Blank Scenario")
         }
     }
 }
 
-private struct ModeDetailView: View {
+private struct ScenarioDetailView: View {
     @EnvironmentObject private var app: AppState
     @Environment(\.dismiss) private var dismiss
-    let modeID: String
+    let scenarioID: String
 
     var body: some View {
         Form {
-            if let index = modeIndex {
+            if let index = scenarioIndex {
                 Section(app.tr("基本信息", "Basics")) {
-                    TextField(app.tr("模式名称", "Mode name"), text: modeBinding(index, \.name))
+                    TextField(app.tr("场景名称", "Scenario name"), text: scenarioBinding(index, \.name))
 
                     Picker(app.tr("默认出口", "Default route"), selection: defaultTarget(index)) {
                         targetOptions(
                             selectedTargetID: targetID(
-                                lineID: app.profile.modes[index].defaultLineID,
-                                subscriptionID: app.profile.modes[index].defaultSubscriptionID
+                                lineID: app.profile.scenarios[index].defaultLineID,
+                                subscriptionID: app.profile.scenarios[index].defaultSubscriptionID
                             ),
                             includeDefault: false
                         )
@@ -164,8 +164,8 @@ private struct ModeDetailView: View {
                     Text(app.tr("分流绑定", "Rule bindings"))
                 } footer: {
                     Text(app.tr(
-                        "带锁规则会明确显示 1.0.0.1 的 Direct 绑定，以及 1.1.1.1 选中的非 Direct 验收出口；单出口模式不执行双出口分流验收。",
-                        "Locked rules explicitly show the Direct binding for 1.0.0.1 and the selected non-Direct acceptance route for 1.1.1.1. Dual-route verification is not run in single-route modes."
+                        "带锁规则会明确显示 1.0.0.1 的 Direct 绑定，以及 1.1.1.1 选中的非 Direct 验收出口；单出口场景不执行双出口分流验收。",
+                        "Locked rules explicitly show the Direct binding for 1.0.0.1 and the selected non-Direct acceptance route for 1.1.1.1. Dual-route verification is not run in single-route scenarios."
                     ))
                 }
                 .disabled(app.hasActiveTunnel || app.isBusy)
@@ -173,29 +173,29 @@ private struct ModeDetailView: View {
                 Section {
                     Button {
                         guard app.canMutateConfiguration else { return }
-                        app.profile.activeModeID = modeID
+                        app.profile.activeScenarioID = scenarioID
                         app.save()
                     } label: {
-                        Label(app.tr("设为当前模式", "Use this mode"), systemImage: "checkmark.circle")
+                        Label(app.tr("设为当前场景", "Use this scenario"), systemImage: "checkmark.circle")
                     }
-                    .disabled(app.profile.activeModeID == modeID
+                    .disabled(app.profile.activeScenarioID == scenarioID
                         || app.hasActiveTunnel || app.isBusy)
                 }
 
                 Section {
-                    Button(app.tr("删除模式", "Delete Mode"), role: .destructive) {
-                        guard let currentIndex = modeIndex else { return }
-                        let mode = app.profile.modes[currentIndex]
-                        app.deleteMode(mode)
+                    Button(app.tr("删除场景", "Delete Scenario"), role: .destructive) {
+                        guard let currentIndex = scenarioIndex else { return }
+                        let scenario = app.profile.scenarios[currentIndex]
+                        app.deleteScenario(scenario)
                         dismiss()
                     }
                     .disabled(app.hasActiveTunnel || app.isBusy)
                 }
             } else {
-                ContentUnavailableView(app.tr("模式已删除", "Mode deleted"), systemImage: "trash")
+                ContentUnavailableView(app.tr("场景已删除", "Scenario deleted"), systemImage: "trash")
             }
         }
-        .navigationTitle(app.tr("编辑模式", "Edit Mode"))
+        .navigationTitle(app.tr("编辑场景", "Edit Scenario"))
         .onDisappear { app.save() }
     }
 
@@ -206,7 +206,10 @@ private struct ModeDetailView: View {
         ruleSetID: String = ""
     ) -> some View {
         let availableLines = app.profile.lines.filter {
-            includeDefault ? app.isUsableRouteLine($0) : app.isUsableDefaultRouteLine($0)
+            let usable = includeDefault
+                ? app.isUsableRouteLine($0)
+                : app.isUsableDefaultRouteLine($0)
+            return usable
         }
         let availableSubscriptions = app.profile.subscriptions.filter(app.isUsableSubscription)
         let availableIDs = Set(
@@ -246,65 +249,65 @@ private struct ModeDetailView: View {
         }
     }
 
-    private var modeIndex: Int? {
-        app.profile.modes.firstIndex { $0.id == modeID }
+    private var scenarioIndex: Int? {
+        app.profile.scenarios.firstIndex { $0.id == scenarioID }
     }
 
-    private func modeBinding<T>(_ index: Int, _ keyPath: WritableKeyPath<Mode, T>) -> Binding<T> {
+    private func scenarioBinding<T>(_ index: Int, _ keyPath: WritableKeyPath<Scenario, T>) -> Binding<T> {
         Binding(
-            get: { app.profile.modes[index][keyPath: keyPath] },
+            get: { app.profile.scenarios[index][keyPath: keyPath] },
             set: {
                 guard !app.hasActiveTunnel, !app.isBusy else { return }
-                app.profile.modes[index][keyPath: keyPath] = $0
+                app.profile.scenarios[index][keyPath: keyPath] = $0
                 app.save()
             }
         )
     }
 
-    private func defaultTarget(_ modeIndex: Int) -> Binding<String> {
+    private func defaultTarget(_ scenarioIndex: Int) -> Binding<String> {
         Binding(
             get: {
                 targetID(
-                    lineID: app.profile.modes[modeIndex].defaultLineID,
-                    subscriptionID: app.profile.modes[modeIndex].defaultSubscriptionID
+                    lineID: app.profile.scenarios[scenarioIndex].defaultLineID,
+                    subscriptionID: app.profile.scenarios[scenarioIndex].defaultSubscriptionID
                 )
             },
             set: { selectedTargetID in
                 guard !app.hasActiveTunnel, !app.isBusy else { return }
                 if selectedTargetID.isEmpty {
-                    app.profile.modes[modeIndex].defaultLineID = ""
-                    app.profile.modes[modeIndex].defaultSubscriptionID = ""
+                    app.profile.scenarios[scenarioIndex].defaultLineID = ""
+                    app.profile.scenarios[scenarioIndex].defaultSubscriptionID = ""
                 } else {
-                    app.profile.modes[modeIndex].defaultTargetID = selectedTargetID
+                    app.profile.scenarios[scenarioIndex].defaultTargetID = selectedTargetID
                 }
                 app.save()
             }
         )
     }
 
-    private func bindingTarget(_ modeIndex: Int, ruleSetID: String) -> Binding<String> {
+    private func bindingTarget(_ scenarioIndex: Int, ruleSetID: String) -> Binding<String> {
         Binding(
-            get: { currentBindingTarget(modeIndex, ruleSetID: ruleSetID) },
+            get: { currentBindingTarget(scenarioIndex, ruleSetID: ruleSetID) },
             set: { selectedTargetID in
                 guard !app.hasActiveTunnel, !app.isBusy else { return }
-                if let index = app.profile.modes[modeIndex].bindings.firstIndex(where: { $0.ruleSetID == ruleSetID }) {
+                if let index = app.profile.scenarios[scenarioIndex].bindings.firstIndex(where: { $0.ruleSetID == ruleSetID }) {
                     if selectedTargetID.isEmpty {
-                        app.profile.modes[modeIndex].bindings.remove(at: index)
+                        app.profile.scenarios[scenarioIndex].bindings.remove(at: index)
                     } else {
-                        app.profile.modes[modeIndex].bindings[index].targetID = selectedTargetID
+                        app.profile.scenarios[scenarioIndex].bindings[index].targetID = selectedTargetID
                     }
                 } else if !selectedTargetID.isEmpty {
                     var binding = RuleBinding(ruleSetID: ruleSetID)
                     binding.targetID = selectedTargetID
-                    app.profile.modes[modeIndex].bindings.append(binding)
+                    app.profile.scenarios[scenarioIndex].bindings.append(binding)
                 }
                 app.save()
             }
         )
     }
 
-    private func currentBindingTarget(_ modeIndex: Int, ruleSetID: String) -> String {
-        guard let binding = app.profile.modes[modeIndex].bindings.first(where: { $0.ruleSetID == ruleSetID }) else {
+    private func currentBindingTarget(_ scenarioIndex: Int, ruleSetID: String) -> String {
+        guard let binding = app.profile.scenarios[scenarioIndex].bindings.first(where: { $0.ruleSetID == ruleSetID }) else {
             return ""
         }
         return targetID(lineID: binding.lineID, subscriptionID: binding.subscriptionID)

@@ -1,0 +1,767 @@
+diff --git a/session/session.go b/session/session.go
+index 22da665..8b0b990 100644
+--- a/session/session.go
++++ b/session/session.go
+@@ -158,7 +158,7 @@ func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
+ 		}
+ 	}
+ 
+-	cSess.xdial = newXDialLiveness(cSess)
++	cSess.xdial = newXDialLiveness(cSess, *header)
+ 	return cSess
+ }
+ 
+diff --git a/session/xdial_liveness.go b/session/xdial_liveness.go
+index 6345f52..870fc82 100644
+--- a/session/xdial_liveness.go
++++ b/session/xdial_liveness.go
+@@ -3,8 +3,11 @@ package session
+ import (
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"net"
++	"net/http"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"syscall"
+@@ -36,20 +39,30 @@ type xdialTransportLiveness struct {
+ 	dpdResponsesRead    uint64
+ 	peerDPDRequestsRead uint64
+ 	keepalivesRead      uint64
++	dataFramesRead      uint64
++	dataFramesWritten   uint64
++	lastDataRead        time.Time
++	lastDataWritten     time.Time
+ 	lastFailureCode     string
+ }
+ 
+ type xdialCloseReason struct {
+-	Code         string `json:"code"`
+-	Channel      string `json:"channel"`
+-	Operation    string `json:"operation"`
+-	ErrorClass   string `json:"error_class"`
+-	OccurredAtMS int64  `json:"occurred_at_unix_milli"`
++	Code               string `json:"code"`
++	Channel            string `json:"channel"`
++	Operation          string `json:"operation"`
++	ErrorClass         string `json:"error_class"`
++	OccurredAtMS       int64  `json:"occurred_at_unix_milli"`
++	PeerPayloadLength  *int   `json:"peer_payload_length,omitempty"`
++	PeerReasonCode     string `json:"peer_reason_code,omitempty"`
++	PeerHasReasonText  bool   `json:"peer_has_reason_text"`
++	PeerReasonCategory string `json:"peer_reason_category,omitempty"`
+ }
+ 
+ type xdialLiveness struct {
+ 	mu          sync.Mutex
+ 	forceDPD    time.Duration
++	startedAt   time.Time
++	negotiated  xdialNegotiatedSnapshot
+ 	tls         xdialTransportLiveness
+ 	dtls        xdialTransportLiveness
+ 	closeReason *xdialCloseReason
+@@ -57,10 +70,16 @@ type xdialLiveness struct {
+ }
+ 
+ type xdialNegotiatedSnapshot struct {
+-	TLSDPDSeconds        int `json:"tls_dpd_seconds"`
+-	TLSKeepaliveSeconds  int `json:"tls_keepalive_seconds"`
+-	DTLSDPDSeconds       int `json:"dtls_dpd_seconds"`
+-	DTLSKeepaliveSeconds int `json:"dtls_keepalive_seconds"`
++	TLSDPDSeconds                      int    `json:"tls_dpd_seconds"`
++	TLSKeepaliveSeconds                int    `json:"tls_keepalive_seconds"`
++	DTLSDPDSeconds                     int    `json:"dtls_dpd_seconds"`
++	DTLSKeepaliveSeconds               int    `json:"dtls_keepalive_seconds"`
++	CSTPRekeySeconds                   *int   `json:"cstp_rekey_seconds,omitempty"`
++	CSTPRekeyMethod                    string `json:"cstp_rekey_method,omitempty"`
++	CSTPLeaseDurationSeconds           *int   `json:"cstp_lease_duration_seconds,omitempty"`
++	CSTPSessionTimeoutSeconds          *int   `json:"cstp_session_timeout_seconds,omitempty"`
++	CSTPSessionTimeoutRemainingSeconds *int   `json:"cstp_session_timeout_remaining_seconds,omitempty"`
++	CSTPIdleTimeoutSeconds             *int   `json:"cstp_idle_timeout_seconds,omitempty"`
+ }
+ 
+ type xdialTransportSnapshot struct {
+@@ -71,9 +90,13 @@ type xdialTransportSnapshot struct {
+ 	DPDResponsesReceived    uint64 `json:"dpd_responses_received"`
+ 	PeerDPDRequestsReceived uint64 `json:"peer_dpd_requests_received"`
+ 	KeepalivesReceived      uint64 `json:"keepalives_received"`
++	DataFramesReceived      uint64 `json:"data_frames_received"`
++	DataFramesWritten       uint64 `json:"data_frames_written"`
+ 	LastFrameAgeMS          *int64 `json:"last_frame_age_ms,omitempty"`
+ 	LastDPDWrittenAgeMS     *int64 `json:"last_dpd_written_age_ms,omitempty"`
+ 	LastDPDResponseAgeMS    *int64 `json:"last_dpd_response_age_ms,omitempty"`
++	LastDataReceivedAgeMS   *int64 `json:"last_data_received_age_ms,omitempty"`
++	LastDataWrittenAgeMS    *int64 `json:"last_data_written_age_ms,omitempty"`
+ 	LastFailureCode         string `json:"last_failure_code,omitempty"`
+ 	EverConnected           bool   `json:"ever_connected"`
+ 	CurrentlyConnected      bool   `json:"currently_connected"`
+@@ -82,6 +105,7 @@ type xdialTransportSnapshot struct {
+ type xdialDiagnosticsSnapshot struct {
+ 	SchemaVersion   int                     `json:"schema_version"`
+ 	ForceDPDSeconds int                     `json:"force_dpd_seconds"`
++	SessionAgeMS    int64                   `json:"session_age_ms"`
+ 	Negotiated      xdialNegotiatedSnapshot `json:"negotiated"`
+ 	TLS             xdialTransportSnapshot  `json:"tls"`
+ 	DTLS            xdialTransportSnapshot  `json:"dtls"`
+@@ -99,14 +123,44 @@ type xdialStepResult struct {
+ 	dtlsDead bool
+ }
+ 
+-func newXDialLiveness(cSess *ConnSession) *xdialLiveness {
++func newXDialLiveness(cSess *ConnSession, header http.Header) *xdialLiveness {
+ 	now := time.Now()
+ 	forceSeconds := base.Cfg.XDialForceDPD()
+ 	forceDPD := time.Duration(forceSeconds) * time.Second
+ 	tlsDPD := effectiveXDialDPD(forceDPD, cSess.TLSDpdTime)
+ 	dtlsDPD := effectiveXDialDPD(forceDPD, cSess.DTLSDpdTime)
+ 	return &xdialLiveness{
+-		forceDPD: forceDPD,
++		forceDPD:  forceDPD,
++		startedAt: now,
++		negotiated: xdialNegotiatedSnapshot{
++			TLSDPDSeconds:        cSess.TLSDpdTime,
++			TLSKeepaliveSeconds:  cSess.TLSKeepaliveTime,
++			DTLSDPDSeconds:       cSess.DTLSDpdTime,
++			DTLSKeepaliveSeconds: cSess.DTLSKeepaliveTime,
++			CSTPRekeySeconds: xdialDurationHeader(
++				header,
++				"X-CSTP-Rekey-Time",
++			),
++			CSTPRekeyMethod: xdialRekeyMethod(
++				header.Get("X-CSTP-Rekey-Method"),
++			),
++			CSTPLeaseDurationSeconds: xdialDurationHeader(
++				header,
++				"X-CSTP-Lease-Duration",
++			),
++			CSTPSessionTimeoutSeconds: xdialDurationHeader(
++				header,
++				"X-CSTP-Session-Timeout",
++			),
++			CSTPSessionTimeoutRemainingSeconds: xdialDurationHeader(
++				header,
++				"X-CSTP-Session-Timeout-Remaining",
++			),
++			CSTPIdleTimeoutSeconds: xdialDurationHeader(
++				header,
++				"X-CSTP-Idle-Timeout",
++			),
++		},
+ 		tls: xdialTransportLiveness{
+ 			negotiatedDPD:       cSess.TLSDpdTime,
+ 			negotiatedKeepalive: cSess.TLSKeepaliveTime,
+@@ -124,6 +178,36 @@ func newXDialLiveness(cSess *ConnSession) *xdialLiveness {
+ 	}
+ }
+ 
++func xdialDurationHeader(header http.Header, name string) *int {
++	value := strings.TrimSpace(header.Get(name))
++	if value == "" {
++		return nil
++	}
++	if strings.EqualFold(value, "none") {
++		disabled := 0
++		return &disabled
++	}
++	seconds, err := strconv.ParseInt(value, 10, 32)
++	if err != nil || seconds < 0 {
++		return nil
++	}
++	result := int(seconds)
++	return &result
++}
++
++func xdialRekeyMethod(value string) string {
++	switch strings.ToLower(strings.TrimSpace(value)) {
++	case "":
++		return ""
++	case "ssl":
++		return "ssl"
++	case "new-tunnel":
++		return "new-tunnel"
++	default:
++		return "unknown"
++	}
++}
++
+ func effectiveXDialDPD(force time.Duration, negotiatedSeconds int) time.Duration {
+ 	if force > 0 {
+ 		return force
+@@ -296,6 +380,10 @@ func (cSess *ConnSession) XDialRecordWrite(
+ 	cSess.xdial.mu.Lock()
+ 	state := cSess.xdial.transport(channel)
+ 	state.lastWrite = now
++	if payloadType == 0x00 {
++		state.dataFramesWritten++
++		state.lastDataWritten = now
++	}
+ 	if payloadType == 0x03 {
+ 		state.dpdQueued = false
+ 		state.dpdRequestsWritten++
+@@ -313,6 +401,9 @@ func (cSess *ConnSession) XDialRecordFrame(channel string, payloadType byte) {
+ 	state := cSess.xdial.transport(channel)
+ 	state.lastFrame = now
+ 	switch payloadType {
++	case 0x00:
++		state.dataFramesRead++
++		state.lastDataRead = now
+ 	case 0x03:
+ 		state.peerDPDRequestsRead++
+ 	case 0x04:
+@@ -366,30 +457,56 @@ func (cSess *ConnSession) XDialRecordReadFailure(channel string, err error) {
+ 	)
+ }
+ 
+-func (cSess *ConnSession) XDialRecordPeerClose(channel, code string) {
++func (cSess *ConnSession) XDialRecordPeerClose(
++	channel, code string,
++	payload []byte,
++) {
++	if cSess.xdial == nil {
++		if channel != xdialDTLS {
++			cSess.Close()
++		}
++		return
++	}
+ 	if channel == xdialDTLS {
+ 		cSess.xdialRecordTransportFailure(channel, code)
+ 		return
+ 	}
+-	cSess.XDialCloseWithReason(code, channel, "peer", "peer")
++	reason := xdialCloseReason{
++		Code:         code,
++		Channel:      channel,
++		Operation:    "peer",
++		ErrorClass:   "peer",
++		OccurredAtMS: cSess.xdial.now().UnixMilli(),
++	}
++	reason.PeerPayloadLength,
++		reason.PeerReasonCode,
++		reason.PeerHasReasonText,
++		reason.PeerReasonCategory = xdialPeerReason(payload)
++	cSess.xdialClose(reason)
+ }
+ 
+ func (cSess *ConnSession) XDialCloseWithReason(
+ 	code, channel, operation, errorClass string,
+ ) {
+-	if cSess.xdial != nil {
+-		cSess.xdial.mu.Lock()
+-		if cSess.xdial.closeReason == nil {
+-			cSess.xdial.closeReason = &xdialCloseReason{
+-				Code:         code,
+-				Channel:      channel,
+-				Operation:    operation,
+-				ErrorClass:   errorClass,
+-				OccurredAtMS: cSess.xdial.now().UnixMilli(),
+-			}
+-		}
+-		cSess.xdial.mu.Unlock()
++	if cSess.xdial == nil {
++		cSess.Close()
++		return
++	}
++	cSess.xdialClose(xdialCloseReason{
++		Code:         code,
++		Channel:      channel,
++		Operation:    operation,
++		ErrorClass:   errorClass,
++		OccurredAtMS: cSess.xdial.now().UnixMilli(),
++	})
++}
++
++func (cSess *ConnSession) xdialClose(reason xdialCloseReason) {
++	cSess.xdial.mu.Lock()
++	if cSess.xdial.closeReason == nil {
++		cSess.xdial.closeReason = &reason
+ 	}
++	cSess.xdial.mu.Unlock()
+ 	cSess.Close()
+ }
+ 
+@@ -400,16 +511,12 @@ func (cSess *ConnSession) XDialDiagnosticsJSON() string {
+ 	now := cSess.xdial.now()
+ 	cSess.xdial.mu.Lock()
+ 	snapshot := xdialDiagnosticsSnapshot{
+-		SchemaVersion:   1,
++		SchemaVersion:   2,
+ 		ForceDPDSeconds: int(cSess.xdial.forceDPD / time.Second),
+-		Negotiated: xdialNegotiatedSnapshot{
+-			TLSDPDSeconds:        cSess.xdial.tls.negotiatedDPD,
+-			TLSKeepaliveSeconds:  cSess.xdial.tls.negotiatedKeepalive,
+-			DTLSDPDSeconds:       cSess.xdial.dtls.negotiatedDPD,
+-			DTLSKeepaliveSeconds: cSess.xdial.dtls.negotiatedKeepalive,
+-		},
+-		TLS:  snapshotXDialTransport(now, cSess.xdial.tls, false),
+-		DTLS: snapshotXDialTransport(now, cSess.xdial.dtls, true),
++		SessionAgeMS:    xdialElapsed(now, cSess.xdial.startedAt),
++		Negotiated:      cSess.xdial.negotiated,
++		TLS:             snapshotXDialTransport(now, cSess.xdial.tls, false),
++		DTLS:            snapshotXDialTransport(now, cSess.xdial.dtls, true),
+ 	}
+ 	if cSess.xdial.closeReason != nil {
+ 		reason := *cSess.xdial.closeReason
+@@ -436,9 +543,13 @@ func snapshotXDialTransport(
+ 		DPDResponsesReceived:    state.dpdResponsesRead,
+ 		PeerDPDRequestsReceived: state.peerDPDRequestsRead,
+ 		KeepalivesReceived:      state.keepalivesRead,
++		DataFramesReceived:      state.dataFramesRead,
++		DataFramesWritten:       state.dataFramesWritten,
+ 		LastFrameAgeMS:          xdialAge(now, state.lastFrame),
+ 		LastDPDWrittenAgeMS:     xdialAge(now, state.lastDPDWritten),
+ 		LastDPDResponseAgeMS:    xdialAge(now, state.lastDPDResponse),
++		LastDataReceivedAgeMS:   xdialAge(now, state.lastDataRead),
++		LastDataWrittenAgeMS:    xdialAge(now, state.lastDataWritten),
+ 		LastFailureCode:         state.lastFailureCode,
+ 	}
+ 	if includeConnection {
+@@ -448,6 +559,14 @@ func snapshotXDialTransport(
+ 	return result
+ }
+ 
++func xdialElapsed(now, then time.Time) int64 {
++	elapsed := now.Sub(then).Milliseconds()
++	if elapsed < 0 {
++		return 0
++	}
++	return elapsed
++}
++
+ func xdialAge(now, then time.Time) *int64 {
+ 	if then.IsZero() {
+ 		return nil
+@@ -459,6 +578,79 @@ func xdialAge(now, then time.Time) *int64 {
+ 	return &age
+ }
+ 
++func xdialPeerReason(payload []byte) (*int, string, bool, string) {
++	length := len(payload)
++	if length == 0 {
++		return &length, "", false, ""
++	}
++	code := fmt.Sprintf("%02x", payload[0])
++	reason := xdialPrintableReason(payload[1:])
++	if reason == "" {
++		return &length, code, false, ""
++	}
++	return &length, code, true, xdialPeerReasonCategory(reason)
++}
++
++func xdialPrintableReason(raw []byte) string {
++	const maximumReasonBytes = 256
++	if len(raw) > maximumReasonBytes {
++		raw = raw[:maximumReasonBytes]
++	}
++	var result strings.Builder
++	spacePending := false
++	for _, current := range raw {
++		switch {
++		case current == 0:
++			raw = nil
++		case current == ' ' || current == '\t' ||
++			current == '\r' || current == '\n':
++			spacePending = result.Len() > 0
++		case current >= 0x20 && current <= 0x7e:
++			if spacePending {
++				result.WriteByte(' ')
++				spacePending = false
++			}
++			result.WriteByte(current)
++		}
++		if raw == nil {
++			break
++		}
++	}
++	return strings.ToLower(strings.TrimSpace(result.String()))
++}
++
++func xdialPeerReasonCategory(reason string) string {
++	switch {
++	case strings.Contains(reason, "idle") &&
++		strings.Contains(reason, "timeout"):
++		return "idle-timeout"
++	case strings.Contains(reason, "session") &&
++		strings.Contains(reason, "timeout"):
++		return "session-timeout"
++	case strings.Contains(reason, "duplicate") ||
++		strings.Contains(reason, "another session"):
++		return "duplicate-session"
++	case strings.Contains(reason, "auth") ||
++		strings.Contains(reason, "login") ||
++		strings.Contains(reason, "credential"):
++		return "authentication"
++	case strings.Contains(reason, "policy") ||
++		strings.Contains(reason, "denied") ||
++		strings.Contains(reason, "not allowed"):
++		return "policy"
++	case strings.Contains(reason, "rekey"):
++		return "rekey"
++	case strings.Contains(reason, "server") ||
++		strings.Contains(reason, "internal") ||
++		strings.Contains(reason, "error") ||
++		strings.Contains(reason, "failure") ||
++		strings.Contains(reason, "unavailable"):
++		return "server-error"
++	default:
++		return "other"
++	}
++}
++
+ func (l *xdialLiveness) transport(channel string) *xdialTransportLiveness {
+ 	if channel == xdialDTLS {
+ 		return &l.dtls
+diff --git a/session/xdial_liveness_test.go b/session/xdial_liveness_test.go
+index 17e2114..b06ea9e 100644
+--- a/session/xdial_liveness_test.go
++++ b/session/xdial_liveness_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"net/http"
++	"strings"
+ 	"sync"
+ 	"syscall"
+ 	"testing"
+@@ -95,6 +96,122 @@ func TestXDialDPDCountsQueueWriteAndResponseSeparately(t *testing.T) {
+ 	}
+ }
+ 
++func TestXDialNegotiatedCSTPHeadersAreBoundedAndNormalized(t *testing.T) {
++	header := http.Header{}
++	header.Set("X-CSTP-DPD", "60")
++	header.Set("X-CSTP-Rekey-Time", "180")
++	header.Set("X-CSTP-Rekey-Method", " NEW-TUNNEL ")
++	header.Set("X-CSTP-Lease-Duration", "none")
++	header.Set("X-CSTP-Session-Timeout", "3600")
++	header.Set("X-CSTP-Session-Timeout-Remaining", "3500")
++	header.Set("X-CSTP-Idle-Timeout", "900")
++	cSess := (&Session{}).NewConnSession(&header)
++
++	var snapshot xdialDiagnosticsSnapshot
++	if err := json.Unmarshal(
++		[]byte(cSess.XDialDiagnosticsJSON()),
++		&snapshot,
++	); err != nil {
++		t.Fatal(err)
++	}
++	if snapshot.SchemaVersion != 2 {
++		t.Fatalf("schema version = %d, want 2", snapshot.SchemaVersion)
++	}
++	if snapshot.Negotiated.CSTPRekeySeconds == nil ||
++		*snapshot.Negotiated.CSTPRekeySeconds != 180 {
++		t.Fatalf(
++			"rekey seconds = %#v, want 180",
++			snapshot.Negotiated.CSTPRekeySeconds,
++		)
++	}
++	if snapshot.Negotiated.CSTPRekeyMethod != "new-tunnel" {
++		t.Fatalf(
++			"rekey method = %q, want new-tunnel",
++			snapshot.Negotiated.CSTPRekeyMethod,
++		)
++	}
++	if snapshot.Negotiated.CSTPLeaseDurationSeconds == nil ||
++		*snapshot.Negotiated.CSTPLeaseDurationSeconds != 0 {
++		t.Fatalf(
++			"lease duration = %#v, want disabled",
++			snapshot.Negotiated.CSTPLeaseDurationSeconds,
++		)
++	}
++	if snapshot.Negotiated.CSTPSessionTimeoutSeconds == nil ||
++		*snapshot.Negotiated.CSTPSessionTimeoutSeconds != 3600 ||
++		snapshot.Negotiated.CSTPSessionTimeoutRemainingSeconds == nil ||
++		*snapshot.Negotiated.CSTPSessionTimeoutRemainingSeconds != 3500 ||
++		snapshot.Negotiated.CSTPIdleTimeoutSeconds == nil ||
++		*snapshot.Negotiated.CSTPIdleTimeoutSeconds != 900 {
++		t.Fatalf("unexpected CSTP timeout snapshot: %#v", snapshot.Negotiated)
++	}
++}
++
++func TestXDialDurationHeadersRejectInvalidValues(t *testing.T) {
++	tests := []struct {
++		value string
++		want  *int
++	}{
++		{value: "", want: nil},
++		{value: "none", want: intPointer(0)},
++		{value: " 42 ", want: intPointer(42)},
++		{value: "-1", want: nil},
++		{value: "2147483648", want: nil},
++		{value: "not-a-duration", want: nil},
++	}
++	for _, test := range tests {
++		t.Run(test.value, func(t *testing.T) {
++			header := http.Header{}
++			header.Set("X-Test-Duration", test.value)
++			got := xdialDurationHeader(header, "X-Test-Duration")
++			if (got == nil) != (test.want == nil) ||
++				got != nil && *got != *test.want {
++				t.Fatalf("duration %q = %#v, want %#v", test.value, got, test.want)
++			}
++		})
++	}
++	if got := xdialRekeyMethod("future-method"); got != "unknown" {
++		t.Fatalf("unknown rekey method = %q", got)
++	}
++	if got := xdialRekeyMethod(""); got != "" {
++		t.Fatalf("missing rekey method = %q", got)
++	}
++}
++
++func TestXDialDataActivityIsSeparateFromControlFrames(t *testing.T) {
++	cSess := newXDialTestSession(t)
++	liveness := cSess.xdial
++	started := liveness.startedAt
++	now := started.Add(2 * time.Second)
++	liveness.now = func() time.Time { return now }
++	cSess.XDialRecordFrame(xdialTLS, 0x00)
++	now = now.Add(time.Second)
++	cSess.XDialRecordWrite(xdialTLS, 0x00, nil)
++	now = now.Add(time.Second)
++	cSess.XDialRecordFrame(xdialTLS, 0x04)
++
++	var snapshot xdialDiagnosticsSnapshot
++	if err := json.Unmarshal(
++		[]byte(cSess.XDialDiagnosticsJSON()),
++		&snapshot,
++	); err != nil {
++		t.Fatal(err)
++	}
++	if snapshot.SessionAgeMS != 4000 {
++		t.Fatalf("session age = %dms, want 4000ms", snapshot.SessionAgeMS)
++	}
++	if snapshot.TLS.DataFramesReceived != 1 ||
++		snapshot.TLS.DataFramesWritten != 1 {
++		t.Fatalf("unexpected DATA counters: %#v", snapshot.TLS)
++	}
++	if snapshot.TLS.LastDataReceivedAgeMS == nil ||
++		*snapshot.TLS.LastDataReceivedAgeMS != 2000 ||
++		snapshot.TLS.LastDataWrittenAgeMS == nil ||
++		*snapshot.TLS.LastDataWrittenAgeMS != 1000 {
++		t.Fatalf("unexpected DATA ages: %#v", snapshot.TLS)
++	}
++}
++
+ func TestXDialFullWriterQueueDropsWithoutBlocking(t *testing.T) {
+ 	cSess := newXDialTestSession(t)
+ 	for len(cSess.PayloadOutTLS) < cap(cSess.PayloadOutTLS) {
+@@ -186,6 +303,39 @@ func TestXDialCloseReasonFirstWriterWins(t *testing.T) {
+ 	}
+ }
+ 
++func TestXDialPeerReasonIsClassifiedWithoutPersistingText(t *testing.T) {
++	cSess := newXDialTestSession(t)
++	payload := append(
++		[]byte{0x03},
++		[]byte(" Session timeout: private gateway detail ")...,
++	)
++	cSess.XDialRecordPeerClose(xdialTLS, "peer-disconnect", payload)
++	cSess.XDialRecordPeerClose(
++		xdialTLS,
++		"peer-terminate",
++		[]byte{0x09, 'r', 'e', 'k', 'e', 'y'},
++	)
++
++	encoded := cSess.XDialDiagnosticsJSON()
++	if strings.Contains(encoded, "private gateway") ||
++		strings.Contains(encoded, "Session timeout") {
++		t.Fatalf("peer reason text leaked into diagnostics: %s", encoded)
++	}
++	var snapshot xdialDiagnosticsSnapshot
++	if err := json.Unmarshal([]byte(encoded), &snapshot); err != nil {
++		t.Fatal(err)
++	}
++	if snapshot.Close == nil ||
++		snapshot.Close.Code != "peer-disconnect" ||
++		snapshot.Close.PeerPayloadLength == nil ||
++		*snapshot.Close.PeerPayloadLength != len(payload) ||
++		snapshot.Close.PeerReasonCode != "03" ||
++		!snapshot.Close.PeerHasReasonText ||
++		snapshot.Close.PeerReasonCategory != "session-timeout" {
++		t.Fatalf("unexpected peer reason: %#v", snapshot.Close)
++	}
++}
++
+ func TestXDialLateOldSessionCloseCannotClearNewSession(t *testing.T) {
+ 	base.Cfg.SetXDialForceDPD(5)
+ 	owner := &Session{}
+@@ -220,3 +370,7 @@ type timeoutError struct{}
+ func (*timeoutError) Error() string   { return "timeout" }
+ func (*timeoutError) Timeout() bool   { return true }
+ func (*timeoutError) Temporary() bool { return true }
++
++func intPointer(value int) *int {
++	return &value
++}
+diff --git a/vpn/dtls.go b/vpn/dtls.go
+index 28e59fc..89298fb 100644
+--- a/vpn/dtls.go
++++ b/vpn/dtls.go
+@@ -148,7 +148,7 @@ func readDTLSPayload(reader io.Reader, dSess *session.DtlsSession, cSess *sessio
+ 	switch payloadType {
+ 	case 0x07: // KEEPALIVE
+ 	case 0x05: // DISCONNECT
+-		cSess.XDialRecordPeerClose("dtls", "dtls-peer-disconnect")
++		cSess.XDialRecordPeerClose("dtls", "dtls-peer-disconnect", nil)
+ 		return bytesReceived, false, nil
+ 	case 0x03: // DPD-REQ
+ 		pl.Type = 0x04
+diff --git a/vpn/tls.go b/vpn/tls.go
+index dee0695..90817c7 100644
+--- a/vpn/tls.go
++++ b/vpn/tls.go
+@@ -109,10 +109,18 @@ func readTLSPayload(reader io.Reader, cSess *session.ConnSession) (bytesReceived
+ 	case 0x07: // KEEPALIVE
+ 		// 收到保活包，无需处理，读操作本身已重置超时。
+ 	case 0x05: // DISCONNECT
+-		cSess.XDialRecordPeerClose("tls", "peer-disconnect")
++		cSess.XDialRecordPeerClose(
++			"tls",
++			"peer-disconnect",
++			pl.Data[headerSize:headerSize+dataLen],
++		)
+ 		return bytesReceived, false, nil
+ 	case 0x09: // TERMINATE
+-		cSess.XDialRecordPeerClose("tls", "peer-terminate")
++		cSess.XDialRecordPeerClose(
++			"tls",
++			"peer-terminate",
++			pl.Data[headerSize:headerSize+dataLen],
++		)
+ 		return bytesReceived, false, nil
+ 	}
+ 	return bytesReceived, true, nil
+diff --git a/vpn/xdial_liveness_test.go b/vpn/xdial_liveness_test.go
+index 19e6f23..0f59397 100644
+--- a/vpn/xdial_liveness_test.go
++++ b/vpn/xdial_liveness_test.go
+@@ -15,9 +15,14 @@ import (
+ type xdialSessionSnapshot struct {
+ 	TLS struct {
+ 		DPDResponsesReceived uint64 `json:"dpd_responses_received"`
++		DataFramesReceived   uint64 `json:"data_frames_received"`
+ 	} `json:"tls"`
+ 	Close *struct {
+-		Code string `json:"code"`
++		Code               string `json:"code"`
++		PeerPayloadLength  *int   `json:"peer_payload_length"`
++		PeerReasonCode     string `json:"peer_reason_code"`
++		PeerHasReasonText  bool   `json:"peer_has_reason_text"`
++		PeerReasonCategory string `json:"peer_reason_category"`
+ 	} `json:"close"`
+ }
+ 
+@@ -67,6 +72,13 @@ func TestReadTLSPayloadRecordsPeerDisconnectAndTerminate(t *testing.T) {
+ 			if snapshot.Close == nil || snapshot.Close.Code != test.wantCode {
+ 				t.Fatalf("close = %#v, want %q", snapshot.Close, test.wantCode)
+ 			}
++			if snapshot.Close.PeerPayloadLength == nil ||
++				*snapshot.Close.PeerPayloadLength != len("private reason") ||
++				snapshot.Close.PeerReasonCode != "70" ||
++				!snapshot.Close.PeerHasReasonText ||
++				snapshot.Close.PeerReasonCategory != "other" {
++				t.Fatalf("peer metadata = %#v", snapshot.Close)
++			}
+ 			if bytes.Contains(
+ 				[]byte(cSess.XDialDiagnosticsJSON()),
+ 				[]byte("private reason"),
+@@ -77,6 +89,68 @@ func TestReadTLSPayloadRecordsPeerDisconnectAndTerminate(t *testing.T) {
+ 	}
+ }
+ 
++func TestReadTLSPayloadBoundsAndSanitizesDisconnectReason(t *testing.T) {
++	tests := []struct {
++		name       string
++		payload    []byte
++		wantCode   string
++		wantText   bool
++		wantReason string
++	}{
++		{name: "empty"},
++		{name: "code-only", payload: []byte{0x08}, wantCode: "08"},
++		{
++			name:       "code-and-one-character",
++			payload:    []byte{0x0a, 'x'},
++			wantCode:   "0a",
++			wantText:   true,
++			wantReason: "other",
++		},
++		{
++			name:       "nul-terminated",
++			payload:    []byte{0x01, 'i', 'd', 'l', 'e', ' ', 't', 'i', 'm', 'e', 'o', 'u', 't', 0, 's', 'e', 'c', 'r', 'e', 't'},
++			wantCode:   "01",
++			wantText:   true,
++			wantReason: "idle-timeout",
++		},
++		{
++			name:       "non-utf8",
++			payload:    []byte{0xff, 0xff, 'r', 'e', 'k', 'e', 'y', '\r', '\n'},
++			wantCode:   "ff",
++			wantText:   true,
++			wantReason: "rekey",
++		},
++		{
++			name:       "oversize",
++			payload:    append([]byte{0x02}, bytes.Repeat([]byte{'x'}, 1024)...),
++			wantCode:   "02",
++			wantText:   true,
++			wantReason: "other",
++		},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			cSess := newVPNXDialSession()
++			_, keepRunning, err := readTLSPayload(
++				bytes.NewReader(cstpFrame(0x05, test.payload)),
++				cSess,
++			)
++			if err != nil || keepRunning {
++				t.Fatalf("read result keep=%v err=%v", keepRunning, err)
++			}
++			snapshot := xdialSnapshot(t, cSess)
++			if snapshot.Close == nil ||
++				snapshot.Close.PeerPayloadLength == nil ||
++				*snapshot.Close.PeerPayloadLength != len(test.payload) ||
++				snapshot.Close.PeerReasonCode != test.wantCode ||
++				snapshot.Close.PeerHasReasonText != test.wantText ||
++				snapshot.Close.PeerReasonCategory != test.wantReason {
++				t.Fatalf("close = %#v", snapshot.Close)
++			}
++		})
++	}
++}
++
+ func TestReadTLSPayloadRecordsDPDResponse(t *testing.T) {
+ 	cSess := newVPNXDialSession()
+ 	_, keepRunning, err := readTLSPayload(
+@@ -90,3 +157,27 @@ func TestReadTLSPayloadRecordsDPDResponse(t *testing.T) {
+ 		t.Fatalf("DPD responses = %d, want 1", got)
+ 	}
+ }
++
++func TestReadTLSPayloadRecordsDataActivity(t *testing.T) {
++	cSess := newVPNXDialSession()
++	payload := []byte{0x45, 0x00, 0x00, 0x14}
++	result := make(chan *proto.Payload, 1)
++	go func() {
++		result <- <-cSess.PayloadIn
++	}()
++	_, keepRunning, err := readTLSPayload(
++		bytes.NewReader(cstpFrame(0x00, payload)),
++		cSess,
++	)
++	if err != nil || !keepRunning {
++		t.Fatalf("read result keep=%v err=%v", keepRunning, err)
++	}
++	got := <-result
++	defer putPayloadBuffer(got)
++	if !bytes.Equal(got.Data, payload) {
++		t.Fatalf("DATA payload = %x, want %x", got.Data, payload)
++	}
++	if count := xdialSnapshot(t, cSess).TLS.DataFramesReceived; count != 1 {
++		t.Fatalf("DATA frames = %d, want 1", count)
++	}
++}
