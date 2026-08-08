@@ -230,14 +230,45 @@ func installMonitoredSession(l *Libbox, cSess *session.ConnSession) uint64 {
 		panic(err)
 	}
 	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	if l.vpn == nil {
+		l.vpn = &startTestVPNClient{
+			connectErr: errors.New("reconnect failed"),
+		}
+	}
+	line := newAnyConnectLineRuntime(
+		bridge,
+		anyConnectDNSServers([]string{"10.0.0.53"}),
+	)
+	runtimeGeneration := l.nextLineRuntimeGenerationLocked()
+	if err := l.lineRuntimes.beginCandidate(runtimeGeneration); err != nil {
+		panic(err)
+	}
+	capability := &anyConnectRuntimeCapability{
+		vpn:     l.vpn,
+		line:    line,
+		bridge:  bridge,
+		session: cSess,
+		config:  engine.VPNConfig{Server: "https://vpn.example.com", Username: "user", Password: "password"},
+		dnsJSON: `["10.0.0.53"]`,
+	}
+	const identity = "test-anyconnect-runtime"
+	if _, _, err := l.lineRuntimes.acquireCandidate(
+		runtimeGeneration,
+		identity,
+		lineRuntimeCapabilityAnyConnect,
+		true,
+		func() (lineRuntimeCapability, error) { return capability, nil },
+	); err != nil {
+		panic(err)
+	}
+	if err := l.lineRuntimes.promoteCandidate(runtimeGeneration); err != nil {
+		panic(err)
+	}
 	l.running = true
 	l.dnsJSON = `["10.0.0.53"]`
 	l.session = cSess
 	l.bridge = bridge
-	l.anyConnectLine = newAnyConnectLineRuntime(
-		bridge,
-		anyConnectDNSServers([]string{"10.0.0.53"}),
-	)
+	l.anyConnectLine = line
 	l.runtimeCtx = runtimeCtx
 	l.runtimeCancel = runtimeCancel
 	l.anyConnectConfig = engine.VPNConfig{
@@ -245,12 +276,10 @@ func installMonitoredSession(l *Libbox, cSess *session.ConnSession) uint64 {
 		Username: "user",
 		Password: "password",
 	}
+	l.anyConnectRuntimeIdentity = identity
+	l.activeLineRuntimeGeneration = runtimeGeneration
+	l.activeAnyConnectCapability = capability
 	l.anyConnectRetryDelays = []time.Duration{0, 0, 0}
-	if l.vpn == nil {
-		l.vpn = &startTestVPNClient{
-			connectErr: errors.New("reconnect failed"),
-		}
-	}
 	l.generation++
 	return l.generation
 }
@@ -279,6 +308,9 @@ func TestSessionMonitorUnexpectedCloseCleansStateAndReportsInOrder(t *testing.T)
 	}
 	if got := l.TunnelNameServers(); got != "[]" {
 		t.Fatalf("DNS state was not cleared: %s", got)
+	}
+	if !l.lineRuntimes.empty() {
+		t.Fatal("fatal retry teardown retained Line runtime leases")
 	}
 
 	var diagnosticState diagnostics

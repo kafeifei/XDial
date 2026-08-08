@@ -11,10 +11,11 @@ package config
 //
 // 与生产代码的耦合纪律：允许调用 resolveOutboundTag / sbRuleSetTag /
 // BuildSubscriptionRuntimeCatalog 这类**命名映射**函数（它们就是“tag 怎么叫”的
-// 单一事实源，测试重写一遍只会漂移）；但绝不调用 buildModeRouteRules /
+// 单一事实源，测试重写一遍只会漂移）；但绝不调用 buildScenarioRouteRules /
 // buildDNS 这类**裁决逻辑**函数——否则断言会退化成“生成器等于它自己”。
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"sort"
@@ -56,19 +57,19 @@ func invBaseProfile() *Profile {
 			{ID: "remote", Name: "远程规则集", Type: RuleSetTypeURL, Enabled: true,
 				URL: "https://example.com/rules.srs"},
 		},
-		Modes: []Mode{{
-			ID: "m", Name: "默认模式",
+		Scenarios: []Scenario{{
+			ID: "m", Name: "默认场景",
 			Bindings: []RuleBinding{
 				{RuleSetID: "intranet", LineID: "corp"},
 				{RuleSetID: "remote", LineID: "px"},
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "m",
+		ActiveScenarioID: "m",
 	}
 }
 
-// invTailscaleLine 是一条已配置但是否生效仍由 active Mode 决定的内置线路。
+// invTailscaleLine 是一条已配置但是否生效仍由 active Scenario 决定的内置线路。
 func invTailscaleLine() Line {
 	return Line{
 		ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
@@ -76,20 +77,20 @@ func invTailscaleLine() Line {
 	}
 }
 
-// invUnusedTrojanLine 是一条 enabled 但不被任何 active Mode 引用的线路。
+// invUnusedTrojanLine 是一条 enabled 但不被任何 active Scenario 引用的线路。
 func invUnusedTrojanLine() Line {
 	return Line{ID: "ghost", Name: "闲置节点", Type: LineTypeTrojan, Enabled: true,
 		TrojanServer: "ghost.example.com", TrojanPort: 8443,
 		TrojanPassword: "ghost", TrojanSNI: "ghost.example.com"}
 }
 
-// invUnusedRuleSet 是一份 enabled 但不被任何 active Mode 引用的规则集。
+// invUnusedRuleSet 是一份 enabled 但不被任何 active Scenario 引用的规则集。
 func invUnusedRuleSet() RuleSet {
 	return RuleSet{ID: "ghost-rs", Name: "闲置规则", Type: RuleSetTypeManual, Enabled: true,
 		Domains: []string{"ghost.example"}, CIDRs: []string{"192.0.2.0/24"}}
 }
 
-// invUnusedSubscription 是一份 enabled 但不被任何 active Mode 引用的订阅（自带规则）。
+// invUnusedSubscription 是一份 enabled 但不被任何 active Scenario 引用的订阅（自带规则）。
 func invUnusedSubscription() Subscription {
 	return Subscription{
 		ID: "ghost-sub", Name: "闲置订阅", URL: "https://example.com/sub", Enabled: true,
@@ -104,7 +105,7 @@ func invUnusedSubscription() Subscription {
 	}
 }
 
-// invReferencedSubscription 是一份被 active Mode 显式绑定的订阅。
+// invReferencedSubscription 是一份被 active Scenario 显式绑定的订阅。
 func invReferencedSubscription() Subscription {
 	return Subscription{
 		ID: "sub1", Name: "主订阅", URL: "https://example.com/sub1", Enabled: true,
@@ -270,13 +271,13 @@ func invObjectArray(value interface{}) []map[string]interface{} {
 	return out
 }
 
-// invActiveOutboundTags 返回 active Mode **显式引用**的出口 tag 集合。
+// invActiveOutboundTags 返回 active Scenario **显式引用**的出口 tag 集合。
 // 这是“归属追溯”的唯一合法来源：任何 DNS server / route rule 指向集合外的 tag，
 // 都意味着生成器凭空造了一个用户看不见的出口。
 func invActiveOutboundTags(profile *Profile) map[string]bool {
 	tags := map[string]bool{}
-	mode := profile.ActiveMode()
-	if mode == nil {
+	scenario := profile.ActiveScenario()
+	if scenario == nil {
 		return tags
 	}
 	add := func(lineID, subscriptionID string) {
@@ -293,8 +294,8 @@ func invActiveOutboundTags(profile *Profile) map[string]bool {
 			tags[resolveOutboundTag(line)] = true
 		}
 	}
-	add(mode.DefaultLineID, mode.DefaultSubscriptionID)
-	for _, binding := range mode.Bindings {
+	add(scenario.DefaultLineID, scenario.DefaultSubscriptionID)
+	for _, binding := range scenario.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
 		if ruleSet == nil || !ruleSet.Enabled {
 			continue
@@ -317,17 +318,17 @@ func invSubscriptionMainTag(profile *Profile, subscriptionID string) string {
 	return ""
 }
 
-// invActiveSubscriptions 返回 active Mode 显式引用且 enabled 的订阅。
+// invActiveSubscriptions 返回 active Scenario 显式引用且 enabled 的订阅。
 func invActiveSubscriptions(profile *Profile) []*Subscription {
-	mode := profile.ActiveMode()
-	if mode == nil {
+	scenario := profile.ActiveScenario()
+	if scenario == nil {
 		return nil
 	}
 	ids := map[string]bool{}
-	if mode.DefaultSubscriptionID != "" {
-		ids[mode.DefaultSubscriptionID] = true
+	if scenario.DefaultSubscriptionID != "" {
+		ids[scenario.DefaultSubscriptionID] = true
 	}
-	for _, binding := range mode.Bindings {
+	for _, binding := range scenario.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
 		if ruleSet == nil || !ruleSet.Enabled || binding.SubscriptionID == "" {
 			continue
@@ -345,16 +346,16 @@ func invActiveSubscriptions(profile *Profile) []*Subscription {
 }
 
 // ===========================================================================
-// INV1 —— 内部正交律：未被 active Mode 引用的对象不得影响本机流量决策
+// INV1 —— 内部正交律：未被 active Scenario 引用的对象不得影响本机流量决策
 // ===========================================================================
 //
 // 守护：架构约束「内部正交律」+「声明≠生效」。Line/RuleSet/订阅可以存在于 profile 里
-// （用户配了但没启用到当前模式），但只要 active Mode 没引用它，生成的数据面配置
+// （用户配了但没启用到当前场景），但只要 active Scenario 没引用它，生成的数据面配置
 // 就必须逐字节语义等价。
 //
 // 什么改动会让它变红：
 //   - 生成器改成“所有 enabled 线路都生成 outbound”（历史上出现过，会让半成品节点
-//     在 box.New 阶段拖垮整个模式）；
+//     在 box.New 阶段拖垮整个场景）；
 //   - 订阅规则改成“只要订阅 enabled 就注入 route.rules”（隐式抢注，违反 D28）；
 //   - 任何形式的 preferred_by / 自动接管。
 func TestINV1_UnreferencedObjectsDoNotAffectGeneratedConfig(t *testing.T) {
@@ -417,7 +418,7 @@ func TestINV1_UnreferencedObjectsDoNotAffectGeneratedConfig(t *testing.T) {
 
 // INV1c —— 桌面 Tailscale 是盒内普通 Line，不享有隐式生效的例外。
 //
-// 未被 Mode 引用时必须和不存在逐字节等价；被引用但未勾选 MagicDNS
+// 未被 Scenario 引用时必须和不存在逐字节等价；被引用但未勾选 MagicDNS
 // 时只生成一个无系统接口、无 peer 路由、无持久 Auth Key 的 endpoint。
 func TestINV1c_DesktopTailscaleHasNoException(t *testing.T) {
 	baseline := invGenerateDesktop(t, invBaseProfile())
@@ -436,7 +437,7 @@ func TestINV1c_DesktopTailscaleHasNoException(t *testing.T) {
 	tailscaleLine := invTailscaleLine()
 	tailscaleLine.TailscaleAuthKey = "must-not-enter-desktop-config"
 	active.Lines = append(active.Lines, tailscaleLine)
-	active.Modes[0].DefaultLineID = "ts"
+	active.Scenarios[0].DefaultLineID = "ts"
 	cfg := invGenerateDesktop(t, active)
 
 	endpoints, ok := cfg["endpoints"].([]interface{})
@@ -493,8 +494,8 @@ func TestINV1d_OnlyOneActiveTailscaleLine(t *testing.T) {
 		ID: "tailnet-only", Name: "Tailnet Only", Type: RuleSetTypeManual,
 		Enabled: true, Domains: []string{"tailnet.example"},
 	})
-	profile.Modes[0].DefaultLineID = first.ID
-	profile.Modes[0].Bindings = append(profile.Modes[0].Bindings, RuleBinding{
+	profile.Scenarios[0].DefaultLineID = first.ID
+	profile.Scenarios[0].Bindings = append(profile.Scenarios[0].Bindings, RuleBinding{
 		RuleSetID: "tailnet-only",
 		LineID:    second.ID,
 	})
@@ -518,7 +519,7 @@ func TestINV1d_OnlyOneActiveTailscaleLine(t *testing.T) {
 //
 // 守护：架构约束「DNS 原理：名字→线路→地址」+「解析权随线路走」。
 // 每一个 dns.servers 条目要么属于显式的全局默认白名单（系统解析器 / 公共 fallback /
-// bootstrap），要么必须能追溯到 active Mode 引用的某条 Line。
+// bootstrap），要么必须能追溯到 active Scenario 引用的某条 Line。
 //
 // 什么改动会让它变红：给某条“存在但没被引用”的线路生成解析器，或者硬编码
 // 一个新的公共 DNS 而不进白名单。
@@ -548,12 +549,12 @@ func TestINV2_EveryDNSServerTracesToAnActiveLine(t *testing.T) {
 			},
 		},
 		{
-			name: "订阅被 active Mode 显式绑定",
+			name: "订阅被 active Scenario 显式绑定",
 			profile: func() *Profile {
 				p := invBaseProfile()
 				p.RuleSets = append(p.RuleSets, invStreamRuleSet())
 				p.Subscriptions = append(p.Subscriptions, invReferencedSubscription())
-				p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+				p.Scenarios[0].Bindings = append(p.Scenarios[0].Bindings,
 					RuleBinding{RuleSetID: "stream", SubscriptionID: "sub1"})
 				return p
 			},
@@ -566,8 +567,8 @@ func TestINV2_EveryDNSServerTracesToAnActiveLine(t *testing.T) {
 			cfg := invGenerateDesktop(t, profile)
 
 			activeTags := invActiveOutboundTags(profile)
-			// 企业 DNS 的归属：active Mode 里存在“手动规则集 → enabled AnyConnect 线路”的绑定。
-			enterpriseOwned := len(collectVPNBoundDomains(profile, profile.ActiveMode())) > 0
+			// 企业 DNS 的归属：active Scenario 里存在“手动规则集 → enabled AnyConnect 线路”的绑定。
+			enterpriseOwned := len(collectVPNBoundDomains(profile, profile.ActiveScenario())) > 0
 
 			for _, server := range invDNSServers(t, cfg) {
 				tag, _ := server["tag"].(string)
@@ -577,12 +578,12 @@ func TestINV2_EveryDNSServerTracesToAnActiveLine(t *testing.T) {
 				switch {
 				case tag == desktopEnterpriseDNSTag:
 					if !enterpriseOwned {
-						t.Errorf("无主 DNS server %q：active Mode 没有任何绑定到 AnyConnect 线路的手动规则集", tag)
+						t.Errorf("无主 DNS server %q：active Scenario 没有任何绑定到 AnyConnect 线路的手动规则集", tag)
 					}
 				case strings.HasPrefix(tag, "proxy-dns-"):
 					detour := strings.TrimPrefix(tag, "proxy-dns-")
 					if !activeTags[detour] {
-						t.Errorf("无主 DNS server %q：出口 %q 不在 active Mode 引用的线路集合 %v 里",
+						t.Errorf("无主 DNS server %q：出口 %q 不在 active Scenario 引用的线路集合 %v 里",
 							tag, detour, activeTags)
 					}
 				default:
@@ -616,7 +617,7 @@ func TestINV3_DesktopSealsDNSInsideTheBox(t *testing.T) {
 				p := invBaseProfile()
 				p.RuleSets = append(p.RuleSets, invStreamRuleSet())
 				p.Subscriptions = append(p.Subscriptions, invReferencedSubscription())
-				p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+				p.Scenarios[0].Bindings = append(p.Scenarios[0].Bindings,
 					RuleBinding{RuleSetID: "stream", SubscriptionID: "sub1"})
 				return p
 			},
@@ -655,13 +656,13 @@ func TestINV3_DesktopSealsDNSInsideTheBox(t *testing.T) {
 // INV4 —— 无隐藏规则：route.rules 每一条都要有出处
 // ===========================================================================
 //
-// 守护：架构约束「Mode 是唯一裁决者」+ D28「供给出来的规则必须以一等公民身份进入 Mode
+// 守护：架构约束「Scenario 是唯一裁决者」+ D28「供给出来的规则必须以一等公民身份进入 Scenario
 // 裁决，绝不隐式抢注」。
 //
 // 每条 route rule 必须属于以下三类之一：
-//   (a) active Mode 的某个 binding（含 connectivity acceptance 那两条 —— 它们来自
+//   (a) active Scenario 的某个 binding（含 connectivity acceptance 那两条 —— 它们来自
 //       用户可见 profile 的普通绑定，所以走 (a) 而不是白名单）；
-//   (b) 被 Mode 引用的订阅供给的规则；
+//   (b) 被 Scenario 引用的订阅供给的规则；
 //   (c) 下面显式写死的系统规则白名单。
 //
 // 什么改动会让它变红：生成器为了“更好用”偷偷加一条规则（广告拦截、私有网段直连、
@@ -674,7 +675,7 @@ type invRuleContext struct{}
 //
 // 刻意**不在**白名单里的两类，说明如下：
 //   - connectivity acceptance 规则（xdial-connectivity-direct /
-//     xdial-connectivity-anyconnect）：它们是用户 profile 里真实存在的 RuleSet + Mode
+//     xdial-connectivity-anyconnect）：它们是用户 profile 里真实存在的 RuleSet + Scenario
 //     binding，只是被生成器提到订阅规则之前而已。它们必须走 (a) 追溯；如果哪天
 //     它们变成生成器凭空注入的，本测试就应该变红。
 //   - 任何“默认直连私有网段 / 默认拦截广告”之类的便利规则：架构约束禁止隐式裁决。
@@ -707,13 +708,13 @@ var invSystemRuleWhitelist = []struct {
 	},
 }
 
-// invMatchesModeBinding 判断规则是否由 active Mode 的某条 binding 产生。
-func invMatchesModeBinding(profile *Profile, rule map[string]interface{}) bool {
-	mode := profile.ActiveMode()
-	if mode == nil {
+// invMatchesScenarioBinding 判断规则是否由 active Scenario 的某条 binding 产生。
+func invMatchesScenarioBinding(profile *Profile, rule map[string]interface{}) bool {
+	scenario := profile.ActiveScenario()
+	if scenario == nil {
 		return false
 	}
-	for _, binding := range mode.Bindings {
+	for _, binding := range scenario.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
 		if ruleSet == nil || !ruleSet.Enabled {
 			continue
@@ -732,6 +733,35 @@ func invMatchesModeBinding(profile *Profile, rule map[string]interface{}) bool {
 			continue
 		}
 		switch ruleSet.Type {
+		case RuleSetTypeApplication:
+			selectors := applicationRuleSetSelectors(ruleSet)
+			users := invStrings(rule["auth_user"])
+			// Route rules intentionally carry only derived SOCKS usernames, not
+			// Bundle paths. Match the exact active RuleSet cardinality and
+			// the fixed "." + lowercase SHA-256 suffix shape; generator tests
+			// separately prove the exact derivation.
+			if len(selectors) == 0 || len(users) != len(selectors) {
+				continue
+			}
+			seen := map[string]bool{}
+			valid := true
+			for _, user := range users {
+				separator := strings.LastIndexByte(user, '.')
+				if separator <= 0 || len(user)-separator-1 != 64 || seen[user] {
+					valid = false
+					break
+				}
+				for _, character := range user[separator+1:] {
+					if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+						valid = false
+						break
+					}
+				}
+				seen[user] = true
+			}
+			if valid {
+				return true
+			}
 		case RuleSetTypeURL:
 			if rule["rule_set"] == sbRuleSetTag(ruleSet) {
 				return true
@@ -749,7 +779,7 @@ func invMatchesModeBinding(profile *Profile, rule map[string]interface{}) bool {
 	return false
 }
 
-// invMatchesSubscriptionRule 判断规则是否由某个被 Mode 引用的订阅供给。
+// invMatchesSubscriptionRule 判断规则是否由某个被 Scenario 引用的订阅供给。
 //
 // 这里只校验「匹配条件出自订阅的规则表」+「出口属于该订阅（或 direct / reject）」，
 // 不逐字校验组名解析结果——出口正确性由 INV1/INV7 与订阅相关的既有测试覆盖，
@@ -802,8 +832,8 @@ func invMatchesSubscriptionRule(profile *Profile, rule map[string]interface{}) b
 }
 
 func invClassifyRouteRule(profile *Profile, rule map[string]interface{}, ctx invRuleContext) string {
-	if invMatchesModeBinding(profile, rule) {
-		return "mode"
+	if invMatchesScenarioBinding(profile, rule) {
+		return "scenario"
 	}
 	if invMatchesActiveMagicDNS(profile, rule) {
 		return "magic-dns"
@@ -820,11 +850,11 @@ func invClassifyRouteRule(profile *Profile, rule map[string]interface{}, ctx inv
 }
 
 func invMatchesActiveMagicDNS(profile *Profile, rule map[string]interface{}) bool {
-	mode := profile.ActiveMode()
-	if mode == nil {
+	scenario := profile.ActiveScenario()
+	if scenario == nil {
 		return false
 	}
-	for _, endpointTag := range effectiveActiveMagicDNSEndpointTags(profile, mode) {
+	for _, endpointTag := range effectiveActiveMagicDNSEndpointTags(profile, scenario) {
 		if rule["preferred_by"] == endpointTag && rule["outbound"] == endpointTag {
 			_, hasCIDR := rule["ip_cidr"]
 			return !hasCIDR
@@ -845,7 +875,7 @@ func TestINV4_NoHiddenRouteRules(t *testing.T) {
 				p := invBaseProfile()
 				p.RuleSets = append(p.RuleSets, invStreamRuleSet())
 				p.Subscriptions = append(p.Subscriptions, invReferencedSubscription())
-				p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+				p.Scenarios[0].Bindings = append(p.Scenarios[0].Bindings,
 					RuleBinding{RuleSetID: "stream", SubscriptionID: "sub1"})
 				return p
 			},
@@ -860,7 +890,7 @@ func TestINV4_NoHiddenRouteRules(t *testing.T) {
 					RuleSet{ID: connectivityOutboundRuleSetID, Name: "验收隧道", Type: RuleSetTypeManual,
 						Enabled: true, CIDRs: []string{"1.0.0.2/32"}},
 				)
-				p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+				p.Scenarios[0].Bindings = append(p.Scenarios[0].Bindings,
 					RuleBinding{RuleSetID: connectivityDirectRuleSetID, LineID: "direct"},
 					RuleBinding{RuleSetID: connectivityOutboundRuleSetID, LineID: "corp"},
 				)
@@ -874,7 +904,7 @@ func TestINV4_NoHiddenRouteRules(t *testing.T) {
 				line := invTailscaleLine()
 				line.TailscaleMagicDNS = true
 				p.Lines = append(p.Lines, line)
-				p.Modes[0].DefaultLineID = line.ID
+				p.Scenarios[0].DefaultLineID = line.ID
 				return p
 			},
 		},
@@ -888,7 +918,7 @@ func TestINV4_NoHiddenRouteRules(t *testing.T) {
 
 			for index, rule := range invRouteRules(t, cfg) {
 				if invClassifyRouteRule(profile, rule, ctx) == "" {
-					t.Errorf("隐藏规则 route.rules[%d]：既不属于任何 Mode binding / 订阅供给，也不在系统白名单\n%s",
+					t.Errorf("隐藏规则 route.rules[%d]：既不属于任何 Scenario binding / 订阅供给，也不在系统白名单\n%s",
 						index, invPretty(rule))
 				}
 			}
@@ -896,42 +926,88 @@ func TestINV4_NoHiddenRouteRules(t *testing.T) {
 	}
 }
 
+// INV4 的应用规则版本：Transparent Proxy 的应用归因只允许通过 active
+// Scenario binding 生成原生 auth_user route rule，不能由某个已声明应用隐式注入。
+func TestINV4_ApplicationRuleIsTraceableToActiveScenarioBinding(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{ID: "px", Type: LineTypeTrojan, Enabled: true,
+				TrojanServer: "px.example", TrojanPort: 443, TrojanPassword: "secret", TrojanSNI: "px.example"},
+		},
+		RuleSets: []RuleSet{
+			{ID: "active-app", Type: RuleSetTypeApplication, Enabled: true,
+				Applications: []ApplicationMatch{{Path: "/Applications/Claude.app"}}},
+			{ID: "unbound-app", Type: RuleSetTypeApplication, Enabled: true,
+				Applications: []ApplicationMatch{{Path: "/Applications/Unbound.app"}}},
+		},
+		Scenarios: []Scenario{{
+			ID:            "scenario",
+			Bindings:      []RuleBinding{{RuleSetID: "active-app", LineID: "px"}},
+			DefaultLineID: "direct",
+		}},
+		ActiveScenarioID: "scenario",
+	}
+	raw, err := GenerateSingBoxTransparentProxy(
+		profile, invSocksPort, "session-user", "session-password", t.TempDir(), invUnderlay, []string{"1.1.1.1"},
+	)
+	if err != nil {
+		t.Fatalf("GenerateSingBoxTransparentProxy: %v", err)
+	}
+	var generated map[string]interface{}
+	if err := json.Unmarshal(raw, &generated); err != nil {
+		t.Fatal(err)
+	}
+	var applicationRules []map[string]interface{}
+	for _, rule := range invRouteRules(t, generated) {
+		if _, exists := rule["auth_user"]; exists {
+			applicationRules = append(applicationRules, rule)
+			if !invMatchesScenarioBinding(profile, rule) {
+				t.Fatalf("application route cannot be traced to its Scenario binding: %s", invPretty(rule))
+			}
+		}
+	}
+	if len(applicationRules) != 1 {
+		t.Fatalf("only the active Scenario application binding may generate a route: %s", invPretty(applicationRules))
+	}
+}
+
 // INV4b —— 用户显式绑定优先于订阅自带规则。
 //
-// 守护：架构约束 D28「供给出来的规则必须以一等公民身份进入 Mode 裁决，绝不隐式抢注」。
-// 订阅自带规则若排在模式普通规则之前，用户在 UI 上明明把某域名绑到了 A 线路，
+// 守护：架构约束 D28「供给出来的规则必须以一等公民身份进入 Scenario 裁决，绝不隐式抢注」。
+// 订阅自带规则若排在场景普通规则之前，用户在 UI 上明明把某域名绑到了 A 线路，
 // 实际却被订阅的大范围规则抢先匹配走 B —— 这是最典型的“隐式抢注”。
 //
-// 什么改动会让它变红：把订阅规则重新提前到模式规则之前。
-func TestINV4b_ModeBindingRulesPrecedeSubscriptionSuppliedRules(t *testing.T) {
+// 什么改动会让它变红：把订阅规则重新提前到场景规则之前。
+func TestINV4b_ScenarioBindingRulesPrecedeSubscriptionSuppliedRules(t *testing.T) {
 	profile := invBaseProfile()
 	profile.RuleSets = append(profile.RuleSets, invStreamRuleSet())
 	profile.Subscriptions = append(profile.Subscriptions, invReferencedSubscription())
-	profile.Modes[0].Bindings = append(profile.Modes[0].Bindings,
+	profile.Scenarios[0].Bindings = append(profile.Scenarios[0].Bindings,
 		RuleBinding{RuleSetID: "stream", SubscriptionID: "sub1"})
 
 	cfg := invGenerateDesktop(t, profile)
 	ctx := invRuleContext{}
 
-	lastModeIndex, firstSubscriptionIndex := -1, -1
+	lastScenarioIndex, firstSubscriptionIndex := -1, -1
 	rules := invRouteRules(t, cfg)
 	for index, rule := range rules {
 		switch invClassifyRouteRule(profile, rule, ctx) {
-		case "mode":
-			lastModeIndex = index
+		case "scenario":
+			lastScenarioIndex = index
 		case "subscription":
 			if firstSubscriptionIndex < 0 {
 				firstSubscriptionIndex = index
 			}
 		}
 	}
-	if lastModeIndex < 0 || firstSubscriptionIndex < 0 {
-		t.Fatalf("夹具没有同时产生模式规则和订阅规则（mode=%d sub=%d）\n%s",
-			lastModeIndex, firstSubscriptionIndex, invPretty(rules))
+	if lastScenarioIndex < 0 || firstSubscriptionIndex < 0 {
+		t.Fatalf("夹具没有同时产生场景规则和订阅规则（scenario=%d sub=%d）\n%s",
+			lastScenarioIndex, firstSubscriptionIndex, invPretty(rules))
 	}
-	if lastModeIndex > firstSubscriptionIndex {
-		t.Fatalf("订阅自带规则抢在模式绑定之前：最后一条模式规则 index=%d，第一条订阅规则 index=%d\n%s",
-			lastModeIndex, firstSubscriptionIndex, invPretty(rules))
+	if lastScenarioIndex > firstSubscriptionIndex {
+		t.Fatalf("订阅自带规则抢在场景绑定之前：最后一条场景规则 index=%d，第一条订阅规则 index=%d\n%s",
+			lastScenarioIndex, firstSubscriptionIndex, invPretty(rules))
 	}
 }
 
@@ -953,33 +1029,33 @@ func TestINV6a_DanglingReferencesAreRejected(t *testing.T) {
 		{
 			name: "binding 指向不存在的 RuleSetID",
 			mutate: func(p *Profile) {
-				p.Modes[0].Bindings = append(p.Modes[0].Bindings,
+				p.Scenarios[0].Bindings = append(p.Scenarios[0].Bindings,
 					RuleBinding{RuleSetID: "nope", LineID: "px"})
 			},
 		},
 		{
 			name: "binding 指向不存在的 LineID",
 			mutate: func(p *Profile) {
-				p.Modes[0].Bindings[1].LineID = "nope"
+				p.Scenarios[0].Bindings[1].LineID = "nope"
 			},
 		},
 		{
 			name: "binding 指向不存在的 SubscriptionID",
 			mutate: func(p *Profile) {
-				p.Modes[0].Bindings[1] = RuleBinding{RuleSetID: "remote", SubscriptionID: "nope"}
+				p.Scenarios[0].Bindings[1] = RuleBinding{RuleSetID: "remote", SubscriptionID: "nope"}
 			},
 		},
 		{
 			name: "默认出口指向不存在的 LineID",
 			mutate: func(p *Profile) {
-				p.Modes[0].DefaultLineID = "nope"
+				p.Scenarios[0].DefaultLineID = "nope"
 			},
 		},
 		{
 			name: "默认出口指向不存在的 SubscriptionID",
 			mutate: func(p *Profile) {
-				p.Modes[0].DefaultLineID = ""
-				p.Modes[0].DefaultSubscriptionID = "nope"
+				p.Scenarios[0].DefaultLineID = ""
+				p.Scenarios[0].DefaultSubscriptionID = "nope"
 			},
 		},
 	}
@@ -1048,8 +1124,8 @@ func TestINV6b_DisabledReferencesWarnButDoNotFail(t *testing.T) {
 		if warning.Message == "" {
 			t.Errorf("warning 缺少可展示的中文说明: %+v", warning)
 		}
-		if warning.ModeID != profile.ActiveModeID {
-			t.Errorf("warning 未标注所属模式: %+v", warning)
+		if warning.ScenarioID != profile.ActiveScenarioID {
+			t.Errorf("warning 未标注所属场景: %+v", warning)
 		}
 	}
 	for _, kind := range []ProfileWarningKind{WarningDisabledRuleSet, WarningDisabledLine} {
@@ -1073,7 +1149,7 @@ func TestINVD30_DesktopRejectsMultipleActiveAnyConnectLines(t *testing.T) {
 		ID: "intranet2", Name: "内网2", Type: RuleSetTypeManual, Enabled: true,
 		Domains: []string{"corp2.example"},
 	})
-	profile.Modes[0].Bindings = append(profile.Modes[0].Bindings,
+	profile.Scenarios[0].Bindings = append(profile.Scenarios[0].Bindings,
 		RuleBinding{RuleSetID: "intranet2", LineID: "corp2"})
 
 	data, err := GenerateSingBoxDesktop(profile, invSocksPort, invVPNServerIP, invBasePath, invEnterpriseDNS, invUnderlay)
@@ -1083,7 +1159,7 @@ func TestINVD30_DesktopRejectsMultipleActiveAnyConnectLines(t *testing.T) {
 }
 
 // ===========================================================================
-// INV7（收窄版）—— 域名绑定与 DNS 分域必须来自同一份 Mode 裁决
+// INV7（收窄版）—— 域名绑定与 DNS 分域必须来自同一份 Scenario 裁决
 // ===========================================================================
 //
 // 为什么收窄：原始表述「任意域名的 DNS 判定与路由判定相同」在当前设计下**不可满足**。
@@ -1098,13 +1174,13 @@ func TestINVD30_DesktopRejectsMultipleActiveAnyConnectLines(t *testing.T) {
 // 实际用本地解析结果去连隧道那头），或者反过来在 dns.rules 里塞了没有路由对应的域名分支。
 func TestINV7_DomainBindingsAndDNSRulesAgree(t *testing.T) {
 	profile := invBaseProfile()
-	// 再加一条「URL 规则集 → AnyConnect 线路」：预设模式“国内”就是这个形状，
+	// 再加一条「URL 规则集 → AnyConnect 线路」：预设场景“国内”就是这个形状，
 	// 它必须走“经隧道的公共 DoH”，而不是企业 DNS，也不能落到 final 的境内解析器。
 	profile.RuleSets = append(profile.RuleSets, RuleSet{
 		ID: "cnip", Name: "国内", Type: RuleSetTypeURL, Enabled: true,
 		URL: "https://example.com/geosite-cn.srs",
 	})
-	profile.Modes[0].Bindings = append(profile.Modes[0].Bindings,
+	profile.Scenarios[0].Bindings = append(profile.Scenarios[0].Bindings,
 		RuleBinding{RuleSetID: "cnip", LineID: "corp"})
 
 	cfg := invGenerateDesktop(t, profile)
@@ -1118,8 +1194,8 @@ func TestINV7_DomainBindingsAndDNSRulesAgree(t *testing.T) {
 	}
 	var expectations []expectation
 
-	mode := profile.ActiveMode()
-	for _, binding := range mode.Bindings {
+	scenario := profile.ActiveScenario()
+	for _, binding := range scenario.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
 		if ruleSet == nil || !ruleSet.Enabled {
 			continue
@@ -1204,6 +1280,98 @@ func TestINV7_DomainBindingsAndDNSRulesAgree(t *testing.T) {
 		if !traced {
 			t.Errorf("dns.rules[%d] 是一条追溯不到任何域名绑定的域名分支：\n%s", index, invPretty(rule))
 		}
+	}
+}
+
+// INV1e —— Transparent Proxy 的 MagicDNS 快照仍只能由
+// “active Scenario 引用 + Line 可见开关”成对启用。开关未成立时不得出现
+// hosts transport、DNS 归属或 peer route；成立后 DNS 必须使用纯内存
+// hosts 且排在普通 Scenario DNS 之前。
+func TestINV1e_TransparentProxyMagicDNSIsMemoryOnlyAndExplicit(t *testing.T) {
+	generate := func(profile *Profile) ([]byte, map[string]interface{}) {
+		t.Helper()
+		data, err := GenerateSingBoxTransparentProxy(
+			profile,
+			29876,
+			"session-user",
+			"session-password",
+			invBasePath,
+			invUnderlay,
+			[]string{"100.100.100.100"},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cfg map[string]interface{}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return data, cfg
+	}
+
+	baselineProfile := invBaseProfile()
+	baseline, _ := generate(baselineProfile)
+	unreferenced := invBaseProfile()
+	line := invTailscaleLine()
+	line.TailscaleMagicDNS = true
+	unreferenced.Lines = append(unreferenced.Lines, line)
+	got, _ := generate(unreferenced)
+	if !bytes.Equal(baseline, got) {
+		t.Fatalf("未被 active Scenario 引用的 MagicDNS 改变了 Transparent Proxy 配置\n--- baseline ---\n%s\n--- got ---\n%s", baseline, got)
+	}
+
+	active := invBaseProfile()
+	line = invTailscaleLine()
+	active.Lines = append(active.Lines, line)
+	active.Scenarios[0].DefaultLineID = line.ID
+	_, disabledCfg := generate(active)
+	for _, server := range invDNSServers(t, disabledCfg) {
+		if server["type"] == "hosts" || server["tag"] == TailscaleMagicDNSDNSServerTag("tailscale-ts") {
+			t.Fatalf("未勾选 MagicDNS 时不得生成 hosts DNS server: %s", invPretty(server))
+		}
+	}
+	for _, rule := range invRouteRules(t, disabledCfg) {
+		if rule["preferred_by"] == "tailscale-ts" ||
+			rule["preferred_by"] == TailscaleMagicDNSDNSServerTag("tailscale-ts") {
+			t.Fatalf("未勾选 MagicDNS 时不得生成快照解析或 peer route: %s", invPretty(rule))
+		}
+	}
+
+	active.Lines[len(active.Lines)-1].TailscaleMagicDNS = true
+	_, enabledCfg := generate(active)
+	serverTag := TailscaleMagicDNSDNSServerTag("tailscale-ts")
+	var hostsServer map[string]interface{}
+	for _, server := range invDNSServers(t, enabledCfg) {
+		if server["tag"] == serverTag {
+			hostsServer = server
+		}
+		if server["type"] == "tailscale" {
+			t.Fatalf("Transparent Proxy 不得启动 inline Tailscale DNS server: %s", invPretty(server))
+		}
+	}
+	if hostsServer == nil || hostsServer["type"] != "hosts" || hostsServer["memory_only"] != true {
+		t.Fatalf("MagicDNS 必须生成纯内存 hosts server: %s", invPretty(hostsServer))
+	}
+	if _, exists := hostsServer["path"]; exists {
+		t.Fatalf("纯内存 hosts server 不得读取文件: %s", invPretty(hostsServer))
+	}
+	rules := invDNSRules(enabledCfg)
+	if len(rules) == 0 || rules[0]["preferred_by"] != serverTag ||
+		rules[0]["server"] != serverTag || rules[0]["disable_cache"] != true {
+		t.Fatalf("MagicDNS 归属必须最高优先且禁用缓存: %s", invPretty(rules))
+	}
+	var foundResolve, foundPeerRoute bool
+	for _, rule := range invRouteRules(t, enabledCfg) {
+		if rule["preferred_by"] == serverTag && rule["action"] == "resolve" &&
+			rule["server"] == serverTag && rule["disable_cache"] == true {
+			foundResolve = true
+		}
+		if rule["preferred_by"] == "tailscale-ts" && rule["outbound"] == "tailscale-ts" {
+			foundPeerRoute = true
+		}
+	}
+	if !foundResolve || !foundPeerRoute {
+		t.Fatalf("MagicDNS DNS 快照与 Tailscale peer route 必须成对生成: %s", invPretty(invRouteRules(t, enabledCfg)))
 	}
 }
 
@@ -1302,5 +1470,31 @@ func TestINVUnderlay_DesktopRejectsMissingSystemSnapshot(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "underlay interface snapshot") {
 		t.Fatalf("Transparent Proxy 空 Underlay 快照必须 fail-closed，got=%v", err)
+	}
+}
+
+// INV6c：空场景可以保存和继续编辑，但在用户显式选择默认 Line / Subscription
+// 前不得连接。生成器若把空默认静默解释为 Direct，就把声明态偷换成了生效态。
+func TestINVScenarioWithoutDefaultOutboundCannotConnect(t *testing.T) {
+	profile := invBaseProfile()
+	profile.Scenarios[0].DefaultLineID = ""
+	profile.Scenarios[0].DefaultSubscriptionID = ""
+
+	if warnings, err := CollectProfileWarnings(profile); err == nil {
+		t.Fatalf("空默认出口通过配置校验，warnings=%+v", warnings)
+	}
+	if plan, err := BuildConnectionPlan(profile); err == nil {
+		t.Fatalf("空默认出口生成连接计划：%+v", plan)
+	}
+	if cfg, err := GenerateSingBoxTransparentProxy(
+		profile,
+		29876,
+		"session-user",
+		"session-password",
+		invBasePath,
+		invUnderlay,
+		[]string{"100.100.100.100"},
+	); err == nil {
+		t.Fatalf("空默认出口静默生成 Direct 配置：%s", cfg)
 	}
 }

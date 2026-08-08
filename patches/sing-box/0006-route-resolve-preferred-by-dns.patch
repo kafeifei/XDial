@@ -1,0 +1,82 @@
+diff --git a/route/rule/rule_default.go b/route/rule/rule_default.go
+--- a/route/rule/rule_default.go
++++ b/route/rule/rule_default.go
+@@ -279,7 +279,14 @@ func NewDefaultRule(ctx context.Context, logger log.ContextLogger, options option
+ 		rule.allItems = append(rule.allItems, item)
+ 	}
+ 	if len(options.PreferredBy) > 0 {
+-		item := NewPreferredByItem(ctx, options.PreferredBy)
++		var item RuleItem
++		if action.Type() == C.RuleActionTypeResolve {
++			// A resolve gate describes ownership of the selected DNS transport,
++			// not an outbound route. Other actions retain upstream semantics.
++			item = NewPreferredByDNSItem(ctx, options.PreferredBy)
++		} else {
++			item = NewPreferredByItem(ctx, options.PreferredBy)
++		}
+ 		rule.items = append(rule.items, item)
+ 		rule.allItems = append(rule.allItems, item)
+ 	}
+diff --git a/route/rule/rule_preferred_by_resolve_xdial_test.go b/route/rule/rule_preferred_by_resolve_xdial_test.go
+new file mode 100644
+--- /dev/null
++++ b/route/rule/rule_preferred_by_resolve_xdial_test.go
+@@ -0,0 +1,58 @@
++package rule
++
++import (
++	"context"
++	"testing"
++
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestXDialResolvePreferredByUsesDNSTransport(t *testing.T) {
++	t.Parallel()
++
++	rule, err := NewDefaultRule(
++		context.Background(),
++		log.NewNOPFactory().NewLogger("router"),
++		option.DefaultRule{
++			RawDefaultRule: option.RawDefaultRule{
++				PreferredBy: []string{"memory-dns"},
++			},
++			RuleAction: option.RuleAction{
++				Action: C.RuleActionTypeResolve,
++				ResolveOptions: option.RouteActionResolve{
++					Server: "memory-dns",
++				},
++			},
++		},
++	)
++	require.NoError(t, err)
++	require.Len(t, rule.items, 1)
++	require.IsType(t, &PreferredByDNSItem{}, rule.items[0])
++}
++
++func TestXDialRoutePreferredByKeepsOutboundSemantics(t *testing.T) {
++	t.Parallel()
++
++	rule, err := NewDefaultRule(
++		context.Background(),
++		log.NewNOPFactory().NewLogger("router"),
++		option.DefaultRule{
++			RawDefaultRule: option.RawDefaultRule{
++				PreferredBy: []string{"tailscale"},
++			},
++			RuleAction: option.RuleAction{
++				Action: C.RuleActionTypeRoute,
++				RouteOptions: option.RouteActionOptions{
++					Outbound: "tailscale",
++				},
++			},
++		},
++	)
++	require.NoError(t, err)
++	require.Len(t, rule.items, 1)
++	require.IsType(t, &PreferredByItem{}, rule.items[0])
++}

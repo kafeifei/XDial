@@ -3,7 +3,7 @@ import SwiftUI
 /// 导航路由。用值驱动的 NavigationStack（`navigationDestination(for:)`）而不是
 /// 一堆散落的 NavigationLink 目标，方便任意视图 push 且集中定义目的地。
 enum Route: Hashable {
-    case modes
+    case scenarios
     case credentials
     case settings
 }
@@ -18,7 +18,7 @@ struct RootView: View {
 
     init() {
         // Simulator：注入互联好的 fake 隧道层（见 FakeTunnel.swift），让 UI 交互
-        // （连接/断开/状态转换/模式切换）在没有 NE entitlement / 真机时也能完整走通。
+        // （连接/断开/状态转换/场景切换）在没有 NE entitlement / 真机时也能完整走通。
         // 真机 / Release：保持默认（NoopTunnelEngine，无 tunnelManager）——真实
         // GoEngine / TunnelManager 的接线留到真机联调时再做，本任务不动真实路径。
         #if targetEnvironment(simulator)
@@ -38,8 +38,8 @@ struct RootView: View {
             ConnectionView()
                 .navigationDestination(for: Route.self) { route in
                     switch route {
-                    case .modes:
-                        ModePickerView()
+                    case .scenarios:
+                        ScenarioPickerView()
                     case .credentials:
                         CredentialsView()
                     case .settings:

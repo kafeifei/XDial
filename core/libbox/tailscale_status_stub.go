@@ -9,7 +9,27 @@ func (l *Libbox) TailscaleStatus(_ string) (string, error) {
 	return "", fmt.Errorf("Tailscale is unavailable in this build")
 }
 
+func (l *Libbox) PreparedSwitchTailscaleStatus(_ string) (string, error) {
+	return "", fmt.Errorf("Tailscale is unavailable in this build")
+}
+
+func (l *Libbox) TailscaleDNSCaptureDomains(_ string) (string, error) {
+	return "", fmt.Errorf("Tailscale is unavailable in this build")
+}
+
+func (l *Libbox) PrepareTailscaleDNS(_, _ string) (string, error) {
+	return "", fmt.Errorf("Tailscale is unavailable in this build")
+}
+
+func (l *Libbox) PreparePreparedSwitchTailscaleDNS(_, _ string) (string, error) {
+	return "", fmt.Errorf("Tailscale is unavailable in this build")
+}
+
 func (l *Libbox) ProbeTailscalePeer(_, _ string, _ int) (string, error) {
+	return "", fmt.Errorf("Tailscale is unavailable in this build")
+}
+
+func (l *Libbox) ProbePreparedSwitchTailscalePeer(_, _ string, _ int) (string, error) {
 	return "", fmt.Errorf("Tailscale is unavailable in this build")
 }
 

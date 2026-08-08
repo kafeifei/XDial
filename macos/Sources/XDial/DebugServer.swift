@@ -79,7 +79,7 @@ final class DebugServer {
                     "GET  /health",
                     "GET  /state",
                     "GET  /ax[?depth=N]",
-                    "POST /action  {action: connect|disconnect|reconnect|connect-with-failure|begin-route-probe|routing-probe-snapshot|select-mode|ax-press|ax-set-value, ...}",
+                    "POST /action  {action: connect|disconnect|reconnect|connect-with-failure|application-attribution-snapshot|begin-route-probe|routing-probe-snapshot|select-scenario|ax-press|ax-set-value, ...}",
                 ],
             ]))
         }
@@ -145,12 +145,47 @@ final class DebugServer {
         dict["language"] = s.language.rawValue
         dict["launchAtLogin"] = s.launchAtLogin
         dict["autoConnect"] = s.autoConnect
-        dict["activeModeID"] = s.profile.activeModeID
+        dict["wakeReconnectPhase"] =
+            s.wakeReconnectPhase?.rawValue ?? ""
+        dict["desiredConnectionState"] =
+            s.desiredConnectionStateForDiagnostics
+        dict["desiredConnectionScenarioID"] =
+            s.desiredConnectionScenarioIDForDiagnostics
+        dict["desiredConnectionOwnership"] =
+            s.desiredConnectionOwnershipForDiagnostics
+        dict["scenarioSwitchTargetID"] =
+            s.scenarioSwitchTargetID ?? ""
+        dict["scenarioSwitchInFlight"] =
+            s.scenarioSwitchInFlightForDiagnostics
+        dict["scenarioSwitchSourceTransactionID"] =
+            s.scenarioSwitchSourceTransactionIDForDiagnostics
+        if let switchProjection = s.engine.scenarioSwitchProjection {
+            dict["scenarioSwitchReport"] = [
+                "status": switchProjection.status,
+                "fromScenarioID": switchProjection.fromScenarioID,
+                "toScenarioID": switchProjection.toScenarioID,
+                "sourceCommittedTransactionID":
+                    switchProjection.sourceCommittedTransactionID,
+                "candidateTransactionID":
+                    switchProjection.candidateTransactionID,
+                "activeCommittedTransactionID":
+                    switchProjection.activeCommittedTransactionID,
+                "inFlight": switchProjection.inFlight,
+                "reusedLineIDs": switchProjection.reusedLineIDs,
+                "code": switchProjection.code ?? "",
+                "message": switchProjection.message ?? "",
+            ] as [String: Any]
+        }
+        dict["activeScenarioID"] = s.profile.activeScenarioID
         // 配置改了但引擎还在跑旧快照 —— 验收改动是否真正生效必须看这个
         dict["configDirty"] = s.configDirty
         if let report = s.engine.connectionReport,
            let data = try? JSONEncoder().encode(report),
-           let object = try? JSONSerialization.jsonObject(with: data) {
+           let rawObject = try? JSONSerialization.jsonObject(with: data),
+           var object = rawObject as? [String: Any] {
+            // The opaque identity is derived from configuration fields that
+            // can include credentials. Debug only needs the comparison result.
+            object.removeValue(forKey: "configuration_fingerprint")
             dict["connectionReport"] = object
         }
         if let data = try? JSONEncoder().encode(
@@ -386,6 +421,15 @@ final class DebugServer {
         case "reconnect":
             state.reconnect()
             return ok(["ok": true, "status": state.engine.status])
+        case "quit":
+            // 先把 HTTP 响应交还调用方，再走 NSApplication 的正常退出委托；
+            // make restart 因而能等待 Provider 回滚，而不是直接杀掉宿主。
+            appLog("DebugServer: graceful quit requested")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                appLog("DebugServer: invoking NSApplication terminate")
+                NSApp.terminate(nil)
+            }
+            return ok(["ok": true])
         case "prepare-system-extension":
             // 主线程同步轮询会阻塞 OSSystemExtensionRequest 的 main-queue
             // delegate，造成“实际已激活、接口却超时”的假阴性。挂起当前 Task 后，
@@ -476,6 +520,55 @@ final class DebugServer {
                     "code": providerDiagnosticsCode(error),
                 ])
             }
+        case "application-attribution-snapshot":
+            guard
+                state.engine.status == "connected",
+                let report = state.engine.connectionReport,
+                report.state == .committed
+            else {
+                return ("409 Conflict", json([
+                    "ok": false,
+                    "code": "transparent-proxy-not-connected",
+                ]))
+            }
+            let result:
+                Result<ProviderApplicationAttributionSnapshot, Error> =
+                await withCheckedContinuation { continuation in
+                    state.engine.applicationAttributionSnapshot(
+                        transactionID: report.transactionID
+                    ) {
+                        continuation.resume(returning: $0)
+                    }
+                }
+            switch result {
+            case let .success(snapshot):
+                return ok([
+                    "ok": true,
+                    "transactionID": report.transactionID,
+                    "activeSelectorKindCounts":
+                        snapshot.activeSelectorKindCounts,
+                    "matchedFlowCount": snapshot.matchedFlowCount,
+                    "matchedSelectorKindCounts":
+                        snapshot.matchedSelectorKindCounts,
+                    "matchedRuleSetIDCounts":
+                        snapshot.matchedRuleSetIDCounts,
+                    "matchedLineIDCounts": snapshot.matchedLineIDCounts,
+                    "matchedSubscriptionIDCounts":
+                        snapshot.matchedSubscriptionIDCounts,
+                    "baseFlowCount": snapshot.baseFlowCount,
+                    "baseMissingSourceIdentityCount":
+                        snapshot.baseMissingSourceIdentityCount,
+                    "rejectedFlowCount": snapshot.rejectedFlowCount,
+                    "rejectedUnresolvedAuditTokenCount":
+                        snapshot.rejectedUnresolvedAuditTokenCount,
+                ])
+            case let .failure(error):
+                return ok([
+                    "ok": false,
+                    "transactionID": report.transactionID,
+                    "code": providerDiagnosticsCode(error),
+                ])
+            }
         case "routing-probe-snapshot":
             guard
                 state.engine.status == "connected",
@@ -513,6 +606,8 @@ final class DebugServer {
                     "transactionID": report.transactionID,
                     "probeID": snapshot.probeID,
                     "matchCount": snapshot.matchCount,
+                    "candidateAddressCount":
+                        snapshot.candidateAddressCount,
                     "outboundTagCounts": snapshot.outboundTagCounts,
                     "lineIDCounts": snapshot.lineIDCounts,
                     "ruleSetTag": snapshot.ruleSetTag ?? "",
@@ -524,20 +619,27 @@ final class DebugServer {
                     "code": providerDiagnosticsCode(error),
                 ])
             }
-        case "select-mode":
+        case "select-scenario":
             guard let id = obj["id"] as? String else {
                 return ("400 Bad Request", json(["error": "missing 'id'"]))
             }
             // 必须走和用户点击完全相同的 intent：直接改 state 会绕开门禁和
             // configDirty 置位，调试验收就会给出"已生效"的假象。
-            guard state.activateMode(id) else {
-                return ("404 Not Found", json(["error": "no such mode", "id": id]))
+            guard state.activateScenario(id) else {
+                return ("404 Not Found", json(["error": "no such scenario", "id": id]))
             }
-            return ok([
+            let result: [String: Any] = [
                 "ok": true,
-                "activeModeID": state.profile.activeModeID,
+                "activeScenarioID": state.profile.activeScenarioID,
+                "desiredConnectionScenarioID":
+                    state.desiredConnectionScenarioIDForDiagnostics,
+                "scenarioSwitchTargetID":
+                    state.scenarioSwitchTargetID ?? "",
+                "scenarioSwitchInFlight":
+                    state.scenarioSwitchInFlightForDiagnostics,
                 "configDirty": state.configDirty,
-            ])
+            ]
+            return ok(result)
         case "open-settings":
             NSApp.activate(ignoringOtherApps: true)
             if let w = settingsWindow() {
@@ -609,7 +711,7 @@ final class DebugServer {
             ])
         default:
             return ("400 Bad Request", json(["error": "unknown action: \(action)",
-                "available": ["connect", "disconnect", "reconnect", "select-mode", "open-settings",
+                "available": ["connect", "disconnect", "reconnect", "select-scenario", "open-settings",
                               "connect-with-failure",
                               "begin-route-probe", "routing-probe-snapshot",
                               "ax-press", "ax-set-value", "setup-helper", "check-helper",

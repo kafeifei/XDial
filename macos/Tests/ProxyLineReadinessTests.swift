@@ -3,8 +3,8 @@ import XCTest
 final class ProxyResourceReadinessTests: XCTestCase {
     func testTargetsEveryActiveProxyResourceInPlanOrder() throws {
         let plan = ConnectionPlan(
-            schemaVersion: 1,
-            mode: ConnectionPlanMode(id: "mode", name: "Mode"),
+            schemaVersion: 3,
+            scenario: ConnectionPlanScenario(id: "scenario", name: "Scenario"),
             tasks: [
                 lineTask(id: "direct", type: "direct"),
                 lineTask(id: "corp", type: "vpn"),
@@ -274,8 +274,8 @@ final class ProxyResourceReadinessTests: XCTestCase {
 
     func testMissingExactLineOutboundFailsClosed() {
         let plan = ConnectionPlan(
-            schemaVersion: 1,
-            mode: ConnectionPlanMode(id: "mode", name: "Mode"),
+            schemaVersion: 3,
+            scenario: ConnectionPlanScenario(id: "scenario", name: "Scenario"),
             tasks: [lineTask(id: "secure", type: "anytls")]
         )
 
@@ -295,8 +295,8 @@ final class ProxyResourceReadinessTests: XCTestCase {
 
     func testMissingExactSubscriptionOutboundFailsClosed() {
         let plan = ConnectionPlan(
-            schemaVersion: 1,
-            mode: ConnectionPlanMode(id: "mode", name: "Mode"),
+            schemaVersion: 3,
+            scenario: ConnectionPlanScenario(id: "scenario", name: "Scenario"),
             tasks: [subscriptionTask(id: "imported")]
         )
 

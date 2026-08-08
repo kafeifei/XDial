@@ -34,6 +34,21 @@ if CommandLine.arguments.contains("--uninstall") {
     exit(0)
 }
 
+if CommandLine.arguments.contains("--install-only") {
+    do {
+        try ApplicationRelocator.installCurrentBundleWithoutRelaunch()
+        fputs("XDial installed successfully.\n", stdout)
+        exit(0)
+    } catch {
+        fputs(
+            "XDial installation failed: "
+                + error.localizedDescription + "\n",
+            stderr
+        )
+        exit(1)
+    }
+}
+
 var launchPreparationComplete = false
 while !launchPreparationComplete {
     switch ApplicationRelocator.prepareForLaunch() {

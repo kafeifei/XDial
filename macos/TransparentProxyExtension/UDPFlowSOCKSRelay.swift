@@ -16,6 +16,7 @@ enum UDPFlowSOCKSRelay {
         socksPort: UInt16,
         credentials: SOCKSCredentials? = nil,
         trialID: String,
+        traffic: ProviderTrafficLedger,
         logger: Logger
     ) -> ProviderRelayHandle {
         let control = NWConnection(
@@ -62,7 +63,8 @@ enum UDPFlowSOCKSRelay {
                             control: control,
                             trialID: trialID,
                             logger: logger,
-                            shutdown: shutdown
+                            shutdown: shutdown,
+                            traffic: traffic
                         )
                         logger.debug(
                             "udp-relay-finished trial=\(trialID, privacy: .public)"
@@ -219,7 +221,8 @@ enum UDPFlowSOCKSRelay {
         control: NWConnection,
         trialID: String,
         logger: Logger,
-        shutdown: RelayTaskShutdown
+        shutdown: RelayTaskShutdown,
+        traffic: ProviderTrafficLedger
     ) async throws {
         try await RelayTaskGroup.run(
             operations: [
@@ -239,6 +242,10 @@ enum UDPFlowSOCKSRelay {
                                 "udp-send trial=\(trialID, privacy: .public) bytes=\(payload.count)"
                             )
                             try await send(packet, to: connection)
+                            traffic.recordUpload(
+                                payload.count,
+                                transactionID: trialID
+                            )
                         }
                     }
                 },
@@ -256,6 +263,10 @@ enum UDPFlowSOCKSRelay {
                         try await writeDatagrams(
                             [(decoded.payload, decoded.endpoint)],
                             to: flow
+                        )
+                        traffic.recordDownload(
+                            decoded.payload.count,
+                            transactionID: trialID
                         )
                     }
                 },

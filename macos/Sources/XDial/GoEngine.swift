@@ -35,11 +35,14 @@ final class GoEngine: ObservableObject {
     private var requestSeq: UInt64 = 0
     private var pendingCallbacks: [String: (DaemonResponse) -> Void] = [:]
     private var transparentProxySystemStatus = "disconnected"
+    var underlayChangeHandler: ((String) -> Void)?
 
     @Published private(set) var status: String = "disconnected"
     @Published var lastError: String?
     @Published private(set) var connectedAt: Date?
     @Published private(set) var connectionReport: ConnectionReport?
+    @Published private(set) var scenarioSwitchProjection:
+        HostScenarioSwitchProjection?
     private var coldLaunchSettledTransactionID: String?
     private var explicitlyStoppedTransactionID: String?
     private var pendingStatusSyncCompletions: [() -> Void] = []
@@ -71,9 +74,14 @@ final class GoEngine: ObservableObject {
     var isBusy: Bool {
         status == "connecting" || status == "disconnecting" || status == "reconnecting"
     }
+    var automaticReconnectState: AutomaticReconnectRuntimeState {
+        transparentProxy.automaticReconnectState
+    }
 
     private init() {
         connectionReport = ConnectionReportJournal.read()
+        scenarioSwitchProjection =
+            transparentProxy.scenarioSwitchProjection
         if let connectionReport,
            ConnectionReportLiveProjection.isSafelySettledTerminal(
                connectionReport
@@ -91,11 +99,25 @@ final class GoEngine: ObservableObject {
                 self?.applyConnectionReport(report)
             }
         }
+        transparentProxy.scenarioSwitchHandler = {
+            [weak self] projection in
+            Task { @MainActor in
+                self?.scenarioSwitchProjection = projection
+            }
+        }
+        transparentProxy.underlayChangeHandler = { [weak self] fingerprint in
+            Task { @MainActor in
+                self?.underlayChangeHandler?(fingerprint)
+            }
+        }
     }
 
     // MARK: - Public API
 
-    func start(profileJSON: String) {
+    func start(
+        profileJSON: String,
+        automaticRetryTrigger: AutomaticReconnectTrigger? = nil
+    ) {
         lastError = nil
         // The journal remains available for recovery and diagnostics, but the
         // previous terminal report must not flash while a new transaction is
@@ -104,7 +126,60 @@ final class GoEngine: ObservableObject {
         explicitlyStoppedTransactionID = nil
         transparentProxySystemStatus = "connecting"
         reconcileTransparentProxyStatus()
-        transparentProxy.start(profileJSON: profileJSON)
+        transparentProxy.start(
+            profileJSON: profileJSON,
+            automaticRetryTrigger: automaticRetryTrigger
+        )
+    }
+
+    /// Replace the committed Scenario inside the current Provider session.
+    /// The source report and `connected` status stay live until the Provider
+    /// atomically commits the target transaction.
+    func switchScenario(
+        profileJSON: String,
+        completion: @escaping (Result<ConnectionReport, Error>) -> Void
+    ) {
+        lastError = nil
+        transparentProxy.switchScenario(
+            profileJSON: profileJSON
+        ) { [weak self] result in
+            Task { @MainActor [weak self] in
+                switch result {
+                case let .success(report):
+                    self?.applyConnectionReport(report)
+                case let .failure(error):
+                    self?.lastError = error.localizedDescription
+                }
+                completion(result)
+            }
+        }
+    }
+
+    func cancelScenarioSwitch() {
+        transparentProxy.cancelScenarioSwitch()
+    }
+
+    func captureCurrentUnderlayFingerprint(
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        transparentProxy.captureCurrentUnderlayFingerprint { result in
+            Task { @MainActor in
+                completion(result)
+            }
+        }
+    }
+
+    func runtimeConfigurationFingerprint(
+        profileJSON: String
+    ) -> Result<String, Error> {
+        transparentProxy.runtimeConfigurationFingerprint(
+            profileJSON: profileJSON
+        )
+    }
+
+    @discardableResult
+    func retryAutomaticReconnectNow() -> Bool {
+        transparentProxy.retryAutomaticReconnectNow()
     }
 
 #if DEBUG
@@ -139,7 +214,31 @@ final class GoEngine: ObservableObject {
         )
     }
 
+    func trafficSnapshot(
+        transactionID: String,
+        completion: @escaping (
+            Result<ProviderTrafficSnapshot, Error>
+        ) -> Void
+    ) {
+        transparentProxy.trafficSnapshot(
+            transactionID: transactionID,
+            completion: completion
+        )
+    }
+
     #if DEBUG
+    func applicationAttributionSnapshot(
+        transactionID: String,
+        completion: @escaping (
+            Result<ProviderApplicationAttributionSnapshot, Error>
+        ) -> Void
+    ) {
+        transparentProxy.applicationAttributionSnapshot(
+            transactionID: transactionID,
+            completion: completion
+        )
+    }
+
     func routingProbeSnapshot(
         transactionID: String,
         probeID: String,
@@ -180,6 +279,17 @@ final class GoEngine: ObservableObject {
         transparentProxy.stop()
     }
 
+    func requiresTerminationDrain() -> Bool {
+        let snapshot = transparentProxy.terminationDrainSnapshot()
+        return ApplicationTerminationPolicy.requiresDrain(
+            runtimeStatus: snapshot.runtimeStatus,
+            hasConnectionReport: snapshot.report != nil,
+            rollbackComplete: snapshot.report?.rollbackComplete ?? false,
+            systemTakeoverRemoved:
+                snapshot.report?.systemTakeoverRemoved ?? false
+        )
+    }
+
     func parseSubscription(url: String, content: String = "", format: String = "auto",
                            completion: @escaping (Result<ParseResult, Error>) -> Void) {
         Task { [weak self] in
@@ -218,6 +328,10 @@ final class GoEngine: ObservableObject {
             pendingStatusSyncCompletions.append(completion)
         }
         transparentProxy.syncStatus()
+    }
+
+    func systemDidWake(completion: (() -> Void)? = nil) {
+        syncStatus(completion: completion)
     }
 
     func prepareTailscale(
@@ -646,12 +760,21 @@ private struct DaemonResponse: Decodable {
 
 struct EngineStatus: Decodable {
     let status: String
-    let mode: String?
+    let scenarioID: String?
     let connectedAt: Int?
     let error: String?
 
     enum CodingKeys: String, CodingKey {
-        case status, mode, error
+        case status, error
+        case scenarioID = "scenario_id"
         case connectedAt = "connected_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        status = try values.decode(String.self, forKey: .status)
+        scenarioID = try values.decodeIfPresent(String.self, forKey: .scenarioID)
+        connectedAt = try values.decodeIfPresent(Int.self, forKey: .connectedAt)
+        error = try values.decodeIfPresent(String.self, forKey: .error)
     }
 }

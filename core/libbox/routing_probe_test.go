@@ -99,6 +99,17 @@ func transparentProxyProbeMetadata(hostname string) adapter.InboundContext {
 	}
 }
 
+func transparentProxyIPProbeMetadata(address string) adapter.InboundContext {
+	return adapter.InboundContext{
+		Inbound:     transparentProxyInboundTag,
+		InboundType: "socks",
+		Destination: M.Socksaddr{
+			Addr: netip.MustParseAddr(address),
+			Port: 443,
+		},
+	}
+}
+
 func decodeRoutingProbeSnapshot(t *testing.T, encoded string) routingProbeSnapshot {
 	t.Helper()
 	var snapshot routingProbeSnapshot
@@ -262,6 +273,70 @@ func TestRoutingProbeExperimentObservesOnlyBoundedAuthenticatedFlow(t *testing.T
 		len(after.OutboundTagCounts) != 0 ||
 		after.RuleSetTag != "" {
 		t.Fatalf("expired probe remained available: %#v", after)
+	}
+}
+
+func TestRoutingProbeExperimentCorrelatesSystemResolvedDNSSnapshotAddress(
+	t *testing.T,
+) {
+	tracker := newRoutingProbeTracker()
+	tracker.replaceDNSSnapshotAddresses(map[string][]netip.Addr{
+		"probe": {
+			netip.MustParseAddr("100.64.0.8"),
+			netip.MustParseAddr("fd7a:115c:a1e0::8"),
+		},
+		"Probe.Example.": {
+			netip.MustParseAddr("100.64.0.8"),
+			netip.MustParseAddr("fd7a:115c:a1e0::8"),
+		},
+		"probe.other.example": {
+			netip.MustParseAddr("100.64.0.9"),
+		},
+	})
+	probeID, err := tracker.begin("probe", 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound := &routingProbeTestOutbound{tag: "tailscale-japan"}
+	tracker.RoutedConnection(
+		context.Background(),
+		nil,
+		transparentProxyIPProbeMetadata("100.64.0.9"),
+		nil,
+		outbound,
+	)
+	tracker.RoutedConnection(
+		context.Background(),
+		nil,
+		transparentProxyProbeMetadata("probe.other.example"),
+		nil,
+		outbound,
+	)
+	tracker.RoutedConnection(
+		context.Background(),
+		nil,
+		transparentProxyProbeMetadata("probe.example"),
+		nil,
+		outbound,
+	)
+	tracker.RoutedConnection(
+		context.Background(),
+		nil,
+		transparentProxyIPProbeMetadata("100.64.0.8"),
+		nil,
+		outbound,
+	)
+
+	got := tracker.snapshot()
+	if got.ProbeID != probeID ||
+		got.MatchCount != 2 ||
+		got.OutboundTagCounts["tailscale-japan"] != 2 {
+		t.Fatalf("resolved-address route probe snapshot = %#v", got)
+	}
+	encoded := tracker.snapshotJSON()
+	if strings.Contains(encoded, "100.64.0.8") ||
+		strings.Contains(encoded, "probe.example") {
+		t.Fatalf("route probe leaked DNS snapshot input: %s", encoded)
 	}
 }
 

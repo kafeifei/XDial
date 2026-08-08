@@ -5,6 +5,11 @@ GOBIN := $(shell go env GOPATH)/bin
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PLIST_VERSION := $(patsubst v%,%,$(VERSION))
 GO_LDFLAGS := -X main.version=$(VERSION)
+# macOS 只会替换构建号更高的 System Extension。Debug 构建若反复使用
+# project.yml 里的固定号，宿主 App 虽然已经更新，Provider 仍可能继续运行旧代码，
+# 而 properties API 又会因为版本号相同误报 ready。一次 make 调用内复用同一个
+# Unix 时间戳，确保 host 与 extension 配套且每次本地构建都能被系统识别为升级。
+DEBUG_BUILD_VERSION ?= $(shell date +%s)
 DESKTOP_GO_TAGS := with_gvisor,with_utls
 MOBILE_LIBBOX_TAGS := with_gvisor,with_utls
 MACOS_LIBBOX_FRAMEWORK := $(BUILD_DIR)/frameworks/macos/Libbox.xcframework
@@ -19,12 +24,23 @@ PATCHED_GO_INPUTS_CURRENT := $(shell bash $(PATCHED_GO_SCRIPT) --check >/dev/nul
 # preserved, so it is the authoritative mapping to the patched Tailscale module.
 PATCHED_GO_ENV = GOWORK='$(PATCHED_WORKFILE)' GOFLAGS=
 SING_BOX_TEST_BINARY := $(abspath $(BUILD_DIR)/tools/sing-box)
+MACOS_ICON_GENERATOR := scripts/generate-macos-app-icon/main.swift
+MACOS_ICON_SOURCE := macos/Sources/XDial/AppIcon.swift
 # SMAppService 要求签名身份跨构建稳定：ad-hoc 签名每次构建身份都变，
 # 系统会把重编后的 daemon 当新程序、要求重新批准。默认用开发者证书
 # （partial match，本机唯一），无证书环境可 SIGN_IDENTITY=- 回落 ad-hoc。
 SIGN_IDENTITY ?= Apple Development
 
-.PHONY: all cli app release restart inspector clean prepare-patched-go go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
+.PHONY: all cli app ci-macos-build release restart inspector clean prepare-patched-go go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
+
+macos/AppIcon.icns: $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
+	@rm -rf "$(BUILD_DIR)/AppIcon.iconset" "$(BUILD_DIR)/generate-app-icon"
+	@mkdir -p "$(BUILD_DIR)/AppIcon.iconset"
+	xcrun swiftc $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR) \
+		-o "$(BUILD_DIR)/generate-app-icon"
+	"$(BUILD_DIR)/generate-app-icon" "$(BUILD_DIR)/AppIcon.iconset"
+	iconutil -c icns "$(BUILD_DIR)/AppIcon.iconset" \
+		-o macos/AppIcon.icns
 
 # 组装 .app bundle。$(1)=swift 产物目录(debug/release) $(2)=bundle 路径
 define assemble_app
@@ -76,7 +92,9 @@ test-patched-tailscale: $(PATCHED_WORKFILE)
 test-patched-sing-box: $(PATCHED_WORKFILE)
 	$(PATCHED_GO_ENV) go test -tags '$(DESKTOP_GO_TAGS)' \
 		github.com/sagernet/sing-box/protocol/tailscale \
-		-run '^TestXDialPreferredRouteSetExcludesExitDefaults$$' \
+		github.com/sagernet/sing-box/dns/transport/hosts \
+		github.com/sagernet/sing-box/protocol/socks \
+		-run '^TestXDial.*$$' \
 		-count=1
 
 test-patched-sslcon: $(PATCHED_WORKFILE)
@@ -89,6 +107,7 @@ test: $(PATCHED_WORKFILE) test-patched-tailscale test-patched-sing-box test-patc
 
 test-macos-transaction:
 	@! rg -n 'probeNetwork|127\.0\.0\.1:9090|test-out' macos/Sources/XDial
+	@! rg -n 'willSleepNotification|screensDidSleepNotification|systemIsSleeping|sawUnavailablePath' macos/Sources/XDial macos/Shared
 	@! rg -n 'URLSession|ip-api\.com' macos/Sources/XDial/NetworkInfo.swift
 	@! rg -U -n '\.on(Appear|Disappear)[[:space:]]*\{[^}]{0,500}(probeNetwork|prepareTailscale|closeTailscaleSetup|URLSession|127\.0\.0\.1:9090)' macos/Sources/XDial/SettingsView.swift
 	@test "$$(rg -U -o 'AXUIElementCopyAttributeValue\([^)]*kAXValueAttribute' macos/Sources/XDial/DebugServer.swift | wc -l | tr -d ' ')" -eq 1
@@ -113,22 +132,37 @@ cli: $(PATCHED_WORKFILE)
 	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS)" -o $(BUILD_DIR)/xdial ./cmd/xdial/
 
 # debug 构建(含 DebugServer,仅本地开发用,不得分发)
-app: cli libbox-macos-xcframework
+app: cli libbox-macos-xcframework macos/AppIcon.icns
 	cd macos && xcodegen generate
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Debug \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
+		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		build
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration Debug \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
+		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		build
 	rm -rf "$(APP_BUNDLE)"
 	ditto "$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app" "$(APP_BUNDLE)"
 
+# GitHub 托管 runner 不持有 System Extension 的签名证书和 provisioning profile。
+# 这里分别编译 Debug / Release 的扩展与宿主，只验证源码和链接；产物没有签名、不可分发。
+ci-macos-build: cli libbox-macos-xcframework macos/AppIcon.icns
+	cd macos && xcodegen generate
+	@set -e; for configuration in Debug Release; do \
+		xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy \
+			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
+			-derivedDataPath $(BUILD_DIR)/macos-xcode-ci CODE_SIGNING_ALLOWED=NO build; \
+		xcodebuild -project macos/XDial.xcodeproj -scheme XDial \
+			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
+			-derivedDataPath $(BUILD_DIR)/macos-xcode-ci CODE_SIGNING_ALLOWED=NO build; \
+	done
+
 # release 构建:swift -c release 使 #if DEBUG 的 DebugServer 整体排除,
 # go -trimpath -s -w 去符号并注入版本。分发一律用这个产物。
-release: libbox-macos-xcframework
+release: libbox-macos-xcframework macos/AppIcon.icns
 	@mkdir -p $(BUILD_DIR)
 	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -trimpath -ldflags "$(GO_LDFLAGS) -s -w" -o $(BUILD_DIR)/xdial ./cmd/xdial/
 	cd macos && xcodegen generate
@@ -144,19 +178,14 @@ release: libbox-macos-xcframework
 	ditto "$(BUILD_DIR)/macos-xcode-release/Build/Products/Release/XDial.app" "$(RELEASE_BUNDLE)"
 	@echo "release bundle: $(RELEASE_BUNDLE) (version $(PLIST_VERSION))"
 
-# 一键重启:杀旧实例→重编→由应用安装事务替换 /Applications 中的旧版
-# →等 debug server 上线。不要在 build/ 留旧 App 容器，否则 macOS 会继续
-# 把它关联的 System Extension 显示为已安装。
-restart: app
-	@pkill -x XDial 2>/dev/null || true
-	@for i in $$(seq 1 20); do pgrep -x XDial >/dev/null || break; sleep 0.2; done
-	@rm -rf "$(BUILD_DIR)/XDial.previous.app"
-	@open "$(APP_BUNDLE)"
-	@for i in $$(seq 1 30); do \
-		if curl -s -m 1 http://127.0.0.1:19876/health >/dev/null 2>&1; then \
-			echo "✓ XDial restarted, debug server ready"; exit 0; fi; \
-		sleep 0.5; \
-	done; echo "✗ debug server not up after 15s"; exit 1
+# 一键重启：先完整构建并签名新版本，成功后才让旧实例完成网络回滚并退出。
+# 构建目录中的进程紧接着执行无 UI 的原子安装，然后只启动
+# /Applications 中的最终版本。外网验收必须放在新事务提交之后，
+# 不得在旧实例退出与新实例启动之间扩大断网窗口。
+# 构建失败不得影响正在运行的旧实例。
+restart:
+	@$(MAKE) app DEBUG_BUILD_VERSION=$(DEBUG_BUILD_VERSION)
+	@bash scripts/restart-macos-app.sh "$(abspath $(APP_BUNDLE))"
 
 inspector:
 	@mkdir -p $(BUILD_DIR)

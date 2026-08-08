@@ -1,11 +1,12 @@
 package config
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
 
-func TestBuildConnectionPlanUsesOnlyActiveModeDependenciesInBindingOrder(t *testing.T) {
+func TestBuildConnectionPlanUsesOnlyActiveScenarioDependenciesInBindingOrder(t *testing.T) {
 	profile := invBaseProfile()
 	profile.Lines = append(profile.Lines, invUnusedTrojanLine(), invTailscaleLine())
 	profile.RuleSets = append(profile.RuleSets, invUnusedRuleSet())
@@ -23,7 +24,7 @@ func TestBuildConnectionPlanUsesOnlyActiveModeDependenciesInBindingOrder(t *test
 		"line:px",
 		"rule-set:remote",
 		"line:direct",
-		"dns:mode",
+		"dns:scenario",
 		"data-plane:sing-box",
 		"ingress:transparent-proxy",
 	}
@@ -38,6 +39,52 @@ func TestBuildConnectionPlanUsesOnlyActiveModeDependenciesInBindingOrder(t *test
 	} {
 		if containsString(got, forbidden) {
 			t.Fatalf("unreferenced task leaked into plan: %s", forbidden)
+		}
+	}
+}
+
+func TestConnectionPlanJSONUsesScenarioContract(t *testing.T) {
+	plan, err := BuildConnectionPlan(invBaseProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.SchemaVersion != 3 {
+		t.Fatalf("schema_version = %d, want 3", plan.SchemaVersion)
+	}
+	if plan.Scenario.ID == "" {
+		t.Fatal("scenario is missing from connection plan")
+	}
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := document["scenario"]; !ok {
+		t.Fatalf("scenario key is missing: %s", encoded)
+	}
+	for _, obsoleteKey := range []string{"mode", "scheme"} {
+		if _, ok := document[obsoleteKey]; ok {
+			t.Fatalf("obsolete key %q is present: %s", obsoleteKey, encoded)
+		}
+	}
+
+	warningJSON, err := json.Marshal(ProfileWarning{ScenarioID: "scenario-1", Message: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var warning map[string]json.RawMessage
+	if err := json.Unmarshal(warningJSON, &warning); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := warning["scenario_id"]; !ok {
+		t.Fatalf("scenario_id is missing: %s", warningJSON)
+	}
+	for _, obsoleteKey := range []string{"mode_id", "scheme_id"} {
+		if _, ok := warning[obsoleteKey]; ok {
+			t.Fatalf("obsolete key %q is present: %s", obsoleteKey, warningJSON)
 		}
 	}
 }
@@ -76,8 +123,8 @@ func TestBuildConnectionPlanIncludesDynamicTailscaleAndGeneratedSubscriptionRule
 			Type: "GEOIP", Value: "JP", Group: "__default__",
 		}},
 	})
-	profile.Modes[0] = Mode{
-		ID: "m", Name: "动态模式",
+	profile.Scenarios[0] = Scenario{
+		ID: "m", Name: "动态场景",
 		Bindings: []RuleBinding{
 			{RuleSetID: "intranet", LineID: "ts"},
 			{RuleSetID: "remote", SubscriptionID: "sub"},
@@ -101,11 +148,51 @@ func TestBuildConnectionPlanIncludesDynamicTailscaleAndGeneratedSubscriptionRule
 	}
 }
 
+func TestBuildConnectionPlanKeepsRuleSetFetchLineOutOfTrafficTasks(t *testing.T) {
+	profile := invBaseProfile()
+	profile.Lines = append(profile.Lines, invUnusedTrojanLine())
+	profile.RuleSets[1].FetchLineID = "ghost"
+
+	plan, err := BuildConnectionPlan(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ruleTask *ConnectionPlanTask
+	for index := range plan.Tasks {
+		if plan.Tasks[index].ID == "rule-set:remote" {
+			ruleTask = &plan.Tasks[index]
+			break
+		}
+	}
+	if ruleTask == nil {
+		t.Fatal("rule-set task is missing")
+	}
+	if containsString(ruleTask.Dependencies, "line:ghost") {
+		t.Fatalf("background fetch Line leaked into traffic dependencies: %+v", ruleTask.Dependencies)
+	}
+	if containsString(connectionPlanTaskIDs(plan), "line:ghost") {
+		t.Fatalf("background fetch Line leaked into traffic tasks: %+v", plan.Tasks)
+	}
+	if ruleTask.Detail != "远程规则；经校验缓存立即启动，连接后更新 → 海外中转" {
+		t.Fatalf("RuleSet fetch source polluted traffic policy: %q", ruleTask.Detail)
+	}
+}
+
 func TestBuildConnectionPlanRejectsBrokenReferencesBeforeSideEffects(t *testing.T) {
 	profile := invBaseProfile()
-	profile.Modes[0].Bindings[0].LineID = "missing"
+	profile.Scenarios[0].Bindings[0].LineID = "missing"
 	if _, err := BuildConnectionPlan(profile); err == nil {
 		t.Fatal("expected broken reference to fail planning")
+	}
+}
+
+func TestBuildConnectionPlanRejectsScenarioWithoutDefaultOutbound(t *testing.T) {
+	profile := invBaseProfile()
+	profile.Scenarios[0].DefaultLineID = ""
+	profile.Scenarios[0].DefaultSubscriptionID = ""
+
+	if plan, err := BuildConnectionPlan(profile); err == nil {
+		t.Fatalf("blank Scenario silently generated a plan: %+v", plan)
 	}
 }
 
@@ -120,7 +207,7 @@ func TestBuildConnectionPlanUnavailableSubscriptionOnlyFailsWhenEffective(t *tes
 	t.Run("active binding", func(t *testing.T) {
 		profile := invBaseProfile()
 		profile.Subscriptions = append(profile.Subscriptions, unavailable)
-		profile.Modes[0].Bindings[0] = RuleBinding{
+		profile.Scenarios[0].Bindings[0] = RuleBinding{
 			RuleSetID:      "intranet",
 			SubscriptionID: unavailable.ID,
 		}
@@ -132,8 +219,8 @@ func TestBuildConnectionPlanUnavailableSubscriptionOnlyFailsWhenEffective(t *tes
 	t.Run("active default", func(t *testing.T) {
 		profile := invBaseProfile()
 		profile.Subscriptions = append(profile.Subscriptions, unavailable)
-		profile.Modes[0].DefaultLineID = ""
-		profile.Modes[0].DefaultSubscriptionID = unavailable.ID
+		profile.Scenarios[0].DefaultLineID = ""
+		profile.Scenarios[0].DefaultSubscriptionID = unavailable.ID
 		if plan, err := BuildConnectionPlan(profile); err == nil {
 			t.Fatalf("unavailable default subscription generated a plan: %+v", plan)
 		}
@@ -143,7 +230,7 @@ func TestBuildConnectionPlanUnavailableSubscriptionOnlyFailsWhenEffective(t *tes
 		profile := invBaseProfile()
 		profile.Subscriptions = append(profile.Subscriptions, unavailable)
 		profile.RuleSets[0].Enabled = false
-		profile.Modes[0].Bindings[0] = RuleBinding{
+		profile.Scenarios[0].Bindings[0] = RuleBinding{
 			RuleSetID:      "intranet",
 			SubscriptionID: unavailable.ID,
 		}
@@ -161,7 +248,7 @@ func TestBuildConnectionPlanUnavailableSubscriptionOnlyFailsWhenEffective(t *tes
 		disabled := unavailable
 		disabled.Enabled = false
 		profile.Subscriptions = append(profile.Subscriptions, disabled)
-		profile.Modes[0].Bindings[0] = RuleBinding{
+		profile.Scenarios[0].Bindings[0] = RuleBinding{
 			RuleSetID:      "intranet",
 			SubscriptionID: disabled.ID,
 		}

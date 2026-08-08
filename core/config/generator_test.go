@@ -26,7 +26,7 @@ func testProfile() *Profile {
 			{ID: "cnip", Name: "国内IP", Type: RuleSetTypeURL, Enabled: true,
 				URL: "https://example.com/geoip-cn.json", Format: "json"},
 		},
-		Modes: []Mode{
+		Scenarios: []Scenario{
 			{
 				ID: "overseas", Name: "海外",
 				Bindings: []RuleBinding{
@@ -51,7 +51,7 @@ func testProfile() *Profile {
 				DefaultLineID: "direct",
 			},
 		},
-		ActiveModeID: "overseas",
+		ActiveScenarioID: "overseas",
 	}
 }
 
@@ -76,8 +76,8 @@ func TestProfileFinders(t *testing.T) {
 	if r := p.FindRuleSet("gfw"); r == nil || r.URL == "" {
 		t.Fatal("FindRuleSet(gfw) failed")
 	}
-	if s := p.ActiveMode(); s == nil || s.Name != "海外" {
-		t.Fatal("ActiveMode failed")
+	if s := p.ActiveScenario(); s == nil || s.Name != "海外" {
+		t.Fatal("ActiveScenario failed")
 	}
 	if v := p.VPNLine(); v == nil || v.VPNServer == "" {
 		t.Fatal("VPNLine failed")
@@ -307,7 +307,7 @@ func TestBuildAnyTLSOutboundAllowsSupportedFingerprintALPNAndIdlePool(t *testing
 	}
 }
 
-func TestGenerateAnyTLSOnlyWhenReferencedByActiveMode(t *testing.T) {
+func TestGenerateAnyTLSOnlyWhenReferencedByActiveScenario(t *testing.T) {
 	profile := &Profile{
 		Lines: []Line{
 			{ID: "direct", Name: "Direct", Type: LineTypeDirect, Enabled: true},
@@ -330,12 +330,12 @@ func TestGenerateAnyTLSOnlyWhenReferencedByActiveMode(t *testing.T) {
 				AnyTLSPassword: "idle-secret",
 			},
 		},
-		Modes: []Mode{{
-			ID:            "mode",
-			Name:          "Mode",
+		Scenarios: []Scenario{{
+			ID:            "scenario",
+			Name:          "Scenario",
 			DefaultLineID: "active-anytls",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 
 	data, err := GenerateSingBox(profile, 0, "")
@@ -371,7 +371,7 @@ func TestBuildLineRuntimeCatalogIncludesTailscaleEndpointTag(t *testing.T) {
 
 func TestGenerateWithManualRuleSet(t *testing.T) {
 	p := testProfile()
-	p.ActiveModeID = "overseas"
+	p.ActiveScenarioID = "overseas"
 
 	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 	if err != nil {
@@ -403,7 +403,7 @@ func TestGenerateWithManualRuleSet(t *testing.T) {
 	if rs, ok := cfg.Route["rule_set"]; ok {
 		sets := rs.([]interface{})
 		if len(sets) > 0 {
-			t.Errorf("overseas mode should not have rule_sets, got %d", len(sets))
+			t.Errorf("overseas scenario should not have rule_sets, got %d", len(sets))
 		}
 	}
 
@@ -412,7 +412,7 @@ func TestGenerateWithManualRuleSet(t *testing.T) {
 
 func TestGenerateWithURLRuleSet_SRS(t *testing.T) {
 	p := testProfile()
-	p.ActiveModeID = "domestic"
+	p.ActiveScenarioID = "domestic"
 
 	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 	if err != nil {
@@ -426,7 +426,7 @@ func TestGenerateWithURLRuleSet_SRS(t *testing.T) {
 
 	rs, ok := cfg.Route["rule_set"].([]interface{})
 	if !ok || len(rs) == 0 {
-		t.Fatal("domestic mode should have rule_sets")
+		t.Fatal("domestic scenario should have rule_sets")
 	}
 
 	gfwSet := rs[0].(map[string]interface{})
@@ -442,14 +442,14 @@ func TestGenerateWithURLRuleSet_SRS(t *testing.T) {
 
 func TestGenerateWithURLRuleSet_JSON(t *testing.T) {
 	p := testProfile()
-	p.Modes = append(p.Modes, Mode{
+	p.Scenarios = append(p.Scenarios, Scenario{
 		ID: "with-cnip", Name: "含国内IP",
 		Bindings: []RuleBinding{
 			{RuleSetID: "cnip", LineID: "direct"},
 		},
 		DefaultLineID: "vpn",
 	})
-	p.ActiveModeID = "with-cnip"
+	p.ActiveScenarioID = "with-cnip"
 
 	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 	if err != nil {
@@ -470,7 +470,7 @@ func TestGenerateWithURLRuleSet_JSON(t *testing.T) {
 
 func TestGenerateMultipleRuleSets(t *testing.T) {
 	p := testProfile()
-	p.ActiveModeID = "domestic-ss"
+	p.ActiveScenarioID = "domestic-ss"
 
 	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 	if err != nil {
@@ -501,7 +501,7 @@ func TestGenerateMultipleRuleSets(t *testing.T) {
 
 func TestGenerateOmitsUnusedEnabledOutbounds(t *testing.T) {
 	p := testProfile()
-	p.ActiveModeID = "overseas"
+	p.ActiveScenarioID = "overseas"
 	p.Lines = append(p.Lines, Line{
 		ID: "unused-vmess", Name: "Unused", Type: LineTypeVMess, Enabled: true,
 		VMessServer: "unused.example.com", VMessPort: 443, VMessUUID: "not-a-valid-uuid",
@@ -532,7 +532,7 @@ func TestGenerateUsesConfiguredConnectivityProbeRules(t *testing.T) {
 		connectivityAnyConnectID = "xdial-connectivity-anyconnect"
 	)
 	p := testProfile()
-	p.ActiveModeID = "overseas"
+	p.ActiveScenarioID = "overseas"
 	p.RuleSets = append(p.RuleSets,
 		RuleSet{ID: connectivityDirectID, Name: "Direct probe", Type: RuleSetTypeManual, Enabled: true,
 			CIDRs: []string{"1.0.0.1/32"}},
@@ -547,13 +547,13 @@ func TestGenerateUsesConfiguredConnectivityProbeRules(t *testing.T) {
 		}},
 		Rules: []SubscriptionRule{{Type: "IP-CIDR", Value: "1.0.0.0/8", Group: "DIRECT"}},
 	}}
-	for index := range p.Modes {
-		if p.Modes[index].ID == p.ActiveModeID {
-			p.Modes[index].Bindings = append([]RuleBinding{
+	for index := range p.Scenarios {
+		if p.Scenarios[index].ID == p.ActiveScenarioID {
+			p.Scenarios[index].Bindings = append([]RuleBinding{
 				{RuleSetID: connectivityDirectID, LineID: "direct"},
 				{RuleSetID: connectivityAnyConnectID, LineID: "vpn"},
 				{RuleSetID: "gfw", SubscriptionID: "probe-priority-sub"},
-			}, p.Modes[index].Bindings...)
+			}, p.Scenarios[index].Bindings...)
 		}
 	}
 
@@ -613,7 +613,7 @@ func TestGenerateDoesNotHideConnectivityProbeRoutes(t *testing.T) {
 
 func TestGenerateNECapturesIPv6AndHijacksDNSIntoMobileDispatcher(t *testing.T) {
 	p := testProfile()
-	p.ActiveModeID = "overseas"
+	p.ActiveScenarioID = "overseas"
 
 	data, err := GenerateSingBoxFor(p, 10800, "", PlatformNE, "/tmp")
 	if err != nil {
@@ -703,8 +703,8 @@ func TestSubscriptionGroupOmitsUnavailableNestedMember(t *testing.T) {
 			},
 			Rules: []SubscriptionRule{{Type: "FINAL", Group: "Outer"}},
 		}},
-		Modes:        []Mode{{ID: "mode", Name: "Mode", DefaultSubscriptionID: "sub"}},
-		ActiveModeID: "mode",
+		Scenarios:        []Scenario{{ID: "scenario", Name: "Scenario", DefaultSubscriptionID: "sub"}},
+		ActiveScenarioID: "scenario",
 	}
 
 	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, "/tmp")
@@ -744,8 +744,8 @@ func TestSubscriptionSelectorUsesPersistedSelection(t *testing.T) {
 				Name: "Choice", Type: "select", Proxies: []string{"One", "Two"}, Selected: "Two",
 			}},
 		}},
-		Modes:        []Mode{{ID: "mode", Name: "Mode", DefaultSubscriptionID: "sub"}},
-		ActiveModeID: "mode",
+		Scenarios:        []Scenario{{ID: "scenario", Name: "Scenario", DefaultSubscriptionID: "sub"}},
+		ActiveScenarioID: "scenario",
 	}
 
 	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, "/tmp")
@@ -779,8 +779,8 @@ func TestDefaultSubscriptionSelectorUsesPersistedSelection(t *testing.T) {
 					SSServer: "two.example.com", SSPort: 8388, SSMethod: "aes-256-gcm", SSPass: "secret"},
 			},
 		}},
-		Modes:        []Mode{{ID: "mode", Name: "Mode", DefaultSubscriptionID: "sub"}},
-		ActiveModeID: "mode",
+		Scenarios:        []Scenario{{ID: "scenario", Name: "Scenario", DefaultSubscriptionID: "sub"}},
+		ActiveScenarioID: "scenario",
 	}
 
 	data, err := GenerateSingBoxFor(profile, 0, "", PlatformNE, "/tmp")
@@ -882,7 +882,7 @@ func TestSubscriptionGeoIPLANUsesPrivateMatcherWithoutRemoteResource(t *testing.
 
 func TestGenerateDefaultLine(t *testing.T) {
 	p := testProfile()
-	p.ActiveModeID = "overseas"
+	p.ActiveScenarioID = "overseas"
 
 	data, err := GenerateSingBox(p, 10800, "")
 	if err != nil {
@@ -920,7 +920,7 @@ func TestVPNServerExcluded(t *testing.T) {
 
 func TestGenerateNEMode(t *testing.T) {
 	p := testProfile()
-	p.ActiveModeID = "overseas"
+	p.ActiveScenarioID = "overseas"
 
 	data, err := GenerateSingBoxFor(p, 10800, "1.2.3.4", PlatformNE, "/var/mobile/Containers/Data/sandbox")
 	if err != nil {
@@ -971,7 +971,7 @@ func TestGenerateNEMode(t *testing.T) {
 
 func TestGenerateMacOSModeUnchanged(t *testing.T) {
 	p := testProfile()
-	p.ActiveModeID = "overseas"
+	p.ActiveScenarioID = "overseas"
 
 	// 旧签名(macOS 模式包装)与显式 PlatformMacOS 应产出完全一致的配置；
 	// 显式路径传入同一份系统 Underlay 快照，且 basePath 在 macOS 模式下被忽略。
@@ -1026,9 +1026,9 @@ func TestGenerateDesktopTailscaleEndpoint(t *testing.T) {
 				TailscaleAuthKey:  "must-not-be-persisted",
 			},
 		},
-		Modes:        []Mode{{ID: "tailnet", Name: "Tailnet", DefaultLineID: "ts"}},
-		ActiveModeID: "tailnet",
-		Tailscale:    TailscaleIdentity{Hostname: "xdial-desktop"},
+		Scenarios:        []Scenario{{ID: "tailnet", Name: "Tailnet", DefaultLineID: "ts"}},
+		ActiveScenarioID: "tailnet",
+		Tailscale:        TailscaleIdentity{Hostname: "xdial-desktop"},
 	}
 
 	data, err := GenerateSingBoxDesktop(p, 0, "", basePath, nil, "en0")
@@ -1084,12 +1084,12 @@ func TestGenerateNETailscaleEndpoint(t *testing.T) {
 				TailscaleExitNode: "exit-node", TailscaleMagicDNS: true,
 			},
 		},
-		// MagicDNS 只对被 active Mode 引用且显式勾选的线路生成（INV1c）。
-		Modes: []Mode{{
+		// MagicDNS 只对被 active Scenario 引用且显式勾选的线路生成（INV1c）。
+		Scenarios: []Scenario{{
 			ID: "tailnet", Name: "Tailnet", DefaultLineID: "mobile-tailnet",
 		}},
-		ActiveModeID: "tailnet",
-		Tailscale:    TailscaleIdentity{Hostname: "xdial-mobile"},
+		ActiveScenarioID: "tailnet",
+		Tailscale:        TailscaleIdentity{Hostname: "xdial-mobile"},
 	}
 
 	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, basePath)
@@ -1184,8 +1184,8 @@ func TestTailscaleMagicDNSOnUnreferencedLineHasNoSideEffects(t *testing.T) {
 			{ID: "direct", Type: LineTypeDirect, Enabled: true},
 			{ID: "tailnet", Type: LineTypeTailscale, Enabled: true, TailscaleMagicDNS: true},
 		},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
-		ActiveModeID: "mode",
+		Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "direct"}},
+		ActiveScenarioID: "scenario",
 	}
 	data, err := GenerateSingBoxFor(profile, 0, "", PlatformNE, t.TempDir())
 	if err != nil {
@@ -1203,10 +1203,10 @@ func TestTailscaleLineWithoutMagicDNSToggleHasNoMagicDNSSideEffects(t *testing.T
 			{ID: "direct", Type: LineTypeDirect, Enabled: true},
 			{ID: "tailnet", Type: LineTypeTailscale, Enabled: true},
 		},
-		Modes: []Mode{{
-			ID: "mode", DefaultLineID: "tailnet",
+		Scenarios: []Scenario{{
+			ID: "scenario", DefaultLineID: "tailnet",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 
 	data, err := GenerateSingBoxFor(profile, 0, "", PlatformNE, t.TempDir())
@@ -1267,11 +1267,11 @@ func TestGenerateNERejectsMultipleActiveTailscaleLines(t *testing.T) {
 			ID: "tail-b-rules", Type: RuleSetTypeManual, Enabled: true,
 			Domains: []string{"tail-b.example"},
 		}},
-		Modes: []Mode{{
-			ID: "mode", DefaultLineID: "tail-a",
+		Scenarios: []Scenario{{
+			ID: "scenario", DefaultLineID: "tail-a",
 			Bindings: []RuleBinding{{RuleSetID: "tail-b-rules", LineID: "tail-b"}},
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 
 	if _, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir()); err == nil ||
@@ -1288,9 +1288,9 @@ func TestGenerateNERejectsMultipleActiveTailscaleLines(t *testing.T) {
 
 func TestGenerateNEWithoutTailscaleStillUsesMobileDNSDispatcher(t *testing.T) {
 	p := &Profile{
-		Lines:        []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
-		ActiveModeID: "mode",
+		Lines:            []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "direct"}},
+		ActiveScenarioID: "scenario",
 	}
 	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir())
 	if err != nil {
@@ -1317,8 +1317,8 @@ func TestGenerateNETailscaleRejectsRelativeStatePath(t *testing.T) {
 			{ID: "direct", Type: LineTypeDirect, Enabled: true},
 			{ID: "ts", Type: LineTypeTailscale, Enabled: true},
 		},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "ts"}},
-		ActiveModeID: "mode",
+		Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "ts"}},
+		ActiveScenarioID: "scenario",
 	}
 
 	_, err := GenerateSingBoxFor(p, 0, "", PlatformNE, "relative")
@@ -1327,9 +1327,9 @@ func TestGenerateNETailscaleRejectsRelativeStatePath(t *testing.T) {
 	}
 }
 
-// MagicDNS 的动态归属排在 Mode 显式绑定之后：两者域名重叠时，
+// MagicDNS 的动态归属排在 Scenario 显式绑定之后：两者域名重叠时，
 // 用户的 CDN / 企业线路决定必须获胜。peer 范围只来自 NetMap，不硬编码 CIDR。
-func TestNETailscaleMagicDNSPreservesExplicitModePriority(t *testing.T) {
+func TestNETailscaleMagicDNSPreservesExplicitScenarioPriority(t *testing.T) {
 	p := &Profile{
 		Lines: []Line{
 			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
@@ -1340,7 +1340,7 @@ func TestNETailscaleMagicDNSPreservesExplicitModePriority(t *testing.T) {
 			{ID: "cdn", Name: "CDN", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"cdn.example.com"}},
 			{ID: "peer", Name: "Peer", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"peer.example.ts.net"}},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "split", Name: "分流",
 			Bindings: []RuleBinding{
 				{RuleSetID: "cdn", LineID: "vpn"},
@@ -1348,7 +1348,7 @@ func TestNETailscaleMagicDNSPreservesExplicitModePriority(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "split",
+		ActiveScenarioID: "split",
 	}
 
 	data, err := GenerateSingBoxFor(p, 10800, "", PlatformNE, t.TempDir())
@@ -1386,9 +1386,9 @@ func TestNETailscaleMagicDNSPreservesExplicitModePriority(t *testing.T) {
 	if explicitIndex >= magicDNSIndex {
 		t.Fatalf("explicit CDN rule must precede MagicDNS ownership: %v", cfg.Route["rules"])
 	}
-	// final 归模式所有：默认直连不被 exit node 抢走。
+	// final 归场景所有：默认直连不被 exit node 抢走。
 	if cfg.Route["final"] != "direct" {
-		t.Fatalf("mode default outbound must remain direct, got %v", cfg.Route["final"])
+		t.Fatalf("scenario default outbound must remain direct, got %v", cfg.Route["final"])
 	}
 }
 
@@ -1397,7 +1397,7 @@ func TestNETailscaleMagicDNSPreservesExplicitModePriority(t *testing.T) {
 // NXDOMAIN（2026-07-26 实测），解析不出来内网就"不通"。
 func TestGenerateDesktopRoutesEnterpriseDomainsToVPNDNS(t *testing.T) {
 	p := testProfile()
-	p.ActiveModeID = "overseas" // internal → vpn
+	p.ActiveScenarioID = "overseas" // internal → vpn
 
 	data, err := GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10", "10.8.0.11"}, "en0")
 	if err != nil {
@@ -1475,7 +1475,7 @@ func splitProfileWithProxy() *Profile {
 			{ID: "oversea", Name: "手动出海", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"example.org"}},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "split", Name: "分流",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
@@ -1484,7 +1484,7 @@ func splitProfileWithProxy() *Profile {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "split",
+		ActiveScenarioID: "split",
 	}
 }
 
@@ -1540,7 +1540,7 @@ func TestGenerateDesktopResolvesProxyBoundDomainsThroughTheLine(t *testing.T) {
 // direct 不算承载线路：它本就要本地视角。绑到 vpn 的手动规则集归 enterprise-dns。
 func TestGenerateDesktopKeepsDirectBoundRuleSetsOnPublicDNS(t *testing.T) {
 	p := splitProfileWithProxy()
-	p.Modes[0].Bindings = []RuleBinding{
+	p.Scenarios[0].Bindings = []RuleBinding{
 		{RuleSetID: "internal", LineID: "vpn"},
 		{RuleSetID: "gfw", LineID: "direct"},
 		{RuleSetID: "oversea", LineID: "direct"},
@@ -1555,12 +1555,12 @@ func TestGenerateDesktopKeepsDirectBoundRuleSetsOnPublicDNS(t *testing.T) {
 	}
 }
 
-// 预设模式"国内"就是这个组合：gfwlist（URL 规则集）绑 AnyConnect 线路。
+// 预设场景"国内"就是这个组合：gfwlist（URL 规则集）绑 AnyConnect 线路。
 // 它既不是内网名（enterprise-dns 只收手动规则集），又曾被当作"vpn 不是代理线路"
 // 跳过，于是落到 final 的境内解析器上被污染 —— 分流白做。
 func TestGenerateDesktopResolvesVPNBoundURLRuleSetThroughTheTunnel(t *testing.T) {
 	p := splitProfileWithProxy()
-	p.Modes[0].Bindings = []RuleBinding{
+	p.Scenarios[0].Bindings = []RuleBinding{
 		{RuleSetID: "internal", LineID: "vpn"},
 		{RuleSetID: "gfw", LineID: "vpn"},
 	}
@@ -1626,11 +1626,10 @@ func TestGenerateDesktopTUNCapturesIPv6(t *testing.T) {
 	}
 }
 
-// 规则集要从它自己所描述的路径上下载，硬编码 direct 就是从被墙链路取 gfwlist；
-// 首次下载失败是硬失败（sing-box router 启动即 FATAL），不是降级。
-func TestGenerateRuleSetDownloadDetourFollowsBinding(t *testing.T) {
+// RuleSet 获取线路不再从流量 binding 推断；未选择时默认直连。
+func TestGenerateRuleSetDownloadDetourDefaultsToDirect(t *testing.T) {
 	p := testProfile()
-	p.ActiveModeID = "domestic-ss"
+	p.ActiveScenarioID = "domestic-ss"
 
 	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 	if err != nil {
@@ -1645,8 +1644,30 @@ func TestGenerateRuleSetDownloadDetourFollowsBinding(t *testing.T) {
 		t.Fatalf("expected the gfw rule set only, got %v", sets)
 	}
 	set := sets[0].(map[string]interface{})
-	if set["tag"] != "ruleset-gfw" || set["download_detour"] != "proxy-ss" {
-		t.Fatalf("rule set must download through its bound line: %v", set)
+	if set["tag"] != "ruleset-gfw" || set["download_detour"] != "direct" {
+		t.Fatalf("rule set must default to direct acquisition: %v", set)
+	}
+}
+
+func TestGenerateRuleSetDownloadDetourFollowsExplicitUpdateLine(t *testing.T) {
+	p := splitProfileWithProxy()
+	p.Scenarios[0].Bindings = []RuleBinding{{
+		RuleSetID: "gfw",
+		LineID:    "px",
+	}}
+	p.RuleSets[1].FetchLineID = "px"
+
+	data, err := GenerateSingBox(p, 10800, "1.2.3.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	set := cfg.Route["rule_set"].([]interface{})[0].(map[string]interface{})
+	if set["download_detour"] != "proxy-px" {
+		t.Fatalf("explicit update Line was ignored: %v", set)
 	}
 }
 
@@ -1661,7 +1682,7 @@ func TestGenerateRuleSetDownloadDetourFallsBackToDirect(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := splitProfileWithProxy()
-			p.Modes[0].Bindings = []RuleBinding{{RuleSetID: "gfw", LineID: tc.lineID}}
+			p.Scenarios[0].Bindings = []RuleBinding{{RuleSetID: "gfw", LineID: tc.lineID}}
 
 			data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 			if err != nil {
@@ -1685,8 +1706,8 @@ func TestGenerateNETailscaleExitNodeAsDefault(t *testing.T) {
 			{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true},
 			{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true, TailscaleExitNode: "exit-node"},
 		},
-		Modes:        []Mode{{ID: "exit", Name: "Exit", DefaultLineID: "ts"}},
-		ActiveModeID: "exit",
+		Scenarios:        []Scenario{{ID: "exit", Name: "Exit", DefaultLineID: "ts"}},
+		ActiveScenarioID: "exit",
 	}
 
 	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir())
@@ -1718,11 +1739,11 @@ func TestGenerateNERejectsMultipleActiveAnyConnectLines(t *testing.T) {
 		RuleSets: []RuleSet{
 			{ID: "internal", Type: RuleSetTypeManual, Enabled: true, Domains: []string{"corp.example.com"}},
 		},
-		Modes: []Mode{{
-			ID: "mode", DefaultLineID: "vpn-a",
+		Scenarios: []Scenario{{
+			ID: "scenario", DefaultLineID: "vpn-a",
 			Bindings: []RuleBinding{{RuleSetID: "internal", LineID: "vpn-b"}},
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 
 	for _, platform := range []Platform{PlatformNE, PlatformMacOS} {
@@ -1732,7 +1753,7 @@ func TestGenerateNERejectsMultipleActiveAnyConnectLines(t *testing.T) {
 			}
 			return GenerateSingBoxFor(profile, 0, "", platform, t.TempDir())
 		}
-		profile.Modes[0].Bindings[0].LineID = "vpn-b"
+		profile.Scenarios[0].Bindings[0].LineID = "vpn-b"
 		profile.RuleSets[0].Enabled = true
 
 		if _, err := generate(); err == nil ||
@@ -1740,12 +1761,12 @@ func TestGenerateNERejectsMultipleActiveAnyConnectLines(t *testing.T) {
 			t.Fatalf("platform %v: expected multiple-AnyConnect error, got %v", platform, err)
 		}
 
-		profile.Modes[0].Bindings[0].LineID = "vpn-a"
+		profile.Scenarios[0].Bindings[0].LineID = "vpn-a"
 		if _, err := generate(); err != nil {
 			t.Fatalf("platform %v: same AnyConnect line referenced twice should be allowed: %v", platform, err)
 		}
 
-		profile.Modes[0].Bindings[0].LineID = "vpn-b"
+		profile.Scenarios[0].Bindings[0].LineID = "vpn-b"
 		profile.RuleSets[0].Enabled = false
 		if _, err := generate(); err != nil {
 			t.Fatalf("platform %v: disabled rule must not create an AnyConnect conflict: %v", platform, err)
@@ -1761,8 +1782,8 @@ func TestGenerateNERejectsMultipleActiveAnyConnectLines(t *testing.T) {
 	}
 }
 
-// 模式的普通规则必须排在订阅自带规则之前：Mode 是唯一裁决者，订阅只是供给源。
-func TestGenerateModeRulesPrecedeSubscriptionSuppliedRules(t *testing.T) {
+// 场景的普通规则必须排在订阅自带规则之前：Scenario 是唯一裁决者，订阅只是供给源。
+func TestGenerateScenarioRulesPrecedeSubscriptionSuppliedRules(t *testing.T) {
 	p := &Profile{
 		Lines: []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
 		RuleSets: []RuleSet{{
@@ -1778,12 +1799,12 @@ func TestGenerateModeRulesPrecedeSubscriptionSuppliedRules(t *testing.T) {
 			// 订阅自带的宽匹配：不加约束就会把 mine.example.com 一起吃掉。
 			Rules: []SubscriptionRule{{Type: "DOMAIN-SUFFIX", Value: "example.com", Group: "DIRECT"}},
 		}},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "m", Name: "M",
 			Bindings:      []RuleBinding{{RuleSetID: "mine", SubscriptionID: "sub"}},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "m",
+		ActiveScenarioID: "m",
 	}
 
 	data, err := GenerateSingBox(p, 10800, "")
@@ -1795,7 +1816,7 @@ func TestGenerateModeRulesPrecedeSubscriptionSuppliedRules(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	modeIdx, subIdx := -1, -1
+	scenarioIdx, subIdx := -1, -1
 	for index, raw := range cfg.Route["rules"].([]interface{}) {
 		rule := raw.(map[string]interface{})
 		domains, ok := rule["domain_suffix"].([]interface{})
@@ -1804,16 +1825,16 @@ func TestGenerateModeRulesPrecedeSubscriptionSuppliedRules(t *testing.T) {
 		}
 		switch domains[0] {
 		case "mine.example.com":
-			modeIdx = index
+			scenarioIdx = index
 		case "example.com":
 			subIdx = index
 		}
 	}
-	if modeIdx < 0 || subIdx < 0 {
-		t.Fatalf("rules missing: modeIdx=%d subIdx=%d", modeIdx, subIdx)
+	if scenarioIdx < 0 || subIdx < 0 {
+		t.Fatalf("rules missing: scenarioIdx=%d subIdx=%d", scenarioIdx, subIdx)
 	}
-	if modeIdx > subIdx {
-		t.Fatalf("mode rule (idx=%d) must precede subscription rule (idx=%d)", modeIdx, subIdx)
+	if scenarioIdx > subIdx {
+		t.Fatalf("scenario rule (idx=%d) must precede subscription rule (idx=%d)", scenarioIdx, subIdx)
 	}
 }
 
@@ -1830,23 +1851,23 @@ func TestGenerateRejectsDanglingReferences(t *testing.T) {
 				ID: "rs", Name: "RS", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"a.example.com"},
 			}},
-			Modes: []Mode{{
+			Scenarios: []Scenario{{
 				ID: "m", Name: "M",
 				Bindings:      []RuleBinding{{RuleSetID: "rs", LineID: "px"}},
 				DefaultLineID: "direct",
 			}},
-			ActiveModeID: "m",
+			ActiveScenarioID: "m",
 		}
 	}
 
 	cases := map[string]func(*Profile){
-		"missing rule set":       func(p *Profile) { p.Modes[0].Bindings[0].RuleSetID = "ghost-rs" },
-		"missing line":           func(p *Profile) { p.Modes[0].Bindings[0].LineID = "ghost-line" },
-		"missing subscription":   func(p *Profile) { p.Modes[0].Bindings[0].SubscriptionID = "ghost-sub" },
-		"missing default line":   func(p *Profile) { p.Modes[0].DefaultLineID = "ghost-default" },
-		"missing default sub":    func(p *Profile) { p.Modes[0].DefaultSubscriptionID = "ghost-default-sub" },
-		"binding without target": func(p *Profile) { p.Modes[0].Bindings[0].LineID = "" },
-		"binding without rule":   func(p *Profile) { p.Modes[0].Bindings[0].RuleSetID = "" },
+		"missing rule set":       func(p *Profile) { p.Scenarios[0].Bindings[0].RuleSetID = "ghost-rs" },
+		"missing line":           func(p *Profile) { p.Scenarios[0].Bindings[0].LineID = "ghost-line" },
+		"missing subscription":   func(p *Profile) { p.Scenarios[0].Bindings[0].SubscriptionID = "ghost-sub" },
+		"missing default line":   func(p *Profile) { p.Scenarios[0].DefaultLineID = "ghost-default" },
+		"missing default sub":    func(p *Profile) { p.Scenarios[0].DefaultSubscriptionID = "ghost-default-sub" },
+		"binding without target": func(p *Profile) { p.Scenarios[0].Bindings[0].LineID = "" },
+		"binding without rule":   func(p *Profile) { p.Scenarios[0].Bindings[0].RuleSetID = "" },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1865,7 +1886,7 @@ func TestGenerateRejectsDanglingReferences(t *testing.T) {
 	// 否则用户哪天一勾选就变成静默错路由。
 	p := base()
 	p.RuleSets[0].Enabled = false
-	p.Modes[0].Bindings[0].LineID = "ghost-line"
+	p.Scenarios[0].Bindings[0].LineID = "ghost-line"
 	if _, err := GenerateSingBox(p, 0, ""); err == nil {
 		t.Fatal("dangling line under a disabled rule set must still be rejected")
 	}
@@ -1873,7 +1894,7 @@ func TestGenerateRejectsDanglingReferences(t *testing.T) {
 	// "direct" 是保留 ID：即使 profile 里没有显式直连线路也不算悬空。
 	p = base()
 	p.Lines = p.Lines[1:]
-	p.Modes[0].Bindings[0].LineID = "direct"
+	p.Scenarios[0].Bindings[0].LineID = "direct"
 	if _, err := GenerateSingBox(p, 0, ""); err != nil {
 		t.Fatalf("builtin direct reference must be accepted: %v", err)
 	}
@@ -1898,7 +1919,7 @@ func TestDisabledReferencesWarnAndDoNotFallBackToDirect(t *testing.T) {
 			{ID: "rs-b", Name: "B", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"b.example.com"}},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "m", Name: "M",
 			Bindings: []RuleBinding{
 				{RuleSetID: "rs-off", LineID: "direct"},
@@ -1907,7 +1928,7 @@ func TestDisabledReferencesWarnAndDoNotFallBackToDirect(t *testing.T) {
 			},
 			DefaultLineID: "off-px",
 		}},
-		ActiveModeID: "m",
+		ActiveScenarioID: "m",
 	}
 
 	warnings, err := CollectProfileWarnings(p)
@@ -1920,8 +1941,8 @@ func TestDisabledReferencesWarnAndDoNotFallBackToDirect(t *testing.T) {
 		if w.Message == "" {
 			t.Fatalf("warning %+v has no message", w)
 		}
-		if w.ModeID != "m" {
-			t.Fatalf("warning %+v should carry the mode id", w)
+		if w.ScenarioID != "m" {
+			t.Fatalf("warning %+v should carry the scenario id", w)
 		}
 	}
 	if got[WarningDisabledRuleSet] != 1 {
@@ -1960,7 +1981,7 @@ func TestDisabledReferencesWarnAndDoNotFallBackToDirect(t *testing.T) {
 	}
 }
 
-// active Mode 直接引用的 enabled Line 若生成不出 outbound，规划和生成都必须
+// active Scenario 直接引用的 enabled Line 若生成不出 outbound，规划和生成都必须
 // fail-closed。它不是显式禁用，不能 warning 后让绑定或默认出口落到 direct。
 func TestActiveEnabledUnavailableLineFailsClosed(t *testing.T) {
 	lines := []Line{
@@ -2000,17 +2021,17 @@ func TestActiveEnabledUnavailableLineFailsClosed(t *testing.T) {
 						Enabled: true,
 						Domains: []string{"a.example.com"},
 					}},
-					Modes: []Mode{{
+					Scenarios: []Scenario{{
 						ID:            "m",
 						Name:          "M",
 						DefaultLineID: "direct",
 					}},
-					ActiveModeID: "m",
+					ActiveScenarioID: "m",
 				}
 				if useAsDefault {
-					profile.Modes[0].DefaultLineID = line.ID
+					profile.Scenarios[0].DefaultLineID = line.ID
 				} else {
-					profile.Modes[0].Bindings = []RuleBinding{{
+					profile.Scenarios[0].Bindings = []RuleBinding{{
 						RuleSetID: "rs",
 						LineID:    line.ID,
 					}}
@@ -2030,7 +2051,7 @@ func TestActiveEnabledUnavailableLineFailsClosed(t *testing.T) {
 	}
 }
 
-func TestUnavailableLineOutsideEffectiveModeDoesNotFail(t *testing.T) {
+func TestUnavailableLineOutsideEffectiveScenarioDoesNotFail(t *testing.T) {
 	profile := &Profile{
 		Lines: []Line{
 			{ID: "direct", Type: LineTypeDirect, Enabled: true},
@@ -2051,7 +2072,7 @@ func TestUnavailableLineOutsideEffectiveModeDoesNotFail(t *testing.T) {
 				Domains: []string{"enabled.example.com"},
 			},
 		},
-		Modes: []Mode{{
+		Scenarios: []Scenario{{
 			ID: "m",
 			Bindings: []RuleBinding{
 				{RuleSetID: "disabled-rule", LineID: "unused"},
@@ -2059,7 +2080,7 @@ func TestUnavailableLineOutsideEffectiveModeDoesNotFail(t *testing.T) {
 			},
 			DefaultLineID: "direct",
 		}},
-		ActiveModeID: "m",
+		ActiveScenarioID: "m",
 	}
 
 	warnings, err := CollectProfileWarnings(profile)
@@ -2076,14 +2097,14 @@ func TestUnavailableLineOutsideEffectiveModeDoesNotFail(t *testing.T) {
 		}
 	}
 	if _, err := GenerateSingBox(profile, 0, ""); err != nil {
-		t.Fatalf("unavailable Line outside the effective Mode must have no data-plane effect: %v", err)
+		t.Fatalf("unavailable Line outside the effective Scenario must have no data-plane effect: %v", err)
 	}
 	if _, err := BuildConnectionPlan(profile); err != nil {
-		t.Fatalf("unavailable Line outside the effective Mode must not enter the plan: %v", err)
+		t.Fatalf("unavailable Line outside the effective Scenario must not enter the plan: %v", err)
 	}
 }
 
-// active Mode 直接引用的 enabled Subscription 若没有任何节点能生成 outbound，
+// active Scenario 直接引用的 enabled Subscription 若没有任何节点能生成 outbound，
 // 必须和独立 Line 一样在校验、规划、生成三层都 fail-closed。
 func TestActiveEnabledUnavailableSubscriptionFailsClosed(t *testing.T) {
 	subscriptions := []Subscription{
@@ -2129,19 +2150,19 @@ func TestActiveEnabledUnavailableSubscriptionFailsClosed(t *testing.T) {
 						Domains: []string{"a.example.com"},
 					}},
 					Subscriptions: []Subscription{subscription},
-					Modes: []Mode{{
+					Scenarios: []Scenario{{
 						ID:            "m",
 						Name:          "M",
 						DefaultLineID: "direct",
 					}},
-					ActiveModeID: "m",
+					ActiveScenarioID: "m",
 				}
 				if useAsDefault {
-					profile.Modes[0].DefaultLineID = ""
-					profile.Modes[0].DefaultSubscriptionID =
+					profile.Scenarios[0].DefaultLineID = ""
+					profile.Scenarios[0].DefaultSubscriptionID =
 						subscription.ID
 				} else {
-					profile.Modes[0].Bindings = []RuleBinding{{
+					profile.Scenarios[0].Bindings = []RuleBinding{{
 						RuleSetID:      "rs",
 						SubscriptionID: subscription.ID,
 					}}
@@ -2178,8 +2199,8 @@ func TestGenerateNETailscaleEndpointCarriesAuthKeyAndStaysPersistent(t *testing.
 			{ID: "ts", Name: "Tailnet", Type: LineTypeTailscale, Enabled: true,
 				TailscaleAuthKey: "tskey-auth-example"},
 		},
-		Modes:        []Mode{{ID: "m", Name: "M", DefaultLineID: "ts"}},
-		ActiveModeID: "m",
+		Scenarios:        []Scenario{{ID: "m", Name: "M", DefaultLineID: "ts"}},
+		ActiveScenarioID: "m",
 	}
 
 	data, err := GenerateSingBoxFor(p, 0, "", PlatformNE, t.TempDir())
@@ -2217,9 +2238,9 @@ func TestGenerateNETailscaleEndpointCarriesAuthKeyAndStaysPersistent(t *testing.
 
 func TestGenerateTransparentProxyUsesAuthenticatedLoopbackSOCKSWithSystemUnderlay(t *testing.T) {
 	p := &Profile{
-		Lines:        []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
-		ActiveModeID: "mode",
+		Lines:            []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "direct"}},
+		ActiveScenarioID: "scenario",
 	}
 	data, err := GenerateSingBoxTransparentProxy(
 		p,
@@ -2264,7 +2285,7 @@ func TestGenerateTransparentProxyUsesAuthenticatedLoopbackSOCKSWithSystemUnderla
 		rules[1].(map[string]interface{})["action"] != "hijack-dns" ||
 		rules[2].(map[string]interface{})["action"] != "resolve" ||
 		rules[2].(map[string]interface{})["server"] != transparentSystemDNSTag {
-		t.Fatalf("Transparent Proxy must not resolve globally before Mode rules: %v", rules)
+		t.Fatalf("Transparent Proxy must not resolve globally before Scenario rules: %v", rules)
 	}
 	if cfg.Route["default_domain_resolver"] != transparentSystemDNSTag ||
 		cfg.DNS["final"] != transparentSystemDNSTag {
@@ -2274,9 +2295,9 @@ func TestGenerateTransparentProxyUsesAuthenticatedLoopbackSOCKSWithSystemUnderla
 
 func TestGenerateTransparentProxyRejectsMissingSessionCredentials(t *testing.T) {
 	p := &Profile{
-		Lines:        []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
-		ActiveModeID: "mode",
+		Lines:            []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "direct"}},
+		ActiveScenarioID: "scenario",
 	}
 	if _, err := GenerateSingBoxTransparentProxy(
 		p,
@@ -2293,9 +2314,9 @@ func TestGenerateTransparentProxyRejectsMissingSessionCredentials(t *testing.T) 
 
 func TestGenerateTransparentProxyRejectsMissingSystemUnderlay(t *testing.T) {
 	p := &Profile{
-		Lines:        []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
-		Modes:        []Mode{{ID: "mode", DefaultLineID: "direct"}},
-		ActiveModeID: "mode",
+		Lines:            []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "direct"}},
+		ActiveScenarioID: "scenario",
 	}
 	if _, err := GenerateSingBoxTransparentProxy(
 		p,

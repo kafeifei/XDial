@@ -260,13 +260,24 @@ func newLoopbackFlowRuntime(t *testing.T) *Libbox {
 
 func newLoopbackFlowRuntimeWithConfig(t *testing.T, configJSON string) *Libbox {
 	t.Helper()
-	loopback, err := net.InterfaceByName("lo0")
+	interfaces, err := net.Interfaces()
 	if err != nil {
-		t.Fatalf("find loopback interface: %v", err)
+		t.Fatalf("list network interfaces: %v", err)
+	}
+	var loopback *net.Interface
+	for index := range interfaces {
+		candidate := &interfaces[index]
+		if candidate.Flags&net.FlagLoopback != 0 && candidate.Flags&net.FlagUp != 0 {
+			loopback = candidate
+			break
+		}
+	}
+	if loopback == nil {
+		t.Fatal("find active loopback interface: no matching interface")
 	}
 	runtime := New(nil)
 	runtime.SetDefaultInterface(loopback.Name, loopback.Index)
-	if err := runtime.SetNetworkInterfaces(`[{"name":"lo0","index":` +
+	if err := runtime.SetNetworkInterfaces(`[{"name":` + strconv.Quote(loopback.Name) + `,"index":` +
 		strconv.Itoa(loopback.Index) + `,"type":"other"}]`); err != nil {
 		t.Fatalf("set platform interfaces: %v", err)
 	}

@@ -34,6 +34,9 @@ enum ApplicationUninstaller {
                         forKey: "xdial.language"
                     )
                     xdialDefaults.removeObject(
+                        forKey: "xdial.appearance"
+                    )
+                    xdialDefaults.removeObject(
                         forKey: "xdial.launchAtLogin"
                     )
                     xdialDefaults.removeObject(

@@ -6,16 +6,17 @@ import (
 )
 
 // ConnectionPlan is the side-effect-free description of one connection attempt.
-// It is compiled from the active Mode and is the single checklist consumed by the
+// It is compiled from the active Scenario and is the single checklist consumed by the
 // Network Extension transaction, UI, diagnostics, and tests.
 type ConnectionPlan struct {
-	SchemaVersion int                  `json:"schema_version"`
-	Mode          ConnectionPlanMode   `json:"mode"`
-	Tasks         []ConnectionPlanTask `json:"tasks"`
-	Warnings      []ProfileWarning     `json:"warnings,omitempty"`
+	SchemaVersion            int                    `json:"schema_version"`
+	Scenario                 ConnectionPlanScenario `json:"scenario"`
+	ConfigurationFingerprint string                 `json:"configuration_fingerprint"`
+	Tasks                    []ConnectionPlanTask   `json:"tasks"`
+	Warnings                 []ProfileWarning       `json:"warnings,omitempty"`
 }
 
-type ConnectionPlanMode struct {
+type ConnectionPlanScenario struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
@@ -41,30 +42,31 @@ const (
 	ConnectionTaskIngress      = "ingress"
 )
 
-// BuildConnectionPlan compiles only the objects that can affect the active Mode.
+// BuildConnectionPlan compiles only the objects that can affect the active Scenario.
 // It must remain side-effect free: cache inspection and network preparation belong
 // to the platform transaction's Prepare phase.
 func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 	if profile == nil {
 		return nil, fmt.Errorf("profile is nil")
 	}
-	mode := profile.ActiveMode()
-	if mode == nil {
-		return nil, fmt.Errorf("no active mode")
+	scenario := profile.ActiveScenario()
+	if scenario == nil {
+		return nil, fmt.Errorf("no active scenario")
 	}
-	warnings, err := inspectModeReferences(profile, mode)
+	warnings, err := inspectScenarioReferences(profile, scenario)
 	if err != nil {
 		return nil, err
 	}
 
 	plan := &ConnectionPlan{
-		SchemaVersion: 1,
-		Mode: ConnectionPlanMode{
-			ID:   mode.ID,
-			Name: mode.Name,
+		SchemaVersion: 3,
+		Scenario: ConnectionPlanScenario{
+			ID:   scenario.ID,
+			Name: scenario.Name,
 		},
 		Warnings: warnings,
 	}
+	fingerprint := newRuntimeConfigurationBuilder(profile, scenario)
 	plan.Tasks = append(plan.Tasks, ConnectionPlanTask{
 		ID:          "underlay:system",
 		Kind:        ConnectionTaskUnderlay,
@@ -83,7 +85,7 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 		seen[task.ID] = true
 		plan.Tasks = append(plan.Tasks, task)
 	}
-	addRuleSet := func(ruleSet *RuleSet, targetTaskID, targetName string) {
+	addRuleSet := func(ruleSet *RuleSet, targetName string) {
 		if ruleSet == nil || !ruleSet.Enabled {
 			return
 		}
@@ -92,16 +94,10 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 		detail := "本地规则"
 		if ruleSet.Type == RuleSetTypeURL {
 			preparation = "cache-or-download"
-			detail = "远程规则；优先使用经校验缓存，必要时下载"
+			detail = "远程规则；经校验缓存立即启动，连接后更新"
 		}
 		if targetName != "" {
 			detail += " → " + targetName
-		}
-		dependencies := []string{"underlay:system"}
-		if targetTaskID != "" {
-			// The edge is represented in Detail for the UI. A RuleSet can be
-			// downloaded concurrently with its Line, so it does not depend on it.
-			_ = targetTaskID
 		}
 		add(ConnectionPlanTask{
 			ID:           taskID,
@@ -109,15 +105,16 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 			Name:         ruleSetLabel(ruleSet),
 			Detail:       detail,
 			Preparation:  preparation,
-			Dependencies: dependencies,
+			Dependencies: []string{"underlay:system"},
 			ResourceID:   ruleSet.ID,
 			ResourceType: string(ruleSet.Type),
 		})
 		ruleTaskIDs = appendUniqueString(ruleTaskIDs, taskID)
+		fingerprint.includeRuleSet(ruleSet)
 	}
-	addLine := func(line *Line) (string, string, bool) {
+	addLine := func(line *Line) (string, string, runtimeConfigurationTarget, bool) {
 		if line == nil || !line.Enabled || !lineHasUsableOutbound(line) {
-			return "", "", false
+			return "", "", runtimeConfigurationTarget{}, false
 		}
 		taskID := "line:" + line.ID
 		preparation := "start-with-data-plane"
@@ -148,9 +145,10 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 			ResourceType: string(line.Type),
 		})
 		targetTaskIDs = appendUniqueString(targetTaskIDs, taskID)
-		return taskID, lineLabel(line), true
+		fingerprint.includeLine(line)
+		return taskID, lineLabel(line), lineRuntimeConfigurationTarget(line), true
 	}
-	addDirect := func() (string, string) {
+	addDirect := func() (string, string, runtimeConfigurationTarget) {
 		line := profile.FindLine(builtinDirectLineID)
 		if line == nil {
 			line = &Line{
@@ -160,13 +158,13 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 				Enabled: true,
 			}
 		}
-		taskID, name, _ := addLine(line)
-		return taskID, name
+		taskID, name, _, _ := addLine(line)
+		return taskID, name, directRuntimeConfigurationTarget()
 	}
-	addSubscription := func(subscription *Subscription) (string, string, bool) {
+	addSubscription := func(subscription *Subscription) (string, string, runtimeConfigurationTarget, bool) {
 		if subscription == nil || !subscription.Enabled ||
 			!subscriptionHasUsableOutbound(subscription) {
-			return "", "", false
+			return "", "", runtimeConfigurationTarget{}, false
 		}
 		taskID := "subscription:" + subscription.ID
 		add(ConnectionPlanTask{
@@ -181,57 +179,63 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 		})
 		targetTaskIDs = appendUniqueString(targetTaskIDs, taskID)
 		addGeneratedSubscriptionRuleSets(plan, seen, subscription, &ruleTaskIDs)
-		return taskID, subscriptionLabel(subscription), true
+		fingerprint.includeSubscription(subscription)
+		return taskID, subscriptionLabel(subscription),
+			subscriptionRuntimeConfigurationTarget(subscription), true
 	}
-	resolveTarget := func(lineID, subscriptionID string) (string, string, bool) {
+	resolveTarget := func(lineID, subscriptionID string) (string, string, runtimeConfigurationTarget, bool) {
 		if subscriptionID != "" {
 			return addSubscription(profile.FindSubscription(subscriptionID))
 		}
 		if lineID == builtinDirectLineID {
-			taskID, name := addDirect()
-			return taskID, name, true
+			taskID, name, target := addDirect()
+			return taskID, name, target, true
 		}
 		return addLine(profile.FindLine(lineID))
 	}
 
-	for _, binding := range mode.Bindings {
+	for _, binding := range scenario.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
 		if ruleSet == nil || !ruleSet.Enabled {
 			continue
 		}
-		targetTaskID, targetName, effective := resolveTarget(
+		targetTaskID, targetName, target, effective := resolveTarget(
 			binding.LineID,
 			binding.SubscriptionID,
 		)
 		if !effective {
 			continue
 		}
-		addRuleSet(ruleSet, targetTaskID, targetName)
+		_ = targetTaskID
+		addRuleSet(ruleSet, targetName)
+		fingerprint.addBinding(ruleSet.ID, target)
 	}
 
-	if _, _, effective := resolveTarget(
-		mode.DefaultLineID,
-		mode.DefaultSubscriptionID,
-	); !effective {
-		addDirect()
+	_, _, defaultTarget, effective := resolveTarget(
+		scenario.DefaultLineID,
+		scenario.DefaultSubscriptionID,
+	)
+	if !effective {
+		_, _, defaultTarget = addDirect()
 	}
+	fingerprint.setDefaultTarget(defaultTarget)
 
 	dnsDependencies := appendUniqueStrings(
 		[]string{"underlay:system"},
 		append(ruleTaskIDs, targetTaskIDs...)...,
 	)
 	add(ConnectionPlanTask{
-		ID:           "dns:mode",
+		ID:           "dns:scenario",
 		Kind:         ConnectionTaskDNS,
 		Name:         "分域解析",
-		Detail:       "由当前 Mode 的规则与出口共同编译",
+		Detail:       "由当前场景的规则与出口共同编译",
 		Preparation:  "compile-and-start",
 		Dependencies: dnsDependencies,
-		ResourceID:   mode.ID,
+		ResourceID:   scenario.ID,
 	})
 
 	dataPlaneDependencies := appendUniqueStrings(
-		[]string{"underlay:system", "dns:mode"},
+		[]string{"underlay:system", "dns:scenario"},
 		targetTaskIDs...,
 	)
 	add(ConnectionPlanTask{
@@ -250,6 +254,10 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 		Preparation:  "commit",
 		Dependencies: []string{"data-plane:sing-box"},
 	})
+	plan.ConfigurationFingerprint, err = fingerprint.fingerprint()
+	if err != nil {
+		return nil, fmt.Errorf("fingerprint connection configuration: %w", err)
+	}
 	return plan, nil
 }
 

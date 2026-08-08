@@ -4,6 +4,8 @@ enum ProviderDiagnosticsCommand: String, Codable {
     case probeLineOutboundAddress = "probe-line-outbound-address"
     case routingProbeSnapshot = "routing-probe-snapshot"
     case beginRouteProbe = "begin-route-probe"
+    case applicationAttributionSnapshot = "application-attribution-snapshot"
+    case trafficSnapshot = "traffic-snapshot"
 }
 
 struct ProviderDiagnosticsRequest: Codable, Equatable {
@@ -51,6 +53,7 @@ struct ProviderDiagnosticsRequest: Codable, Equatable {
 struct ProviderRoutingProbeSnapshot: Codable, Equatable {
     let probeID: String
     let matchCount: Int
+    let candidateAddressCount: Int
     let outboundTagCounts: [String: Int]
     let lineIDCounts: [String: Int]
     let ruleSetTag: String?
@@ -58,6 +61,7 @@ struct ProviderRoutingProbeSnapshot: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case probeID = "probe_id"
         case matchCount = "match_count"
+        case candidateAddressCount = "candidate_address_count"
         case outboundTagCounts = "outbound_tag_counts"
         case lineIDCounts = "line_id_counts"
         case ruleSetTag = "rule_set_tag"
@@ -66,12 +70,14 @@ struct ProviderRoutingProbeSnapshot: Codable, Equatable {
     init(
         probeID: String,
         matchCount: Int,
+        candidateAddressCount: Int = 0,
         outboundTagCounts: [String: Int],
         lineIDCounts: [String: Int] = [:],
         ruleSetTag: String? = nil
     ) {
         self.probeID = probeID
         self.matchCount = matchCount
+        self.candidateAddressCount = candidateAddressCount
         self.outboundTagCounts = outboundTagCounts
         self.lineIDCounts = lineIDCounts
         self.ruleSetTag = ruleSetTag
@@ -81,6 +87,10 @@ struct ProviderRoutingProbeSnapshot: Codable, Equatable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         probeID = try values.decode(String.self, forKey: .probeID)
         matchCount = try values.decode(Int.self, forKey: .matchCount)
+        candidateAddressCount = try values.decodeIfPresent(
+            Int.self,
+            forKey: .candidateAddressCount
+        ) ?? 0
         outboundTagCounts = try values.decode(
             [String: Int].self,
             forKey: .outboundTagCounts
@@ -122,6 +132,7 @@ struct ProviderRoutingProbeSnapshot: Codable, Equatable {
         return ProviderRoutingProbeSnapshot(
             probeID: probeID,
             matchCount: max(0, matchCount),
+            candidateAddressCount: max(0, candidateAddressCount),
             outboundTagCounts: filteredTags,
             lineIDCounts: attributedLines,
             ruleSetTag: ruleSetTag.flatMap {
@@ -158,25 +169,78 @@ struct ProviderBegunRouteProbe: Codable, Equatable {
     }
 }
 
+/// 仅描述当前 Provider 事务内的应用归因结果，不包含目标域名、IP、路径或凭据。
+struct ProviderApplicationAttributionSnapshot: Codable, Equatable {
+    let activeSelectorKindCounts: [String: Int]
+    let matchedFlowCount: Int
+    let matchedSelectorKindCounts: [String: Int]
+    let matchedRuleSetIDCounts: [String: Int]
+    let matchedLineIDCounts: [String: Int]
+    let matchedSubscriptionIDCounts: [String: Int]
+    let baseFlowCount: Int
+    let baseMissingSourceIdentityCount: Int
+    let rejectedFlowCount: Int
+    let rejectedUnresolvedAuditTokenCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case activeSelectorKindCounts = "active_selector_kind_counts"
+        case matchedFlowCount = "matched_flow_count"
+        case matchedSelectorKindCounts = "matched_selector_kind_counts"
+        case matchedRuleSetIDCounts = "matched_rule_set_id_counts"
+        case matchedLineIDCounts = "matched_line_id_counts"
+        case matchedSubscriptionIDCounts = "matched_subscription_id_counts"
+        case baseFlowCount = "base_flow_count"
+        case baseMissingSourceIdentityCount =
+            "base_missing_source_identity_count"
+        case rejectedFlowCount = "rejected_flow_count"
+        case rejectedUnresolvedAuditTokenCount =
+            "rejected_unresolved_audit_token_count"
+    }
+}
+
+/// 当前已提交 Provider 事务转发给应用层的净荷字节累计值。
+///
+/// 这里只统计 Transparent Proxy relay 实际完成转发的 TCP/UDP payload；不把
+/// Underlay 接口、SOCKS framing 或其他进程流量混进来。
+struct ProviderTrafficSnapshot: Codable, Equatable {
+    let downloadBytes: UInt64
+    let uploadBytes: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case downloadBytes = "download_bytes"
+        case uploadBytes = "upload_bytes"
+    }
+}
+
 struct ProviderDiagnosticsData: Codable, Equatable {
     let routingProbe: ProviderRoutingProbeSnapshot?
     let lineOutboundAddress: ProviderLineOutboundAddress?
     let begunRouteProbe: ProviderBegunRouteProbe?
+    let applicationAttribution:
+        ProviderApplicationAttributionSnapshot?
+    let traffic: ProviderTrafficSnapshot?
 
     enum CodingKeys: String, CodingKey {
         case routingProbe = "routing_probe"
         case lineOutboundAddress = "line_outbound_address"
         case begunRouteProbe = "begun_route_probe"
+        case applicationAttribution = "application_attribution"
+        case traffic
     }
 
     init(
         routingProbe: ProviderRoutingProbeSnapshot? = nil,
         lineOutboundAddress: ProviderLineOutboundAddress? = nil,
-        begunRouteProbe: ProviderBegunRouteProbe? = nil
+        begunRouteProbe: ProviderBegunRouteProbe? = nil,
+        applicationAttribution:
+            ProviderApplicationAttributionSnapshot? = nil,
+        traffic: ProviderTrafficSnapshot? = nil
     ) {
         self.routingProbe = routingProbe
         self.lineOutboundAddress = lineOutboundAddress
         self.begunRouteProbe = begunRouteProbe
+        self.applicationAttribution = applicationAttribution
+        self.traffic = traffic
     }
 }
 
@@ -411,6 +475,8 @@ enum ProviderDiagnosticsCodec {
 
         var allowedKeys = baseKeys
         switch command {
+        case .applicationAttributionSnapshot, .trafficSnapshot:
+            break
         case .routingProbeSnapshot:
             allowedKeys.insert("probe_id")
         case .probeLineOutboundAddress:
@@ -433,6 +499,8 @@ enum ProviderDiagnosticsCodec {
             throw ProviderDiagnosticsCodecError.invalidRequest
         }
         switch request.cmd {
+        case .applicationAttributionSnapshot, .trafficSnapshot:
+            break
         case .routingProbeSnapshot:
             guard
                 let probeID = request.probeID,

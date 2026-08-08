@@ -205,14 +205,14 @@ func buildNEConfigRoutingToVPN(t *testing.T, basePath string) []byte {
 			{ID: "intranet", Name: "内网", Type: config.RuleSetTypeManual, Enabled: true,
 				CIDRs: []string{vpnTargetCIDR}},
 		},
-		Modes: []config.Mode{
+		Scenarios: []config.Scenario{
 			{
 				ID: "c1", Name: "默认",
 				Bindings:      []config.RuleBinding{{RuleSetID: "intranet", LineID: "vpn"}},
 				DefaultLineID: "direct",
 			},
 		},
-		ActiveModeID: "c1",
+		ActiveScenarioID: "c1",
 	}
 
 	raw, err := config.GenerateSingBoxFor(profile, 10800, "1.2.3.4", config.PlatformNE, basePath)

@@ -3,7 +3,7 @@
 这个探针只验证 D34 的平台前提，不属于 XDial 正式数据面。依据
 `NEAppProxyProvider.handleNewFlow` 的 Apple SDK 契约，
 `NETransparentProxyProvider` 对命中的 flow 返回 `false` 时会把 flow 交回系统网络栈，
-而不是由探针代理；探针不会读取 Profile，也不会选择 Line、RuleSet、Mode、DNS 或出口。
+而不是由探针代理；探针不会读取 Profile，也不会选择 Line、RuleSet、Scenario、DNS 或出口。
 
 `configure-scoped` 只匹配当前受控公司端点 `139.196.60.210/32`。
 `configure-all` 用于观察系统实际交付的 flow 身份，可能影响整机网络，只能在用户在线且

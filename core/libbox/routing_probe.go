@@ -46,6 +46,7 @@ type routingProbeTracker struct {
 	anyConnectTargetTags   map[string]uint64
 	experimentMu           sync.Mutex
 	experiment             *routingProbeExperiment
+	dnsSnapshotAddresses   map[string]map[netip.Addr]struct{}
 }
 
 type routingProbeSnapshot struct {
@@ -59,6 +60,7 @@ type routingProbeSnapshot struct {
 	AnyConnectTargetTags   map[string]uint64 `json:"anyconnect_target_tags"`
 	ProbeID                string            `json:"probe_id"`
 	MatchCount             uint64            `json:"match_count"`
+	CandidateAddressCount  int               `json:"candidate_address_count,omitempty"`
 	OutboundTagCounts      map[string]uint64 `json:"outbound_tag_counts"`
 	RuleSetTag             string            `json:"rule_set_tag,omitempty"`
 }
@@ -66,6 +68,8 @@ type routingProbeSnapshot struct {
 type routingProbeExperiment struct {
 	id                   string
 	hostname             string
+	hostnames            map[string]struct{}
+	addresses            map[netip.Addr]struct{}
 	matchCount           uint64
 	outboundTagCounts    map[string]uint64
 	ruleSetTag           string
@@ -77,7 +81,42 @@ func newRoutingProbeTracker() *routingProbeTracker {
 	return &routingProbeTracker{
 		directTargetTags:     make(map[string]uint64),
 		anyConnectTargetTags: make(map[string]uint64),
+		dnsSnapshotAddresses: make(map[string]map[netip.Addr]struct{}),
 	}
+}
+
+// replaceDNSSnapshotAddresses keeps only the address side of the same
+// in-memory Tailscale DNS snapshot used by the data plane. macOS resolves a
+// hostname before NETransparentProxyProvider receives the flow, so the public
+// remoteEndpoint often contains only an IP even though the system still knows
+// the original name. The debug route probe needs this bounded correlation to
+// attribute that real flow; it does not participate in routing decisions.
+func (t *routingProbeTracker) replaceDNSSnapshotAddresses(
+	hosts map[string][]netip.Addr,
+) {
+	next := make(map[string]map[netip.Addr]struct{}, len(hosts))
+	for rawHostname, addresses := range hosts {
+		hostname := strings.TrimSuffix(
+			strings.ToLower(strings.TrimSpace(rawHostname)),
+			".",
+		)
+		if hostname == "" {
+			continue
+		}
+		for _, address := range addresses {
+			if !address.IsValid() || address.Zone() != "" {
+				continue
+			}
+			if next[hostname] == nil {
+				next[hostname] = make(map[netip.Addr]struct{})
+			}
+			next[hostname][address.Unmap()] = struct{}{}
+		}
+	}
+
+	t.experimentMu.Lock()
+	t.dnsSnapshotAddresses = next
+	t.experimentMu.Unlock()
 }
 
 func (t *routingProbeTracker) RoutedConnection(
@@ -171,18 +210,25 @@ func (t *routingProbeTracker) recordExperiment(
 	matchedRule adapter.Rule,
 	outboundTag string,
 ) {
-	if metadata.Destination.Port != 443 ||
-		!metadata.Destination.IsFqdn() {
+	if metadata.Destination.Port != 443 {
 		return
 	}
-	hostname := strings.ToLower(metadata.Destination.Fqdn)
 
 	t.experimentMu.Lock()
 	defer t.experimentMu.Unlock()
 	experiment := t.experiment
-	if experiment == nil ||
-		experiment.hostname == "" ||
-		experiment.hostname != hostname {
+	if experiment == nil || experiment.hostname == "" {
+		return
+	}
+	canonicalDestination := strings.TrimSuffix(
+		strings.ToLower(metadata.Destination.Fqdn),
+		".",
+	)
+	_, matchesHostname := experiment.hostnames[canonicalDestination]
+	matchesHostname = metadata.Destination.IsFqdn() && matchesHostname
+	_, matchesAddress := experiment.addresses[metadata.Destination.Addr.Unmap()]
+	if !matchesHostname &&
+		(!metadata.Destination.Addr.IsValid() || !matchesAddress) {
 		return
 	}
 	experiment.matchCount++
@@ -245,11 +291,13 @@ func (t *routingProbeTracker) snapshot() routingProbeSnapshot {
 	t.experimentMu.Lock()
 	probeID := ""
 	matchCount := uint64(0)
+	candidateAddressCount := 0
 	outboundTagCounts := make(map[string]uint64)
 	ruleSetTag := ""
 	if experiment := t.experiment; experiment != nil {
 		probeID = experiment.id
 		matchCount = experiment.matchCount
+		candidateAddressCount = len(experiment.addresses)
 		outboundTagCounts = make(
 			map[string]uint64,
 			len(experiment.outboundTagCounts),
@@ -273,6 +321,7 @@ func (t *routingProbeTracker) snapshot() routingProbeSnapshot {
 		AnyConnectTargetTags:   anyConnectTargetTags,
 		ProbeID:                probeID,
 		MatchCount:             matchCount,
+		CandidateAddressCount:  candidateAddressCount,
 		OutboundTagCounts:      outboundTagCounts,
 		RuleSetTag:             ruleSetTag,
 	}
@@ -294,9 +343,31 @@ func (t *routingProbeTracker) begin(
 		return "", fmt.Errorf("create route probe ID: %w", err)
 	}
 	probeID := hex.EncodeToString(randomID[:])
+	addresses := make(map[netip.Addr]struct{})
+	hostnames := map[string]struct{}{hostname: {}}
+	t.experimentMu.Lock()
+	for address := range t.dnsSnapshotAddresses[hostname] {
+		addresses[address] = struct{}{}
+	}
+	// The system resolver may canonicalize a short SearchDomains alias before
+	// the flow reaches NETransparentProxyProvider. Correlate only full names
+	// whose complete address set is identical to the requested alias; an
+	// overlapping or different record remains deliberately unmatched.
+	if !strings.Contains(hostname, ".") && len(addresses) > 0 {
+		prefix := hostname + "."
+		for candidateHostname, candidateAddresses := range t.dnsSnapshotAddresses {
+			if strings.HasPrefix(candidateHostname, prefix) &&
+				equalRoutingProbeAddressSets(addresses, candidateAddresses) {
+				hostnames[candidateHostname] = struct{}{}
+			}
+		}
+	}
+	t.experimentMu.Unlock()
 	experiment := &routingProbeExperiment{
 		id:                   probeID,
 		hostname:             hostname,
+		hostnames:            hostnames,
+		addresses:            addresses,
 		outboundTagCounts:    make(map[string]uint64),
 		ruleSetTagConsistent: true,
 	}
@@ -322,6 +393,21 @@ func (t *routingProbeTracker) begin(
 	)
 	t.experimentMu.Unlock()
 	return probeID, nil
+}
+
+func equalRoutingProbeAddressSets(
+	left map[netip.Addr]struct{},
+	right map[netip.Addr]struct{},
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for address := range left {
+		if _, found := right[address]; !found {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeRoutingProbeHostname(rawHostname string) (string, error) {

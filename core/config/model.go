@@ -63,7 +63,7 @@ type Line struct {
 	// 身份（设备名、登录态、state 目录）不在这里 —— 它是整个 Profile 全局唯一的一份，
 	// 见 Profile.Tailscale。Line 上只留“这条线路怎么用那个 tailnet”：
 	// 选哪个出口，以及是否显式启用这条线路的 MagicDNS 与节点路由。
-	// 两者都只在 Line 被 active Mode 引用时进入数据面。
+	// 两者都只在 Line 被 active Scenario 引用时进入数据面。
 	TailscaleExitNode string `json:"tailscale_exit_node,omitempty"`
 	TailscaleMagicDNS bool   `json:"tailscale_magic_dns,omitempty"`
 
@@ -92,8 +92,9 @@ type Line struct {
 type RuleSetType string
 
 const (
-	RuleSetTypeURL    RuleSetType = "url"
-	RuleSetTypeManual RuleSetType = "manual"
+	RuleSetTypeURL         RuleSetType = "url"
+	RuleSetTypeManual      RuleSetType = "manual"
+	RuleSetTypeApplication RuleSetType = "application"
 )
 
 // RuleSetMatchKind 是 NetworkExtension 在严格下载并解析远程规则集后写入的
@@ -108,6 +109,15 @@ const (
 	RuleSetMatchMixed   RuleSetMatchKind = "mixed"
 )
 
+// ApplicationMatch 是一个由用户选择的 macOS App Bundle。BundleIdentifier
+// 匹配系统直接提供的 source-app 身份；Path 对 audit-token 解析出的可执行路径
+// 做边界匹配。旧 Profile 里的 identities 字段由 JSON 解码器忽略。
+type ApplicationMatch struct {
+	Name             string `json:"name,omitempty"`
+	Path             string `json:"path"`
+	BundleIdentifier string `json:"bundle_identifier,omitempty"`
+}
+
 // RuleSet 规则：匹配哪些流量
 type RuleSet struct {
 	ID      string      `json:"id"`
@@ -116,30 +126,49 @@ type RuleSet struct {
 	Enabled bool        `json:"enabled"`
 
 	// URL 规则（远程规则集）
-	URL    string `json:"url,omitempty"`
-	Format string `json:"format,omitempty"`
-	// Invert 只作用于 URL RuleSet 的匹配条件。它让“海外 IP”可以复用
-	// 国内 IP 列表并取反，避免维护一份庞大且容易漂移的补集。
+	URL         string `json:"url,omitempty"`
+	Format      string `json:"format,omitempty"`
+	FetchLineID string `json:"fetch_line_id,omitempty"`
+	// Invert 取反整个 RuleSet 的匹配条件，不改变 Scenario 中的线路绑定。
+	// 例如“海外 IP”可以复用国内 IP 列表并取反，避免维护补集。
 	Invert bool `json:"invert,omitempty"`
 
 	// 手动规则
 	Domains []string `json:"domains,omitempty"`
 	CIDRs   []string `json:"cidrs,omitempty"`
 
+	// 应用规则。Applications 保存根 Bundle ID 与 App Bundle 前缀；Processes 保存用户显式输入的
+	// Surge PROCESS-NAME 表达式（文件名/通配符、完整路径或末尾带 / 的路径前缀）。
+	// 二者都只描述匹配内容，不携带任何 Line 或 Scenario 信息；只有 active Scenario 的
+	// binding 才会把它们编译为数据面规则。
+	Applications []ApplicationMatch `json:"applications,omitempty"`
+	Processes    []string           `json:"processes,omitempty"`
+
 	RuntimeMatchKind RuleSetMatchKind `json:"-"`
 }
 
-// RuleBinding 模式中的一条绑定：规则→线路（或订阅）
+// EffectiveFetchLineID returns the explicitly selected source Line. Legacy
+// RuleSets without the field retain Direct as their acquisition path.
+func (r RuleSet) EffectiveFetchLineID() string {
+	if r.FetchLineID != "" {
+		return r.FetchLineID
+	}
+	return builtinDirectLineID
+}
+
+// RuleBinding 场景中的一条绑定：规则→线路（或订阅）
 type RuleBinding struct {
 	RuleSetID      string `json:"rule_set_id"`
 	LineID         string `json:"line_id,omitempty"`
 	SubscriptionID string `json:"subscription_id,omitempty"`
 }
 
-// Mode 模式：一组规则→线路的绑定
-type Mode struct {
+// Scenario 场景：一组规则→线路的绑定
+type Scenario struct {
 	ID                    string        `json:"id"`
 	Name                  string        `json:"name"`
+	Icon                  string        `json:"icon,omitempty"`
+	MatchSSIDs            []string      `json:"match_ssids,omitempty"`
 	Bindings              []RuleBinding `json:"bindings"`
 	DefaultLineID         string        `json:"default_line_id"`
 	DefaultSubscriptionID string        `json:"default_subscription_id,omitempty"`
@@ -193,36 +222,15 @@ type TailscaleIdentity struct {
 
 // Profile 完整配置
 type Profile struct {
-	Lines         []Line            `json:"lines"`
-	RuleSets      []RuleSet         `json:"rule_sets"`
-	Modes         []Mode            `json:"modes"`
-	Subscriptions []Subscription    `json:"subscriptions,omitempty"`
-	ActiveModeID  string            `json:"active_mode_id"`
-	Tailscale     TailscaleIdentity `json:"tailscale,omitempty"`
+	Lines            []Line            `json:"lines"`
+	RuleSets         []RuleSet         `json:"rule_sets"`
+	Scenarios        []Scenario        `json:"scenarios"`
+	Subscriptions    []Subscription    `json:"subscriptions,omitempty"`
+	ActiveScenarioID string            `json:"active_scenario_id"`
+	Tailscale        TailscaleIdentity `json:"tailscale,omitempty"`
 }
 
-// UnmarshalJSON 让 Profile 解码时兼容旧比喻命名的 JSON key
-// （ports/cargoes/cruises/active_cruise_id/cargo_id/port_id/default_port_id），
-// 使 Go 侧无论收到新格式还是旧格式的 profileJSON 都能正确解码。
-// 规范化通过 normalizeProfileKeys 递归重写 key 完成，然后用别名类型
-// （profileAlias，无自定义 UnmarshalJSON）解码，避免无限递归。
-func (p *Profile) UnmarshalJSON(data []byte) error {
-	normalized, err := normalizeProfileKeys(data)
-	if err != nil {
-		return err
-	}
-	type profileAlias Profile
-	var alias profileAlias
-	if err := json.Unmarshal(normalized, &alias); err != nil {
-		return err
-	}
-	*p = Profile(alias)
-	return nil
-}
-
-// ParseProfile 从 JSON 解码 Profile，兼容新旧两种 key 命名。
-// 是所有 profileJSON 解码入口的推荐调用点（等价于 json.Unmarshal 到 *Profile，
-// 因为 Profile 已实现兼容旧 key 的 UnmarshalJSON）。
+// ParseProfile 从 JSON 解码当前正式 Profile 契约。
 func ParseProfile(data []byte) (*Profile, error) {
 	var p Profile
 	if err := json.Unmarshal(data, &p); err != nil {
@@ -231,10 +239,10 @@ func ParseProfile(data []byte) (*Profile, error) {
 	return &p, nil
 }
 
-func (p *Profile) ActiveMode() *Mode {
-	for i := range p.Modes {
-		if p.Modes[i].ID == p.ActiveModeID {
-			return &p.Modes[i]
+func (p *Profile) ActiveScenario() *Scenario {
+	for i := range p.Scenarios {
+		if p.Scenarios[i].ID == p.ActiveScenarioID {
+			return &p.Scenarios[i]
 		}
 	}
 	return nil
@@ -277,19 +285,19 @@ func (p *Profile) VPNLine() *Line {
 	return nil
 }
 
-// ActiveVPNLine 返回活动模式实际引用的 VPN 线路。
+// ActiveVPNLine 返回活动场景实际引用的 VPN 线路。
 func (p *Profile) ActiveVPNLine() *Line {
-	mode := p.ActiveMode()
-	if mode == nil {
+	scenario := p.ActiveScenario()
+	if scenario == nil {
 		return nil
 	}
-	for _, binding := range mode.Bindings {
+	for _, binding := range scenario.Bindings {
 		line := p.FindLine(binding.LineID)
 		if line != nil && line.Enabled && line.Type == LineTypeVPN {
 			return line
 		}
 	}
-	line := p.FindLine(mode.DefaultLineID)
+	line := p.FindLine(scenario.DefaultLineID)
 	if line != nil && line.Enabled && line.Type == LineTypeVPN {
 		return line
 	}

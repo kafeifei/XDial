@@ -282,18 +282,71 @@ struct TailscaleRuntimeStatus: Decodable, Hashable {
     var isRunning: Bool { backendState.lowercased() == "running" }
 }
 
+/// 一个被用户选入应用 RuleSet 的 App Bundle。Bundle ID 用于 macOS 直接提供的
+/// source-app 归因，规范化 Bundle 路径用于 audit token 可解析时的交叉验证和兜底。
+struct ApplicationRuleApplication: Codable, Identifiable, Hashable {
+    var name: String
+    var path: String
+    var bundleIdentifier: String?
+    private var containedLegacyIdentities = false
+
+    var id: String { path }
+
+    init(name: String, path: String, bundleIdentifier: String? = nil) {
+        self.name = name
+        self.path = path
+        self.bundleIdentifier = bundleIdentifier
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case path
+        case bundleIdentifier = "bundle_identifier"
+        case identities
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        name = try values.decodeIfPresent(String.self, forKey: .name) ?? ""
+        path = try values.decode(String.self, forKey: .path)
+        bundleIdentifier = try values.decodeIfPresent(
+            String.self,
+            forKey: .bundleIdentifier
+        )
+        // 旧版递归持久化的 signing identities 不再参与匹配。保留这个内存标记
+        // 只为让 loadSaved 的清洗迁移检测到差异并立即回写，新的编码永不输出它们。
+        containedLegacyIdentities = values.contains(.identities)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(name, forKey: .name)
+        try values.encode(path, forKey: .path)
+        try values.encodeIfPresent(
+            bundleIdentifier,
+            forKey: .bundleIdentifier
+        )
+    }
+}
+
 struct RuleSet: Codable, Identifiable, Hashable {
     var id: String
     var name: String
-    var type: String  // url / manual
+    var type: String  // url / manual / application
     var enabled: Bool = true
     var url: String = ""
     var format: String = "auto"
+    var fetchLineID: String = "direct"
     /// 仅用于 URL RuleSet。true 表示匹配远程列表之外的目标，例如
     /// “海外 IP”复用国内 IP 列表并取反，不需要维护一份容易漂移的世界 CIDR 副本。
     var invert: Bool = false
     var domains: [String] = []
     var cidrs: [String] = []
+    var applications: [ApplicationRuleApplication] = []
+    /// Surge PROCESS-NAME expressions. A bare value matches the executable
+    /// filename (with `*`/`?`), an absolute path matches exactly, and an
+    /// absolute path ending in `/` matches by prefix.
+    var processes: [String] = []
 
     init(
         id: String,
@@ -302,9 +355,12 @@ struct RuleSet: Codable, Identifiable, Hashable {
         enabled: Bool = true,
         url: String = "",
         format: String = "auto",
+        fetchLineID: String = "direct",
         invert: Bool = false,
         domains: [String] = [],
-        cidrs: [String] = []
+        cidrs: [String] = [],
+        applications: [ApplicationRuleApplication] = [],
+        processes: [String] = []
     ) {
         self.id = id
         self.name = name
@@ -312,9 +368,12 @@ struct RuleSet: Codable, Identifiable, Hashable {
         self.enabled = enabled
         self.url = url
         self.format = format
+        self.fetchLineID = fetchLineID
         self.invert = invert
         self.domains = domains
         self.cidrs = cidrs
+        self.applications = applications
+        self.processes = processes
     }
 
     enum CodingKeys: String, CodingKey {
@@ -324,9 +383,12 @@ struct RuleSet: Codable, Identifiable, Hashable {
         case enabled
         case url
         case format
+        case fetchLineID = "fetch_line_id"
         case invert
         case domains
         case cidrs
+        case applications
+        case processes
     }
 
     init(from decoder: Decoder) throws {
@@ -346,6 +408,10 @@ struct RuleSet: Codable, Identifiable, Hashable {
             String.self,
             forKey: .format
         ) ?? "auto"
+        fetchLineID = try values.decodeIfPresent(
+            String.self,
+            forKey: .fetchLineID
+        ) ?? "direct"
         invert = try values.decodeIfPresent(
             Bool.self,
             forKey: .invert
@@ -358,6 +424,14 @@ struct RuleSet: Codable, Identifiable, Hashable {
             [String].self,
             forKey: .cidrs
         ) ?? []
+        applications = try values.decodeIfPresent(
+            [ApplicationRuleApplication].self,
+            forKey: .applications
+        ) ?? []
+        processes = try values.decodeIfPresent(
+            [String].self,
+            forKey: .processes
+        ) ?? []
     }
 
     /// 清洗单条域名/CIDR 条目：剥掉所有控制与格式类字符（粘贴常混入
@@ -368,6 +442,100 @@ struct RuleSet: Codable, Identifiable, Hashable {
         let stripped = String(String.UnicodeScalarView(
             raw.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }))
         return stripped.trimmingCharacters(in: .whitespaces)
+    }
+
+    static func sanitizeApplications(
+        _ applications: [ApplicationRuleApplication]
+    ) -> [ApplicationRuleApplication] {
+        var applicationsByPath: [String: ApplicationRuleApplication] = [:]
+        for application in applications {
+            let rawPath = application.path.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            guard rawPath.hasPrefix("/") else { continue }
+            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            guard
+                path == rawPath,
+                URL(fileURLWithPath: path).pathExtension
+                    .localizedCaseInsensitiveCompare("app") == .orderedSame,
+                URL(fileURLWithPath: path).deletingPathExtension()
+                    .lastPathComponent.isEmpty == false
+            else { continue }
+            let name = sanitizeEntry(application.name)
+            let persistedBundleIdentifier = application.bundleIdentifier
+                .map(sanitizeEntry)
+                .flatMap { Self.isValidBundleIdentifier($0) ? $0 : nil }
+            let discoveredBundleIdentifier = Bundle(
+                url: URL(fileURLWithPath: path)
+            )?.bundleIdentifier.flatMap {
+                Self.isValidBundleIdentifier($0) ? $0 : nil
+            }
+            let normalized = ApplicationRuleApplication(
+                name: name.isEmpty
+                    ? URL(fileURLWithPath: path).deletingPathExtension()
+                        .lastPathComponent
+                    : name,
+                path: path,
+                bundleIdentifier: persistedBundleIdentifier
+                    ?? discoveredBundleIdentifier
+            )
+            if applicationsByPath[path] == nil {
+                applicationsByPath[path] = normalized
+            }
+        }
+        return applicationsByPath.values.sorted { lhs, rhs in
+            lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
+        }
+    }
+
+    static func isValidBundleIdentifier(_ value: String) -> Bool {
+        guard
+            !value.isEmpty,
+            value.utf8.count <= 255,
+            value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            scalar.value < 128
+                && !CharacterSet.controlCharacters.contains(scalar)
+                && !CharacterSet.whitespacesAndNewlines.contains(scalar)
+        }
+    }
+
+    static func sanitizeProcesses(_ processes: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for raw in processes {
+            let expression = sanitizeEntry(raw)
+            guard
+                !expression.isEmpty,
+                expression.utf8.count <= 4096
+            else { continue }
+
+            let normalized: String
+            if !expression.hasPrefix("/") {
+                guard
+                    !expression.contains("/"),
+                    expression.utf8.count <= 255
+                else { continue }
+                normalized = expression
+            } else if expression.hasSuffix("/") {
+                let prefix = String(expression.dropLast())
+                guard
+                    !prefix.isEmpty,
+                    (prefix as NSString).standardizingPath == prefix
+                else { continue }
+                normalized = prefix + "/"
+            } else {
+                guard (expression as NSString).standardizingPath == expression
+                else { continue }
+                normalized = expression
+            }
+
+            if seen.insert(normalized).inserted {
+                result.append(normalized)
+            }
+        }
+        return result
     }
 }
 
@@ -396,7 +564,11 @@ struct RuleBinding: Codable, Hashable, Identifiable {
         case subscriptionID = "subscription_id"
     }
 
-    init(ruleSetID: String, lineID: String = "", subscriptionID: String = "") {
+    init(
+        ruleSetID: String,
+        lineID: String = "",
+        subscriptionID: String = ""
+    ) {
         self.ruleSetID = ruleSetID
         self.lineID = lineID
         self.subscriptionID = subscriptionID
@@ -518,9 +690,13 @@ struct Subscription: Codable, Identifiable, Hashable {
     }
 }
 
-struct Mode: Codable, Identifiable, Hashable {
+struct Scenario: Codable, Identifiable, Hashable {
     var id: String
     var name: String
+    /// 稳定的语义图标 Key；nil 表示根据名称与已保存 SSID 自动选择。
+    /// 这里不保存 SF Symbol 名，避免把平台绘制细节写进配置契约。
+    var iconOverride: String?
+    var matchSSIDs: [String] = []
     var bindings: [RuleBinding] = []
     var defaultLineID: String = ""
     var defaultSubscriptionID: String = ""
@@ -539,12 +715,16 @@ struct Mode: Codable, Identifiable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, bindings
+        case iconOverride = "icon"
+        case matchSSIDs = "match_ssids"
         case defaultLineID = "default_line_id"
         case defaultSubscriptionID = "default_subscription_id"
     }
 
-    init(id: String, name: String, bindings: [RuleBinding] = [], defaultLineID: String = "", defaultSubscriptionID: String = "") {
-        self.id = id; self.name = name; self.bindings = bindings
+    init(id: String, name: String, matchSSIDs: [String] = [], bindings: [RuleBinding] = [], defaultLineID: String = "", defaultSubscriptionID: String = "", iconOverride: String? = nil) {
+        self.id = id; self.name = name; self.iconOverride = iconOverride
+        self.matchSSIDs = matchSSIDs
+        self.bindings = bindings
         self.defaultLineID = defaultLineID; self.defaultSubscriptionID = defaultSubscriptionID
     }
 
@@ -552,6 +732,12 @@ struct Mode: Codable, Identifiable, Hashable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
+        iconOverride = try c.decodeIfPresent(String.self, forKey: .iconOverride)
+        if iconOverride?.isEmpty == true { iconOverride = nil }
+        matchSSIDs = try c.decodeIfPresent(
+            [String].self,
+            forKey: .matchSSIDs
+        ) ?? []
         bindings = try c.decodeIfPresent([RuleBinding].self, forKey: .bindings) ?? []
         defaultLineID = try c.decodeIfPresent(String.self, forKey: .defaultLineID) ?? ""
         defaultSubscriptionID = try c.decodeIfPresent(String.self, forKey: .defaultSubscriptionID) ?? ""
@@ -561,17 +747,17 @@ struct Mode: Codable, Identifiable, Hashable {
 struct Profile: Codable, Hashable {
     var lines: [Line] = []
     var ruleSets: [RuleSet] = []
-    var modes: [Mode] = []
+    var scenarios: [Scenario] = []
     var subscriptions: [Subscription] = []
-    var activeModeID: String = ""
+    var activeScenarioID: String = ""
     var tailscale = TailscaleIdentity()
 
     enum CodingKeys: String, CodingKey {
         case lines = "lines"
         case ruleSets = "rule_sets"
-        case modes = "modes"
+        case scenarios = "scenarios"
         case subscriptions
-        case activeModeID = "active_mode_id"
+        case activeScenarioID = "active_scenario_id"
         case tailscale
     }
 
@@ -581,14 +767,34 @@ struct Profile: Codable, Hashable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         lines = try c.decodeIfPresent([Line].self, forKey: .lines) ?? []
         ruleSets = try c.decodeIfPresent([RuleSet].self, forKey: .ruleSets) ?? []
-        modes = try c.decodeIfPresent([Mode].self, forKey: .modes) ?? []
+        scenarios = try c.decodeIfPresent(
+            [Scenario].self,
+            forKey: .scenarios
+        ) ?? []
         subscriptions = try c.decodeIfPresent([Subscription].self, forKey: .subscriptions) ?? []
-        activeModeID = try c.decodeIfPresent(String.self, forKey: .activeModeID) ?? ""
+        activeScenarioID = try c.decodeIfPresent(
+            String.self,
+            forKey: .activeScenarioID
+        ) ?? ""
         tailscale = try c.decodeIfPresent(TailscaleIdentity.self, forKey: .tailscale) ?? TailscaleIdentity()
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(lines, forKey: .lines)
+        try c.encode(ruleSets, forKey: .ruleSets)
+        try c.encode(scenarios, forKey: .scenarios)
+        try c.encode(subscriptions, forKey: .subscriptions)
+        try c.encode(activeScenarioID, forKey: .activeScenarioID)
+        try c.encode(tailscale, forKey: .tailscale)
     }
 }
 
 extension Profile {
+    func scenario(matchingSSID ssid: String) -> Scenario? {
+        scenarios.first { $0.matchSSIDs.contains(ssid) }
+    }
+
     static func bootstrap() -> Profile {
         var p = Profile()
         p.lines = [
@@ -609,8 +815,8 @@ extension Profile {
         return p
     }
 
-    static func templateOverseas(ruleSetIDs: [String], vpnLineID: String, directLineID: String) -> Mode {
-        Mode(
+    static func templateOverseas(ruleSetIDs: [String], vpnLineID: String, directLineID: String) -> Scenario {
+        Scenario(
             id: UUID().uuidString,
             name: "海外",
             bindings: ruleSetIDs.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) },
@@ -618,12 +824,12 @@ extension Profile {
         )
     }
 
-    static func templateDomestic(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, directLineID: String) -> Mode {
+    static func templateDomestic(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, directLineID: String) -> Scenario {
         var bindings = ruleSetIDs.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) }
         if !gfwRuleSetID.isEmpty {
             bindings.append(RuleBinding(ruleSetID: gfwRuleSetID, lineID: vpnLineID))
         }
-        return Mode(
+        return Scenario(
             id: UUID().uuidString,
             name: "国内",
             bindings: bindings,
@@ -631,12 +837,12 @@ extension Profile {
         )
     }
 
-    static func templateDomesticSS(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, ssLineID: String, directLineID: String) -> Mode {
+    static func templateDomesticSS(ruleSetIDs: [String], gfwRuleSetID: String, vpnLineID: String, ssLineID: String, directLineID: String) -> Scenario {
         var bindings = ruleSetIDs.map { RuleBinding(ruleSetID: $0, lineID: vpnLineID) }
         if !gfwRuleSetID.isEmpty {
             bindings.append(RuleBinding(ruleSetID: gfwRuleSetID, lineID: ssLineID))
         }
-        return Mode(
+        return Scenario(
             id: UUID().uuidString,
             name: "国内+SS",
             bindings: bindings,

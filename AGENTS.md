@@ -11,16 +11,17 @@ XDial 是 macOS 菜单栏网络工具：SwiftUI 提供控制面，sing-box 提�
 
 1. 动代码前完整阅读 [ARCHITECTURE.md](ARCHITECTURE.md)，尤其是三条定律、相关 ADR、
    第 7 节禁止事项和第 9 节自检清单。
-2. 再读改动涉及的实现和测试。不要仅凭文档猜测当前代码行为。
-3. 如果实现与架构规范冲突，先判断是实现越界还是规范需要改变。未经用户明确同意，不得
+2. UI、交互或视觉改动还必须完整阅读 [DESIGN.md](DESIGN.md)，不得只照当前截图复制局部样式。
+3. 再读改动涉及的实现和测试。不要仅凭文档猜测当前代码行为。
+4. 如果实现与架构规范冲突，先判断是实现越界还是规范需要改变。未经用户明确同意，不得
    改写架构约束来迁就实现。
 
 架构的最短摘要：
 
 - **控制面与数据面分离**：XDial 表达、编译和托管；sing-box 接管、解析、裁决和转发。
 - **外部密封律**：XDial 对系统只增加一个网络叠加层，DNS、路由和分流不散落到盒外。
-- **内部正交律**：Ingress / Line / RuleSet / Mode 相互正交，Mode 是唯一连接点。
-  声明不等于生效；未被 active Mode 引用的对象不得影响本机流量。
+- **内部正交律**：Ingress / Line / RuleSet / Scenario 相互正交，Scenario 是唯一连接点。
+  声明不等于生效；未被 active Scenario 引用的对象不得影响本机流量。
 - **自然叠加**：启动前的网线、Wi-Fi、企业 VPN、Tailscale 等共同组成不透明 Underlay。
   XDial 不识别产品、不重排接口，只把系统已有裁决交给 sing-box。
 
@@ -84,11 +85,11 @@ curl -sS -X POST 127.0.0.1:19876/action \
 curl -sS -X POST 127.0.0.1:19876/action \
   -d '{"action":"prepare-system-extension"}'
 
-# 打开设置、选择模式
+# 打开设置、选择场景
 curl -sS -X POST 127.0.0.1:19876/action \
   -d '{"action":"open-settings"}'
 curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"select-mode","id":"mode-id"}'
+  -d '{"action":"select-scenario","id":"scenario-id"}'
 
 # 在当前已提交事务中建立一次固定 443 端口的路由归因探针，再读取结构化快照。
 # host 只接受 ASCII DNS 名；Provider 会再次校验当前 transaction。
@@ -109,8 +110,13 @@ curl -sS -X POST 127.0.0.1:19876/action \
 事件顺序及回滚结果。诊断安装或连接失败时先读对应报告，不得从文本日志反推控制流。
 安装报告就绪只证明 app、helper 和 System Extension 前置条件，不证明网络配置、Line、
 RuleSet、DNS 或真实出口已经工作。
+`/state` 中当前与期望场景分别读取 `activeScenarioID`、`desiredConnectionScenarioID`。
+Debug 动作只使用 `select-scenario`；不保留旧领域名别名。
+`/state.configDirty` 只表示已保存配置的有效运行依赖与当前事务不同；未引用对象、显示名、
+SSID 和顶层视觉排序变化不得令它置位。底层指纹可能受凭据影响，因此不得通过 Debug、日志
+或 UI 暴露。
 `/state.network.perLine` 只是由当前 Provider 事务产生、按 `transactionID` 绑定的易失
-出口地址观察；它不表示 Line 运行状态，断开、Mode 或 transaction 改变时会清空。
+出口地址观察；它不表示 Line 运行状态，断开、Scenario 或 transaction 改变时会清空。
 逐域名归因使用 `begin-route-probe` 后读取 `routing-probe-snapshot`；不得用页面显示、
 公网 IP 或旧的 Clash API selector 反推命中线路。实际 Line 归因只读响应中的
 `lineIDCounts`；`outboundTagCounts` 是 Provider 内部证据，无法唯一映射时不得猜测。
@@ -131,7 +137,7 @@ Popover 只有在菜单栏图标被点开后才会出现在 AX 树中；设置�
 - 官方 Tailscale exit node 等全流量 Network Extension 作为 Underlay 时，原生 TUN
   存在 D34 平台边界。不得只凭 `route.default_interface`、一条 `route get` 或出口
   自测宣告叠加成功；系统 DNS 必须进入 XDial，且普通 TCP/UDP 要分别证明命中真实
-  Mode 出口。DNS 接管路由被下层 link route 抢走时应让连接失败，不得追加产品特例或
+  Scenario 出口。DNS 接管路由被下层 link route 抢走时应让连接失败，不得追加产品特例或
   再尝试第二个 Packet Tunnel。
 - 旧原生 TUN 遇到 `RTF_GLOBAL` Underlay，必须在任何 Line 会话、规则预取和 sing-box
   启动之前拒绝。Transparent Proxy 不靠这条路由判据，但同样必须先完成 sing-box 与
@@ -153,7 +159,7 @@ Popover 只有在菜单栏图标被点开后才会出现在 AX 树中；设置�
 
 ## 仓库特有纪律
 
-- 概念命名固定为线路 Line / 规则 RuleSet / 模式 Mode。
+- 概念命名固定为线路 Line / 规则 RuleSet / 场景 Scenario。
 - 不修改 `third_party/`。需要上游变更时使用本地补丁并留痕。
 - Go 代码提交前执行 `gofmt`。
 - 回复用户用中文，代码标识符保持英文。

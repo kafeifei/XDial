@@ -32,7 +32,9 @@
 		<true/>
 	</dict>
 	<key>NSSystemExtensionUsageDescription</key>
-	<string>XDial 使用网络扩展将线路、规则和模式交给 sing-box 统一执行。</string>
+	<string>XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。</string>
 	<key>XDialTransparentProxyBundleIdentifier</key>
 	<string>$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)</string>
 </dict>

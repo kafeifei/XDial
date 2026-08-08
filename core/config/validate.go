@@ -1,8 +1,12 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
 
-// 本文件实现 INV6：模式引用的完整性检查，把"引用解析不了"这件事分成两类处理。
+// 本文件实现 INV6：场景引用的完整性检查，把"引用解析不了"这件事分成两类处理。
 //
 //	INV6a 悬空引用（FindLine/FindRuleSet/FindSubscription 返回 nil，
 //	      或绑定压根没写出口）—— 配置已经损坏，生成直接失败。
@@ -18,7 +22,7 @@ import "fmt"
 // 悬空引用就变成静默错路由。
 
 // builtinDirectLineID 是保留的线路 ID：direct outbound 由生成器无条件产出，
-// 所以模式引用 "direct" 时即使 profile 的 Lines 里没有对应条目也不算悬空。
+// 所以场景引用 "direct" 时即使 profile 的 Lines 里没有对应条目也不算悬空。
 // 这是既有约定（默认 profile 里有这条线路，但大量精简配置直接引用它）。
 const builtinDirectLineID = "direct"
 
@@ -33,14 +37,14 @@ const (
 	WarningDisabledLine ProfileWarningKind = "disabled_line"
 	// WarningDisabledSubscription 绑定引用的订阅存在但被禁用。
 	WarningDisabledSubscription ProfileWarningKind = "disabled_subscription"
-	// WarningDisabledDefaultLine 模式默认出口线路被禁用，默认出口回落 direct。
+	// WarningDisabledDefaultLine 场景默认出口线路被禁用，默认出口回落 direct。
 	WarningDisabledDefaultLine ProfileWarningKind = "disabled_default_line"
-	// WarningDisabledDefaultSubscription 模式默认出口订阅被禁用，默认出口回落 direct。
+	// WarningDisabledDefaultSubscription 场景默认出口订阅被禁用，默认出口回落 direct。
 	WarningDisabledDefaultSubscription ProfileWarningKind = "disabled_default_subscription"
-	// WarningUnavailableLine 仅为旧 JSON/API 兼容保留。active Mode 直接引用的 enabled
+	// WarningUnavailableLine 仅为旧 JSON/API 兼容保留。active Scenario 直接引用的 enabled
 	// Line 无法生成 outbound 时现在必须返回 error，不再产生此 warning。
 	WarningUnavailableLine ProfileWarningKind = "unavailable_line"
-	// WarningUnavailableSubscription 仅为旧 JSON/API 兼容保留。active Mode 直接引用的
+	// WarningUnavailableSubscription 仅为旧 JSON/API 兼容保留。active Scenario 直接引用的
 	// enabled Subscription 无法生成主 outbound 时现在必须返回 error。
 	WarningUnavailableSubscription ProfileWarningKind = "unavailable_subscription"
 )
@@ -49,7 +53,7 @@ const (
 // 与 error 的区别：error 表示拒绝生成配置，warning 表示配置照生成但用户必须知情。
 type ProfileWarning struct {
 	Kind           ProfileWarningKind `json:"kind"`
-	ModeID         string             `json:"mode_id,omitempty"`
+	ScenarioID     string             `json:"scenario_id,omitempty"`
 	RuleSetID      string             `json:"rule_set_id,omitempty"`
 	LineID         string             `json:"line_id,omitempty"`
 	SubscriptionID string             `json:"subscription_id,omitempty"`
@@ -60,14 +64,14 @@ func (w ProfileWarning) String() string {
 	return w.Message
 }
 
-// CollectProfileWarnings 校验活动模式的引用完整性。
+// CollectProfileWarnings 校验活动场景的引用完整性。
 //
 // 返回 error = 配置里有悬空引用（INV6a），GenerateSingBox* 也一定会用同一份逻辑拒绝生成。
 // 返回 warnings = 有对象存在但被显式禁用（INV6b），生成会继续，但调用方
 // （daemon / UI）必须把这些提示展示给用户。
 //
-// active Mode 直接引用的 enabled Line / Subscription 若生成不出 outbound 则返回
-// error。它不是用户主动禁用，而是无法兑现 Mode 已声明的出口；继续生成会让绑定消失
+// active Scenario 直接引用的 enabled Line / Subscription 若生成不出 outbound 则返回
+// error。它不是用户主动禁用，而是无法兑现 Scenario 已声明的出口；继续生成会让绑定消失
 // 或让默认出口落到 direct，违反 fail-closed。
 //
 // 这是一个独立的只读入口，刻意不改 GenerateSingBox / GenerateSingBoxFor /
@@ -76,31 +80,31 @@ func CollectProfileWarnings(profile *Profile) ([]ProfileWarning, error) {
 	if profile == nil {
 		return nil, fmt.Errorf("profile is nil")
 	}
-	mode := profile.ActiveMode()
-	if mode == nil {
-		return nil, fmt.Errorf("no active mode")
+	scenario := profile.ActiveScenario()
+	if scenario == nil {
+		return nil, fmt.Errorf("no active scenario")
 	}
-	return inspectModeReferences(profile, mode)
+	return inspectScenarioReferences(profile, scenario)
 }
 
-// inspectModeReferences 是 INV6 的唯一实现点：generateSingBox 与
+// inspectScenarioReferences 是 INV6 的唯一实现点：generateSingBox 与
 // CollectProfileWarnings 都走它，保证"能不能生成"和"为什么某条没生效"的判定一致。
-func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, error) {
+func inspectScenarioReferences(profile *Profile, scenario *Scenario) ([]ProfileWarning, error) {
 	var warnings []ProfileWarning
 	warn := func(w ProfileWarning) {
-		w.ModeID = mode.ID
+		w.ScenarioID = scenario.ID
 		warnings = append(warnings, w)
 	}
 
-	for index := range mode.Bindings {
-		binding := mode.Bindings[index]
+	for index := range scenario.Bindings {
+		binding := scenario.Bindings[index]
 
 		if binding.RuleSetID == "" {
-			return nil, fmt.Errorf("mode %q binding #%d has no rule set reference", mode.ID, index+1)
+			return nil, fmt.Errorf("scenario %q binding #%d has no rule set reference", scenario.ID, index+1)
 		}
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
 		if ruleSet == nil {
-			return nil, fmt.Errorf("mode %q references missing rule set %q", mode.ID, binding.RuleSetID)
+			return nil, fmt.Errorf("scenario %q references missing rule set %q", scenario.ID, binding.RuleSetID)
 		}
 
 		// 先把出口引用的"存在性"验掉（不看 Enabled）——见文件头注释。
@@ -112,28 +116,28 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 		case binding.SubscriptionID != "":
 			subscription = profile.FindSubscription(binding.SubscriptionID)
 			if subscription == nil {
-				return nil, fmt.Errorf("mode %q binds rule set %q to missing subscription %q",
-					mode.ID, binding.RuleSetID, binding.SubscriptionID)
+				return nil, fmt.Errorf("scenario %q binds rule set %q to missing subscription %q",
+					scenario.ID, binding.RuleSetID, binding.SubscriptionID)
 			}
 		case binding.LineID == builtinDirectLineID:
 			// 内建直连：不需要 profile 里有对应 Line，也没有可禁用的对象。
 		case binding.LineID != "":
 			line = profile.FindLine(binding.LineID)
 			if line == nil {
-				return nil, fmt.Errorf("mode %q binds rule set %q to missing line %q",
-					mode.ID, binding.RuleSetID, binding.LineID)
+				return nil, fmt.Errorf("scenario %q binds rule set %q to missing line %q",
+					scenario.ID, binding.RuleSetID, binding.LineID)
 			}
 		default:
-			return nil, fmt.Errorf("mode %q binds rule set %q to neither a line nor a subscription",
-				mode.ID, binding.RuleSetID)
+			return nil, fmt.Errorf("scenario %q binds rule set %q to neither a line nor a subscription",
+				scenario.ID, binding.RuleSetID)
 		}
 
 		switch ruleSet.Type {
-		case RuleSetTypeURL, RuleSetTypeManual:
+		case RuleSetTypeURL, RuleSetTypeManual, RuleSetTypeApplication:
 		default:
 			return nil, fmt.Errorf(
-				"mode %q references rule set %q with unsupported type %q",
-				mode.ID,
+				"scenario %q references rule set %q with unsupported type %q",
+				scenario.ID,
 				ruleSet.ID,
 				ruleSet.Type,
 			)
@@ -146,10 +150,37 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 				RuleSetID:      ruleSet.ID,
 				LineID:         binding.LineID,
 				SubscriptionID: binding.SubscriptionID,
-				Message: fmt.Sprintf("规则 %q 已禁用，模式 %q 里绑定它的分流不生效",
-					ruleSetLabel(ruleSet), modeLabel(mode)),
+				Message: fmt.Sprintf("规则 %q 已禁用，场景 %q 里绑定它的分流不生效",
+					ruleSetLabel(ruleSet), scenarioLabel(scenario)),
 			})
 			continue
+		}
+		if ruleSet.Type == RuleSetTypeURL && ruleSet.FetchLineID != "" {
+			if ruleSet.FetchLineID != builtinDirectLineID {
+				fetchLine := profile.FindLine(ruleSet.FetchLineID)
+				if fetchLine == nil {
+					return nil, fmt.Errorf(
+						"scenario %q updates rule set %q through missing line %q",
+						scenario.ID,
+						ruleSet.ID,
+						ruleSet.FetchLineID,
+					)
+				}
+				if !fetchLine.Enabled || !lineHasUsableOutbound(fetchLine) {
+					return nil, fmt.Errorf(
+						"scenario %q updates rule set %q through unavailable line %q",
+						scenario.ID,
+						ruleSet.ID,
+						ruleSet.FetchLineID,
+					)
+				}
+			}
+		}
+		if ruleSet.Type == RuleSetTypeApplication {
+			if err := validateApplicationRuleSet(ruleSet); err != nil {
+				return nil, fmt.Errorf("scenario %q references invalid application rule set %q: %w",
+					scenario.ID, ruleSet.ID, err)
+			}
 		}
 
 		if subscription != nil {
@@ -158,15 +189,15 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 					Kind:           WarningDisabledSubscription,
 					RuleSetID:      ruleSet.ID,
 					SubscriptionID: subscription.ID,
-					Message: fmt.Sprintf("订阅 %q 已禁用，规则 %q 绑定的流量回落到模式默认出口",
+					Message: fmt.Sprintf("订阅 %q 已禁用，规则 %q 绑定的流量回落到场景默认出口",
 						subscriptionLabel(subscription), ruleSetLabel(ruleSet)),
 				})
 				continue
 			}
 			if !subscriptionHasUsableOutbound(subscription) {
 				return nil, fmt.Errorf(
-					"mode %q binds enabled rule set %q to enabled subscription %q, but the subscription cannot generate an outbound",
-					mode.ID,
+					"scenario %q binds enabled rule set %q to enabled subscription %q, but the subscription cannot generate an outbound",
+					scenario.ID,
 					ruleSet.ID,
 					subscription.ID,
 				)
@@ -183,15 +214,15 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 				Kind:      WarningDisabledLine,
 				RuleSetID: ruleSet.ID,
 				LineID:    line.ID,
-				Message: fmt.Sprintf("线路 %q 已禁用，规则 %q 绑定的流量回落到模式默认出口",
+				Message: fmt.Sprintf("线路 %q 已禁用，规则 %q 绑定的流量回落到场景默认出口",
 					lineLabel(line), ruleSetLabel(ruleSet)),
 			})
 			continue
 		}
 		if !lineHasUsableOutbound(line) {
 			return nil, fmt.Errorf(
-				"mode %q binds enabled rule set %q to enabled line %q (type %q), but the line cannot generate an outbound",
-				mode.ID,
+				"scenario %q binds enabled rule set %q to enabled line %q (type %q), but the line cannot generate an outbound",
+				scenario.ID,
 				ruleSet.ID,
 				line.ID,
 				line.Type,
@@ -202,57 +233,105 @@ func inspectModeReferences(profile *Profile, mode *Mode) ([]ProfileWarning, erro
 	// 默认出口：悬空同样报错；禁用则回落 direct 并告警（generateSingBox 里
 	// defaultTag 的解析结果与这里一一对应）。
 	switch {
-	case mode.DefaultSubscriptionID != "":
-		subscription := profile.FindSubscription(mode.DefaultSubscriptionID)
+	case scenario.DefaultSubscriptionID != "":
+		subscription := profile.FindSubscription(scenario.DefaultSubscriptionID)
 		if subscription == nil {
-			return nil, fmt.Errorf("mode %q default subscription %q does not exist",
-				mode.ID, mode.DefaultSubscriptionID)
+			return nil, fmt.Errorf("scenario %q default subscription %q does not exist",
+				scenario.ID, scenario.DefaultSubscriptionID)
 		}
 		if !subscription.Enabled {
 			warn(ProfileWarning{
 				Kind:           WarningDisabledDefaultSubscription,
 				SubscriptionID: subscription.ID,
-				Message: fmt.Sprintf("模式 %q 的默认出口订阅 %q 已禁用，默认出口回落直连",
-					modeLabel(mode), subscriptionLabel(subscription)),
+				Message: fmt.Sprintf("场景 %q 的默认出口订阅 %q 已禁用，默认出口回落直连",
+					scenarioLabel(scenario), subscriptionLabel(subscription)),
 			})
 		} else if !subscriptionHasUsableOutbound(subscription) {
 			return nil, fmt.Errorf(
-				"mode %q uses enabled subscription %q as its default, but the subscription cannot generate an outbound",
-				mode.ID,
+				"scenario %q uses enabled subscription %q as its default, but the subscription cannot generate an outbound",
+				scenario.ID,
 				subscription.ID,
 			)
 		}
-	case mode.DefaultLineID == builtinDirectLineID:
+	case scenario.DefaultLineID == builtinDirectLineID:
 		// 内建直连默认出口，恒可用。
-	case mode.DefaultLineID != "":
-		line := profile.FindLine(mode.DefaultLineID)
+	case scenario.DefaultLineID != "":
+		line := profile.FindLine(scenario.DefaultLineID)
 		if line == nil {
-			return nil, fmt.Errorf("mode %q default line %q does not exist",
-				mode.ID, mode.DefaultLineID)
+			return nil, fmt.Errorf("scenario %q default line %q does not exist",
+				scenario.ID, scenario.DefaultLineID)
 		}
 		if !line.Enabled {
 			warn(ProfileWarning{
 				Kind:   WarningDisabledDefaultLine,
 				LineID: line.ID,
-				Message: fmt.Sprintf("模式 %q 的默认出口线路 %q 已禁用，默认出口回落直连",
-					modeLabel(mode), lineLabel(line)),
+				Message: fmt.Sprintf("场景 %q 的默认出口线路 %q 已禁用，默认出口回落直连",
+					scenarioLabel(scenario), lineLabel(line)),
 			})
 		} else if !lineHasUsableOutbound(line) {
 			return nil, fmt.Errorf(
-				"mode %q uses enabled line %q (type %q) as its default, but the line cannot generate an outbound",
-				mode.ID,
+				"scenario %q uses enabled line %q (type %q) as its default, but the line cannot generate an outbound",
+				scenario.ID,
 				line.ID,
 				line.Type,
 			)
 		}
+	default:
+		// An empty Scenario is a valid persisted editing state, but it is not
+		// connectable. Treating an omitted default as Direct would turn an
+		// unfinished declaration into effective traffic policy.
+		return nil, fmt.Errorf(
+			"scenario %q has no default line or subscription",
+			scenario.ID,
+		)
 	}
 
 	return warnings, nil
 }
 
+func validateApplicationRuleSet(ruleSet *RuleSet) error {
+	if len(ruleSet.Applications) == 0 && len(ruleSet.Processes) == 0 {
+		return fmt.Errorf("application process selectors are empty")
+	}
+	for applicationIndex, application := range ruleSet.Applications {
+		if _, ok := canonicalApplicationBundlePath(application.Path); !ok {
+			return fmt.Errorf("application #%d bundle path is invalid", applicationIndex+1)
+		}
+		if application.BundleIdentifier != "" {
+			if _, ok := canonicalApplicationBundleIdentifier(application.BundleIdentifier); !ok {
+				return fmt.Errorf("application #%d bundle identifier is invalid", applicationIndex+1)
+			}
+		}
+	}
+	for processIndex, process := range ruleSet.Processes {
+		if _, ok := canonicalApplicationProcessSelector(process); !ok {
+			return fmt.Errorf("process #%d selector is invalid", processIndex+1)
+		}
+	}
+	return nil
+}
+
+// canonicalApplicationBundlePath validates the persisted Surge-style App
+// Bundle selector without consulting the live filesystem. Planning remains
+// side-effect free, while the Provider can compare the exact same lexical path
+// against the audit-token-derived executable path at flow time.
+func canonicalApplicationBundlePath(raw string) (string, bool) {
+	if raw == "" || len(raw) > 4096 || strings.TrimSpace(raw) != raw ||
+		strings.IndexByte(raw, 0) >= 0 || !filepath.IsAbs(raw) {
+		return "", false
+	}
+	cleaned := filepath.Clean(raw)
+	base := filepath.Base(cleaned)
+	if cleaned != raw || len(base) <= len(".app") ||
+		!strings.HasSuffix(strings.ToLower(base), ".app") {
+		return "", false
+	}
+	return cleaned, true
+}
+
 // lineHasUsableOutbound 判断一条 enabled 线路能不能真的生成出 outbound。
 // direct / vpn / tailscale 由生成器直接构造，恒可用；代理类线路参数不全时
-// buildProxyOutbound 返回 nil。active Mode 直接引用这种线路时必须拒绝规划和生成，
+// buildProxyOutbound 返回 nil。active Scenario 直接引用这种线路时必须拒绝规划和生成，
 // 不能把缺失 outbound 降为 warning。
 func lineHasUsableOutbound(line *Line) bool {
 	switch line.Type {
@@ -278,11 +357,11 @@ func subscriptionHasUsableOutbound(subscription *Subscription) bool {
 	return mainTag != ""
 }
 
-func modeLabel(mode *Mode) string {
-	if mode.Name != "" {
-		return mode.Name
+func scenarioLabel(scenario *Scenario) string {
+	if scenario.Name != "" {
+		return scenario.Name
 	}
-	return mode.ID
+	return scenario.ID
 }
 
 func lineLabel(line *Line) string {

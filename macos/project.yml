@@ -35,7 +35,7 @@ targets:
         NetworkExtension:
           NEProviderClasses:
             com.apple.networkextension.app-proxy: "$(PRODUCT_MODULE_NAME).TransparentProxyProvider"
-        NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和模式交给 sing-box 统一执行。
+        NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。
     settings:
       base:
         # Apple requires a Network Extension system extension's filename to
@@ -43,7 +43,7 @@ targets:
         # outer .systemextension filename.
         PRODUCT_NAME: "$(PRODUCT_BUNDLE_IDENTIFIER)"
         MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "87"
+        CURRENT_PROJECT_VERSION: "94"
         ENABLE_APP_SANDBOX: YES
       configs:
         Debug:
@@ -87,13 +87,14 @@ targets:
         LSUIElement: true
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-        NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和模式交给 sing-box 统一执行。
+        NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。
+        NSLocationWhenInUseUsageDescription: XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。
         XDialTransparentProxyBundleIdentifier: "$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)"
     settings:
       base:
         PRODUCT_NAME: XDial
         MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "87"
+        CURRENT_PROJECT_VERSION: "94"
         ENABLE_USER_SCRIPT_SANDBOXING: NO
       configs:
         Debug:
@@ -118,6 +119,8 @@ targets:
       - sdk: NetworkExtension.framework
       - sdk: SystemExtensions.framework
       - sdk: SystemConfiguration.framework
+      - sdk: CoreLocation.framework
+      - sdk: CoreWLAN.framework
     postBuildScripts:
       - name: Embed private RuleSet presets
         script: |
@@ -149,8 +152,10 @@ targets:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
             "${extension_dir}/${extension_name}/Contents/Info.plist")" \
             = "${XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER}"
-          /usr/bin/codesign --verify --deep --strict \
-            "${extension_dir}/${extension_name}"
+          if [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ]; then
+            /usr/bin/codesign --verify --deep --strict \
+              "${extension_dir}/${extension_name}"
+          fi
         inputFiles:
           - "$(BUILT_PRODUCTS_DIR)/$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER).systemextension"
         outputFiles:
@@ -165,6 +170,9 @@ targets:
           mkdir -p "${helper_dir}" "${launchd_dir}"
           cp "${helper_source}" "${helper_dir}/xdial-daemon"
           cp "${SRCROOT}/com.kafeifei.xdial.helper.plist" "${launchd_dir}/"
+          if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ]; then
+            exit 0
+          fi
           if [ "${CONFIGURATION}" = "Release" ]; then
             /usr/bin/codesign --force --options runtime --timestamp \
               --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
@@ -190,7 +198,11 @@ targets:
       - Tests
       - Shared
       - Sources/XDial/Models.swift
+      - Sources/XDial/ScenarioIconCatalog.swift
+      - Sources/XDial/ScenarioGridLayout.swift
+      - TransparentProxyExtension/ConnectionTransactionReporter.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.tests
         GENERATE_INFOPLIST_FILE: YES
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) XDIAL_TESTING"

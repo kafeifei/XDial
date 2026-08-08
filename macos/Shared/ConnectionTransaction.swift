@@ -21,25 +21,29 @@ final class ConnectionCancellation {
 
 struct ConnectionPlan: Codable, Equatable {
     let schemaVersion: Int
-    let mode: ConnectionPlanMode
+    let scenario: ConnectionPlanScenario
+    let configurationFingerprint: String
     let tasks: [ConnectionPlanTask]
     let warnings: [ConnectionPlanWarning]
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
-        case mode
+        case scenario
+        case configurationFingerprint = "configuration_fingerprint"
         case tasks
         case warnings
     }
 
     init(
         schemaVersion: Int,
-        mode: ConnectionPlanMode,
+        scenario: ConnectionPlanScenario,
+        configurationFingerprint: String = "",
         tasks: [ConnectionPlanTask],
         warnings: [ConnectionPlanWarning] = []
     ) {
         self.schemaVersion = schemaVersion
-        self.mode = mode
+        self.scenario = scenario
+        self.configurationFingerprint = configurationFingerprint
         self.tasks = tasks
         self.warnings = warnings
     }
@@ -47,7 +51,14 @@ struct ConnectionPlan: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
-        mode = try values.decode(ConnectionPlanMode.self, forKey: .mode)
+        scenario = try values.decode(
+            ConnectionPlanScenario.self,
+            forKey: .scenario
+        )
+        configurationFingerprint = try values.decodeIfPresent(
+            String.self,
+            forKey: .configurationFingerprint
+        ) ?? ""
         tasks = try values.decode([ConnectionPlanTask].self, forKey: .tasks)
         warnings = try values.decodeIfPresent(
             [ConnectionPlanWarning].self,
@@ -56,7 +67,7 @@ struct ConnectionPlan: Codable, Equatable {
     }
 }
 
-struct ConnectionPlanMode: Codable, Equatable {
+struct ConnectionPlanScenario: Codable, Equatable {
     let id: String
     let name: String
 }
@@ -132,7 +143,7 @@ struct ConnectionPlanTask: Codable, Equatable, Identifiable {
 
 struct ConnectionPlanWarning: Codable, Equatable {
     let kind: String
-    let modeID: String
+    let scenarioID: String
     let ruleSetID: String
     let lineID: String
     let subscriptionID: String
@@ -140,7 +151,7 @@ struct ConnectionPlanWarning: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case kind
-        case modeID = "mode_id"
+        case scenarioID = "scenario_id"
         case ruleSetID = "rule_set_id"
         case lineID = "line_id"
         case subscriptionID = "subscription_id"
@@ -150,9 +161,9 @@ struct ConnectionPlanWarning: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         kind = try values.decode(String.self, forKey: .kind)
-        modeID = try values.decodeIfPresent(
+        scenarioID = try values.decodeIfPresent(
             String.self,
-            forKey: .modeID
+            forKey: .scenarioID
         ) ?? ""
         ruleSetID = try values.decodeIfPresent(
             String.self,
@@ -599,7 +610,8 @@ struct ConnectionReportEvent: Codable, Equatable, Identifiable {
 struct ConnectionReport: Codable, Equatable {
     let schemaVersion: Int
     let transactionID: String
-    let mode: ConnectionPlanMode
+    let scenario: ConnectionPlanScenario
+    let configurationFingerprint: String
     var state: ConnectionTransactionState
     let startedAt: Date
     var updatedAt: Date
@@ -614,7 +626,8 @@ struct ConnectionReport: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
         case transactionID = "transaction_id"
-        case mode
+        case scenario
+        case configurationFingerprint = "configuration_fingerprint"
         case state
         case startedAt = "started_at"
         case updatedAt = "updated_at"
@@ -629,9 +642,10 @@ struct ConnectionReport: Codable, Equatable {
 
     init(transactionID: String, plan: ConnectionPlan) {
         let now = Date()
-        schemaVersion = 1
+        schemaVersion = 3
         self.transactionID = transactionID
-        mode = plan.mode
+        scenario = plan.scenario
+        configurationFingerprint = plan.configurationFingerprint
         state = .planning
         startedAt = now
         updatedAt = now
@@ -669,10 +683,14 @@ struct ConnectionReport: Codable, Equatable {
             String.self,
             forKey: .transactionID
         )
-        mode = try values.decode(
-            ConnectionPlanMode.self,
-            forKey: .mode
+        scenario = try values.decode(
+            ConnectionPlanScenario.self,
+            forKey: .scenario
         )
+        configurationFingerprint = try values.decodeIfPresent(
+            String.self,
+            forKey: .configurationFingerprint
+        ) ?? ""
         state = try values.decode(
             ConnectionTransactionState.self,
             forKey: .state
@@ -1096,6 +1114,8 @@ enum ConnectionReportJournal {
     private static let groupIdentifier =
         "UVZM439VGU.com.kafeifei.xdial.network"
     private static let fileName = "connection-report.json"
+    private static let switchCandidateFileName =
+        "connection-report-switch-candidate.json"
     private static let lockFileName = "connection-report.lock"
 
     static func read() -> ConnectionReport? {
@@ -1107,6 +1127,75 @@ enum ConnectionReportJournal {
     static func write(_ report: ConnectionReport) throws {
         try withJournalLock(exclusive: true) {
             try writeUnlocked(report)
+        }
+    }
+
+    /// Writes a Switch candidate beside the authoritative report. Preparing a
+    /// candidate therefore proves the Provider can encode, lock, and persist
+    /// its report without replacing the source transaction that still carries
+    /// traffic.
+    static func stageSwitchCandidate(
+        _ report: ConnectionReport
+    ) throws {
+        try withJournalLock(exclusive: true) {
+            guard let url = candidateURL(createDirectory: true) else {
+                throw JournalError.groupContainerUnavailable
+            }
+            try write(report, to: url)
+        }
+    }
+
+    /// Atomically promotes only the expected committed candidate. A stale
+    /// candidate from an interrupted or superseded Switch can never replace a
+    /// newer transaction.
+    @discardableResult
+    static func commitStagedSwitchCandidate(
+        transactionID: String
+    ) throws -> ConnectionReport {
+        try withJournalLock(exclusive: true) {
+            guard
+                let candidateURL = candidateURL(
+                    createDirectory: false
+                ),
+                let data = try? Data(contentsOf: candidateURL),
+                let report = try? ConnectionReportCodec.decode(data),
+                report.transactionID == transactionID,
+                report.state == .committed,
+                !report.systemTakeoverRemoved,
+                let authoritativeURL = journalURL(
+                    createDirectory: true
+                )
+            else {
+                throw JournalError.invalidSwitchCandidate
+            }
+            guard rename(
+                candidateURL.path,
+                authoritativeURL.path
+            ) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: authoritativeURL.path
+            )
+            return report
+        }
+    }
+
+    static func discardStagedSwitchCandidate(
+        transactionID: String? = nil
+    ) {
+        try? withJournalLock(exclusive: true) {
+            guard let url = candidateURL(createDirectory: false) else {
+                return
+            }
+            if let transactionID,
+               let data = try? Data(contentsOf: url),
+               let report = try? ConnectionReportCodec.decode(data),
+               report.transactionID != transactionID {
+                return
+            }
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
@@ -1142,6 +1231,13 @@ enum ConnectionReportJournal {
         guard let url = journalURL(createDirectory: true) else {
             throw JournalError.groupContainerUnavailable
         }
+        try write(report, to: url)
+    }
+
+    private static func write(
+        _ report: ConnectionReport,
+        to url: URL
+    ) throws {
         let data = try ConnectionReportCodec.encode(report)
         try data.write(to: url, options: [.atomic])
         try? FileManager.default.setAttributes(
@@ -1181,11 +1277,40 @@ enum ConnectionReportJournal {
     }
 
     private static func journalURL(createDirectory: Bool) -> URL? {
+        transactionURL(
+            fileName: fileName,
+            createDirectory: createDirectory
+        )
+    }
+
+    private static func candidateURL(
+        createDirectory: Bool
+    ) -> URL? {
+        transactionURL(
+            fileName: switchCandidateFileName,
+            createDirectory: createDirectory
+        )
+    }
+
+    private static func transactionURL(
+        fileName: String,
+        createDirectory: Bool
+    ) -> URL? {
+#if XDIAL_TESTING
+        // Unit tests must not contend with or mutate the live Provider journal.
+        // The process suffix also isolates concurrent XCTest workers.
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "com.kafeifei.xdial.tests-\(ProcessInfo.processInfo.processIdentifier)",
+                isDirectory: true
+            )
+#else
         guard let container = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: groupIdentifier
         ) else {
             return nil
         }
+#endif
         let directory = container.appendingPathComponent(
             "Transactions",
             isDirectory: true
@@ -1204,6 +1329,7 @@ enum ConnectionReportJournal {
 private enum JournalError: LocalizedError {
     case groupContainerUnavailable
     case lockUnavailable
+    case invalidSwitchCandidate
 
     var errorDescription: String? {
         switch self {
@@ -1211,6 +1337,8 @@ private enum JournalError: LocalizedError {
             "XDial 事务报告目录不可用"
         case .lockUnavailable:
             "XDial 事务报告锁不可用"
+        case .invalidSwitchCandidate:
+            "XDial Switch 候选事务报告不存在或尚未提交"
         }
     }
 }

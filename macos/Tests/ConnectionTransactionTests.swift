@@ -21,7 +21,7 @@ final class ConnectionTransactionTests: XCTestCase {
         for id in [
             "line:vpn",
             "line:tailscale",
-            "dns:mode",
+            "dns:scenario",
             "data-plane:sing-box",
         ] {
             report.updateTask(id: id, state: .ready)
@@ -43,7 +43,7 @@ final class ConnectionTransactionTests: XCTestCase {
         XCTAssertEqual(rollbackOrder, [
             "ingress:transparent-proxy",
             "data-plane:sing-box",
-            "dns:mode",
+            "dns:scenario",
             "line:tailscale",
             "line:vpn",
         ])
@@ -310,6 +310,30 @@ final class ConnectionTransactionTests: XCTestCase {
         )
     }
 
+    func testConfigurationFingerprintSurvivesReportRoundTrip() throws {
+        let plan = ConnectionPlan(
+            schemaVersion: 3,
+            scenario: ConnectionPlanScenario(id: "scenario", name: "Test"),
+            configurationFingerprint: "runtime-v1:abc123",
+            tasks: []
+        )
+        let report = ConnectionReport(
+            transactionID: "transaction",
+            plan: plan
+        )
+
+        let encoded = try JSONEncoder().encode(report)
+        let decoded = try JSONDecoder().decode(
+            ConnectionReport.self,
+            from: encoded
+        )
+
+        XCTAssertEqual(
+            decoded.configurationFingerprint,
+            "runtime-v1:abc123"
+        )
+    }
+
     private func preparedCommittedReport() -> ConnectionReport {
         var report = makeReport()
         for task in report.tasks where [
@@ -329,8 +353,8 @@ final class ConnectionTransactionTests: XCTestCase {
 
     private func makeReport() -> ConnectionReport {
         let plan = ConnectionPlan(
-            schemaVersion: 1,
-            mode: ConnectionPlanMode(id: "mode", name: "Test"),
+            schemaVersion: 3,
+            scenario: ConnectionPlanScenario(id: "scenario", name: "Test"),
             tasks: [
                 task("underlay:system", kind: "underlay"),
                 task("rule-set:cnip", kind: "rule_set"),
@@ -343,7 +367,7 @@ final class ConnectionTransactionTests: XCTestCase {
                     resourceID: "tailscale",
                     resourceType: "tailscale"
                 ),
-                task("dns:mode", kind: "dns"),
+                task("dns:scenario", kind: "dns"),
                 task("data-plane:sing-box", kind: "data_plane"),
                 task(
                     "ingress:transparent-proxy",

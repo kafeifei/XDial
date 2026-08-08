@@ -11,7 +11,7 @@ struct XDialIOSApp: App {
 
 enum MobileTab: Hashable {
     case home
-    case modes
+    case scenarios
     case configuration
     case settings
 }
@@ -54,9 +54,14 @@ struct MobileRootView: View {
                 .tabItem { Label(app.tr("首页", "Home"), systemImage: "power") }
                 .tag(MobileTab.home)
 
-            ModesView()
-                .tabItem { Label(app.tr("模式", "Modes"), systemImage: "shuffle") }
-                .tag(MobileTab.modes)
+            ScenariosView()
+                .tabItem {
+                    Label(
+                        app.tr("场景", "Scenarios"),
+                        systemImage: "square.grid.2x2"
+                    )
+                }
+                .tag(MobileTab.scenarios)
 
             ConfigurationView()
                 .tabItem { Label(app.tr("配置", "Config"), systemImage: "slider.horizontal.3") }

@@ -14,6 +14,14 @@ struct InterfaceSnapshot {
     let systemDNSJSON: String
 }
 
+struct ApplicationProcessCredential: Sendable {
+    let selector: TransparentProxyProcessSelector
+    let credentials: SOCKSCredentials
+    let ruleSetID: String
+    let lineID: String?
+    let subscriptionID: String?
+}
+
 final class EmbeddedSingBoxRuntime {
     private static let networkStateGroup =
         "UVZM439VGU.com.kafeifei.xdial.network"
@@ -21,18 +29,57 @@ final class EmbeddedSingBoxRuntime {
     struct Session {
         let port: UInt16
         let credentials: SOCKSCredentials
+        /// Active Surge-style process selectors in Scenario binding order, each
+        /// paired with its per-session SOCKS credentials. This list is never
+        /// persisted or exposed in diagnostics.
+        let applicationProcessCredentials: [ApplicationProcessCredential]
         let lineOutbounds: [String: String]
+        /// Opaque, Provider-memory-only identities for runtime Line leases.
+        /// They never enter ConnectionPlan, reports, logs, or diagnostics.
+        let lineRuntimeIdentities: [String: String]
         let ruleSetTags: Set<String>
+        let dnsCaptureDomains: [String]
+        let tailscaleDNSRecordCount: Int
+        /// The process-singleton AnyConnect capability held by this complete
+        /// generation. `nil` means the generation does not use AnyConnect.
+        /// The value is opaque and must never leave Provider memory.
+        let anyConnectRuntimeIdentity: String?
+        let containsTailscale: Bool
+    }
+
+    struct PreparedSwitch {
+        fileprivate let id: UUID
+        let session: Session
     }
 
     private struct SessionEnvelope: Decodable {
-        struct AnyConnect: Decodable {
+        struct ApplicationProcessCredential: Decodable {
+            let kind: TransparentProxyProcessSelectorKind
+            let value: String
+            let username: String
+            let ruleSetID: String
+            let lineID: String?
+            let subscriptionID: String?
+
+            enum CodingKeys: String, CodingKey {
+                case kind
+                case value
+                case username
+                case ruleSetID = "rule_set_id"
+                case lineID = "line_id"
+                case subscriptionID = "subscription_id"
+            }
+        }
+
+        struct AnyConnect: Codable {
+            let lineID: String
             let server: String
             let username: String
             let password: String
             let allowInsecure: Bool
 
             enum CodingKeys: String, CodingKey {
+                case lineID = "line_id"
                 case server
                 case username
                 case password
@@ -40,23 +87,27 @@ final class EmbeddedSingBoxRuntime {
             }
         }
 
-        struct Tailscale: Decodable {
+        struct Tailscale: Codable {
             let endpointTag: String
             let exitNode: String
             let magicDNSEnabled: Bool
+            let dnsServerTag: String?
 
             enum CodingKeys: String, CodingKey {
                 case endpointTag = "endpoint_tag"
                 case exitNode = "exit_node"
                 case magicDNSEnabled = "magic_dns_enabled"
+                case dnsServerTag = "dns_server_tag"
             }
         }
 
         let configJSON: String
         let plan: ConnectionPlan
         let lineOutbounds: [String: String]
+        let lineRuntimeIdentities: [String: String]
         let subscriptionOutbounds: [String: [String]]
         let ruleSetTags: [String]
+        let applicationProcessCredentials: [ApplicationProcessCredential]?
         let anyConnect: AnyConnect?
         let tailscale: Tailscale?
 
@@ -64,10 +115,62 @@ final class EmbeddedSingBoxRuntime {
             case configJSON = "config_json"
             case plan
             case lineOutbounds = "line_outbounds"
+            case lineRuntimeIdentities = "line_runtime_identities"
             case subscriptionOutbounds = "subscription_outbounds"
             case ruleSetTags = "rule_set_tags"
+            case applicationProcessCredentials = "application_process_credentials"
             case anyConnect = "anyconnect"
             case tailscale
+        }
+    }
+
+    private struct RuleSetBootstrapEnvelope: Decodable {
+        struct Refresh: Codable {
+            let ruleSetID: String
+            let url: String
+            let localPath: String
+            let inputFormat: String
+            let storedFormat: String
+            let outboundTag: String
+            let resolverTag: String
+
+            enum CodingKeys: String, CodingKey {
+                case ruleSetID = "rule_set_id"
+                case url
+                case localPath = "local_path"
+                case inputFormat = "input_format"
+                case storedFormat = "stored_format"
+                case outboundTag = "outbound_tag"
+                case resolverTag = "resolver_tag"
+            }
+        }
+
+        struct BootstrapSession: Decodable {
+            let configJSON: String
+            let lineID: String
+            let outboundTag: String
+            let refreshes: [Refresh]
+            let reuseActive: Bool
+            let anyConnect: SessionEnvelope.AnyConnect?
+            let tailscale: SessionEnvelope.Tailscale?
+
+            enum CodingKeys: String, CodingKey {
+                case configJSON = "config_json"
+                case lineID = "line_id"
+                case outboundTag = "outbound_tag"
+                case refreshes
+                case reuseActive = "reuse_active"
+                case anyConnect = "anyconnect"
+                case tailscale
+            }
+        }
+
+        let preflightSessions: [BootstrapSession]?
+        let backgroundSessions: [BootstrapSession]?
+
+        enum CodingKeys: String, CodingKey {
+            case preflightSessions = "preflight_sessions"
+            case backgroundSessions = "background_sessions"
         }
     }
 
@@ -191,10 +294,29 @@ final class EmbeddedSingBoxRuntime {
         let path: TailscalePeerDERPPath
     }
 
+    private enum TailscaleRuntimeGeneration {
+        case active
+        case preparedSwitch
+    }
+
     private let logger: Logger
     private let callback: EngineCallback
     private let engineLock = NSLock()
     private var engine: LibboxLibbox?
+    private var backgroundRuleSetSessions:
+        [RuleSetBootstrapEnvelope.BootstrapSession] = []
+    private var backgroundNetworkSnapshot: InterfaceSnapshot?
+    private var backgroundCancellation: ConnectionCancellation?
+    private var acquisitionEngine: LibboxLibbox?
+    private struct PreparedSwitchState {
+        let id: UUID
+        let backgroundRuleSetSessions:
+            [RuleSetBootstrapEnvelope.BootstrapSession]
+        let networkSnapshot: InterfaceSnapshot
+        let cancellation: ConnectionCancellation
+        let anyConnectTaskID: String?
+    }
+    private var preparedSwitchState: PreparedSwitchState?
 
     init(
         logger: Logger,
@@ -228,7 +350,48 @@ final class EmbeddedSingBoxRuntime {
 
         try checkCancellation(cancellation)
         reporter.setState(.preparing)
-        reporter.setTask(id: "dns:mode", state: .running)
+        var bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
+        while bootstrapPort == port {
+            bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
+        }
+        var bootstrapGenerationError: NSError?
+        let bootstrapJSON =
+            LibboxGenerateTransparentProxyRuleSetBootstrap(
+                profileJSON,
+                basePath.path,
+                Int(bootstrapPort),
+                UUID().uuidString,
+                UUID().uuidString + UUID().uuidString,
+                networkSnapshot.defaultInterface.name,
+                networkSnapshot.systemDNSJSON,
+                &bootstrapGenerationError
+            )
+        if let bootstrapGenerationError {
+            throw bootstrapGenerationError
+        }
+        guard
+            let bootstrapData = bootstrapJSON.data(using: .utf8),
+            let bootstrap = try? JSONDecoder().decode(
+                RuleSetBootstrapEnvelope.self,
+                from: bootstrapData
+            ),
+            (bootstrap.preflightSessions ?? []).allSatisfy(
+                isValidRuleSetBootstrapSession
+            ),
+            (bootstrap.backgroundSessions ?? []).allSatisfy(
+                isValidRuleSetBootstrapSession
+            )
+        else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        for bootstrapSession in bootstrap.preflightSessions ?? [] {
+            try runRuleSetAcquisitionSession(
+                bootstrapSession,
+                networkSnapshot: networkSnapshot,
+                reporter: reporter,
+                cancellation: cancellation
+            )
+        }
         let preparationCallback = PreparationCallback(
             reporter: reporter
         )
@@ -272,6 +435,11 @@ final class EmbeddedSingBoxRuntime {
             !plannedLineIDs.contains(""),
             Set(envelope.lineOutbounds.keys) == plannedLineIDs,
             envelope.lineOutbounds.values.allSatisfy({ !$0.isEmpty }),
+            Set(envelope.lineRuntimeIdentities.keys) == plannedLineIDs,
+            envelope.lineRuntimeIdentities.values.allSatisfy({ identity in
+                identity.hasPrefix("line-runtime-v1:") &&
+                    identity.utf8.count == 80
+            }),
             !plannedSubscriptionIDs.contains(""),
             Set(envelope.subscriptionOutbounds.keys) ==
                 plannedSubscriptionIDs,
@@ -282,7 +450,26 @@ final class EmbeddedSingBoxRuntime {
             }),
             !envelope.ruleSetTags.contains(""),
             Set(envelope.ruleSetTags).count ==
-                envelope.ruleSetTags.count
+                envelope.ruleSetTags.count,
+            (envelope.applicationProcessCredentials ?? []).allSatisfy({ entry in
+                TransparentProxyProcessSelector(
+                    kind: entry.kind,
+                    value: entry.value
+                ) != nil &&
+                    !entry.username.isEmpty &&
+                    entry.username.utf8.count <= 255 &&
+                    !entry.ruleSetID.isEmpty &&
+                    ((entry.lineID?.isEmpty == false)
+                        != (entry.subscriptionID?.isEmpty == false))
+            }),
+            Set((envelope.applicationProcessCredentials ?? []).map({ entry in
+                entry.kind.rawValue + "\u{0}" + entry.value
+            })).count ==
+                (envelope.applicationProcessCredentials ?? []).count,
+            envelope.tailscale.map({ tailscale in
+                !tailscale.magicDNSEnabled ||
+                    !(tailscale.dnsServerTag ?? "").isEmpty
+            }) ?? true
         else {
             throw RuntimeError.invalidSessionEnvelope
         }
@@ -290,6 +477,7 @@ final class EmbeddedSingBoxRuntime {
         reporter.setPendingTasks(kind: "rule_set", state: .ready)
         reporter.setTasks(kind: "line", state: .running)
         reporter.setTasks(kind: "subscription", state: .running)
+        reporter.setTask(id: "dns:scenario", state: .running)
         reporter.setTask(id: "data-plane:sing-box", state: .running)
         try checkCancellation(cancellation)
         guard let instance = LibboxNew(callback) else {
@@ -298,6 +486,9 @@ final class EmbeddedSingBoxRuntime {
         let anyConnectTaskID = envelope.plan.tasks.first {
             $0.kind == "line" && $0.resourceType == "vpn"
         }?.id
+        let anyConnectRuntimeIdentity = try self.anyConnectRuntimeIdentity(
+            in: envelope
+        )
         callback.attach(
             engine: instance,
             taskID: anyConnectTaskID ?? "data-plane:sing-box",
@@ -318,6 +509,9 @@ final class EmbeddedSingBoxRuntime {
 
         do {
             if let anyConnect = envelope.anyConnect {
+                guard let anyConnectRuntimeIdentity else {
+                    throw RuntimeError.invalidSessionEnvelope
+                }
                 try checkCancellation(cancellation)
                 var resolveError: NSError?
                 let dialAddress = LibboxResolveServerIPv4(
@@ -328,11 +522,12 @@ final class EmbeddedSingBoxRuntime {
                     throw resolveError
                 }
                 try instance.startResolved(
-                    withInsecure: anyConnect.server,
+                    withInsecureAndRuntimeIdentity: anyConnect.server,
                     dialAddress: dialAddress,
                     username: anyConnect.username,
                     password: anyConnect.password,
                     allowInsecure: anyConnect.allowInsecure,
+                    runtimeIdentity: anyConnectRuntimeIdentity,
                     configJSON: envelope.configJSON
                 )
             } else {
@@ -400,13 +595,15 @@ final class EmbeddedSingBoxRuntime {
                     )
                 }
             )
+            var preparedTailscaleDNS:
+                TransparentProxyPreparedTailscaleDNS?
             if let tailscale = envelope.tailscale {
                 let taskID = envelope.plan.tasks.first {
                     $0.kind == "line" &&
                         $0.resourceType == "tailscale"
                 }?.id ?? "data-plane:sing-box"
                 do {
-                    try waitForTailscale(
+                    preparedTailscaleDNS = try waitForTailscale(
                         instance,
                         target: tailscale,
                         reporter: reporter,
@@ -453,10 +650,29 @@ final class EmbeddedSingBoxRuntime {
                     matchingResourceType: "vpn"
                 )
             }
-            reporter.setTask(id: "dns:mode", state: .ready)
+            reporter.setTask(id: "dns:scenario", state: .ready)
             try checkCancellation(cancellation)
+            let safeBackgroundSessions =
+                (bootstrap.backgroundSessions ?? []).filter { candidate in
+                    let conflictsWithActiveSingleton =
+                        !candidate.reuseActive &&
+                        ((candidate.anyConnect != nil &&
+                            envelope.anyConnect != nil) ||
+                            (candidate.tailscale != nil &&
+                                envelope.tailscale != nil))
+                    if conflictsWithActiveSingleton {
+                        logger.warning(
+                            "rule-set-refresh-deferred reason=active-singleton-conflict line=\(candidate.lineID, privacy: .public)"
+                        )
+                    }
+                    return !conflictsWithActiveSingleton
+                }
             engineLock.lock()
             engine = instance
+            backgroundRuleSetSessions =
+                safeBackgroundSessions
+            backgroundNetworkSnapshot = networkSnapshot
+            backgroundCancellation = cancellation
             engineLock.unlock()
             reporter.setTask(
                 id: "data-plane:sing-box",
@@ -466,13 +682,789 @@ final class EmbeddedSingBoxRuntime {
             return Session(
                 port: port,
                 credentials: credentials,
+                applicationProcessCredentials:
+                    (envelope.applicationProcessCredentials ?? []).map { entry in
+                        ApplicationProcessCredential(
+                            selector: TransparentProxyProcessSelector(
+                                kind: entry.kind,
+                                value: entry.value
+                            )!,
+                            credentials: SOCKSCredentials(
+                                username: entry.username,
+                                password: credentials.password
+                            ),
+                            ruleSetID: entry.ruleSetID,
+                            lineID: entry.lineID,
+                            subscriptionID: entry.subscriptionID
+                        )
+                    },
                 lineOutbounds: envelope.lineOutbounds,
-                ruleSetTags: Set(envelope.ruleSetTags)
+                lineRuntimeIdentities:
+                    envelope.lineRuntimeIdentities,
+                ruleSetTags: Set(envelope.ruleSetTags),
+                dnsCaptureDomains:
+                    preparedTailscaleDNS?.captureDomains ?? [],
+                tailscaleDNSRecordCount:
+                    preparedTailscaleDNS?.recordCount ?? 0,
+                anyConnectRuntimeIdentity:
+                    anyConnectRuntimeIdentity,
+                containsTailscale: envelope.tailscale != nil
             )
         } catch {
             callback.markStopped()
             try? instance.stop()
             throw error
+        }
+    }
+
+    /// Builds a complete unpublished generation beside the currently running
+    /// one. The active engine, callback reporter and background refresh state
+    /// are intentionally left untouched until `commitPreparedSwitch`.
+    func prepareSwitch(
+        profileJSON: String,
+        networkSnapshot: InterfaceSnapshot,
+        sourceSession: Session,
+        reporter: ConnectionTransactionReporter,
+        cancellation: ConnectionCancellation
+    ) throws -> PreparedSwitch {
+        try checkCancellation(cancellation)
+        guard let instance = currentEngine() else {
+            throw RuntimeError.switchSourceUnavailable
+        }
+        engineLock.lock()
+        let alreadyPrepared = preparedSwitchState != nil
+        engineLock.unlock()
+        guard !alreadyPrepared else {
+            throw RuntimeError.switchAlreadyPreparing
+        }
+
+        var port = UInt16.random(in: 20_000 ... 60_000)
+        while port == sourceSession.port {
+            port = UInt16.random(in: 20_000 ... 60_000)
+        }
+        let credentials = SOCKSCredentials(
+            username: UUID().uuidString,
+            password: UUID().uuidString + UUID().uuidString
+        )
+        let basePath = try runtimeDirectory()
+
+        reporter.setState(.preparing)
+        reporter.markUnderlaySnapshotReady()
+        var bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
+        while bootstrapPort == port || bootstrapPort == sourceSession.port {
+            bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
+        }
+        var bootstrapGenerationError: NSError?
+        let bootstrapJSON =
+            LibboxGenerateTransparentProxyRuleSetBootstrap(
+                profileJSON,
+                basePath.path,
+                Int(bootstrapPort),
+                UUID().uuidString,
+                UUID().uuidString + UUID().uuidString,
+                networkSnapshot.defaultInterface.name,
+                networkSnapshot.systemDNSJSON,
+                &bootstrapGenerationError
+            )
+        if let bootstrapGenerationError {
+            throw bootstrapGenerationError
+        }
+        guard
+            let bootstrapData = bootstrapJSON.data(using: .utf8),
+            let bootstrap = try? JSONDecoder().decode(
+                RuleSetBootstrapEnvelope.self,
+                from: bootstrapData
+            ),
+            (bootstrap.preflightSessions ?? []).allSatisfy(
+                isValidRuleSetBootstrapSession
+            ),
+            (bootstrap.backgroundSessions ?? []).allSatisfy(
+                isValidRuleSetBootstrapSession
+            )
+        else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        // A cold URL RuleSet acquisition may own a process-singleton Line.
+        // Until that acquisition can borrow the active capability, starting a
+        // second helper session would violate D30/D38. Keep the committed
+        // generation live and report this candidate as unsupported instead.
+        guard (bootstrap.preflightSessions ?? []).isEmpty else {
+            throw RuntimeError.switchRuleSetPreflightUnavailable
+        }
+
+        let preparationCallback = PreparationCallback(reporter: reporter)
+        var generationError: NSError?
+        let envelopeJSON =
+            LibboxGenerateTransparentProxySessionWithCallback(
+                profileJSON,
+                basePath.path,
+                Int(port),
+                credentials.username,
+                credentials.password,
+                networkSnapshot.defaultInterface.name,
+                networkSnapshot.systemDNSJSON,
+                preparationCallback,
+                &generationError
+            )
+        if let generationError {
+            throw generationError
+        }
+        try checkCancellation(cancellation)
+        guard
+            let envelopeData = envelopeJSON.data(using: .utf8),
+            let envelope = try? JSONDecoder().decode(
+                SessionEnvelope.self,
+                from: envelopeData
+            )
+        else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        let plannedLineIDs = Set(
+            envelope.plan.tasks
+                .filter { $0.kind == "line" }
+                .map(\.resourceID)
+        )
+        let plannedSubscriptionIDs = Set(
+            envelope.plan.tasks
+                .filter { $0.kind == "subscription" }
+                .map(\.resourceID)
+        )
+        guard
+            !plannedLineIDs.contains(""),
+            Set(envelope.lineOutbounds.keys) == plannedLineIDs,
+            envelope.lineOutbounds.values.allSatisfy({ !$0.isEmpty }),
+            Set(envelope.lineRuntimeIdentities.keys) == plannedLineIDs,
+            envelope.lineRuntimeIdentities.values.allSatisfy({ identity in
+                identity.hasPrefix("line-runtime-v1:") &&
+                    identity.utf8.count == 80
+            }),
+            !plannedSubscriptionIDs.contains(""),
+            Set(envelope.subscriptionOutbounds.keys) ==
+                plannedSubscriptionIDs,
+            envelope.subscriptionOutbounds.values.allSatisfy({ tags in
+                !tags.isEmpty &&
+                    tags.allSatisfy({ !$0.isEmpty }) &&
+                    Set(tags).count == tags.count
+            }),
+            !envelope.ruleSetTags.contains(""),
+            Set(envelope.ruleSetTags).count ==
+                envelope.ruleSetTags.count,
+            (envelope.applicationProcessCredentials ?? []).allSatisfy({ entry in
+                TransparentProxyProcessSelector(
+                    kind: entry.kind,
+                    value: entry.value
+                ) != nil &&
+                    !entry.username.isEmpty &&
+                    entry.username.utf8.count <= 255 &&
+                    !entry.ruleSetID.isEmpty &&
+                    ((entry.lineID?.isEmpty == false)
+                        != (entry.subscriptionID?.isEmpty == false))
+            }),
+            Set((envelope.applicationProcessCredentials ?? []).map({ entry in
+                entry.kind.rawValue + "\u{0}" + entry.value
+            })).count ==
+                (envelope.applicationProcessCredentials ?? []).count
+        else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        // Tailscale state cannot be borrowed by two concurrent Boxes. A source
+        // without Tailscale may safely prepare a new candidate endpoint; a
+        // source which already owns the state directory must keep running and
+        // report the capability boundary before Go acquires anything.
+        guard !(sourceSession.containsTailscale &&
+            envelope.tailscale != nil) else {
+            throw RuntimeError.switchTailscaleUnavailable
+        }
+
+        try reporter.validate(plan: envelope.plan)
+        reporter.setPendingTasks(kind: "rule_set", state: .ready)
+        reporter.setTasks(kind: "line", state: .running)
+        reporter.setTasks(kind: "subscription", state: .running)
+        reporter.setTask(id: "dns:scenario", state: .running)
+        reporter.setTask(id: "data-plane:sing-box", state: .running)
+
+        let targetAnyConnectTaskID = envelope.plan.tasks.first {
+            $0.kind == "line" && $0.resourceType == "vpn"
+        }?.id
+        let targetAnyConnectIdentity = try anyConnectRuntimeIdentity(
+            in: envelope
+        )
+        do {
+            if let anyConnect = envelope.anyConnect {
+                guard let targetAnyConnectIdentity else {
+                    throw RuntimeError.invalidSessionEnvelope
+                }
+                if let sourceIdentity =
+                    sourceSession.anyConnectRuntimeIdentity {
+                    guard sourceIdentity == targetAnyConnectIdentity else {
+                        throw RuntimeError.switchRequiresAnyConnectRebuild
+                    }
+                    try instance.prepareSwitch(
+                        withLineID:
+                        envelope.configJSON,
+                        anyConnectLineID: anyConnect.lineID,
+                        anyConnectRuntimeIdentity:
+                            targetAnyConnectIdentity,
+                        networkInterfacesJSON:
+                            networkSnapshot.interfacesJSON,
+                        defaultInterfaceName:
+                            networkSnapshot.defaultInterface.name,
+                        defaultInterfaceIndex:
+                            networkSnapshot.defaultInterface.index
+                    )
+                } else {
+                    var resolveError: NSError?
+                    let dialAddress = LibboxResolveServerIPv4(
+                        anyConnect.server,
+                        &resolveError
+                    )
+                    if let resolveError {
+                        throw resolveError
+                    }
+                    try instance.prepareSwitch(
+                        withAnyConnectAndLineID: anyConnect.server,
+                        dialAddress: dialAddress,
+                        username: anyConnect.username,
+                        password: anyConnect.password,
+                        allowInsecure: anyConnect.allowInsecure,
+                        anyConnectLineID: anyConnect.lineID,
+                        anyConnectRuntimeIdentity:
+                            targetAnyConnectIdentity,
+                        configJSON: envelope.configJSON,
+                        networkInterfacesJSON:
+                            networkSnapshot.interfacesJSON,
+                        defaultInterfaceName:
+                            networkSnapshot.defaultInterface.name,
+                        defaultInterfaceIndex:
+                            networkSnapshot.defaultInterface.index
+                    )
+                }
+            } else {
+                try instance.prepareSwitch(
+                    envelope.configJSON,
+                    anyConnectRuntimeIdentity: "",
+                    networkInterfacesJSON:
+                        networkSnapshot.interfacesJSON,
+                    defaultInterfaceName:
+                        networkSnapshot.defaultInterface.name,
+                    defaultInterfaceIndex:
+                        networkSnapshot.defaultInterface.index
+                )
+            }
+            var reusedLineIDsError: NSError?
+            let reusedLineIDsJSON =
+                instance.preparedSwitchReusedLineIDs(
+                    &reusedLineIDsError
+                )
+            if let reusedLineIDsError {
+                throw reusedLineIDsError
+            }
+            guard
+                let reusedLineIDsData = reusedLineIDsJSON.data(
+                    using: .utf8
+                ),
+                let reusedLineIDs = try? JSONDecoder().decode(
+                    [String].self,
+                    from: reusedLineIDsData
+                ),
+                Set(reusedLineIDs).count == reusedLineIDs.count,
+                reusedLineIDs.allSatisfy({ lineID in
+                    !lineID.isEmpty &&
+                        envelope.plan.tasks.contains(where: { task in
+                            task.kind == "line" &&
+                                task.resourceType == "vpn" &&
+                                task.resourceID == lineID &&
+                                task.id == "line:\(lineID)"
+                        })
+                })
+            else {
+                throw RuntimeError.invalidSessionEnvelope
+            }
+            for lineID in reusedLineIDs {
+                reporter.note(
+                    code:
+                        ConnectionReportRuntimeFacts.lineRuntimeReusedCode,
+                    message: "已复用现有线路运行能力，未重新认证",
+                    taskID: "line:\(lineID)",
+                    facts: ["reused": true]
+                )
+            }
+            try checkCancellation(cancellation)
+            reporter.setTasks(
+                kind: "line",
+                state: .ready,
+                matchingResourceType: "direct"
+            )
+            let proxyTargets = try ProxyResourceReadiness.targets(
+                plan: envelope.plan,
+                lineOutbounds: envelope.lineOutbounds,
+                subscriptionOutbounds:
+                    envelope.subscriptionOutbounds
+            )
+            try ProxyResourceReadiness.verifyConcurrently(
+                proxyTargets,
+                probe: { target, outboundTag in
+                    do {
+                        try self.checkCancellation(cancellation)
+                        var probeError: NSError?
+                        let address = instance
+                            .probePreparedSwitchOutboundIP(
+                                outboundTag,
+                                timeoutMS: 8_000,
+                                error: &probeError
+                            )
+                        try self.checkCancellation(cancellation)
+                        guard probeError == nil, !address.isEmpty else {
+                            throw ProxyResourceReadiness.failure(
+                                target: target,
+                                reason:
+                                    probeError?.localizedDescription ??
+                                    "exact candidate outbound probe returned no address"
+                            )
+                        }
+                    } catch {
+                        if cancellation.isCancelled ||
+                            error is ConnectionRuntimeFailure {
+                            throw error
+                        }
+                        throw ProxyResourceReadiness.failure(
+                            target: target,
+                            reason: error.localizedDescription
+                        )
+                    }
+                },
+                markReady: { target in
+                    reporter.note(
+                        code: target.readyCode,
+                        message: target.readyMessage,
+                        taskID: target.taskID
+                    )
+                    reporter.setTask(id: target.taskID, state: .ready)
+                }
+            )
+            var preparedTailscaleDNS:
+                TransparentProxyPreparedTailscaleDNS?
+            if let tailscale = envelope.tailscale {
+                let taskID = envelope.plan.tasks.first {
+                    $0.kind == "line" &&
+                        $0.resourceType == "tailscale"
+                }?.id ?? "data-plane:sing-box"
+                preparedTailscaleDNS = try waitForTailscale(
+                    instance,
+                    target: tailscale,
+                    reporter: reporter,
+                    taskID: taskID,
+                    cancellation: cancellation,
+                    generation: .preparedSwitch
+                )
+                reporter.setTasks(
+                    kind: "line",
+                    state: .ready,
+                    matchingResourceType: "tailscale"
+                )
+            }
+            if envelope.anyConnect != nil {
+                reporter.setTasks(
+                    kind: "line",
+                    state: .ready,
+                    matchingResourceType: "vpn"
+                )
+            }
+            reporter.setTask(id: "dns:scenario", state: .ready)
+            reporter.setTask(id: "data-plane:sing-box", state: .ready)
+            try checkCancellation(cancellation)
+
+            let safeBackgroundSessions =
+                (bootstrap.backgroundSessions ?? []).filter { candidate in
+                    let conflictsWithActiveSingleton =
+                        !candidate.reuseActive &&
+                        ((candidate.anyConnect != nil &&
+                            envelope.anyConnect != nil) ||
+                            (candidate.tailscale != nil &&
+                                envelope.tailscale != nil))
+                    return !conflictsWithActiveSingleton
+                }
+            let preparedID = UUID()
+            let candidateSession = Session(
+                port: port,
+                credentials: credentials,
+                applicationProcessCredentials:
+                    (envelope.applicationProcessCredentials ?? []).map { entry in
+                        ApplicationProcessCredential(
+                            selector: TransparentProxyProcessSelector(
+                                kind: entry.kind,
+                                value: entry.value
+                            )!,
+                            credentials: SOCKSCredentials(
+                                username: entry.username,
+                                password: credentials.password
+                            ),
+                            ruleSetID: entry.ruleSetID,
+                            lineID: entry.lineID,
+                            subscriptionID: entry.subscriptionID
+                        )
+                    },
+                lineOutbounds: envelope.lineOutbounds,
+                lineRuntimeIdentities:
+                    envelope.lineRuntimeIdentities,
+                ruleSetTags: Set(envelope.ruleSetTags),
+                dnsCaptureDomains:
+                    preparedTailscaleDNS?.captureDomains ?? [],
+                tailscaleDNSRecordCount:
+                    preparedTailscaleDNS?.recordCount ?? 0,
+                anyConnectRuntimeIdentity:
+                    targetAnyConnectIdentity,
+                containsTailscale: envelope.tailscale != nil
+            )
+            engineLock.lock()
+            let mayPublish = engine === instance &&
+                !cancellation.isCancelled &&
+                preparedSwitchState == nil
+            if mayPublish {
+                preparedSwitchState = PreparedSwitchState(
+                    id: preparedID,
+                    backgroundRuleSetSessions:
+                        safeBackgroundSessions,
+                    networkSnapshot: networkSnapshot,
+                    cancellation: cancellation,
+                    anyConnectTaskID: targetAnyConnectTaskID
+                )
+            }
+            engineLock.unlock()
+            guard mayPublish else {
+                throw cancellation.isCancelled
+                    ? RuntimeError.cancelled
+                    : RuntimeError.switchSourceUnavailable
+            }
+            return PreparedSwitch(
+                id: preparedID,
+                session: candidateSession
+            )
+        } catch {
+            try? instance.abortPreparedSwitch()
+            engineLock.lock()
+            preparedSwitchState = nil
+            engineLock.unlock()
+            if cancellation.isCancelled {
+                throw RuntimeError.cancelled
+            }
+            throw error
+        }
+    }
+
+    /// Publishes only the already-prepared immutable Box. Libbox retains the
+    /// source generation so its existing relay claims remain valid until the
+    /// Provider completes bounded drain and calls `retireCommittedSwitch()`.
+    func commitPreparedSwitch(
+        _ prepared: PreparedSwitch,
+        reporter: ConnectionTransactionReporter
+    ) throws {
+        guard let instance = currentEngine() else {
+            throw RuntimeError.switchSourceUnavailable
+        }
+        engineLock.lock()
+        guard let state = preparedSwitchState,
+              state.id == prepared.id else {
+            engineLock.unlock()
+            throw RuntimeError.switchCandidateUnavailable
+        }
+        engineLock.unlock()
+
+        try instance.commitPreparedSwitch()
+
+        engineLock.lock()
+        let oldCancellation = backgroundCancellation
+        backgroundRuleSetSessions = state.backgroundRuleSetSessions
+        backgroundNetworkSnapshot = state.networkSnapshot
+        backgroundCancellation = state.cancellation
+        preparedSwitchState = nil
+        engineLock.unlock()
+        oldCancellation?.cancel()
+        callback.retarget(
+            engine: instance,
+            taskID: state.anyConnectTaskID ?? "data-plane:sing-box",
+            reporter: reporter
+        )
+    }
+
+    func retireCommittedSwitch() throws {
+        guard let instance = currentEngine() else {
+            throw RuntimeError.switchSourceUnavailable
+        }
+        try instance.retireCommittedSwitch()
+    }
+
+    /// Safe from a queue other than the Provider engine queue. Go invalidates
+    /// the preparation token before returning, so a blocked Prepare cannot
+    /// later publish a cancelled candidate.
+    func abortPreparedSwitch() {
+        guard let instance = currentEngine() else { return }
+        let abortError: Error?
+        do {
+            try instance.abortPreparedSwitch()
+            abortError = nil
+        } catch {
+            abortError = error
+        }
+        engineLock.lock()
+        preparedSwitchState = nil
+        engineLock.unlock()
+        if let abortError {
+            logger.warning(
+                "scenario-switch-abort-failed error=\(abortError.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    static func switchFailureCode(for error: Error) -> String {
+        (error as? RuntimeError)?.reportCode ??
+            (error as? ConnectionRuntimeFailure)?.code ??
+            "scenario-switch-prepare-failed"
+    }
+
+    private func anyConnectRuntimeIdentity(
+        in envelope: SessionEnvelope
+    ) throws -> String? {
+        let vpnLineIDs = envelope.plan.tasks.compactMap { task in
+            task.kind == "line" && task.resourceType == "vpn"
+                ? task.resourceID
+                : nil
+        }
+        if envelope.anyConnect == nil {
+            guard vpnLineIDs.isEmpty else {
+                throw RuntimeError.invalidSessionEnvelope
+            }
+            return nil
+        }
+        guard
+            vpnLineIDs.count == 1,
+            let lineID = vpnLineIDs.first,
+            envelope.anyConnect?.lineID == lineID,
+            let identity = envelope.lineRuntimeIdentities[lineID]
+        else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        return identity
+    }
+
+    private func isValidRuleSetBootstrapSession(
+        _ session: RuleSetBootstrapEnvelope.BootstrapSession
+    ) -> Bool {
+        !session.configJSON.isEmpty &&
+            !session.lineID.isEmpty &&
+            !session.outboundTag.isEmpty &&
+            !session.refreshes.isEmpty &&
+            session.refreshes.allSatisfy { refresh in
+                !refresh.ruleSetID.isEmpty &&
+                    !refresh.url.isEmpty &&
+                    !refresh.localPath.isEmpty &&
+                    !refresh.inputFormat.isEmpty &&
+                    !refresh.storedFormat.isEmpty &&
+                    !refresh.outboundTag.isEmpty &&
+                    !refresh.resolverTag.isEmpty
+            } &&
+            (session.tailscale.map { tailscale in
+                !tailscale.endpointTag.isEmpty &&
+                    !tailscale.exitNode.isEmpty &&
+                    (!tailscale.magicDNSEnabled ||
+                        !(tailscale.dnsServerTag ?? "").isEmpty)
+            } ?? true)
+    }
+
+    private func encodedRuleSetRefreshRequest(
+        _ refresh: RuleSetBootstrapEnvelope.Refresh
+    ) throws -> String {
+        let data = try JSONEncoder().encode(refresh)
+        guard let request = String(data: data, encoding: .utf8) else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        return request
+    }
+
+    private func configureBootstrapInstance(
+        _ instance: LibboxLibbox,
+        networkSnapshot: InterfaceSnapshot
+    ) throws {
+        instance.setUnderlayInterfaceBinding(true)
+        try instance.setNetworkInterfaces(networkSnapshot.interfacesJSON)
+        instance.setDefaultInterface(
+            networkSnapshot.defaultInterface.name,
+            index: networkSnapshot.defaultInterface.index
+        )
+    }
+
+    private func startBootstrapInstance(
+        _ instance: LibboxLibbox,
+        session: RuleSetBootstrapEnvelope.BootstrapSession,
+        cancellation: ConnectionCancellation
+    ) throws {
+        try checkCancellation(cancellation)
+        if let anyConnect = session.anyConnect {
+            var resolveError: NSError?
+            let dialAddress = LibboxResolveServerIPv4(
+                anyConnect.server,
+                &resolveError
+            )
+            if let resolveError {
+                throw resolveError
+            }
+            try instance.startResolved(
+                withInsecure: anyConnect.server,
+                dialAddress: dialAddress,
+                username: anyConnect.username,
+                password: anyConnect.password,
+                allowInsecure: anyConnect.allowInsecure,
+                configJSON: session.configJSON
+            )
+            try waitForAnyConnectRecovery(
+                instance,
+                cancellation: cancellation
+            )
+        } else {
+            try instance.startStandalone(session.configJSON)
+        }
+    }
+
+    private func runRuleSetAcquisitionSession(
+        _ session: RuleSetBootstrapEnvelope.BootstrapSession,
+        networkSnapshot: InterfaceSnapshot,
+        reporter: ConnectionTransactionReporter?,
+        cancellation: ConnectionCancellation,
+        continueAfterRefreshFailure: Bool = false
+    ) throws {
+        let bootstrapCallback = BootstrapEngineCallback(logger: logger)
+        guard let instance = LibboxNew(bootstrapCallback) else {
+            throw RuntimeError.unavailable
+        }
+        engineLock.lock()
+        acquisitionEngine = instance
+        engineLock.unlock()
+        defer {
+            engineLock.lock()
+            if acquisitionEngine === instance {
+                acquisitionEngine = nil
+            }
+            engineLock.unlock()
+        }
+        do {
+            try configureBootstrapInstance(
+                instance,
+                networkSnapshot: networkSnapshot
+            )
+            try startBootstrapInstance(
+                instance,
+                session: session,
+                cancellation: cancellation
+            )
+            if let tailscale = session.tailscale {
+                _ = try waitForTailscale(
+                    instance,
+                    target: tailscale,
+                    reporter: reporter,
+                    taskID: "rule-set:" +
+                        (session.refreshes.first?.ruleSetID ?? ""),
+                    cancellation: cancellation
+                )
+            } else if session.anyConnect == nil {
+                try checkCancellation(cancellation)
+                var probeError: NSError?
+                let address = instance.probeOutboundIP(
+                    session.outboundTag,
+                    timeoutMS: 8_000,
+                    error: &probeError
+                )
+                guard probeError == nil, !address.isEmpty else {
+                    throw probeError ?? RuntimeError.lineCapabilityUnavailable
+                }
+            }
+            for (index, refresh) in session.refreshes.enumerated() {
+                try checkCancellation(cancellation)
+                let taskID = "rule-set:" + refresh.ruleSetID
+                reporter?.setTask(id: taskID, state: .running)
+                let request = try encodedRuleSetRefreshRequest(refresh)
+                do {
+                    try instance.refreshRuleSet(request)
+                } catch {
+                    reporter?.fail(
+                        error,
+                        code: "rule-set-refresh-failed",
+                        taskID: taskID
+                    )
+                    if !continueAfterRefreshFailure {
+                        throw error
+                    }
+                    logger.warning(
+                        "rule-set-refresh-failed phase=isolated index=\(index, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                    )
+                    continue
+                }
+                reporter?.setTask(id: taskID, state: .ready)
+                logger.notice(
+                    "rule-set-refresh-ready phase=isolated index=\(index, privacy: .public)"
+                )
+            }
+        } catch {
+            try? instance.stop()
+            throw error
+        }
+        try instance.stop()
+    }
+
+    func beginRuleSetRefreshes() {
+        engineLock.lock()
+        let sessions = backgroundRuleSetSessions
+        let networkSnapshot = backgroundNetworkSnapshot
+        let cancellation = backgroundCancellation
+        backgroundRuleSetSessions = []
+        engineLock.unlock()
+        guard
+            !sessions.isEmpty,
+            let networkSnapshot,
+            let cancellation
+        else {
+            return
+        }
+        DispatchQueue.global(qos: .utility).async {
+            for (sessionIndex, session) in sessions.enumerated() {
+                if cancellation.isCancelled {
+                    return
+                }
+                do {
+                    if session.reuseActive {
+                        guard let instance = self.currentEngine() else {
+                            return
+                        }
+                        for (refreshIndex, refresh) in
+                            session.refreshes.enumerated()
+                        {
+                            do {
+                                let request = try
+                                    self.encodedRuleSetRefreshRequest(refresh)
+                                try instance.refreshRuleSet(request)
+                                self.logger.notice(
+                                    "rule-set-refresh-ready phase=active session=\(sessionIndex, privacy: .public) index=\(refreshIndex, privacy: .public)"
+                                )
+                            } catch {
+                                self.logger.warning(
+                                    "rule-set-refresh-failed phase=active session=\(sessionIndex, privacy: .public) index=\(refreshIndex, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                                )
+                            }
+                        }
+                    } else {
+                        try self.runRuleSetAcquisitionSession(
+                            session,
+                            networkSnapshot: networkSnapshot,
+                            reporter: nil,
+                            cancellation: cancellation,
+                            continueAfterRefreshFailure: true
+                        )
+                    }
+                } catch {
+                    self.logger.warning(
+                        "rule-set-refresh-failed phase=background session=\(sessionIndex, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
         }
     }
 
@@ -544,8 +1536,15 @@ final class EmbeddedSingBoxRuntime {
         callback.markStopped()
         engineLock.lock()
         let current = engine
+        let currentAcquisition = acquisitionEngine
         engine = nil
+        acquisitionEngine = nil
+        backgroundRuleSetSessions = []
+        backgroundNetworkSnapshot = nil
+        backgroundCancellation = nil
+        preparedSwitchState = nil
         engineLock.unlock()
+        try? currentAcquisition?.stop()
         guard let current else {
             return
         }
@@ -585,14 +1584,17 @@ final class EmbeddedSingBoxRuntime {
     private func waitForTailscale(
         _ instance: LibboxLibbox,
         target: SessionEnvelope.Tailscale,
-        reporter: ConnectionTransactionReporter,
+        reporter: ConnectionTransactionReporter?,
         taskID: String,
-        cancellation: ConnectionCancellation
-    ) throws {
+        cancellation: ConnectionCancellation,
+        generation: TailscaleRuntimeGeneration = .active
+    ) throws -> TransparentProxyPreparedTailscaleDNS? {
         try checkCancellation(cancellation)
         var underlayProbeError: NSError?
-        let underlayAddress = instance.probeOutboundIP(
-            "direct",
+        let underlayAddress = probeTailscaleGenerationOutbound(
+            instance,
+            generation: generation,
+            outboundTag: "direct",
             timeoutMS: 5_000,
             error: &underlayProbeError
         )
@@ -619,8 +1621,10 @@ final class EmbeddedSingBoxRuntime {
         while Date() < deadline {
             try checkCancellation(cancellation)
             var statusError: NSError?
-            let statusJSON = instance.tailscaleStatus(
-                target.endpointTag,
+            let statusJSON = tailscaleGenerationStatus(
+                instance,
+                generation: generation,
+                endpointTag: target.endpointTag,
                 error: &statusError
             )
             if let statusError {
@@ -688,8 +1692,10 @@ final class EmbeddedSingBoxRuntime {
                         break
                     }
                     var probeError: NSError?
-                    let publicAddress = instance.probeOutboundIP(
-                        target.endpointTag,
+                    let publicAddress = probeTailscaleGenerationOutbound(
+                        instance,
+                        generation: generation,
+                        outboundTag: target.endpointTag,
                         timeoutMS: min(5_000, remainingMS),
                         error: &probeError
                     )
@@ -697,11 +1703,63 @@ final class EmbeddedSingBoxRuntime {
                         logger.notice(
                             "tailscale-ready endpoint=\(target.endpointTag, privacy: .public)"
                         )
-                        return
+                        if !target.magicDNSEnabled {
+                            return nil
+                        }
+                        guard let dnsServerTag = target.dnsServerTag else {
+                            throw RuntimeError.invalidSessionEnvelope
+                        }
+                        try checkCancellation(cancellation)
+                        var preparationError: NSError?
+                        // Snapshot and replace happen atomically in Libbox.
+                        // Only bounded ingress metadata crosses into Swift so
+                        // member address mappings cannot reach reports or
+                        // Provider configuration.
+                        let metadataJSON =
+                            prepareTailscaleGenerationDNS(
+                                instance,
+                                generation: generation,
+                                endpointTag: target.endpointTag,
+                                dnsServerTag: dnsServerTag,
+                                error: &preparationError
+                            )
+                        if preparationError != nil {
+                            throw ConnectionRuntimeFailure(
+                                code:
+                                    "tailscale-dns-preparation-failed",
+                                message:
+                                    "无法准备当前 Tailnet 的内存 DNS 记录",
+                                taskID: "dns:scenario",
+                                evidence: nil
+                            )
+                        }
+                        let prepared:
+                            TransparentProxyPreparedTailscaleDNS
+                        do {
+                            prepared = try
+                                TransparentProxyDNSCapturePlan
+                                .decodePreparedTailscaleDNS(
+                                    metadataJSON
+                                )
+                        } catch {
+                            throw ConnectionRuntimeFailure(
+                                code:
+                                    "tailscale-dns-preparation-failed",
+                                message: error.localizedDescription,
+                                taskID: "dns:scenario",
+                                evidence: nil
+                            )
+                        }
+                        try checkCancellation(cancellation)
+                        logger.notice(
+                            "tailscale-dns-prepared records=\(prepared.recordCount) capture-domains=\(prepared.captureDomains.count)"
+                        )
+                        return prepared
                     }
                     if let latest = latestSelectedExitNode(
                             instance,
-                            target: target
+                            target: target,
+                            generation: generation
                         )
                     {
                         lastPostProbeSample = latest
@@ -867,7 +1925,7 @@ final class EmbeddedSingBoxRuntime {
                     )
                 facts["final_path_candidate_relay"] =
                     node.pathCandidate == "relay"
-                reporter.note(
+                reporter?.note(
                     code: "tailscale-peer-derp-path-observation",
                     message:
                         "DERP 路径首尾观察：\(comparison.logSummary)",
@@ -890,11 +1948,14 @@ final class EmbeddedSingBoxRuntime {
 
     private func latestSelectedExitNode(
         _ instance: LibboxLibbox,
-        target: SessionEnvelope.Tailscale
+        target: SessionEnvelope.Tailscale,
+        generation: TailscaleRuntimeGeneration
     ) -> (status: TailscaleStatus, node: TailscaleStatus.ExitNode)? {
         var statusError: NSError?
-        let statusJSON = instance.tailscaleStatus(
-            target.endpointTag,
+        let statusJSON = tailscaleGenerationStatus(
+            instance,
+            generation: generation,
+            endpointTag: target.endpointTag,
             error: &statusError
         )
         guard
@@ -911,6 +1972,69 @@ final class EmbeddedSingBoxRuntime {
             return nil
         }
         return (status, selected)
+    }
+
+    private func probeTailscaleGenerationOutbound(
+        _ instance: LibboxLibbox,
+        generation: TailscaleRuntimeGeneration,
+        outboundTag: String,
+        timeoutMS: Int,
+        error: inout NSError?
+    ) -> String {
+        switch generation {
+        case .active:
+            instance.probeOutboundIP(
+                outboundTag,
+                timeoutMS: timeoutMS,
+                error: &error
+            )
+        case .preparedSwitch:
+            instance.probePreparedSwitchOutboundIP(
+                outboundTag,
+                timeoutMS: timeoutMS,
+                error: &error
+            )
+        }
+    }
+
+    private func tailscaleGenerationStatus(
+        _ instance: LibboxLibbox,
+        generation: TailscaleRuntimeGeneration,
+        endpointTag: String,
+        error: inout NSError?
+    ) -> String {
+        switch generation {
+        case .active:
+            instance.tailscaleStatus(endpointTag, error: &error)
+        case .preparedSwitch:
+            instance.preparedSwitchTailscaleStatus(
+                endpointTag,
+                error: &error
+            )
+        }
+    }
+
+    private func prepareTailscaleGenerationDNS(
+        _ instance: LibboxLibbox,
+        generation: TailscaleRuntimeGeneration,
+        endpointTag: String,
+        dnsServerTag: String,
+        error: inout NSError?
+    ) -> String {
+        switch generation {
+        case .active:
+            instance.prepareTailscaleDNS(
+                endpointTag,
+                dnsServerTag: dnsServerTag,
+                error: &error
+            )
+        case .preparedSwitch:
+            instance.preparePreparedSwitchTailscaleDNS(
+                endpointTag,
+                dnsServerTag: dnsServerTag,
+                error: &error
+            )
+        }
     }
 
     private func waitForAnyConnectRecovery(
@@ -943,6 +2067,29 @@ final class EmbeddedSingBoxRuntime {
         }
     }
 
+}
+
+private final class BootstrapEngineCallback:
+    NSObject,
+    LibboxCallbackProtocol
+{
+    private let logger: Logger
+
+    init(logger: Logger) {
+        self.logger = logger
+    }
+
+    func onStatusChanged(_ statusJSON: String?) {
+        logger.debug(
+            "rule-set-bootstrap-status value=\(statusJSON ?? "-", privacy: .private)"
+        )
+    }
+
+    func onError(_ code: Int, message: String?) {
+        logger.warning(
+            "rule-set-bootstrap-error code=\(code, privacy: .public) message=\(message ?? "-", privacy: .private)"
+        )
+    }
 }
 
 private final class PreparationCallback:
@@ -1000,6 +2147,28 @@ private final class EngineCallback: NSObject, LibboxCallbackProtocol {
         self.taskID = taskID
         fatalFailure = nil
         gate.beginStart()
+        lock.unlock()
+    }
+
+    /// Changes only which committed report receives future runtime events.
+    /// Unlike `attach`, this does not reset the live runtime gate or discard a
+    /// fatal event observed while the Switch candidate was being committed.
+    func retarget(
+        engine: LibboxLibbox,
+        taskID: String,
+        reporter: ConnectionTransactionReporter
+    ) {
+        lock.lock()
+        self.engine = engine
+        self.reporter = reporter
+        self.taskID = taskID
+        if fatalFailure == nil {
+            // CommitPreparedSwitch has already proven that the complete
+            // candidate Box is running. The retired AnyConnect generation may
+            // have emitted `disconnected`; do not let that stale status leave
+            // the newly committed standalone Box outside the fatal gate.
+            gate.consumeStatus("{\"status\":\"connected\"}")
+        }
         lock.unlock()
     }
 
@@ -1148,6 +2317,12 @@ private enum RuntimeError: Error {
     case lineCapabilityUnavailable
     case diagnosticsUnavailable
     case cancelled
+    case switchSourceUnavailable
+    case switchAlreadyPreparing
+    case switchCandidateUnavailable
+    case switchRuleSetPreflightUnavailable
+    case switchTailscaleUnavailable
+    case switchRequiresAnyConnectRebuild
 }
 
 extension RuntimeError: LocalizedError {
@@ -1199,6 +2374,18 @@ extension RuntimeError: LocalizedError {
             "当前数据面诊断不可用"
         case .cancelled:
             "XDial 连接已取消"
+        case .switchSourceUnavailable:
+            "当前数据面无法执行场景切换"
+        case .switchAlreadyPreparing:
+            "已有场景切换正在准备"
+        case .switchCandidateUnavailable:
+            "场景切换候选数据面已经失效"
+        case .switchRuleSetPreflightUnavailable:
+            "目标场景需要冷获取规则，当前连接暂不支持无断流准备"
+        case .switchTailscaleUnavailable:
+            "目标场景包含 Tailscale，当前运行时无法安全并行准备，原场景保持连接"
+        case .switchRequiresAnyConnectRebuild:
+            "目标场景需要重建不同的 AnyConnect 线路，原场景保持连接"
         }
     }
 
@@ -1226,8 +2413,14 @@ extension RuntimeError: LocalizedError {
             "tailscale-peer-handshake-failed"
         case .anyConnectRecoveryTimedOut:
             "anyconnect-line-reconnect-timeout"
+        case .switchTailscaleUnavailable:
+            "switch-tailscale-capability-unavailable"
+        case .switchRequiresAnyConnectRebuild:
+            "switch-anyconnect-rebuild-required"
+        case .switchRuleSetPreflightUnavailable:
+            "switch-rule-set-preflight-unavailable"
         default:
-            "tailscale-readiness-failed"
+            "scenario-switch-prepare-failed"
         }
     }
 }

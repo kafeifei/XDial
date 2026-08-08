@@ -23,7 +23,7 @@ func srsPayload() []byte {
 	return append(append([]byte{}, srsMagic...), 0x01, 0x02, 0x03)
 }
 
-// gfwProfile 复刻用户的真实模式：URL 规则集 gfw 绑到指定线路。
+// gfwProfile 复刻用户的真实场景：URL 规则集 gfw 绑到指定线路。
 func gfwProfile(url string, line config.Line, binding config.RuleBinding) *config.Profile {
 	binding.RuleSetID = "gfw"
 	return &config.Profile{
@@ -31,10 +31,10 @@ func gfwProfile(url string, line config.Line, binding config.RuleBinding) *confi
 		RuleSets: []config.RuleSet{{
 			ID: "gfw", Name: "gfwlist", Type: config.RuleSetTypeURL, Enabled: true, URL: url,
 		}},
-		Modes: []config.Mode{{
+		Scenarios: []config.Scenario{{
 			ID: "m", Bindings: []config.RuleBinding{binding}, DefaultLineID: "direct",
 		}},
-		ActiveModeID: "m",
+		ActiveScenarioID: "m",
 	}
 }
 
