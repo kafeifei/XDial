@@ -10,18 +10,26 @@ jobs:
   review:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     permissions:
       contents: read
       pull-requests: write
       issues: read
       id-token: write
     steps:
+      - name: report unavailable review credentials
+        if: env.ANTHROPIC_API_KEY == ''
+        run: |
+          echo "::warning::ANTHROPIC_API_KEY is not configured for this actor; skipping Claude review"
       - uses: actions/checkout@v4
+        if: env.ANTHROPIC_API_KEY != ''
         with:
           fetch-depth: 0
       - uses: anthropics/claude-code-action@v1
+        if: env.ANTHROPIC_API_KEY != ''
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
           allowed_bots: "dependabot[bot]"
           prompt: |
             REPO: ${{ github.repository }}
