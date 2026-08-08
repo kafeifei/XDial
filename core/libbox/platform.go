@@ -3,6 +3,7 @@
 package libbox
 
 import (
+	stdjson "encoding/json"
 	"net"
 	"net/netip"
 	"sync"
@@ -390,6 +391,57 @@ func (p *xdPlatformInterface) setUnderlayInterfaceBinding(enabled bool) {
 	p.mu.Lock()
 	p.bindUnderlaySocket = enabled
 	p.mu.Unlock()
+}
+
+// switchCandidate returns an isolated PlatformInterface for an unpublished
+// Box generation. The source Box keeps its original NWPath snapshot until the
+// switch commits; mutating one shared platform object during prepare would
+// silently change the old generation's socket binding and DNS routing facts.
+func (p *xdPlatformInterface) switchCandidate(
+	interfacesJSON,
+	defaultInterfaceName string,
+	defaultInterfaceIndex int,
+) (*xdPlatformInterface, error) {
+	if defaultInterfaceName == "" || defaultInterfaceIndex <= 0 {
+		return nil, E.New("platform: default Underlay interface is unavailable")
+	}
+	var snapshots []platformNetworkInterfaceSnapshot
+	if err := stdjson.Unmarshal([]byte(interfacesJSON), &snapshots); err != nil {
+		return nil, E.Cause(err, "decode platform network interfaces")
+	}
+	if len(snapshots) == 0 {
+		return nil, E.New("platform: Underlay interface snapshot is empty")
+	}
+	defaultFound := false
+	for _, snapshot := range snapshots {
+		if snapshot.Name == defaultInterfaceName &&
+			snapshot.Index == defaultInterfaceIndex {
+			defaultFound = true
+			break
+		}
+	}
+	if !defaultFound {
+		return nil, E.New(
+			"platform: default Underlay is absent from interface snapshot",
+		)
+	}
+
+	p.mu.Lock()
+	candidate := &xdPlatformInterface{
+		tunFD:              p.tunFD,
+		opener:             p.opener,
+		ownInterfaceName:   p.ownInterfaceName,
+		bindUnderlaySocket: p.bindUnderlaySocket,
+	}
+	p.mu.Unlock()
+	if err := candidate.setNetworkInterfaces(snapshots); err != nil {
+		return nil, err
+	}
+	candidate.setDefaultInterface(
+		defaultInterfaceName,
+		defaultInterfaceIndex,
+	)
+	return candidate, nil
 }
 
 type platformNetworkInterfaceSnapshot struct {

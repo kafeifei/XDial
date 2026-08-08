@@ -413,7 +413,7 @@ func (e *Engine) snapshotDataPlaneUnderlay(ctx context.Context) (string, error) 
 // takeoverDNSLocked 在开关允许时接管系统 DNS。调用方必须持 e.mu（见 connectInternal
 // 里那段关于"必须仍在锁内"的说明）。开关关闭时一条命令都不发。
 //
-// daemon 打开接管开关后，失败就是数据面未密封：域名解析仍在盒外，Mode 的域名规则
+// daemon 打开接管开关后，失败就是数据面未密封：域名解析仍在盒外，Scenario 的域名规则
 // 无法保证生效。必须让本次连接失败，不能只发警告后继续显示 Connected。
 func (e *Engine) takeoverDNSLocked() error {
 	if !e.allowDNSTakeover {

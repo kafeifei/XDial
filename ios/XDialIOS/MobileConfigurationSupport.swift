@@ -10,7 +10,7 @@ enum MobileConfigurationError: Error, Equatable {
     case invalidIdentifier(String)
     case duplicateIdentifier(String)
     case unsupportedLineType(String)
-    case invalidActiveMode
+    case invalidActiveScenario
     case invalidReference(String)
     case fileTooLarge
 }
@@ -30,8 +30,8 @@ extension MobileConfigurationError: LocalizedError {
             return "The configuration contains a duplicate \(kind) identifier."
         case .unsupportedLineType(let type):
             return "The configuration contains an unsupported line type: \(type)."
-        case .invalidActiveMode:
-            return "The active mode does not exist in this configuration."
+        case .invalidActiveScenario:
+            return "The active scenario does not exist in this configuration."
         case .invalidReference(let reference):
             return "The configuration contains an invalid reference: \(reference)."
         case .fileTooLarge:
@@ -202,20 +202,23 @@ enum MobileConfigurationService {
     }
 
     private static func validateRequiredFields(in object: [String: Any]) throws {
-        for field in ["lines", "rule_sets", "modes", "subscriptions"] {
+        for field in ["lines", "rule_sets", "subscriptions"] {
             guard object[field] is [Any] else {
                 throw MobileConfigurationError.missingField(field)
             }
         }
-        guard object["active_mode_id"] is String else {
-            throw MobileConfigurationError.missingField("active_mode_id")
+        guard object["scenarios"] is [Any] else {
+            throw MobileConfigurationError.missingField("scenarios")
+        }
+        guard object["active_scenario_id"] is String else {
+            throw MobileConfigurationError.missingField("active_scenario_id")
         }
     }
 
     private static func validate(_ profile: Profile) throws {
         try validateIDs(profile.lines.map(\.id), kind: "line")
         try validateIDs(profile.ruleSets.map(\.id), kind: "rule")
-        try validateIDs(profile.modes.map(\.id), kind: "mode")
+        try validateIDs(profile.scenarios.map(\.id), kind: "scenario")
         try validateIDs(profile.subscriptions.map(\.id), kind: "subscription")
 
         let supportedLineTypes: Set<String> = [
@@ -274,13 +277,13 @@ enum MobileConfigurationService {
         let lineIDs = Set(profile.lines.map(\.id))
         let ruleIDs = Set(profile.ruleSets.map(\.id))
         let subscriptionIDs = Set(profile.subscriptions.map(\.id))
-        let modeIDs = Set(profile.modes.map(\.id))
+        let scenarioIDs = Set(profile.scenarios.map(\.id))
 
-        if !profile.activeModeID.isEmpty, !modeIDs.contains(profile.activeModeID) {
-            throw MobileConfigurationError.invalidActiveMode
+        if !profile.activeScenarioID.isEmpty, !scenarioIDs.contains(profile.activeScenarioID) {
+            throw MobileConfigurationError.invalidActiveScenario
         }
-        if profile.activeModeID.isEmpty, !profile.modes.isEmpty {
-            throw MobileConfigurationError.invalidActiveMode
+        if profile.activeScenarioID.isEmpty, !profile.scenarios.isEmpty {
+            throw MobileConfigurationError.invalidActiveScenario
         }
 
         let supportedRuleTypes: Set<String> = ["url", "manual"]
@@ -300,21 +303,21 @@ enum MobileConfigurationService {
             }
         }
 
-        for mode in profile.modes {
-            let hasDefaultLine = !mode.defaultLineID.isEmpty
-            let hasDefaultSubscription = !mode.defaultSubscriptionID.isEmpty
+        for scenario in profile.scenarios {
+            let hasDefaultLine = !scenario.defaultLineID.isEmpty
+            let hasDefaultSubscription = !scenario.defaultSubscriptionID.isEmpty
             guard hasDefaultLine != hasDefaultSubscription else {
-                throw MobileConfigurationError.invalidReference("mode.default_target")
+                throw MobileConfigurationError.invalidReference("scenario.default_target")
             }
-            if !mode.defaultLineID.isEmpty, !lineIDs.contains(mode.defaultLineID) {
-                throw MobileConfigurationError.invalidReference("mode.default_line_id")
+            if !scenario.defaultLineID.isEmpty, !lineIDs.contains(scenario.defaultLineID) {
+                throw MobileConfigurationError.invalidReference("scenario.default_line_id")
             }
-            if !mode.defaultSubscriptionID.isEmpty,
-               !subscriptionIDs.contains(mode.defaultSubscriptionID) {
-                throw MobileConfigurationError.invalidReference("mode.default_subscription_id")
+            if !scenario.defaultSubscriptionID.isEmpty,
+               !subscriptionIDs.contains(scenario.defaultSubscriptionID) {
+                throw MobileConfigurationError.invalidReference("scenario.default_subscription_id")
             }
-            try validateIDs(mode.bindings.map(\.ruleSetID), kind: "mode binding rule")
-            for binding in mode.bindings {
+            try validateIDs(scenario.bindings.map(\.ruleSetID), kind: "scenario binding rule")
+            for binding in scenario.bindings {
                 guard ruleIDs.contains(binding.ruleSetID) else {
                     throw MobileConfigurationError.invalidReference("binding.rule_set_id")
                 }
@@ -395,7 +398,7 @@ enum MobileDiagnosticsService {
             版本：\(version)
             状态：\(safeStatus)
             系统描述文件：\(systemProfileInstalled ? "已安装" : "未安装")
-            对象计数：线路 \(profile.lines.count)，规则 \(profile.ruleSets.count)，模式 \(profile.modes.count)，订阅 \(profile.subscriptions.count)
+            对象计数：线路 \(profile.lines.count)，规则 \(profile.ruleSets.count)，场景 \(profile.scenarios.count)，订阅 \(profile.subscriptions.count)
             出口探针：\(renderedProbe ?? "未运行")
             最近错误：\(renderedError ?? "无")
             """
@@ -405,7 +408,7 @@ enum MobileDiagnosticsService {
         Version: \(version)
         Status: \(safeStatus)
         System profile: \(systemProfileInstalled ? "Installed" : "Not installed")
-        Object counts: lines \(profile.lines.count), rules \(profile.ruleSets.count), modes \(profile.modes.count), subscriptions \(profile.subscriptions.count)
+        Object counts: lines \(profile.lines.count), rules \(profile.ruleSets.count), scenarios \(profile.scenarios.count), subscriptions \(profile.subscriptions.count)
         Egress probe: \(renderedProbe ?? "Not run")
         Last error: \(renderedError ?? "None")
         """

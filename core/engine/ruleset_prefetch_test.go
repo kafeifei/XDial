@@ -23,7 +23,7 @@ func srsPayload() []byte {
 	return append(append([]byte{}, srsMagic...), 0x01, 0x02, 0x03)
 }
 
-// remoteProfile 复刻用户的真实模式：URL 规则集 remote 绑到指定线路。
+// remoteProfile 复刻用户的真实场景：URL 规则集 remote 绑到指定线路。
 func remoteProfile(url string, line config.Line, binding config.RuleBinding) *config.Profile {
 	binding.RuleSetID = "remote"
 	return &config.Profile{
@@ -31,10 +31,10 @@ func remoteProfile(url string, line config.Line, binding config.RuleBinding) *co
 		RuleSets: []config.RuleSet{{
 			ID: "remote", Name: "remotePolicy", Type: config.RuleSetTypeURL, Enabled: true, URL: url,
 		}},
-		Modes: []config.Mode{{
+		Scenarios: []config.Scenario{{
 			ID: "m", Bindings: []config.RuleBinding{binding}, DefaultLineID: "direct",
 		}},
-		ActiveModeID: "m",
+		ActiveScenarioID: "m",
 	}
 }
 

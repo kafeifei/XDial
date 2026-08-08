@@ -1,7 +1,7 @@
 import Foundation
 
 /// 宿主层的连接意图只决定何时发起一笔完整连接事务；它不读取或改写
-/// Line / RuleSet / Mode，也不绕过 ConnectionPlan 直接操作数据面。
+/// Line / RuleSet / Scenario，也不绕过 ConnectionPlan 直接操作数据面。
 struct AutomaticConnectionPolicy {
     static let defaultEnabled = true
 
@@ -45,49 +45,49 @@ struct ConnectionDesiredState: Equatable {
         case unresolved
         case disconnected(explicit: Bool)
         case connected(
-            modeID: String,
+            scenarioID: String,
             runtimeOwnership: RuntimeOwnership
         )
     }
 
     private(set) var value: Value = .unresolved
 
-    var modeID: String? {
-        guard case let .connected(modeID, _) = value else { return nil }
-        return modeID
+    var scenarioID: String? {
+        guard case let .connected(scenarioID, _) = value else { return nil }
+        return scenarioID
     }
 
-    var wantsConnection: Bool { modeID != nil }
+    var wantsConnection: Bool { scenarioID != nil }
 
     var runtimeOwnership: RuntimeOwnership? {
         guard case let .connected(_, ownership) = value else { return nil }
         return ownership
     }
 
-    mutating func observeExistingConnection(modeID: String) {
+    mutating func observeExistingConnection(scenarioID: String) {
         // 冷启动同步只允许补齐未知事实。用户已经明确点过断开时，迟到的系统
         // 状态回调不能反向恢复连接期望。
         guard case .unresolved = value else { return }
         value = .connected(
-            modeID: modeID,
+            scenarioID: scenarioID,
             runtimeOwnership: .adopted
         )
     }
 
-    mutating func userRequestedConnection(modeID: String) {
+    mutating func userRequestedConnection(scenarioID: String) {
         value = .connected(
-            modeID: modeID,
+            scenarioID: scenarioID,
             runtimeOwnership: .owned
         )
     }
 
     @discardableResult
-    mutating func automaticConnectionRequested(modeID: String) -> Bool {
+    mutating func automaticConnectionRequested(scenarioID: String) -> Bool {
         if case .disconnected(explicit: true) = value {
             return false
         }
         value = .connected(
-            modeID: modeID,
+            scenarioID: scenarioID,
             runtimeOwnership: .owned
         )
         return true
@@ -95,11 +95,11 @@ struct ConnectionDesiredState: Equatable {
 
     @discardableResult
     mutating func beginRestoringAdoptedRuntime() -> Bool {
-        guard case let .connected(modeID, .adopted) = value else {
+        guard case let .connected(scenarioID, .adopted) = value else {
             return false
         }
         value = .connected(
-            modeID: modeID,
+            scenarioID: scenarioID,
             runtimeOwnership: .restoring
         )
         return true
@@ -114,8 +114,8 @@ struct ConnectionDesiredState: Equatable {
         value = .disconnected(explicit: false)
     }
 
-    func permitsRestoration(activeModeID: String) -> Bool {
-        modeID == activeModeID
+    func permitsRestoration(activeScenarioID: String) -> Bool {
+        scenarioID == activeScenarioID
     }
 }
 
@@ -126,20 +126,20 @@ enum DesiredConnectionReconcileAction: Equatable {
     case stopRuntime
     case waitForRuntime
     case waitForNetwork
-    case startAutomatically(modeID: String)
-    case modeChanged(expectedModeID: String, activeModeID: String)
-    case configurationUnavailable(modeID: String)
+    case startAutomatically(scenarioID: String)
+    case scenarioChanged(expectedScenarioID: String, activeScenarioID: String)
+    case configurationUnavailable(scenarioID: String)
 }
 
 struct DesiredConnectionReconcilePolicy {
     static func decide(
         desired: ConnectionDesiredState,
-        activeModeID: String,
+        activeScenarioID: String,
         runtimeStatus: String,
         canConnect: Bool,
         networkWaitCompleted: Bool
     ) -> DesiredConnectionReconcileAction {
-        guard let desiredModeID = desired.modeID else {
+        guard let desiredScenarioID = desired.scenarioID else {
             if AutomaticConnectionPolicy.holdsConnectionIntent(
                 runtimeStatus: runtimeStatus
             ) {
@@ -148,10 +148,10 @@ struct DesiredConnectionReconcilePolicy {
             return .none
         }
 
-        guard desiredModeID == activeModeID else {
-            return .modeChanged(
-                expectedModeID: desiredModeID,
-                activeModeID: activeModeID
+        guard desiredScenarioID == activeScenarioID else {
+            return .scenarioChanged(
+                expectedScenarioID: desiredScenarioID,
+                activeScenarioID: activeScenarioID
             )
         }
 
@@ -167,9 +167,9 @@ struct DesiredConnectionReconcilePolicy {
             return .waitForNetwork
         }
         guard canConnect else {
-            return .configurationUnavailable(modeID: desiredModeID)
+            return .configurationUnavailable(scenarioID: desiredScenarioID)
         }
-        return .startAutomatically(modeID: desiredModeID)
+        return .startAutomatically(scenarioID: desiredScenarioID)
     }
 }
 

@@ -379,9 +379,9 @@ Thunderbolt Bridge`
 // 齐：config 侧改了 tun 地址，这条会立刻炸出来。
 func TestDNSTakeoverAddressIsTunAddressPlusOne(t *testing.T) {
 	profile := &config.Profile{
-		Lines:        []config.Line{{ID: "dir", Name: "直连", Type: config.LineTypeDirect, Enabled: true}},
-		Modes:        []config.Mode{{ID: "m1", Name: "默认", DefaultLineID: "dir"}},
-		ActiveModeID: "m1",
+		Lines:            []config.Line{{ID: "dir", Name: "直连", Type: config.LineTypeDirect, Enabled: true}},
+		Scenarios:        []config.Scenario{{ID: "m1", Name: "默认", DefaultLineID: "dir"}},
+		ActiveScenarioID: "m1",
 	}
 	data, err := config.GenerateSingBoxDesktop(profile, 1080, "", t.TempDir(), nil, "en0")
 	if err != nil {

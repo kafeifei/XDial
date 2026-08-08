@@ -92,11 +92,11 @@ struct CredentialsView: View {
 
     // MARK: - 选择要编辑的 VPN 线路
 
-    /// 选中当前 active 模式实际用到的 VPN 线路；找不到则退回第一个 VPN 类型线路。
+    /// 选中当前 active 场景实际用到的 VPN 线路；找不到则退回第一个 VPN 类型线路。
     private var vpnLineIndex: Int? {
-        if let mode = app.activeMode {
-            var usedIDs = Set(mode.bindings.map { $0.lineID })
-            if !mode.defaultLineID.isEmpty { usedIDs.insert(mode.defaultLineID) }
+        if let scenario = app.activeScenario {
+            var usedIDs = Set(scenario.bindings.map { $0.lineID })
+            if !scenario.defaultLineID.isEmpty { usedIDs.insert(scenario.defaultLineID) }
             if let idx = app.profile.lines.firstIndex(where: {
                 $0.type == "vpn" && usedIDs.contains($0.id)
             }) {

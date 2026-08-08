@@ -144,12 +144,12 @@ struct TunnelAcceptanceTarget: Codable, Sendable, Equatable {
 
 struct TunnelAcceptancePlan: Codable, Sendable, Equatable {
     let requiresAnyConnect: Bool
-    /// nil 只允许用于真正的单出口 Direct 模式。非 nil 时，它是配置页可见的
+    /// nil 只允许用于真正的单出口 Direct 场景。非 nil 时，它是配置页可见的
     /// 1.1.1.1 锁定规则所绑定的确定性非 Direct outbound。
     let currentRouteTag: String?
     let targets: [TunnelAcceptanceTarget]
     /// Go generator emits every enabled Tailscale line as a global endpoint
-    /// because preferred_by/accept_routes may affect routing without a mode
+    /// because preferred_by/accept_routes may affect routing without a scenario
     /// binding. Readiness must cover that exact generated endpoint set.
     let generatedTailscaleTargets: [TunnelAcceptanceTarget]
 
@@ -158,9 +158,9 @@ struct TunnelAcceptancePlan: Codable, Sendable, Equatable {
         profileJSON: String,
         anyConnect: AnyConnectCredentials?
     ) throws -> TunnelAcceptancePlan {
-        guard let mode = profile.modes.first(where: { $0.id == profile.activeModeID }) else {
+        guard let scenario = profile.scenarios.first(where: { $0.id == profile.activeScenarioID }) else {
             throw NSError(domain: "XDial", code: -6,
-                userInfo: [NSLocalizedDescriptionKey: "当前模式不可用"])
+                userInfo: [NSLocalizedDescriptionKey: "当前场景不可用"])
         }
 
         struct Catalog: Decodable {
@@ -174,8 +174,8 @@ struct TunnelAcceptancePlan: Codable, Sendable, Equatable {
             let subscriptions: [Entry]
         }
 
-        let usesSubscriptions = !mode.defaultSubscriptionID.isEmpty
-            || mode.bindings.contains { !$0.subscriptionID.isEmpty }
+        let usesSubscriptions = !scenario.defaultSubscriptionID.isEmpty
+            || scenario.bindings.contains { !$0.subscriptionID.isEmpty }
         var subscriptionTags: [String: String] = [:]
         if usesSubscriptions {
             var catalogError: NSError?
@@ -235,15 +235,15 @@ struct TunnelAcceptancePlan: Codable, Sendable, Equatable {
             )
         }
         guard targetTag(
-            lineID: mode.defaultLineID,
-            subscriptionID: mode.defaultSubscriptionID
+            lineID: scenario.defaultLineID,
+            subscriptionID: scenario.defaultSubscriptionID
         ) != nil else {
             throw NSError(domain: "XDial", code: -6,
-                userInfo: [NSLocalizedDescriptionKey: "当前模式的默认出口不可用"])
+                userInfo: [NSLocalizedDescriptionKey: "当前场景的默认出口不可用"])
         }
 
-        let expectedOutboundBinding = profile.connectivityOutboundBinding(for: mode)
-        let configuredOutboundBinding = mode.bindings.first {
+        let expectedOutboundBinding = profile.connectivityOutboundBinding(for: scenario)
+        let configuredOutboundBinding = scenario.bindings.first {
             $0.ruleSetID == RuleSet.connectivityOutboundID
         }
         guard expectedOutboundBinding?.lineID == configuredOutboundBinding?.lineID,
@@ -277,8 +277,8 @@ struct TunnelAcceptancePlan: Codable, Sendable, Equatable {
             }
             targets.append(TunnelAcceptanceTarget(tag: tag, label: label))
         }
-        addTarget(lineID: mode.defaultLineID, subscriptionID: mode.defaultSubscriptionID)
-        for binding in mode.bindings {
+        addTarget(lineID: scenario.defaultLineID, subscriptionID: scenario.defaultSubscriptionID)
+        for binding in scenario.bindings {
             guard profile.ruleSets.first(where: { $0.id == binding.ruleSetID })?.enabled == true else {
                 continue
             }
@@ -286,15 +286,15 @@ struct TunnelAcceptancePlan: Codable, Sendable, Equatable {
         }
         guard !targets.isEmpty else {
             throw NSError(domain: "XDial", code: -6,
-                userInfo: [NSLocalizedDescriptionKey: "当前模式没有可验收的出口"])
+                userInfo: [NSLocalizedDescriptionKey: "当前场景没有可验收的出口"])
         }
         if targets.count > 1 && currentRouteTag == nil {
             throw NSError(domain: "XDial", code: -6,
-                userInfo: [NSLocalizedDescriptionKey: "多出口模式缺少非 Direct 路由验收目标"])
+                userInfo: [NSLocalizedDescriptionKey: "多出口场景缺少非 Direct 路由验收目标"])
         }
         if targets.count == 1 && targets[0].tag != "direct" {
             throw NSError(domain: "XDial", code: -6,
-                userInfo: [NSLocalizedDescriptionKey: "单出口验收只允许 Direct 模式"])
+                userInfo: [NSLocalizedDescriptionKey: "单出口验收只允许 Direct 场景"])
         }
         return TunnelAcceptancePlan(
             requiresAnyConnect: requiresAnyConnect,
@@ -686,7 +686,7 @@ struct RoutingProbeSnapshot: Decodable, Sendable, Equatable {
         )
     }
 
-    /// 单出口 Direct 模式仍证明系统 URLSession 确实经过配置中的 Direct 规则，
+    /// 单出口 Direct 场景仍证明系统 URLSession 确实经过配置中的 Direct 规则，
     /// 但不把这条单路由证据包装成“分流通过”。
     func provesConfiguredDirectRouting(
         after current: RoutingProbeSnapshot,
@@ -2176,16 +2176,16 @@ final class TunnelManager: ObservableObject, TunnelManaging {
         in profile: Profile,
         credentials: AnyConnectCredentials
     ) throws -> Line {
-        guard let mode = profile.modes.first(where: { $0.id == profile.activeModeID }) else {
+        guard let scenario = profile.scenarios.first(where: { $0.id == profile.activeScenarioID }) else {
             throw NSError(domain: "XDial", code: -6,
-                userInfo: [NSLocalizedDescriptionKey: "当前模式不可用"])
+                userInfo: [NSLocalizedDescriptionKey: "当前场景不可用"])
         }
 
         var referencedLineIDs = Set<String>()
-        if !mode.defaultLineID.isEmpty {
-            referencedLineIDs.insert(mode.defaultLineID)
+        if !scenario.defaultLineID.isEmpty {
+            referencedLineIDs.insert(scenario.defaultLineID)
         }
-        for binding in mode.bindings {
+        for binding in scenario.bindings {
             guard !binding.lineID.isEmpty,
                   profile.ruleSets.first(where: { $0.id == binding.ruleSetID })?.enabled == true else {
                 continue
@@ -2202,7 +2202,7 @@ final class TunnelManager: ObservableObject, TunnelManaging {
               line.vpnUsername == credentials.username,
               line.vpnPassword == credentials.password else {
             throw NSError(domain: "XDial", code: -6,
-                userInfo: [NSLocalizedDescriptionKey: "当前模式的 AnyConnect 线路不唯一或凭据不匹配"])
+                userInfo: [NSLocalizedDescriptionKey: "当前场景的 AnyConnect 线路不唯一或凭据不匹配"])
         }
         return line
     }
@@ -2229,8 +2229,8 @@ final class TunnelManager: ObservableObject, TunnelManaging {
     /// 从活动线路的默认出口 Line 推导一个展示用 serverAddress(纯 UI 用途)。
     /// 找不到就返回空串,由 ensureConfigured 兜底成占位。
     static func serverAddress(for profile: Profile) -> String {
-        guard let mode = profile.modes.first(where: { $0.id == profile.activeModeID }),
-              let line = profile.lines.first(where: { $0.id == mode.defaultLineID }) else {
+        guard let scenario = profile.scenarios.first(where: { $0.id == profile.activeScenarioID }),
+              let line = profile.lines.first(where: { $0.id == scenario.defaultLineID }) else {
             return ""
         }
         switch line.type {

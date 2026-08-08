@@ -27,7 +27,7 @@ import (
 // sing-box 官方 libbox 的 GetDNSServerAddress 用的就是 Addr().Next()，同款约定。
 //
 // 至于为什么非得接管系统 DNS：启动前 Underlay 的 resolver 可能通过 on-link 路由
-// 或下层虚拟接口直达，天然绕过 tun；应用拿到的解析视角就可能与 Mode 选择的出口
+// 或下层虚拟接口直达，天然绕过 tun；应用拿到的解析视角就可能与 Scenario 选择的出口
 // 视角不一致，按域名分流随之失准。
 const dnsTakeoverAddress = "198.18.0.2"
 

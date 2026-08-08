@@ -252,7 +252,7 @@ final class HomeViewUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["已连接"].exists)
     }
 
-    func testConfigurationModeAndDiagnosticsEntryPoints() {
+    func testConfigurationScenarioAndDiagnosticsEntryPoints() {
         let app = launchApp()
 
         app.tabBars.buttons["配置"].tap()
@@ -277,10 +277,10 @@ final class HomeViewUITests: XCTestCase {
         XCTAssertTrue(app.textFields["订阅 URL"].waitForExistence(timeout: 2))
         app.buttons["取消"].tap()
 
-        app.tabBars.buttons["模式"].tap()
-        app.buttons["添加模式"].tap()
-        app.buttons["空白模式"].tap()
-        XCTAssertTrue(app.staticTexts["空白模式"].waitForExistence(timeout: 2))
+        app.tabBars.buttons["场景"].tap()
+        app.buttons["添加场景"].tap()
+        app.buttons["空白场景"].tap()
+        XCTAssertTrue(app.staticTexts["空白场景"].waitForExistence(timeout: 2))
 
         app.tabBars.buttons["设置"].tap()
         let diagnosticsButton = app.buttons["查看诊断详情"]
@@ -628,8 +628,8 @@ final class HomeViewUITests: XCTestCase {
             "这是 XDial 内置线路的独立授权，与手机上的 Tailscale App 登录状态不共享。完成一次授权后，XDial 会自动继续连接验收。"
         ].exists)
 
-        app.tabBars.buttons["模式"].tap()
-        XCTAssertFalse(app.buttons["添加模式"].isEnabled)
+        app.tabBars.buttons["场景"].tap()
+        XCTAssertFalse(app.buttons["添加场景"].isEnabled)
 
         app.tabBars.buttons["配置"].tap()
         XCTAssertFalse(app.buttons["添加线路"].isEnabled)

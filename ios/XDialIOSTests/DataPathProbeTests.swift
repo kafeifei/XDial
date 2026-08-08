@@ -11,8 +11,8 @@ final class DataPathProbeTests: XCTestCase {
             trojanServer: "proxy.example.com",
             trojanPassword: "secret"
         ))
-        profile.modes = [Mode(id: "proxy", name: "Proxy", defaultLineID: "proxy-one")]
-        profile.activeModeID = "proxy"
+        profile.scenarios = [Scenario(id: "proxy", name: "Proxy", defaultLineID: "proxy-one")]
+        profile.activeScenarioID = "proxy"
         profile.ensureConnectivityTestConfiguration()
         let data = try JSONEncoder().encode(profile)
         let json = try XCTUnwrap(String(data: data, encoding: .utf8))
@@ -33,8 +33,8 @@ final class DataPathProbeTests: XCTestCase {
         profile.lines[1].vpnServer = "gateway.example.com"
         profile.lines[1].vpnUsername = "user"
         profile.lines[1].vpnPassword = "secret"
-        profile.modes = [Mode(id: "ac", name: "AC", defaultLineID: "vpn")]
-        profile.activeModeID = "ac"
+        profile.scenarios = [Scenario(id: "ac", name: "AC", defaultLineID: "vpn")]
+        profile.activeScenarioID = "ac"
         profile.ensureConnectivityTestConfiguration()
         let data = try JSONEncoder().encode(profile)
         let json = try XCTUnwrap(String(data: data, encoding: .utf8))
@@ -98,7 +98,7 @@ final class DataPathProbeTests: XCTestCase {
             type: "manual",
             domains: ["example.com"]
         ))
-        profile.modes = [Mode(
+        profile.scenarios = [Scenario(
             id: "mixed",
             name: "Mixed",
             bindings: [
@@ -107,7 +107,7 @@ final class DataPathProbeTests: XCTestCase {
             ],
             defaultLineID: "direct"
         )]
-        profile.activeModeID = "mixed"
+        profile.activeScenarioID = "mixed"
         profile.ensureConnectivityTestConfiguration()
         let data = try JSONEncoder().encode(profile)
         let json = try XCTUnwrap(String(data: data, encoding: .utf8))
@@ -132,8 +132,8 @@ final class DataPathProbeTests: XCTestCase {
 
     func testPureDirectPlanMarksSplitRoutingNotApplicable() throws {
         var profile = Profile.bootstrap()
-        profile.modes = [Mode(id: "direct-only", name: "Direct", defaultLineID: "direct")]
-        profile.activeModeID = "direct-only"
+        profile.scenarios = [Scenario(id: "direct-only", name: "Direct", defaultLineID: "direct")]
+        profile.activeScenarioID = "direct-only"
         profile.ensureConnectivityTestConfiguration()
         let data = try JSONEncoder().encode(profile)
         let json = try XCTUnwrap(String(data: data, encoding: .utf8))
@@ -210,13 +210,13 @@ final class DataPathProbeTests: XCTestCase {
             type: "manual",
             cidrs: ["100.64.0.0/10"]
         ))
-        profile.modes = [Mode(
+        profile.scenarios = [Scenario(
             id: "direct-overlay",
             name: "Direct + Overlay",
             bindings: [RuleBinding(ruleSetID: "overlay-rule", lineID: "overlay")],
             defaultLineID: "direct"
         )]
-        profile.activeModeID = "direct-overlay"
+        profile.activeScenarioID = "direct-overlay"
         profile.ensureConnectivityTestConfiguration()
         let data = try JSONEncoder().encode(profile)
         let json = try XCTUnwrap(String(data: data, encoding: .utf8))
@@ -233,7 +233,7 @@ final class DataPathProbeTests: XCTestCase {
             Set(plan.generatedTailscaleTargets.map(\.tag)),
             Set(["tailscale-overlay", "tailscale-exit"])
         )
-        XCTAssertFalse(profile.modes[0].bindings.contains {
+        XCTAssertFalse(profile.scenarios[0].bindings.contains {
             $0.ruleSetID == RuleSet.connectivityOutboundID
         })
     }

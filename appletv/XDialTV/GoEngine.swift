@@ -472,13 +472,22 @@ struct DaemonResponse: Decodable {
 
 struct EngineStatus: Decodable {
     let status: String
-    let mode: String?
+    let scenarioID: String?
     let connectedAt: Int?
     let error: String?
 
     enum CodingKeys: String, CodingKey {
-        case status, mode, error
+        case status, error
+        case scenarioID = "scenario_id"
         case connectedAt = "connected_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        status = try values.decode(String.self, forKey: .status)
+        scenarioID = try values.decodeIfPresent(String.self, forKey: .scenarioID)
+        connectedAt = try values.decodeIfPresent(Int.self, forKey: .connectedAt)
+        error = try values.decodeIfPresent(String.self, forKey: .error)
     }
 }
 

@@ -151,8 +151,8 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
 
     private func failedReport(code: String) -> ConnectionReport {
         let plan = ConnectionPlan(
-            schemaVersion: 1,
-            mode: ConnectionPlanMode(id: "mode", name: "Mode"),
+            schemaVersion: 3,
+            scenario: ConnectionPlanScenario(id: "scenario", name: "Scenario"),
             tasks: [
                 ConnectionPlanTask(
                     id: "underlay:system",

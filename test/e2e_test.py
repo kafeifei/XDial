@@ -10,7 +10,7 @@
     vault 密码（~/.xdial/vault.json），真连接后断言：
       连接态：系统 DNS 已被接管到 198.18.0.2、解析可用、默认线路可达、
               VPN 绑定的内网域名可达、sing-box 数据面进程存在
-      同源性：对活动模式里每条基于域名的绑定，断言「同一域名的路由出口与
+      同源性：对活动场景里每条基于域名的绑定，断言「同一域名的路由出口与
               DNS 应答来源一致」（ARCHITECTURE.md §4.1 因果链 / INV7 的运行时版）：
               - DNS 侧：向名义公网解析器发查询必须被盒内应答（hijack-dns），
                 且名义服务器换成接管地址答案不变；VPN 绑定的内网名，应答
@@ -192,19 +192,19 @@ class DaemonClient:
 # ---------------------------------------------------------------------------
 
 def dangling_profile(new_keys: bool) -> dict:
-    """活动模式绑定了一个不存在的规则 —— 必须 fail-closed 拒绝启动。"""
+    """活动场景绑定了一个不存在的规则 —— 必须 fail-closed 拒绝启动。"""
     if new_keys:
         return {
             "lines": [
                 {"id": "direct", "name": "直连", "type": "direct", "enabled": True},
             ],
             "rule_sets": [],
-            "modes": [
+            "scenarios": [
                 {"id": "m", "name": "测试",
                  "bindings": [{"rule_set_id": "ghost", "line_id": "direct"}],
                  "default_line_id": "direct"},
             ],
-            "active_mode_id": "m",
+            "active_scenario_id": "m",
         }
     # 旧比喻命名（ports/cargoes/cruises），验证 daemon 端兼容层解码后
     # 走的是同一套校验
@@ -284,7 +284,7 @@ def test_old_key_compat_fail_closed(client: DaemonClient):
     else:
         err = resp.get("message", "")
         # 旧 key 若解码失败会以 invalid profile 拒绝；结构校验同步失败则证明
-        # 兼容层已经把旧字段归一化成了同一份 Mode 引用。
+        # 兼容层已经把旧字段归一化成了同一份 Scenario 引用。
         if "invalid profile" in err:
             raise Failure(f"旧 key profile 未通过兼容层解码: {err}")
         if client.status() != "disconnected":
@@ -385,14 +385,13 @@ def inject_vault_passwords(profile: dict) -> int:
 
 
 def pick_vpn_probe_domain(profile: dict) -> Optional[str]:
-    """从活动模式里找一个绑定到 VPN 线路的手动规则域名（内网可达性探针）。"""
-    mode = next((m for m in profile.get("modes", [])
-                 if m["id"] == profile.get("active_mode_id")), None)
-    if mode is None:
+    """从活动场景里找一个绑定到 VPN 线路的手动规则域名（内网可达性探针）。"""
+    scenario = active_scenario(profile)
+    if scenario is None:
         return None
     lines = {l["id"]: l for l in profile.get("lines", [])}
     rulesets = {r["id"]: r for r in profile.get("rule_sets", [])}
-    for binding in mode.get("bindings", []):
+    for binding in scenario.get("bindings", []):
         line = lines.get(binding.get("line_id", ""))
         rs = rulesets.get(binding.get("rule_set_id", ""))
         if not line or not rs:
@@ -456,7 +455,7 @@ def resolve_ok(name: str) -> bool:
 # 同源性断言：同一域名的路由出口与 DNS 应答来源必须一致。
 #
 # 这是 ARCHITECTURE.md §4.1 因果链（名字→线路→地址）/ INV7 的运行时版：
-# INV7 在生成阶段保证 route 规则与 dns 规则从同一份 mode.Bindings 编译，
+# INV7 在生成阶段保证 route 规则与 dns 规则从同一份 scenario.Bindings 编译，
 # 这里在真实数据面上验证编译产物确实按同一归属生效——流量走 A 线路而解析
 # 走 B 线路（漂移）时，得到的地址在 A 那头根本不通，且配置里看不出问题。
 #
@@ -496,7 +495,7 @@ def dig_short(name: str, nominal_server: str) -> list:
     """向指定名义服务器发 A 查询，返回应答 IP 列表。
 
     连接态下这个查询必然被 hijack-dns 拦在盒内——nominal_server 只是包上写的
-    地址，真正的应答者由 sing-box DNS 规则链（mode.Bindings 编译产物）决定。
+    地址，真正的应答者由 sing-box DNS 规则链（scenario.Bindings 编译产物）决定。
     """
     try:
         out = run(["dig", "+short", "+time=3", "+tries=1",
@@ -604,27 +603,28 @@ def line_outbound_tag(line: dict) -> str:
     return "proxy-" + line["id"]
 
 
-def active_mode(profile: dict) -> Optional[dict]:
-    return next((m for m in profile.get("modes", [])
-                 if m["id"] == profile.get("active_mode_id")), None)
+def active_scenario(profile: dict) -> Optional[dict]:
+    scenarios = profile.get("scenarios", [])
+    active_id = profile.get("active_scenario_id")
+    return next((s for s in scenarios if s["id"] == active_id), None)
 
 
 def build_consistency_probes(profile: dict) -> list:
-    """把活动模式里「基于域名的绑定」编译成同源性探针清单。
+    """把活动场景里「基于域名的绑定」编译成同源性探针清单。
 
-    输入源刻意与生成器相同（mode.Bindings），覆盖范围与 INV7 的收窄语义一致：
+    输入源刻意与生成器相同（scenario.Bindings），覆盖范围与 INV7 的收窄语义一致：
     只看域名绑定；direct / tailscale 豁免（前者不声明解析器，后者的 tailnet
     名字在静态配置里没有域名列表）；URL 规则集的域名在远端 .srs 里，测试侧
     无法枚举，跳过（route 侧与 dns 侧引用的本就是同一份 rule_set 资源，
     静态一致性由 INV7 守护）。
     """
-    mode = active_mode(profile)
-    if mode is None:
+    scenario = active_scenario(profile)
+    if scenario is None:
         return []
     lines = {l["id"]: l for l in profile.get("lines", [])}
     rulesets = {r["id"]: r for r in profile.get("rule_sets", [])}
     probes = []
-    for binding in mode.get("bindings", []):
+    for binding in scenario.get("bindings", []):
         if binding.get("subscription_id"):
             continue  # 订阅出口的组 tag 经 slugify，测试侧不复刻命名规则
         line = lines.get(binding.get("line_id", ""))
@@ -789,7 +789,7 @@ def assert_route_dns_agree(probe: dict) -> None:
 def assert_default_line_chain(default_tag: str) -> None:
     """默认出口（route.final）的路由归属。
 
-    「未绑定域名」不能靠假设——热门域名常被模式 URL 规则集 / 订阅自带规则
+    「未绑定域名」不能靠假设——热门域名常被场景 URL 规则集 / 订阅自带规则
     截走（此时断言的是那条规则而不是 final，若出口同名就恒绿假测）。判据用
     结构化的 rule 字段：未命中任何规则时它就是字符串 "final"。被截走则换
     备选域名，全部被截走时可见跳过，不产出假绿。出口比对用 chains 末元素
@@ -839,11 +839,10 @@ def run_tier_b(socket_path: str, require_fresh: bool) -> int:
     profile = load_real_profile()
     injected = inject_vault_passwords(profile)
     probe_domain = pick_vpn_probe_domain(profile)
-    mode = next((m for m in profile.get("modes", [])
-                 if m["id"] == profile.get("active_mode_id")), None)
-    if mode is None:
-        raise Failure("真实 profile 没有活动模式")
-    print(f"  活动模式: {mode.get('name')}，注入密码 {injected} 条，"
+    scenario = active_scenario(profile)
+    if scenario is None:
+        raise Failure("真实 profile 没有活动场景")
+    print(f"  活动场景: {scenario.get('name')}，注入密码 {injected} 条，"
           f"内网探针: {probe_domain or '无（跳过该断言）'}")
 
     client = DaemonClient(socket_path)
@@ -921,7 +920,7 @@ def run_tier_b(socket_path: str, require_fresh: bool) -> int:
         check("Clash API 可达", assert_clash_api_up)
         probes = build_consistency_probes(profile)
         if not probes:
-            print("  – 同源性：活动模式没有可探测的域名绑定（手动规则集），跳过")
+            print("  – 同源性：活动场景没有可探测的域名绑定（手动规则集），跳过")
         for consistency_probe in probes:
             check(f"同源性 {consistency_probe['ruleset']} → {consistency_probe['tag']}",
                   lambda p=consistency_probe: assert_route_dns_agree(p))
@@ -930,11 +929,11 @@ def run_tier_b(socket_path: str, require_fresh: bool) -> int:
         # 否则 final 回落 "direct"。残余口径差：enabled 但参数不全的代理线路
         # 也会回落 direct（lineHasUsableOutbound），测试侧不复刻——vault
         # 注入后现实中不出现。
-        if mode.get("default_subscription_id"):
+        if scenario.get("default_subscription_id"):
             print("  – 默认出口是订阅组（tag 经 slugify 生成，测试侧不复刻），跳过出口链断言")
         else:
             default_line = next((l for l in profile.get("lines", [])
-                                 if l["id"] == mode.get("default_line_id")), None)
+                                 if l["id"] == scenario.get("default_line_id")), None)
             if default_line is not None and default_line.get("enabled"):
                 default_tag = line_outbound_tag(default_line)
             else:

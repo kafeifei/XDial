@@ -947,7 +947,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     }
 
     /// 组装 GoEngine.EngineStatus 期望的 JSON:{"status": "...", "error": "..."?}。
-    /// EngineStatus 只解 status / mode / connected_at / error;这里给 status(+error)。
+    /// EngineStatus 只解 status / scenario_id / connected_at / error；这里给 status(+error)。
     private func statusJSONString() -> String {
         let running = currentEngine()?.isRunning() ?? false
         var dict: [String: Any] = ["status": running ? "connected" : "disconnected"]

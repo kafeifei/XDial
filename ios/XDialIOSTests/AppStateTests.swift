@@ -412,8 +412,8 @@ final class AppStateTests: XCTestCase {
         profile.lines[1].vpnServer = "gateway.example.com"
         profile.lines[1].vpnUsername = "tester"
         profile.lines[1].vpnPassword = "secret"
-        profile.modes = [Mode(id: "test-mode", name: "Test", defaultLineID: "vpn")]
-        profile.activeModeID = "test-mode"
+        profile.scenarios = [Scenario(id: "test-scenario", name: "Test", defaultLineID: "vpn")]
+        profile.activeScenarioID = "test-scenario"
         profile.ensureConnectivityTestConfiguration()
         return profile
     }
@@ -421,8 +421,8 @@ final class AppStateTests: XCTestCase {
     func testConnectivityAcceptanceRulesAreVisibleAndExplicitlyBound() {
         var profile = Profile.bootstrap()
         profile.ruleSets.removeAll { $0.isConnectivityTestRule }
-        profile.modes = [Mode(
-            id: "legacy-mode",
+        profile.scenarios = [Scenario(
+            id: "legacy-scenario",
             name: "Legacy",
             bindings: [RuleBinding(ruleSetID: "internal", lineID: "vpn")],
             defaultLineID: "direct"
@@ -438,13 +438,13 @@ final class AppStateTests: XCTestCase {
             ["1.1.1.1/32"]
         )
         XCTAssertEqual(
-            Array(profile.modes[0].bindings.prefix(2)),
+            Array(profile.scenarios[0].bindings.prefix(2)),
             [
                 RuleBinding(ruleSetID: RuleSet.connectivityDirectID, lineID: "direct"),
                 RuleBinding(ruleSetID: RuleSet.connectivityOutboundID, lineID: "vpn"),
             ]
         )
-        XCTAssertTrue(profile.modes[0].bindings.contains {
+        XCTAssertTrue(profile.scenarios[0].bindings.contains {
             $0.ruleSetID == "internal" && $0.lineID == "vpn"
         })
         XCTAssertFalse(profile.ensureConnectivityTestConfiguration())
@@ -453,22 +453,22 @@ final class AppStateTests: XCTestCase {
     func testConnectivityAcceptanceMarksPureDirectAsSingleRoute() {
         var profile = Profile.bootstrap()
         profile.lines.append(Line(id: "vpn-two", name: "Second", type: "vpn"))
-        profile.modes = [Mode(id: "blank", name: "Blank", defaultLineID: "direct")]
+        profile.scenarios = [Scenario(id: "blank", name: "Blank", defaultLineID: "direct")]
 
         profile.ensureConnectivityTestConfiguration()
 
-        XCTAssertFalse(profile.modes[0].bindings.contains {
+        XCTAssertFalse(profile.scenarios[0].bindings.contains {
             $0.ruleSetID == RuleSet.connectivityOutboundID
         })
     }
 
     func testConnectivityAcceptanceDoesNotInjectUnreferencedSingleAnyConnectLine() {
         var profile = Profile.bootstrap()
-        profile.modes = [Mode(id: "blank", name: "Blank", defaultLineID: "direct")]
+        profile.scenarios = [Scenario(id: "blank", name: "Blank", defaultLineID: "direct")]
 
         profile.ensureConnectivityTestConfiguration()
 
-        XCTAssertFalse(profile.modes[0].bindings.contains {
+        XCTAssertFalse(profile.scenarios[0].bindings.contains {
             $0.ruleSetID == RuleSet.connectivityOutboundID
         })
     }
@@ -488,7 +488,7 @@ final class AppStateTests: XCTestCase {
             type: "manual",
             domains: ["proxy.example"]
         ))
-        profile.modes = [Mode(
+        profile.scenarios = [Scenario(
             id: "mixed",
             name: "Mixed",
             bindings: [
@@ -501,7 +501,7 @@ final class AppStateTests: XCTestCase {
         profile.ensureConnectivityTestConfiguration()
 
         XCTAssertEqual(
-            profile.modes[0].bindings.first(where: {
+            profile.scenarios[0].bindings.first(where: {
                 $0.ruleSetID == RuleSet.connectivityOutboundID
             }),
             RuleBinding(ruleSetID: RuleSet.connectivityOutboundID, lineID: "proxy-one")
@@ -512,14 +512,14 @@ final class AppStateTests: XCTestCase {
         var profile = Profile.bootstrap()
         profile.lines[0].enabled = false
         profile.lines.append(Line(id: "direct-enabled", name: "Direct Enabled", type: "direct"))
-        profile.modes = [Mode(id: "test", name: "Test", defaultLineID: "vpn")]
+        profile.scenarios = [Scenario(id: "test", name: "Test", defaultLineID: "vpn")]
 
         profile.ensureConnectivityTestConfiguration()
 
-        XCTAssertTrue(profile.modes[0].bindings.contains {
+        XCTAssertTrue(profile.scenarios[0].bindings.contains {
             $0.ruleSetID == RuleSet.connectivityDirectID && $0.lineID == "direct-enabled"
         })
-        XCTAssertFalse(profile.modes[0].bindings.contains {
+        XCTAssertFalse(profile.scenarios[0].bindings.contains {
             $0.ruleSetID == RuleSet.connectivityDirectID && $0.lineID == "direct"
         })
     }
@@ -530,8 +530,8 @@ final class AppStateTests: XCTestCase {
         let persistence = makePersistence()
         let app = AppState(engine: engine, tunnelManager: manager, persistence: persistence)
         var profile = configuredProfile()
-        profile.modes[0].defaultLineID = "direct"
-        profile.modes[0].bindings.removeAll { !$0.isConnectivityAcceptanceBindingForTest }
+        profile.scenarios[0].defaultLineID = "direct"
+        profile.scenarios[0].bindings.removeAll { !$0.isConnectivityAcceptanceBindingForTest }
         app.profile = profile
 
         XCTAssertTrue(app.save())
@@ -541,12 +541,12 @@ final class AppStateTests: XCTestCase {
 
         XCTAssertEqual(manager.startCallCount, 1)
         XCTAssertNil(manager.lastAnyConnect)
-        XCTAssertFalse(app.profile.modes[0].bindings.contains {
+        XCTAssertFalse(app.profile.scenarios[0].bindings.contains {
             $0.ruleSetID == RuleSet.connectivityOutboundID
         })
     }
 
-    func testPureProxyModeStartsWithoutAnyConnectCredentials() async {
+    func testPureProxyScenarioStartsWithoutAnyConnectCredentials() async {
         let engine = RuntimeSpyEngine()
         let manager = RuntimeSpyManager(engine: engine)
         let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
@@ -560,8 +560,8 @@ final class AppStateTests: XCTestCase {
             ssMethod: "aes-128-gcm",
             ssPassword: "secret"
         ))
-        profile.modes = [Mode(id: "proxy-mode", name: "Proxy", defaultLineID: "proxy-one")]
-        profile.activeModeID = "proxy-mode"
+        profile.scenarios = [Scenario(id: "proxy-scenario", name: "Proxy", defaultLineID: "proxy-one")]
+        profile.activeScenarioID = "proxy-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -573,7 +573,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertNil(manager.lastAnyConnect)
     }
 
-    func testPureTailscaleModeStartsWithoutAnyConnectCredentials() async {
+    func testPureTailscaleScenarioStartsWithoutAnyConnectCredentials() async {
         let engine = RuntimeSpyEngine()
         let manager = RuntimeSpyManager(engine: engine)
         let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
@@ -585,8 +585,8 @@ final class AppStateTests: XCTestCase {
             tailscaleExitNode: "100.64.0.8",
             tailscaleAuthenticated: true
         ))
-        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
-        profile.activeModeID = "tail-mode"
+        profile.scenarios = [Scenario(id: "tail-scenario", name: "Tail", defaultLineID: "tail")]
+        profile.activeScenarioID = "tail-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -687,8 +687,8 @@ final class AppStateTests: XCTestCase {
             type: "tailscale",
             enabled: true
         ))
-        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
-        profile.activeModeID = "tail-mode"
+        profile.scenarios = [Scenario(id: "tail-scenario", name: "Tail", defaultLineID: "tail")]
+        profile.activeScenarioID = "tail-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -974,8 +974,8 @@ final class AppStateTests: XCTestCase {
             type: "tailscale",
             tailscaleAuthenticated: true
         ))
-        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
-        profile.activeModeID = "tail-mode"
+        profile.scenarios = [Scenario(id: "tail-scenario", name: "Tail", defaultLineID: "tail")]
+        profile.activeScenarioID = "tail-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -1105,12 +1105,12 @@ final class AppStateTests: XCTestCase {
             )
             var profile = Profile.bootstrap()
             profile.lines.append(line)
-            profile.modes = [Mode(
-                id: "mode-\(line.id)",
-                name: "Mode \(line.name)",
+            profile.scenarios = [Scenario(
+                id: "scenario-\(line.id)",
+                name: "Scenario \(line.name)",
                 defaultLineID: line.id
             )]
-            profile.activeModeID = profile.modes[0].id
+            profile.activeScenarioID = profile.scenarios[0].id
             profile.ensureConnectivityTestConfiguration()
             app.profile = profile
 
@@ -1141,13 +1141,13 @@ final class AppStateTests: XCTestCase {
             type: "manual",
             domains: ["internal.example"]
         ))
-        profile.modes = [Mode(
-            id: "mode",
-            name: "Mode",
+        profile.scenarios = [Scenario(
+            id: "scenario",
+            name: "Scenario",
             bindings: [RuleBinding(ruleSetID: "tailnet", lineID: "tail")],
             defaultLineID: "direct"
         )]
-        profile.activeModeID = "mode"
+        profile.activeScenarioID = "scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -1208,7 +1208,7 @@ final class AppStateTests: XCTestCase {
             type: "manual",
             domains: ["example.invalid"]
         ))
-        profile.modes[0].bindings.append(RuleBinding(
+        profile.scenarios[0].bindings.append(RuleBinding(
             ruleSetID: "incomplete-rule",
             lineID: "incomplete-proxy"
         ))
@@ -1254,12 +1254,12 @@ final class AppStateTests: XCTestCase {
             ],
             selected: "Broken Node"
         )]
-        profile.modes = [Mode(
-            id: "subscription-mode",
+        profile.scenarios = [Scenario(
+            id: "subscription-scenario",
             name: "Subscription",
             defaultSubscriptionID: "subscription"
         )]
-        profile.activeModeID = "subscription-mode"
+        profile.activeScenarioID = "subscription-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -1309,12 +1309,12 @@ final class AppStateTests: XCTestCase {
                 selected: "Broken Node"
             )]
         )]
-        profile.modes = [Mode(
-            id: "subscription-mode",
+        profile.scenarios = [Scenario(
+            id: "subscription-scenario",
             name: "Subscription",
             defaultSubscriptionID: "subscription"
         )]
-        profile.activeModeID = "subscription-mode"
+        profile.activeScenarioID = "subscription-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -1353,7 +1353,7 @@ final class AppStateTests: XCTestCase {
             enabled: false,
             domains: ["optional.example"]
         ))
-        profile.modes[0].bindings.append(RuleBinding(
+        profile.scenarios[0].bindings.append(RuleBinding(
             ruleSetID: "optional-rule",
             lineID: "disabled-line"
         ))
@@ -1398,20 +1398,20 @@ final class AppStateTests: XCTestCase {
             type: "manual",
             domains: ["internal.example"]
         ))
-        profile.modes = [Mode(
+        profile.scenarios = [Scenario(
             id: "overlay",
             name: "Overlay",
             bindings: [RuleBinding(ruleSetID: "tailnet-only", lineID: "tail-overlay")],
             defaultLineID: "direct"
         )]
-        profile.activeModeID = "overlay"
+        profile.activeScenarioID = "overlay"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
         XCTAssertTrue(app.canConnect, app.activeConfigurationIssues.joined(separator: "\n"))
-        XCTAssertNil(app.profile.connectivityOutboundBinding(for: app.profile.modes[0]))
+        XCTAssertNil(app.profile.connectivityOutboundBinding(for: app.profile.scenarios[0]))
 
-        app.profile.modes[0].defaultLineID = "tail-overlay"
+        app.profile.scenarios[0].defaultLineID = "tail-overlay"
         app.profile.ensureConnectivityTestConfiguration()
         XCTAssertFalse(app.canConnect)
         XCTAssertTrue(app.activeConfigurationIssues.contains {
@@ -1445,7 +1445,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(app.isConnected)
         XCTAssertFalse(app.hasPendingRuntimeChanges)
 
-        guard app.profile.lines.indices.contains(1), !app.profile.modes.isEmpty else {
+        guard app.profile.lines.indices.contains(1), !app.profile.scenarios.isEmpty else {
             XCTFail("configured profile disappeared while testing connected edits")
             return
         }
@@ -1453,7 +1453,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(app.save())
         XCTAssertFalse(app.hasPendingRuntimeChanges)
 
-        app.profile.modes[0].name = "Changed"
+        app.profile.scenarios[0].name = "Changed"
         XCTAssertTrue(app.save())
         XCTAssertTrue(app.hasPendingRuntimeChanges)
     }
@@ -1626,15 +1626,15 @@ final class AppStateTests: XCTestCase {
         profile.lines[1].vpnServer = "gateway.example.com"
         profile.lines[1].vpnUsername = "tester"
         profile.lines[1].vpnPassword = "secret"
-        profile.modes = [
-            Mode(
-                id: "test-mode",
+        profile.scenarios = [
+            Scenario(
+                id: "test-scenario",
                 name: "Test",
                 bindings: [RuleBinding(ruleSetID: "internal", lineID: "vpn")],
                 defaultLineID: "direct"
             ),
         ]
-        profile.activeModeID = "test-mode"
+        profile.activeScenarioID = "test-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -1655,15 +1655,15 @@ final class AppStateTests: XCTestCase {
         let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
 
         var profile = Profile.bootstrap()
-        profile.modes = [
-            Mode(
-                id: "test-mode",
+        profile.scenarios = [
+            Scenario(
+                id: "test-scenario",
                 name: "Test",
                 bindings: [RuleBinding(ruleSetID: "internal", lineID: "vpn")],
                 defaultLineID: "direct"
             ),
         ]
-        profile.activeModeID = "test-mode"
+        profile.activeScenarioID = "test-scenario"
         app.profile = profile
 
         XCTAssertFalse(app.isConnectionConfigured)
@@ -1688,8 +1688,8 @@ final class AppStateTests: XCTestCase {
         profile.lines[1].vpnServer = "gateway.example.com"
         profile.lines[1].vpnUsername = "tester"
         profile.lines[1].vpnPassword = "secret"
-        profile.modes = [Mode(id: "test-mode", name: "Test", defaultLineID: "vpn")]
-        profile.activeModeID = "test-mode"
+        profile.scenarios = [Scenario(id: "test-scenario", name: "Test", defaultLineID: "vpn")]
+        profile.activeScenarioID = "test-scenario"
         app.profile = profile
         engine.lastError = "keep this message"
 
@@ -1808,7 +1808,7 @@ final class AppStateTests: XCTestCase {
     }
 
     #if targetEnvironment(simulator)
-    func testActiveModeRejectsMultipleAnyConnectLines() {
+    func testActiveScenarioRejectsMultipleAnyConnectLines() {
         let engine = FakeTunnelEngine()
         let manager = FakeTunnelManager(engine: engine)
         engine.retain(manager: manager)
@@ -1826,32 +1826,32 @@ final class AppStateTests: XCTestCase {
             vpnUsername: "tester-b",
             vpnPassword: "secret-b"
         ))
-        profile.modes = [
-            Mode(
-                id: "test-mode",
+        profile.scenarios = [
+            Scenario(
+                id: "test-scenario",
                 name: "Test",
                 bindings: [RuleBinding(ruleSetID: "internal", lineID: "vpn-b")],
                 defaultLineID: "vpn"
             ),
         ]
-        profile.activeModeID = "test-mode"
+        profile.activeScenarioID = "test-scenario"
         app.profile = profile
 
         XCTAssertEqual(app.activeAnyConnectLineIDs, Set(["vpn", "vpn-b"]))
         XCTAssertFalse(app.canConnect)
         XCTAssertTrue(app.activeConfigurationIssues.contains { $0.contains("只能使用一条") || $0.contains("only one") })
 
-        app.profile.modes[0].bindings[0].lineID = "vpn"
+        app.profile.scenarios[0].bindings[0].lineID = "vpn"
         app.profile.ensureConnectivityTestConfiguration()
         XCTAssertEqual(app.activeAnyConnectLineIDs, Set(["vpn"]))
         XCTAssertTrue(app.canConnect)
 
-        guard let internalBindingIndex = app.profile.modes[0].bindings.firstIndex(where: {
+        guard let internalBindingIndex = app.profile.scenarios[0].bindings.firstIndex(where: {
             $0.ruleSetID == "internal"
         }) else {
             return XCTFail("internal binding missing")
         }
-        app.profile.modes[0].bindings[internalBindingIndex].lineID = "vpn-b"
+        app.profile.scenarios[0].bindings[internalBindingIndex].lineID = "vpn-b"
         if let index = app.profile.ruleSets.firstIndex(where: { $0.id == "internal" }) {
             app.profile.ruleSets[index].enabled = false
         }
@@ -1860,7 +1860,7 @@ final class AppStateTests: XCTestCase {
     }
     #endif
 
-    func testTailscaleOnlyAndMixedModesCanConnect() {
+    func testTailscaleOnlyAndMixedScenariosCanConnect() {
         let engine = RuntimeSpyEngine()
         let manager = RuntimeSpyManager(engine: engine)
         let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
@@ -1881,12 +1881,12 @@ final class AppStateTests: XCTestCase {
             type: "manual",
             domains: ["internal.example"]
         )]
-        profile.modes = [Mode(
-            id: "tailscale-mode",
+        profile.scenarios = [Scenario(
+            id: "tailscale-scenario",
             name: "Tailscale",
             defaultLineID: "tailscale-home"
         )]
-        profile.activeModeID = "tailscale-mode"
+        profile.activeScenarioID = "tailscale-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -1899,7 +1899,7 @@ final class AppStateTests: XCTestCase {
         app.profile.lines[anyConnectIndex].vpnServer = "gateway.example.com"
         app.profile.lines[anyConnectIndex].vpnUsername = "tester"
         app.profile.lines[anyConnectIndex].vpnPassword = "secret"
-        app.profile.modes[0].bindings = [RuleBinding(ruleSetID: "internal", lineID: "vpn")]
+        app.profile.scenarios[0].bindings = [RuleBinding(ruleSetID: "internal", lineID: "vpn")]
         app.profile.ensureConnectivityTestConfiguration()
 
         XCTAssertEqual(app.activeAnyConnectLineIDs, Set(["vpn"]))
@@ -1930,12 +1930,12 @@ final class AppStateTests: XCTestCase {
             tailscaleExitNode: "100.64.0.8",
             tailscaleAuthenticated: true
         ))
-        profile.modes = [Mode(
-            id: "tailscale-mode",
+        profile.scenarios = [Scenario(
+            id: "tailscale-scenario",
             name: "Tailscale",
             defaultLineID: "tailscale-home"
         )]
-        profile.activeModeID = "tailscale-mode"
+        profile.activeScenarioID = "tailscale-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
         app.connect()
@@ -1972,8 +1972,8 @@ final class AppStateTests: XCTestCase {
             tailscaleExitNode: "100.64.0.8",
             tailscaleAuthenticated: true
         ))
-        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
-        profile.activeModeID = "tail-mode"
+        profile.scenarios = [Scenario(id: "tail-scenario", name: "Tail", defaultLineID: "tail")]
+        profile.activeScenarioID = "tail-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -1991,9 +1991,9 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(app.statusText.contains("Tailscale"))
         XCTAssertTrue(app.statusText.contains("登录") || app.statusText.contains("Sign-in"))
 
-        let originalModeCount = app.profile.modes.count
-        app.createMode(from: .blank, named: "Must Not Be Added")
-        XCTAssertEqual(app.profile.modes.count, originalModeCount)
+        let originalScenarioCount = app.profile.scenarios.count
+        app.createScenario(from: .blank, named: "Must Not Be Added")
+        XCTAssertEqual(app.profile.scenarios.count, originalScenarioCount)
 
         let result: Result<TailscaleRuntimeStatus, Error> = await withCheckedContinuation {
             continuation in
@@ -2034,8 +2034,8 @@ final class AppStateTests: XCTestCase {
             type: "tailscale",
             tailscaleAuthenticated: true
         ))
-        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
-        profile.activeModeID = "tail-mode"
+        profile.scenarios = [Scenario(id: "tail-scenario", name: "Tail", defaultLineID: "tail")]
+        profile.activeScenarioID = "tail-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
         engine.tailscaleResultsByEndpointTag = [
@@ -2114,8 +2114,8 @@ final class AppStateTests: XCTestCase {
             type: "tailscale",
             enabled: false
         ))
-        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
-        profile.activeModeID = "tail-mode"
+        profile.scenarios = [Scenario(id: "tail-scenario", name: "Tail", defaultLineID: "tail")]
+        profile.activeScenarioID = "tail-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -2154,8 +2154,8 @@ final class AppStateTests: XCTestCase {
             tailscaleExitNode: "100.64.0.8",
             tailscaleAuthenticated: true
         ))
-        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
-        profile.activeModeID = "tail-mode"
+        profile.scenarios = [Scenario(id: "tail-scenario", name: "Tail", defaultLineID: "tail")]
+        profile.activeScenarioID = "tail-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -2189,8 +2189,8 @@ final class AppStateTests: XCTestCase {
         let app = AppState(engine: engine, tunnelManager: manager, persistence: makePersistence())
         var profile = Profile.bootstrap()
         profile.lines.append(Line(id: "tail", name: "Tail", type: "tailscale"))
-        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
-        profile.activeModeID = "tail-mode"
+        profile.scenarios = [Scenario(id: "tail-scenario", name: "Tail", defaultLineID: "tail")]
+        profile.activeScenarioID = "tail-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -2225,8 +2225,8 @@ final class AppStateTests: XCTestCase {
             type: "tailscale",
             tailscaleAuthenticated: true
         ))
-        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail")]
-        profile.activeModeID = "tail-mode"
+        profile.scenarios = [Scenario(id: "tail-scenario", name: "Tail", defaultLineID: "tail")]
+        profile.activeScenarioID = "tail-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
 
@@ -2326,8 +2326,8 @@ final class AppStateTests: XCTestCase {
         var profile = Profile.bootstrap()
         profile.lines.append(Line(id: "tail-active", name: "Active", type: "tailscale"))
         profile.lines.append(Line(id: "tail-unused", name: "Unused", type: "tailscale"))
-        profile.modes = [Mode(id: "tail-mode", name: "Tail", defaultLineID: "tail-active")]
-        profile.activeModeID = "tail-mode"
+        profile.scenarios = [Scenario(id: "tail-scenario", name: "Tail", defaultLineID: "tail-active")]
+        profile.activeScenarioID = "tail-scenario"
         profile.ensureConnectivityTestConfiguration()
         app.profile = profile
         app.connect()
@@ -2386,8 +2386,8 @@ final class AppStateTests: XCTestCase {
                 trojanPassword: "secret"
             )]
         )]
-        profile.modes = [Mode(
-            id: "sub-mode",
+        profile.scenarios = [Scenario(
+            id: "sub-scenario",
             name: "Subscription",
             bindings: [
                 RuleBinding(ruleSetID: "disabled-rule", lineID: "proxy-disabled-rule"),
@@ -2396,7 +2396,7 @@ final class AppStateTests: XCTestCase {
         )]
         profile.ensureConnectivityTestConfiguration()
 
-        let targets = profile.activeRouteTargetSummaries(for: profile.modes[0])
+        let targets = profile.activeRouteTargetSummaries(for: profile.scenarios[0])
 
         XCTAssertTrue(targets.contains {
             $0.id == "sub:sub-main" && $0.name == "Main Subscription"
@@ -2452,21 +2452,21 @@ final class AppStateTests: XCTestCase {
         profile.subscriptions = [
             Subscription(id: "sub-1", name: "Example", url: "https://example.com/sub")
         ]
-        profile.modes = [
-            Mode(id: "mode-1", name: "Example", defaultSubscriptionID: "sub-1")
+        profile.scenarios = [
+            Scenario(id: "scenario-1", name: "Example", defaultSubscriptionID: "sub-1")
         ]
-        profile.activeModeID = "mode-1"
+        profile.activeScenarioID = "scenario-1"
         app.profile = profile
 
         app.deleteSubscription("sub-1")
 
         XCTAssertTrue(app.profile.subscriptions.isEmpty)
-        guard let mode = app.profile.modes.first else {
-            XCTFail("Deleting a subscription must not remove its referencing mode")
+        guard let scenario = app.profile.scenarios.first else {
+            XCTFail("Deleting a subscription must not remove its referencing scenario")
             return
         }
-        XCTAssertEqual(mode.defaultSubscriptionID, "sub-1")
-        XCTAssertEqual(mode.defaultLineID, "")
+        XCTAssertEqual(scenario.defaultSubscriptionID, "sub-1")
+        XCTAssertEqual(scenario.defaultLineID, "")
         XCTAssertTrue(app.activeConfigurationIssues.contains { $0.contains("订阅已删除") || $0.contains("deleted subscription") })
     }
 
@@ -2791,20 +2791,20 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(app.persistenceRequiresRecovery)
 
         var replacement = Profile.bootstrap()
-        replacement.modes = [
-            Mode(id: "recovered-mode", name: "Recovered", defaultLineID: "direct"),
+        replacement.scenarios = [
+            Scenario(id: "recovered-scenario", name: "Recovered", defaultLineID: "direct"),
         ]
-        replacement.activeModeID = "recovered-mode"
+        replacement.activeScenarioID = "recovered-scenario"
         XCTAssertTrue(app.replaceProfileAndSave(replacement))
         XCTAssertFalse(app.persistenceRequiresRecovery)
 
         let reloaded = AppState(engine: NoopTunnelEngine(), persistence: persistence)
         XCTAssertFalse(reloaded.persistenceRequiresRecovery)
-        guard let reloadedMode = reloaded.profile.modes.first else {
+        guard let reloadedScenario = reloaded.profile.scenarios.first else {
             XCTFail("The explicitly replaced profile must survive reload")
             return
         }
-        XCTAssertEqual(reloadedMode.name, "Recovered")
+        XCTAssertEqual(reloadedScenario.name, "Recovered")
     }
 
     func testCorruptStoredProfileFailsClosed() {

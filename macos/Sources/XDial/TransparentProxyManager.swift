@@ -33,6 +33,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     var statusHandler: StatusHandler?
     var reportHandler: ReportHandler?
     var activationStatusHandler: ActivationStatusHandler?
+    var underlayChangeHandler: ((String) -> Void)?
     var activeTransactionID: String? {
         TransparentProxyRuntimeGate.connectionProofTransactionID(
             currentTransactionID: currentTransactionID,
@@ -80,6 +81,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var stableConnectionResetWorkItem: DispatchWorkItem?
     private var stableConnectionResetAt: Date?
     private var connectedSessionTransactionID: String?
+    private var activeScenarioSwitch: HostScenarioSwitch?
+    private var lastScenarioSwitchProjection:
+        HostScenarioSwitchProjection?
     private var activeReconnectIncidentID: String?
     private var stableResetIncidentID: String?
     private var lastPublishedRuntimeStatus = "disconnected"
@@ -103,6 +107,41 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         )
     }
 
+    var scenarioSwitchProjection: HostScenarioSwitchProjection? {
+        guard let active = activeScenarioSwitch else {
+            return lastScenarioSwitchProjection
+        }
+        let status: String
+        if active.reconciling {
+            status = "reconciling"
+        } else if active.timedOut {
+            status = "cancelling-after-timeout"
+        } else if active.cancellationRequested {
+            status = "cancelling"
+        } else if active.requestSent {
+            status = "preparing"
+        } else {
+            status = "capturing-underlay"
+        }
+        return makeScenarioSwitchProjection(
+            active,
+            status: status,
+            // Once a sent request has an ambiguous response, the source is
+            // only the last host-known commit. Do not label it active until a
+            // read-only Provider reconciliation proves source or target.
+            activeTransactionID: active.reconciling
+                ? ""
+                : currentTransactionID ?? active.sourceTransactionID,
+            code: active.reconciling
+                ? "switch-outcome-unknown"
+                : nil,
+            message: active.reconciling
+                ? active.reconciliationError?.localizedDescription
+                : nil,
+            inFlight: true
+        )
+    }
+
     deinit {
         if let statusObserver {
             NotificationCenter.default.removeObserver(statusObserver)
@@ -111,6 +150,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         underlayMonitor?.cancel()
         automaticReconnectRetryWorkItem?.cancel()
         stableConnectionResetWorkItem?.cancel()
+        activeScenarioSwitch?.timeoutWorkItem?.cancel()
+        activeScenarioSwitch?.reconciliationWorkItem?.cancel()
     }
 
     func start(
@@ -121,6 +162,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             publishFailure(ManagerError.missingProfile)
             return
         }
+        lastScenarioSwitchProjection = nil
         let transactionID: String
         do {
             transactionID = try beginTransaction(profileJSON: profileJSON)
@@ -185,6 +227,305 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 self.publishFailure(error)
             }
         }
+    }
+
+    /// Stage and atomically commit a new Scenario inside the already-running
+    /// Provider session. The currently committed report remains authoritative
+    /// until the Provider returns a committed target report; candidate state is
+    /// never written into `ConnectionReportJournal`.
+    func switchScenario(
+        profileJSON: String,
+        completion: @escaping (Result<ConnectionReport, Error>) -> Void
+    ) {
+        guard activeScenarioSwitch == nil else {
+            completion(.failure(ManagerError.scenarioSwitchInProgress))
+            return
+        }
+        guard
+            let sourceReport = ConnectionReportJournal.read(),
+            sourceReport.transactionID == currentTransactionID,
+            sourceReport.state == .committed,
+            !sourceReport.systemTakeoverRemoved,
+            manager?.connection.status == .connected
+        else {
+            completion(.failure(ManagerError.scenarioSwitchUnavailable))
+            return
+        }
+
+        let plan: ConnectionPlan
+        do {
+            plan = try generateConnectionPlan(profileJSON: profileJSON)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        guard
+            plan.schemaVersion == 3,
+            !plan.scenario.id.isEmpty,
+            !plan.configurationFingerprint.isEmpty
+        else {
+            completion(.failure(ManagerError.invalidConnectionPlan))
+            return
+        }
+
+        let requestID = UUID().uuidString
+        let targetTransactionID = UUID().uuidString
+        let targetReport = ConnectionReport(
+            transactionID: targetTransactionID,
+            plan: plan
+        )
+        let targetReportJSON: String
+        do {
+            let data = try ConnectionReportCodec.encode(targetReport)
+            guard let encoded = String(data: data, encoding: .utf8) else {
+                throw ManagerError.invalidConnectionPlan
+            }
+            targetReportJSON = encoded
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        activeScenarioSwitch = HostScenarioSwitch(
+            requestID: requestID,
+            sourceTransactionID: sourceReport.transactionID,
+            sourceReport: sourceReport,
+            targetTransactionID: targetTransactionID,
+            targetScenarioID: plan.scenario.id,
+            targetConfigurationFingerprint:
+                plan.configurationFingerprint,
+            profileJSON: profileJSON,
+            targetReportJSON: targetReportJSON,
+            completionGate: HostCompletionGate(completion),
+            cancellationRequested: false,
+            requestSent: false,
+            timedOut: false,
+            reconciling: false,
+            reconciliationError: nil,
+            reconciliationWorkItem: nil,
+            underlay: nil,
+            timeoutWorkItem: nil
+        )
+        HostUnderlayCapture.start { [weak self] result in
+            self?.continueScenarioSwitchAfterUnderlayCapture(
+                requestID: requestID,
+                result: result
+            )
+        }
+    }
+
+    /// Cancellation is scoped to the staged switch. It must not stop the
+    /// Network Extension session or alter the source transaction.
+    func cancelScenarioSwitch() {
+        guard var active = activeScenarioSwitch,
+              !active.cancellationRequested else {
+            return
+        }
+        if !active.requestSent {
+            activeScenarioSwitch = nil
+            active.timeoutWorkItem?.cancel()
+            recordScenarioSwitch(
+                active,
+                status: "cancelled",
+                activeTransactionID: active.sourceTransactionID,
+                code: "switch-cancelled",
+                message: ManagerError.scenarioSwitchCancelled
+                    .localizedDescription
+            )
+            active.completionGate.finish(.failure(
+                ManagerError.scenarioSwitchCancelled
+            ))
+            return
+        }
+        active.cancellationRequested = true
+        activeScenarioSwitch = active
+        let request = ProviderScenarioSwitchRequest.cancelSwitch(
+            requestID: active.requestID,
+            expectedTransactionID: active.sourceTransactionID
+        )
+        sendScenarioSwitchMessage(request) { result in
+            if case let .failure(error) = result {
+                appLog(
+                    "Scenario switch cancellation delivery failed: "
+                        + error.localizedDescription
+                )
+            }
+        }
+        // A cancellation acknowledgement is not a terminal transaction fact:
+        // settings may still be in flight, or commit may already have won.
+        // Begin read-only reconciliation immediately because either the
+        // original response or the cancellation acknowledgement can be lost.
+        beginScenarioSwitchReconciliation(
+            requestID: request.requestID,
+            error: ManagerError.scenarioSwitchCancelled
+        )
+    }
+
+    /// Re-sample the complete host Underlay at a network-epoch settle point.
+    /// Only its opaque in-process identity crosses into AppState; the actual
+    /// interfaces and DNS snapshot remain owned by this manager and are
+    /// captured again for the eventual Provider Switch request.
+    func captureCurrentUnderlayFingerprint(
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        HostUnderlayCapture.start { result in
+            completion(result.map(\.epochFingerprint))
+        }
+    }
+
+    private func continueScenarioSwitchAfterUnderlayCapture(
+        requestID: String,
+        result: Result<HostUnderlaySnapshot, Error>
+    ) {
+        guard var active = activeScenarioSwitch,
+              active.requestID == requestID else {
+            // A newer desired generation cancelled this capture. It must not
+            // leak an obsolete target into the Provider.
+            return
+        }
+        guard !active.cancellationRequested else {
+            activeScenarioSwitch = nil
+            recordScenarioSwitch(
+                active,
+                status: "cancelled",
+                activeTransactionID: active.sourceTransactionID,
+                code: "switch-cancelled",
+                message: ManagerError.scenarioSwitchCancelled
+                    .localizedDescription
+            )
+            active.completionGate.finish(.failure(
+                ManagerError.scenarioSwitchCancelled
+            ))
+            return
+        }
+        guard case let .success(underlay) = result else {
+            activeScenarioSwitch = nil
+            if case let .failure(error) = result {
+                recordScenarioSwitch(
+                    active,
+                    status: "failed",
+                    activeTransactionID: active.sourceTransactionID,
+                    code: "underlay-capture-failed",
+                    message: error.localizedDescription
+                )
+                active.completionGate.finish(.failure(error))
+            }
+            return
+        }
+        guard
+            let liveSourceReport = ConnectionReportJournal.read(),
+            liveSourceReport.transactionID == active.sourceTransactionID,
+            liveSourceReport.transactionID == currentTransactionID,
+            liveSourceReport.state == .committed,
+            !liveSourceReport.systemTakeoverRemoved,
+            manager?.connection.status == .connected
+        else {
+            activeScenarioSwitch = nil
+            recordScenarioSwitch(
+                active,
+                status: "failed",
+                activeTransactionID: currentTransactionID ??
+                    active.sourceTransactionID,
+                code: "switch-source-changed",
+                message: ManagerError.scenarioSwitchUnavailable
+                    .localizedDescription
+            )
+            active.completionGate.finish(.failure(
+                ManagerError.scenarioSwitchUnavailable
+            ))
+            return
+        }
+        active.sourceReport = liveSourceReport
+
+        if liveSourceReport.scenario.id == active.targetScenarioID,
+           liveSourceReport.configurationFingerprint ==
+            active.targetConfigurationFingerprint,
+           activeUnderlay?.isEquivalent(to: underlay) == true {
+            activeScenarioSwitch = nil
+            recordScenarioSwitch(
+                active,
+                status: "no-op",
+                activeTransactionID: liveSourceReport.transactionID,
+                code: nil,
+                message: nil
+            )
+            active.completionGate.finish(.success(liveSourceReport))
+            return
+        }
+
+        active.underlay = underlay
+        let timeoutWorkItem = DispatchWorkItem { [weak self] in
+            self?.timeOutScenarioSwitch(requestID: requestID)
+        }
+        active.timeoutWorkItem = timeoutWorkItem
+        activeScenarioSwitch = active
+        let request = ProviderScenarioSwitchRequest.switchScenario(
+            requestID: active.requestID,
+            expectedTransactionID: active.sourceTransactionID,
+            targetTransactionID: active.targetTransactionID,
+            profileJSON: active.profileJSON,
+            connectionReportJSON: active.targetReportJSON,
+            underlayInterfacesJSON: underlay.interfacesJSON,
+            underlayDefaultName: underlay.defaultInterface.name,
+            underlayDefaultIndex: underlay.defaultInterface.index,
+            systemDNSJSON: underlay.systemDNSJSON
+        )
+        sendScenarioSwitchMessage(request) { [weak self] switchResult in
+            self?.finishScenarioSwitch(
+                requestID: requestID,
+                result: switchResult
+            )
+        }
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 90,
+            execute: timeoutWorkItem
+        )
+    }
+
+    private func timeOutScenarioSwitch(requestID: String) {
+        guard var active = activeScenarioSwitch,
+              active.requestID == requestID else {
+            return
+        }
+        active.timeoutWorkItem?.cancel()
+        active.timeoutWorkItem = nil
+        active.timedOut = true
+        if !active.requestSent {
+            activeScenarioSwitch = nil
+            recordScenarioSwitch(
+                active,
+                status: "timed-out",
+                activeTransactionID: active.sourceTransactionID,
+                code: "switch-timeout",
+                message: ManagerError.scenarioSwitchTimedOut
+                    .localizedDescription
+            )
+            active.completionGate.finish(.failure(
+                ManagerError.scenarioSwitchTimedOut
+            ))
+            return
+        }
+        active.cancellationRequested = true
+        activeScenarioSwitch = active
+        let cancelRequest = ProviderScenarioSwitchRequest.cancelSwitch(
+            requestID: active.requestID,
+            expectedTransactionID: active.sourceTransactionID
+        )
+        sendScenarioSwitchMessage(cancelRequest) { result in
+            if case let .failure(error) = result {
+                appLog(
+                    "Timed-out Scenario switch cancellation delivery failed: "
+                        + error.localizedDescription
+                )
+            }
+            // Cancellation acknowledgement means only that cancellation was
+            // accepted (or lost the commit race); reconciliation below reads
+            // the live committed Provider transaction.
+        }
+        beginScenarioSwitchReconciliation(
+            requestID: active.requestID,
+            error: ManagerError.scenarioSwitchTimedOut
+        )
     }
 
 #if DEBUG
@@ -397,6 +738,17 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     #endif
 
     func stop() {
+        if activeScenarioSwitch != nil {
+            cancelScenarioSwitch()
+            if let active = activeScenarioSwitch {
+                activeScenarioSwitch = nil
+                active.timeoutWorkItem?.cancel()
+                active.reconciliationWorkItem?.cancel()
+                active.completionGate.finish(.failure(
+                    ManagerError.scenarioSwitchCancelled
+                ))
+            }
+        }
         if let transactionID = currentTransactionID {
             updateReport(transactionID: transactionID) { report in
                 guard report.state != .committed else { return }
@@ -936,6 +1288,467 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
     }
 
+    private func sendScenarioSwitchMessage(
+        _ request: ProviderScenarioSwitchRequest,
+        completion: @escaping (
+            Result<ProviderScenarioSwitchResponse, Error>
+        ) -> Void
+    ) {
+        let requestData: Data
+        do {
+            requestData = try ProviderScenarioSwitchCodec.encodeRequest(
+                request
+            )
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        withExistingManager { result in
+            switch result {
+            case .failure:
+                completion(.failure(
+                    ManagerError.scenarioSwitchUnavailable
+                ))
+            case .success(nil):
+                completion(.failure(
+                    ManagerError.scenarioSwitchUnavailable
+                ))
+            case let .success(manager?):
+                guard manager.connection.status == .connected,
+                      let session = manager.connection
+                        as? NETunnelProviderSession else {
+                    completion(.failure(
+                        ManagerError.scenarioSwitchUnavailable
+                    ))
+                    return
+                }
+                if request.cmd == .switchScenario {
+                    guard var active = self.activeScenarioSwitch,
+                          active.requestID == request.requestID,
+                          !active.cancellationRequested,
+                          !active.requestSent else {
+                        completion(.failure(
+                            ManagerError.scenarioSwitchCancelled
+                        ))
+                        return
+                    }
+                    // `requestSent` means sendProviderMessage is about to be
+                    // invoked, not merely that manager lookup started. A cancel
+                    // racing the lookup can therefore remove the candidate and
+                    // prevent an obsolete Switch from being delivered later.
+                    active.requestSent = true
+                    self.activeScenarioSwitch = active
+                }
+                do {
+                    try session.sendProviderMessage(requestData) {
+                        responseData in
+                        DispatchQueue.main.async {
+                            guard let responseData else {
+                                completion(.failure(
+                                    ManagerError
+                                        .scenarioSwitchInvalidResponse
+                                ))
+                                return
+                            }
+                            do {
+                                let response = try
+                                    ProviderScenarioSwitchCodec
+                                    .decodeResponse(responseData)
+                                guard
+                                    response.cmd == request.cmd,
+                                    response.requestID == request.requestID,
+                                    response.sourceTransactionID ==
+                                        request.expectedTransactionID
+                                else {
+                                    throw ManagerError
+                                        .scenarioSwitchInvalidResponse
+                                }
+                                completion(.success(response))
+                            } catch {
+                                completion(.failure(error))
+                            }
+                        }
+                    }
+                } catch {
+                    completion(.failure(
+                        ManagerError.scenarioSwitchSendFailed
+                    ))
+                }
+            }
+        }
+    }
+
+    private func finishScenarioSwitch(
+        requestID: String,
+        result: Result<ProviderScenarioSwitchResponse, Error>
+    ) {
+        guard
+            let active = activeScenarioSwitch,
+            active.requestID == requestID
+        else {
+            return
+        }
+
+        switch result {
+        case let .failure(error):
+            guard active.requestSent else {
+                finishSourceScenarioSwitchFailure(
+                    active,
+                    error: error,
+                    code: "switch-host-failed",
+                    message: error.localizedDescription
+                )
+                return
+            }
+            beginScenarioSwitchReconciliation(
+                requestID: requestID,
+                error: active.timedOut
+                    ? ManagerError.scenarioSwitchTimedOut
+                    : error
+            )
+        case let .success(response):
+            guard response.ok else {
+                finishSourceScenarioSwitchFailure(
+                    active,
+                    error: active.timedOut
+                        ? ManagerError.scenarioSwitchTimedOut
+                        : ProviderScenarioSwitchRejectedError(
+                            code: response.code ?? "switch-failed",
+                            message: response.message
+                        ),
+                    code: active.timedOut
+                        ? "switch-timeout"
+                        : response.code ?? "switch-failed",
+                    message: response.message
+                )
+                return
+            }
+            guard
+                let (report, reportJSON) = committedReport(
+                    from: response
+                ),
+                response.activeTransactionID == active.targetTransactionID,
+                report.transactionID == active.targetTransactionID,
+                report.scenario.id == active.targetScenarioID,
+                report.configurationFingerprint ==
+                    active.targetConfigurationFingerprint
+            else {
+                beginScenarioSwitchReconciliation(
+                    requestID: requestID,
+                    error: ManagerError.scenarioSwitchInvalidResponse
+                )
+                return
+            }
+            adoptCommittedScenarioSwitch(
+                active,
+                report: report,
+                reportJSON: reportJSON
+            )
+        }
+    }
+
+    private func beginScenarioSwitchReconciliation(
+        requestID: String,
+        error: Error
+    ) {
+        guard var active = activeScenarioSwitch,
+              active.requestID == requestID,
+              active.requestSent else {
+            return
+        }
+        active.timeoutWorkItem?.cancel()
+        active.timeoutWorkItem = nil
+        active.reconciling = true
+        if active.reconciliationError == nil {
+            active.reconciliationError = error
+        }
+        activeScenarioSwitch = active
+        scheduleScenarioSwitchReconciliation(
+            requestID: requestID,
+            delay: 0
+        )
+    }
+
+    private func scheduleScenarioSwitchReconciliation(
+        requestID: String,
+        delay: TimeInterval
+    ) {
+        guard var active = activeScenarioSwitch,
+              active.requestID == requestID,
+              active.reconciling,
+              active.reconciliationWorkItem == nil else {
+            return
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.performScenarioSwitchReconciliation(
+                requestID: requestID
+            )
+        }
+        active.reconciliationWorkItem = workItem
+        activeScenarioSwitch = active
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + delay,
+            execute: workItem
+        )
+    }
+
+    private func performScenarioSwitchReconciliation(
+        requestID: String
+    ) {
+        guard let active = activeScenarioSwitch,
+              active.requestID == requestID,
+              active.reconciling else {
+            return
+        }
+        let request = ProviderScenarioSwitchRequest.reconcileSwitch(
+            requestID: active.requestID,
+            expectedTransactionID: active.sourceTransactionID,
+            targetTransactionID: active.targetTransactionID
+        )
+        sendScenarioSwitchMessage(request) { [weak self] result in
+            self?.finishScenarioSwitchReconciliation(
+                requestID: requestID,
+                result: result
+            )
+        }
+    }
+
+    private func finishScenarioSwitchReconciliation(
+        requestID: String,
+        result: Result<ProviderScenarioSwitchResponse, Error>
+    ) {
+        guard var active = activeScenarioSwitch,
+              active.requestID == requestID,
+              active.reconciling else {
+            return
+        }
+        active.reconciliationWorkItem = nil
+        activeScenarioSwitch = active
+
+        guard case let .success(response) = result,
+              response.ok,
+              let switchInProgress = response.switchInProgress,
+              let (report, reportJSON) = committedReport(from: response),
+              report.transactionID == response.activeTransactionID else {
+            if case let .failure(error) = result,
+               active.reconciliationError == nil {
+                active.reconciliationError = error
+                activeScenarioSwitch = active
+            }
+            scheduleScenarioSwitchReconciliation(
+                requestID: requestID,
+                delay: 0.5
+            )
+            return
+        }
+
+        switch ProviderScenarioSwitchReconciliation.resolve(
+            sourceTransactionID: active.sourceTransactionID,
+            targetTransactionID: active.targetTransactionID,
+            activeTransactionID: report.transactionID,
+            switchInProgress: switchInProgress
+        ) {
+        case .targetCommitted:
+            guard report.scenario.id == active.targetScenarioID,
+                  report.configurationFingerprint ==
+                    active.targetConfigurationFingerprint else {
+                scheduleScenarioSwitchReconciliation(
+                    requestID: requestID,
+                    delay: 0.5
+                )
+                return
+            }
+            adoptCommittedScenarioSwitch(
+                active,
+                report: report,
+                reportJSON: reportJSON
+            )
+        case .sourceInProgress:
+            guard report.scenario.id == active.sourceReport.scenario.id,
+                  report.configurationFingerprint ==
+                    active.sourceReport.configurationFingerprint else {
+                scheduleScenarioSwitchReconciliation(
+                    requestID: requestID,
+                    delay: 0.5
+                )
+                return
+            }
+            scheduleScenarioSwitchReconciliation(
+                requestID: requestID,
+                delay: 0.25
+            )
+        case .sourceRestored:
+            guard report.scenario.id == active.sourceReport.scenario.id,
+                  report.configurationFingerprint ==
+                    active.sourceReport.configurationFingerprint else {
+                scheduleScenarioSwitchReconciliation(
+                    requestID: requestID,
+                    delay: 0.5
+                )
+                return
+            }
+            let terminalError: Error
+            let code: String
+            if active.timedOut {
+                terminalError = ManagerError.scenarioSwitchTimedOut
+                code = "switch-timeout"
+            } else if active.cancellationRequested {
+                terminalError = ManagerError.scenarioSwitchCancelled
+                code = "switch-cancelled"
+            } else {
+                terminalError = active.reconciliationError
+                    ?? ManagerError.scenarioSwitchInvalidResponse
+                code = "switch-not-committed"
+            }
+            finishSourceScenarioSwitchFailure(
+                active,
+                error: terminalError,
+                code: code,
+                message: terminalError.localizedDescription,
+                sourceReport: report,
+                sourceReportJSON: reportJSON
+            )
+        case .unrelatedTransaction:
+            // A transaction outside this host's source/target pair is still an
+            // explicit Provider fact, but this request cannot safely attach
+            // the missing Profile snapshot to it. Keep the outcome uncertain
+            // instead of silently relabelling the old source as active.
+            scheduleScenarioSwitchReconciliation(
+                requestID: requestID,
+                delay: 0.5
+            )
+        }
+    }
+
+    private func committedReport(
+        from response: ProviderScenarioSwitchResponse
+    ) -> (ConnectionReport, String)? {
+        guard
+            let reportJSON = response.reportJSON,
+            let reportData = reportJSON.data(using: .utf8),
+            let report = try? ConnectionReportCodec.decode(reportData),
+            report.state == .committed,
+            !report.systemTakeoverRemoved,
+            report.tasks.contains(where: {
+                $0.id == "ingress:transparent-proxy"
+                    && $0.kind == "ingress"
+                    && $0.state == .committed
+            })
+        else {
+            return nil
+        }
+        return (report, reportJSON)
+    }
+
+    private func adoptCommittedScenarioSwitch(
+        _ active: HostScenarioSwitch,
+        report: ConnectionReport,
+        reportJSON: String
+    ) {
+        activeScenarioSwitch = nil
+        active.timeoutWorkItem?.cancel()
+        active.reconciliationWorkItem?.cancel()
+        stopUnderlayMonitoring()
+        activeUnderlay = active.underlay
+        requestedProfileJSON = active.profileJSON
+        currentTransactionID = report.transactionID
+        currentTransactionSeedJSON = reportJSON
+        networkExtensionSessionTransactionID = report.transactionID
+        connectedSessionTransactionID = report.transactionID
+        do {
+            try ConnectionReportJournal.write(report)
+        } catch {
+            appLog(
+                "Scenario switch committed report journal write failed: "
+                    + error.localizedDescription
+            )
+        }
+        publishReport(report)
+        recordScenarioSwitch(
+            active,
+            status: "committed",
+            activeTransactionID: report.transactionID,
+            code: nil,
+            message: nil,
+            reusedLineIDs:
+                ConnectionReportRuntimeFacts.reusedLineIDs(report: report)
+        )
+        active.completionGate.finish(.success(report))
+    }
+
+    private func finishSourceScenarioSwitchFailure(
+        _ active: HostScenarioSwitch,
+        error: Error,
+        code: String,
+        message: String?,
+        sourceReport: ConnectionReport? = nil,
+        sourceReportJSON: String? = nil
+    ) {
+        activeScenarioSwitch = nil
+        active.timeoutWorkItem?.cancel()
+        active.reconciliationWorkItem?.cancel()
+        if let sourceReport {
+            currentTransactionID = sourceReport.transactionID
+            currentTransactionSeedJSON = sourceReportJSON
+            networkExtensionSessionTransactionID =
+                sourceReport.transactionID
+            connectedSessionTransactionID = sourceReport.transactionID
+            try? ConnectionReportJournal.write(sourceReport)
+            publishReport(sourceReport)
+        }
+        recordScenarioSwitch(
+            active,
+            status: active.timedOut ? "timed-out" : "failed",
+            activeTransactionID: active.sourceTransactionID,
+            code: code,
+            message: message
+        )
+        active.completionGate.finish(.failure(error))
+    }
+
+    private func makeScenarioSwitchProjection(
+        _ active: HostScenarioSwitch,
+        status: String,
+        activeTransactionID: String,
+        code: String?,
+        message: String?,
+        inFlight: Bool,
+        reusedLineIDs: [String] = []
+    ) -> HostScenarioSwitchProjection {
+        HostScenarioSwitchProjection(
+            status: status,
+            fromScenarioID: active.sourceReport.scenario.id,
+            toScenarioID: active.targetScenarioID,
+            sourceCommittedTransactionID: active.sourceTransactionID,
+            candidateTransactionID: active.targetTransactionID,
+            activeCommittedTransactionID: activeTransactionID,
+            inFlight: inFlight,
+            reusedLineIDs: reusedLineIDs,
+            code: code,
+            message: message
+        )
+    }
+
+    private func recordScenarioSwitch(
+        _ active: HostScenarioSwitch,
+        status: String,
+        activeTransactionID: String,
+        code: String?,
+        message: String?,
+        reusedLineIDs: [String] = []
+    ) {
+        lastScenarioSwitchProjection = makeScenarioSwitchProjection(
+            active,
+            status: status,
+            activeTransactionID: activeTransactionID,
+            code: code,
+            message: message,
+            inFlight: false,
+            reusedLineIDs: reusedLineIDs
+        )
+    }
+
     /// 每次都从系统当前配置重新取得 connected manager/session。这里不缓存
     /// `NETunnelProviderSession`，避免重连后把请求发给上一笔事务的连接对象。
     private func sendProviderDiagnostics(
@@ -972,7 +1785,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             return
         }
 
-        let gate = ProviderDiagnosticsCompletionGate(completion)
+        let gate = HostCompletionGate(completion)
         DispatchQueue.main.asyncAfter(
             deadline: .now() + max(1, timeout)
         ) {
@@ -1385,7 +2198,23 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         handleAutomaticReconnectAfterDisconnect(report: report)
     }
 
-    private func beginTransaction(profileJSON: String) throws -> String {
+    func runtimeConfigurationFingerprint(
+        profileJSON: String
+    ) -> Result<String, Error> {
+        do {
+            let plan = try generateConnectionPlan(profileJSON: profileJSON)
+            guard !plan.configurationFingerprint.isEmpty else {
+                throw ManagerError.invalidConnectionPlan
+            }
+            return .success(plan.configurationFingerprint)
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    private func generateConnectionPlan(
+        profileJSON: String
+    ) throws -> ConnectionPlan {
         var planError: NSError?
         let planJSON = LibboxGenerateConnectionPlan(
             profileJSON,
@@ -1403,6 +2232,11 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         else {
             throw ManagerError.invalidConnectionPlan
         }
+        return plan
+    }
+
+    private func beginTransaction(profileJSON: String) throws -> String {
+        let plan = try generateConnectionPlan(profileJSON: profileJSON)
         let transactionID = UUID().uuidString
         let report = ConnectionReport(
             transactionID: transactionID,
@@ -1767,9 +2601,20 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         else {
             return
         }
+        startUnderlayMonitoring(baseline: baseline)
+    }
+
+    private func startUnderlayMonitoring(
+        baseline: HostUnderlaySnapshot
+    ) {
+        guard underlayMonitor == nil,
+              requestedProfileJSON != nil,
+              startIntentID != nil else {
+            return
+        }
         let monitor = HostUnderlayMonitor(baseline: baseline) {
             [weak self] snapshot in
-            self?.restartForUnderlayChange(snapshot)
+            self?.handleUnderlayChange(snapshot)
         }
         underlayMonitor = monitor
         monitor.start()
@@ -1780,40 +2625,14 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         underlayMonitor = nil
     }
 
-    private func restartForUnderlayChange(
+    private func handleUnderlayChange(
         _ underlay: HostUnderlaySnapshot
     ) {
         guard
-            let profileJSON = requestedProfileJSON,
-            let manager,
+            requestedProfileJSON != nil,
             startIntentID != nil,
-            !automaticReconnectInProgress,
-            automaticReconnectAttemptsUsed
-                < automaticReconnectRetryPolicy.maxAttempts
+            manager?.connection.status == .connected
         else {
-            return
-        }
-        cancelStableConnectionReset()
-        stopUnderlayMonitoring()
-        cancelAutomaticReconnectRetry(resetAttempts: false)
-        let intentID = UUID()
-        startIntentID = intentID
-        automaticReconnectInProgress = true
-        automaticReconnectTrigger = .underlayChange
-        automaticReconnectTransactionID = nil
-        automaticReconnectAttemptsUsed += 1
-        connectedSessionTransactionID = nil
-        do {
-            let transactionID = try beginTransaction(
-                profileJSON: profileJSON
-            )
-            automaticReconnectTransactionID = transactionID
-            updateReport(transactionID: transactionID) {
-                $0.updateTask(id: "underlay:system", state: .ready)
-                $0.setState(.preparing)
-            }
-        } catch {
-            publishFailure(error)
             return
         }
         let changeKinds = activeUnderlay?
@@ -1823,16 +2642,14 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             "Transparent Proxy underlay changed "
                 + "\(activeUnderlay?.defaultInterface.name ?? "unknown")"
                 + " -> \(underlay.defaultInterface.name) "
-                + "kinds=\(changeKinds); rebuilding"
+                + "kinds=\(changeKinds); scheduling staged switch"
         )
-        publishRuntimeStatus("reconnecting", error: nil)
-        startConnection(
-            manager,
-            profileJSON: profileJSON,
-            underlay: underlay,
-            intentID: intentID,
-            debugFailureStage: nil
-        )
+        // HostUnderlayMonitor has already stopped itself at this point. Start
+        // a fresh observer from the newest sample so another physical change
+        // can supersede a candidate that is still preparing.
+        underlayMonitor = nil
+        startUnderlayMonitoring(baseline: underlay)
+        underlayChangeHandler?(underlay.epochFingerprint)
     }
 
     private func handleAutomaticReconnectAfterDisconnect(
@@ -2206,6 +3023,16 @@ private struct HostUnderlaySnapshot {
     let interfacesJSON: String
     let systemDNSJSON: String
 
+    /// Exact canonical identity for coalescing host notifications. This value
+    /// is never logged, persisted, sent to Provider, or exposed by Debug.
+    var epochFingerprint: String {
+        ([
+            "\(defaultInterface.index):\(defaultInterface.name)",
+            canonicalInterfaceKeys.joined(separator: ","),
+            systemDNSJSON,
+        ]).joined(separator: "\u{1F}")
+    }
+
     func isEquivalent(to other: HostUnderlaySnapshot) -> Bool {
         defaultInterface.name == other.defaultInterface.name
             && defaultInterface.index == other.defaultInterface.index
@@ -2559,7 +3386,7 @@ enum ProviderDiagnosticsHostError: LocalizedError {
     }
 }
 
-private final class ProviderDiagnosticsCompletionGate<Value> {
+private final class HostCompletionGate<Value> {
     private let lock = NSLock()
     private var completion: ((Result<Value, Error>) -> Void)?
 
@@ -2581,11 +3408,67 @@ private final class ProviderDiagnosticsCompletionGate<Value> {
     }
 }
 
+/// Separate host-side Switch fact projection. It deliberately does not replace
+/// the authoritative committed ConnectionReport while a candidate is pending
+/// or when that candidate fails.
+struct HostScenarioSwitchProjection: Equatable {
+    let status: String
+    let fromScenarioID: String
+    let toScenarioID: String
+    let sourceCommittedTransactionID: String
+    let candidateTransactionID: String
+    let activeCommittedTransactionID: String
+    let inFlight: Bool
+    /// Public Line IDs only. Opaque runtime identities never leave Provider
+    /// memory or enter this host/Debug projection.
+    let reusedLineIDs: [String]
+    let code: String?
+    let message: String?
+}
+
+private struct HostScenarioSwitch {
+    let requestID: String
+    let sourceTransactionID: String
+    var sourceReport: ConnectionReport
+    let targetTransactionID: String
+    let targetScenarioID: String
+    let targetConfigurationFingerprint: String
+    let profileJSON: String
+    let targetReportJSON: String
+    let completionGate: HostCompletionGate<ConnectionReport>
+    var cancellationRequested: Bool
+    var requestSent: Bool
+    var timedOut: Bool
+    var reconciling: Bool
+    var reconciliationError: Error?
+    var reconciliationWorkItem: DispatchWorkItem?
+    var underlay: HostUnderlaySnapshot?
+    var timeoutWorkItem: DispatchWorkItem?
+}
+
+private struct ProviderScenarioSwitchRejectedError: LocalizedError {
+    let code: String
+    let message: String?
+
+    var errorDescription: String? {
+        if let message, !message.isEmpty {
+            return message
+        }
+        return "场景切换失败（\(code)）"
+    }
+}
+
 private enum ManagerError: LocalizedError {
     case activationInProgress
     case missingProfile
     case missingTransaction
     case invalidConnectionPlan
+    case scenarioSwitchInProgress
+    case scenarioSwitchUnavailable
+    case scenarioSwitchInvalidResponse
+    case scenarioSwitchSendFailed
+    case scenarioSwitchCancelled
+    case scenarioSwitchTimedOut
     case interruptedTransactionRecovered
     case providerSessionLost
     case providerStartFailed
@@ -2607,7 +3490,19 @@ private enum ManagerError: LocalizedError {
         case .missingTransaction:
             "XDial 连接事务不存在"
         case .invalidConnectionPlan:
-            "当前模式无法生成有效的连接计划"
+            "当前场景无法生成有效的连接计划"
+        case .scenarioSwitchInProgress:
+            "已有一笔场景切换正在进行"
+        case .scenarioSwitchUnavailable:
+            "当前连接尚未进入可切换状态"
+        case .scenarioSwitchInvalidResponse:
+            "XDial Provider 返回了无效的场景切换结果"
+        case .scenarioSwitchSendFailed:
+            "无法向 XDial Provider 发送场景切换请求"
+        case .scenarioSwitchCancelled:
+            "场景切换已取消"
+        case .scenarioSwitchTimedOut:
+            "场景切换准备超时，当前场景保持连接"
         case .interruptedTransactionRecovered:
             "检测到上一次连接事务未完成，已撤销系统网络接管"
         case .providerSessionLost:

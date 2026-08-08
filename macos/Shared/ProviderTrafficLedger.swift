@@ -15,16 +15,30 @@ final class ProviderTrafficLedger: @unchecked Sendable {
         lock.unlock()
     }
 
-    func recordDownload(_ byteCount: Int) {
+    func recordDownload(
+        _ byteCount: Int,
+        transactionID: String
+    ) {
         guard byteCount > 0 else { return }
         lock.lock()
+        guard self.transactionID == transactionID else {
+            lock.unlock()
+            return
+        }
         downloadBytes = adding(byteCount, to: downloadBytes)
         lock.unlock()
     }
 
-    func recordUpload(_ byteCount: Int) {
+    func recordUpload(
+        _ byteCount: Int,
+        transactionID: String
+    ) {
         guard byteCount > 0 else { return }
         lock.lock()
+        guard self.transactionID == transactionID else {
+            lock.unlock()
+            return
+        }
         uploadBytes = adding(byteCount, to: uploadBytes)
         lock.unlock()
     }

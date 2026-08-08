@@ -160,10 +160,10 @@ final class AnyConnectFailureEvidenceTests: XCTestCase {
         var report = ConnectionReport(
             transactionID: "transaction",
             plan: ConnectionPlan(
-                schemaVersion: 1,
-                mode: ConnectionPlanMode(
-                    id: "mode",
-                    name: "Mode"
+                schemaVersion: 3,
+                scenario: ConnectionPlanScenario(
+                    id: "scenario",
+                    name: "Scenario"
                 ),
                 tasks: [
                     ConnectionPlanTask(
@@ -242,10 +242,10 @@ final class AnyConnectFailureEvidenceTests: XCTestCase {
         var report = ConnectionReport(
             transactionID: "legacy",
             plan: ConnectionPlan(
-                schemaVersion: 1,
-                mode: ConnectionPlanMode(
-                    id: "mode",
-                    name: "Mode"
+                schemaVersion: 3,
+                scenario: ConnectionPlanScenario(
+                    id: "scenario",
+                    name: "Scenario"
                 ),
                 tasks: []
             )

@@ -1,9 +1,9 @@
 import SwiftUI
 
-/// 主视图：连接状态 + 当前模式 + 连接/断开按钮 + 进入模式选择/凭据/设置的导航入口。
+/// 主视图：连接状态 + 当前场景 + 连接/断开按钮 + 进入场景选择/凭据/设置的导航入口。
 ///
 /// 完全数据驱动：只读 AppState 暴露的派生属性（statusText / isConnected / isBusy /
-/// canConnect / activeMode），不硬编码任何具体连接结果。引擎层未接入时，
+/// canConnect / activeScenario），不硬编码任何具体连接结果。引擎层未接入时，
 /// NoopTunnelEngine 让状态停在 "disconnected"，视图照常渲染。
 struct ConnectionView: View {
     @EnvironmentObject private var app: AppState
@@ -41,7 +41,7 @@ struct ConnectionView: View {
                 .font(.title)
                 .foregroundStyle(.primary)
 
-            Text(modeSubtitle)
+            Text(scenarioSubtitle)
                 .font(.title3)
                 .foregroundStyle(.secondary)
         }
@@ -59,11 +59,11 @@ struct ConnectionView: View {
         return .secondary
     }
 
-    private var modeSubtitle: String {
-        if let c = app.activeMode {
-            return app.tr("当前模式：", "Mode: ") + c.name
+    private var scenarioSubtitle: String {
+        if let c = app.activeScenario {
+            return app.tr("当前场景：", "Scenario: ") + c.name
         }
-        return app.tr("未选择模式", "No mode selected")
+        return app.tr("未选择场景", "No scenario selected")
     }
 
     // MARK: - 主操作按钮（连接 / 断开）
@@ -106,8 +106,11 @@ struct ConnectionView: View {
 
     private var navRow: some View {
         HStack(spacing: 32) {
-            NavigationLink(value: Route.modes) {
-                navTile(icon: "shuffle", title: app.tr("选择模式", "Modes"))
+            NavigationLink(value: Route.scenarios) {
+                navTile(
+                    icon: "square.grid.2x2.fill",
+                    title: app.tr("选择场景", "Scenarios")
+                )
             }
             NavigationLink(value: Route.credentials) {
                 navTile(icon: "key.fill", title: app.tr("凭据", "Credentials"))

@@ -32,11 +32,12 @@ struct CollapsibleCard<Header: View, Detail: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 7) {
             // 折叠头
-            HStack {
+            HStack(spacing: 7) {
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                     .foregroundStyle(locked ? .quaternary : .secondary)
+                    .font(.system(size: 9, weight: .semibold))
                     .frame(width: 12)
 
                 header()
@@ -67,25 +68,40 @@ struct CollapsibleCard<Header: View, Detail: View>: View {
             // 展开内容
             if isExpanded && !locked {
                 detail()
-                    .padding(.leading, 18)
+                    .padding(.leading, 19)
+                    .padding(.top, 2)
             }
         }
-        .padding(8)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 9)
         .background(
             ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(Color.gray.opacity(accentBar ? 0.06 : 0.08))
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(
+                        accentBar
+                            ? XDialPalette.selection.opacity(0.10)
+                            : XDialPalette.surface
+                    )
                 if accentBar {
                     HStack(spacing: 0) {
-                        Color.accentColor.opacity(0.5)
+                        XDialPalette.selection.opacity(0.72)
                             .frame(width: 3)
                             .clipShape(RoundedRectangle(cornerRadius: 1.5))
                         Spacer()
                     }
-                    .padding(.vertical, 2)
+                    .padding(.vertical, 7)
                 }
             }
         )
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(
+                    accentBar
+                        ? XDialPalette.selection.opacity(0.18)
+                        : Color.primary.opacity(0.065),
+                    lineWidth: 0.5
+                )
+        }
     }
 }
 
@@ -98,7 +114,43 @@ struct AddBar<Content: View>: View {
             Spacer()
             content()
                 .menuStyle(.borderlessButton)
-                .padding(8)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(XDialPalette.primaryAction)
+                .padding(.horizontal, 10)
+                .frame(height: 28)
+                .background(
+                    XDialPalette.primaryAction.opacity(0.09),
+                    in: Capsule()
+                )
+                .overlay {
+                    Capsule().stroke(
+                        XDialPalette.primaryAction.opacity(0.16),
+                        lineWidth: 0.5
+                    )
+                }
         }
+        .padding(.horizontal, 12)
+        .frame(height: 44)
+        .background(Color.primary.opacity(0.015))
+    }
+}
+
+/// 通用设置使用与列表卡片相同的表面层级。
+struct SettingsPanel<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        content()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 9)
+            .background(
+                Color(nsColor: .windowBackgroundColor),
+                in: RoundedRectangle(cornerRadius: 10)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.primary.opacity(0.065), lineWidth: 0.5)
+            }
     }
 }

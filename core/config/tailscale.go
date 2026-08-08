@@ -89,7 +89,7 @@ func randomHexSuffix() string {
 // buildTailscaleEndpoint 生成 sing-box 的 tailscale endpoint。
 //
 // 显式关闭的字段：
-//   - accept_routes：XDial 里 Tailscale 只是一条出口线路，只有模式显式绑定的流量
+//   - accept_routes：XDial 里 Tailscale 只是一条出口线路，只有场景显式绑定的流量
 //     才走它。接受 peer 广播的子网路由会把一堆用户没要求的网段拉进来，
 //     还可能和本地网段撞上（例如公司和家里都是 192.168.1.0/24）。
 //   - system_interface：Tailscale 只是一条 sing-box 盒内 Line，不能创建第二个

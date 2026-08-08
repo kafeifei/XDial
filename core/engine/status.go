@@ -31,7 +31,7 @@ func (s Status) String() string {
 
 type StatusMessage struct {
 	Status      string `json:"status"`
-	Mode        string `json:"mode,omitempty"`
+	ScenarioID  string `json:"scenario_id,omitempty"`
 	ConnectedAt int64  `json:"connected_at,omitempty"`
 	UpBytes     int64  `json:"up_bytes,omitempty"`
 	DownBytes   int64  `json:"down_bytes,omitempty"`

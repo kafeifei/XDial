@@ -43,7 +43,7 @@ enum TransparentProxyProcessSelectorKind: String, Sendable, Codable {
     case pathPrefix = "path_prefix"
 }
 
-/// The three PROCESS-NAME modes exposed by Surge Mac, plus a distinct bundle
+/// The three PROCESS-NAME scenarios exposed by Surge Mac, plus a distinct bundle
 /// kind retained for the App picker. Matching is performed only against the
 /// executable path macOS attributes to the current flow.
 struct TransparentProxyProcessSelector: Sendable, Equatable {
@@ -157,7 +157,7 @@ struct TransparentProxyProcessSelector: Sendable, Equatable {
 
 /// The credential selection decision is deliberately pure so path attribution
 /// can be tested without constructing a Network Extension flow. Bundle order
-/// is the active Mode binding order returned by Go and therefore must not be
+/// is the active Scenario binding order returned by Go and therefore must not be
 /// sorted or converted to a dictionary before matching.
 enum TransparentProxyApplicationCredentialDecision: Equatable {
     case base
@@ -185,7 +185,7 @@ enum TransparentProxyApplicationCredentialDecision: Equatable {
         guard let auditExecutablePath else {
             // A user process supplied an audit token but Security.framework
             // could not resolve it. Do not silently send a selected app through
-            // the Mode default when attribution is unavailable.
+            // the Scenario default when attribution is unavailable.
             return .reject
         }
         for selector in activeSelectors {

@@ -7,10 +7,20 @@ extension Notification.Name {
     )
 }
 
+enum InstallationOperation: String, CaseIterable, Identifiable {
+    case install
+    case uninstall
+
+    var id: String { rawValue }
+}
+
 @MainActor
 final class InstallationCoordinator: ObservableObject {
     static let shared = InstallationCoordinator()
 
+    @Published private(set) var presentedOperation: InstallationOperation =
+        .install
+    @Published private(set) var isInstalling = false
     @Published private(set) var report = InstallationReport.fresh(
         applicationAlreadyInstalled:
             ApplicationRelocator.isRunningFromApplications
@@ -47,6 +57,7 @@ final class InstallationCoordinator: ObservableObject {
         if !markerMatches || !PrivilegeManager.isInstalled {
             present()
         }
+        isInstalling = true
         runTask = Task { [weak self] in
             await self?.run()
         }
@@ -65,7 +76,14 @@ final class InstallationCoordinator: ObservableObject {
         }
     }
 
-    func present() {
+    func selectOperation(_ operation: InstallationOperation) {
+        presentedOperation = operation
+    }
+
+    func present(
+        operation: InstallationOperation = .install
+    ) {
+        presentedOperation = operation
         DispatchQueue.main.async {
             NotificationCenter.default.post(
                 name: .xdialOpenInstallation,
@@ -75,7 +93,10 @@ final class InstallationCoordinator: ObservableObject {
     }
 
     private func run() async {
-        defer { runTask = nil }
+        defer {
+            runTask = nil
+            isInstalling = false
+        }
         do {
             guard ApplicationRelocator.isRunningFromApplications else {
                 throw InstallationFailure(

@@ -66,6 +66,7 @@ enum TCPFlowSOCKSRelay {
                             connection: connection,
                             resources: resources,
                             shutdown: shutdown,
+                            transactionID: trialID,
                             traffic: traffic
                         )
                         logger.debug(
@@ -290,6 +291,7 @@ enum TCPFlowSOCKSRelay {
         connection: NWConnection,
         resources: TCPRelayResources,
         shutdown: RelayTaskShutdown,
+        transactionID: String,
         traffic: ProviderTrafficLedger
     ) async throws {
         try await RelayTaskPair.run(
@@ -302,7 +304,10 @@ enum TCPFlowSOCKSRelay {
                         return
                     }
                     try await send(data, to: connection)
-                    traffic.recordUpload(data.count)
+                    traffic.recordUpload(
+                        data.count,
+                        transactionID: transactionID
+                    )
                 }
             },
             second: {
@@ -310,7 +315,10 @@ enum TCPFlowSOCKSRelay {
                     let result = try await receive(from: connection)
                     if !result.data.isEmpty {
                         try await write(result.data, to: flow)
-                        traffic.recordDownload(result.data.count)
+                        traffic.recordDownload(
+                            result.data.count,
+                            transactionID: transactionID
+                        )
                     }
                     if let error = result.error {
                         throw error

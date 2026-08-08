@@ -43,6 +43,8 @@ struct XDialApp: App {
         MenuBarExtra {
             MainPopover()
                 .environmentObject(state)
+                .tint(XDialPalette.accent)
+                .preferredColorScheme(state.appearance.colorScheme)
         } label: {
             MenuBarLabel()
         }
@@ -51,14 +53,19 @@ struct XDialApp: App {
         Window("XDial 设置", id: "settings") {
             SettingsView()
                 .environmentObject(state)
+                .tint(XDialPalette.accent)
+                .preferredColorScheme(state.appearance.colorScheme)
         }
         .defaultSize(width: 540, height: 540)
         .windowResizability(.contentSize)
 
-        Window("XDial 安装", id: "installation") {
+        Window("XDial 安装与卸载", id: "installation") {
             InstallationView(
                 coordinator: InstallationCoordinator.shared
             )
+            .environmentObject(state)
+            .tint(XDialPalette.accent)
+            .preferredColorScheme(state.appearance.colorScheme)
         }
         .defaultSize(width: 480, height: 420)
         .windowResizability(.contentSize)

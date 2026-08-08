@@ -123,11 +123,11 @@ func TestEngineRejectsUnsupportedUnderlayBeforeStartingLines(t *testing.T) {
 			Enabled: true,
 			// 故意不填服务器和凭据：若 Line 校验先执行，错误会变成“服务器未填写”。
 		}},
-		Modes: []config.Mode{{
-			ID:            "mode",
+		Scenarios: []config.Scenario{{
+			ID:            "scenario",
 			DefaultLineID: "vpn",
 		}},
-		ActiveModeID: "mode",
+		ActiveScenarioID: "scenario",
 	}
 	engine := New(t.TempDir(), t.TempDir(), nil)
 	engine.detectDataPlaneUnderlay = func(context.Context) (string, error) {
