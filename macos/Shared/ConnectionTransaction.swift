@@ -1296,11 +1296,21 @@ enum ConnectionReportJournal {
         fileName: String,
         createDirectory: Bool
     ) -> URL? {
+#if XDIAL_TESTING
+        // Unit tests must not contend with or mutate the live Provider journal.
+        // The process suffix also isolates concurrent XCTest workers.
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "com.kafeifei.xdial.tests-\(ProcessInfo.processInfo.processIdentifier)",
+                isDirectory: true
+            )
+#else
         guard let container = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: groupIdentifier
         ) else {
             return nil
         }
+#endif
         let directory = container.appendingPathComponent(
             "Transactions",
             isDirectory: true

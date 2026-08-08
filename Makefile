@@ -31,7 +31,7 @@ MACOS_ICON_SOURCE := macos/Sources/XDial/AppIcon.swift
 # （partial match，本机唯一），无证书环境可 SIGN_IDENTITY=- 回落 ad-hoc。
 SIGN_IDENTITY ?= Apple Development
 
-.PHONY: all cli app release restart inspector clean prepare-patched-go go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
+.PHONY: all cli app ci-macos-build release restart inspector clean prepare-patched-go go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
 
 macos/AppIcon.icns: $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
 	@rm -rf "$(BUILD_DIR)/AppIcon.iconset" "$(BUILD_DIR)/generate-app-icon"
@@ -146,6 +146,19 @@ app: cli libbox-macos-xcframework macos/AppIcon.icns
 		build
 	rm -rf "$(APP_BUNDLE)"
 	ditto "$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app" "$(APP_BUNDLE)"
+
+# GitHub 托管 runner 不持有 System Extension 的签名证书和 provisioning profile。
+# 这里分别编译 Debug / Release 的扩展与宿主，只验证源码和链接；产物没有签名、不可分发。
+ci-macos-build: cli libbox-macos-xcframework macos/AppIcon.icns
+	cd macos && xcodegen generate
+	@set -e; for configuration in Debug Release; do \
+		xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy \
+			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
+			-derivedDataPath $(BUILD_DIR)/macos-xcode-ci CODE_SIGNING_ALLOWED=NO build; \
+		xcodebuild -project macos/XDial.xcodeproj -scheme XDial \
+			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
+			-derivedDataPath $(BUILD_DIR)/macos-xcode-ci CODE_SIGNING_ALLOWED=NO build; \
+	done
 
 # release 构建:swift -c release 使 #if DEBUG 的 DebugServer 整体排除,
 # go -trimpath -s -w 去符号并注入版本。分发一律用这个产物。

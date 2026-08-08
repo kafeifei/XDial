@@ -152,8 +152,10 @@ targets:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
             "${extension_dir}/${extension_name}/Contents/Info.plist")" \
             = "${XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER}"
-          /usr/bin/codesign --verify --deep --strict \
-            "${extension_dir}/${extension_name}"
+          if [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ]; then
+            /usr/bin/codesign --verify --deep --strict \
+              "${extension_dir}/${extension_name}"
+          fi
         inputFiles:
           - "$(BUILT_PRODUCTS_DIR)/$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER).systemextension"
         outputFiles:
@@ -168,6 +170,9 @@ targets:
           mkdir -p "${helper_dir}" "${launchd_dir}"
           cp "${helper_source}" "${helper_dir}/xdial-daemon"
           cp "${SRCROOT}/com.kafeifei.xdial.helper.plist" "${launchd_dir}/"
+          if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ]; then
+            exit 0
+          fi
           if [ "${CONFIGURATION}" = "Release" ]; then
             /usr/bin/codesign --force --options runtime --timestamp \
               --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
@@ -200,3 +205,4 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.tests
         GENERATE_INFOPLIST_FILE: YES
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) XDIAL_TESTING"
