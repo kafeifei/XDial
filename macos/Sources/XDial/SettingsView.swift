@@ -64,7 +64,10 @@ struct SettingsView: View {
                     .frame(width: 292)
                     .background(Color.primary.opacity(0.04), in: Capsule())
                     .overlay {
-                        Capsule().stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+                        Capsule().stroke(
+                            XDialPalette.divider.opacity(0.65),
+                            lineWidth: 0.5
+                        )
                     }
                     Spacer(minLength: 0)
                 }
@@ -81,7 +84,10 @@ struct SettingsView: View {
                 .frame(width: 92)
                 .background(Color.primary.opacity(0.04), in: Capsule())
                 .overlay {
-                    Capsule().stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+                    Capsule().stroke(
+                        XDialPalette.divider.opacity(0.65),
+                        lineWidth: 0.5
+                    )
                 }
             }
             .padding(.horizontal, 16)
@@ -148,15 +154,15 @@ struct SettingsView: View {
             .frame(height: 28)
             .background(
                 selected
-                    ? XDialPalette.selection.opacity(0.13)
+                    ? XDialPalette.selection.opacity(0.18)
                     : Color.clear,
                 in: Capsule()
             )
             .overlay {
                 if selected {
                     Capsule().stroke(
-                        XDialPalette.selection.opacity(0.19),
-                        lineWidth: 0.5
+                        XDialPalette.selection.opacity(0.52),
+                        lineWidth: 0.75
                     )
                 }
             }
@@ -372,52 +378,48 @@ struct GeneralTab: View {
                 }
 
                 SettingsPanel {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: installationStatusSymbol)
-                                .font(.system(size: 14, weight: .medium))
-                                .foregroundStyle(installationStatusColor)
-                                .frame(width: 18, height: 18)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(state.tr(
-                                    "安装与卸载",
-                                    "Install & Uninstall"
-                                ))
-                                .font(.system(size: 12, weight: .semibold))
-                                Text(installationStatusText)
-                                    .font(.system(size: 10.5))
-                                    .foregroundStyle(.secondary)
-                            }
+                    HStack(spacing: 8) {
+                        Image(systemName: installationStatusSymbol)
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(installationStatusColor)
+                            .frame(width: 18, height: 18)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(state.tr(
+                                "安装与卸载",
+                                "Install & Uninstall"
+                            ))
+                            .font(.system(size: 12, weight: .semibold))
+                            Text(installationStatusText)
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
 
-                        HStack(spacing: 8) {
-                            Spacer()
-                            Button {
-                                state.installation.present(
-                                    operation: .install
-                                )
-                            } label: {
-                                Label(
-                                    state.tr("安装", "Install"),
-                                    systemImage: "square.and.arrow.down"
-                                )
-                                .font(.system(size: 11.5))
-                            }
-                            .controlSize(.small)
-
-                            Button(role: .destructive) {
-                                state.installation.present(
-                                    operation: .uninstall
-                                )
-                            } label: {
-                                Label(
-                                    state.tr("卸载", "Uninstall"),
-                                    systemImage: "trash"
-                                )
-                                .font(.system(size: 11.5))
-                            }
-                            .controlSize(.small)
+                        Button {
+                            state.installation.present(
+                                operation: .install
+                            )
+                        } label: {
+                            Label(
+                                state.tr("安装", "Install"),
+                                systemImage: "square.and.arrow.down"
+                            )
+                            .font(.system(size: 11.5))
                         }
+                        .controlSize(.small)
+
+                        Button(role: .destructive) {
+                            state.installation.present(
+                                operation: .uninstall
+                            )
+                        } label: {
+                            Label(
+                                state.tr("卸载", "Uninstall"),
+                                systemImage: "trash"
+                            )
+                            .font(.system(size: 11.5))
+                        }
+                        .controlSize(.small)
                     }
                 }
             }
@@ -1856,32 +1858,42 @@ struct RuleSetRow: View {
                     rule.invert.toggle()
                     state.save()
                 } label: {
-                    Label(
-                        state.tr("反向", "Invert"),
-                        systemImage: "arrow.left.arrow.right"
-                    )
+                    HStack(spacing: 4) {
+                        Image(systemName: rule.invert
+                            ? "checkmark"
+                            : "arrow.left.arrow.right")
+                            .font(.system(
+                                size: 9,
+                                weight: rule.invert ? .bold : .semibold
+                            ))
+                            .frame(width: 12)
+                        Text(state.tr("反向", "Invert"))
+                    }
                     .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(
-                        rule.invert ? XDialPalette.selection : Color.secondary
+                        rule.invert
+                            ? XDialPalette.selection
+                            : XDialPalette.textSecondary
                     )
                     .padding(.horizontal, 7)
-                    .frame(height: 21)
+                    .frame(height: 22)
                     .background(
                         rule.invert
-                            ? XDialPalette.selection.opacity(0.11)
-                            : Color.primary.opacity(0.035),
+                            ? XDialPalette.selection.opacity(0.20)
+                            : XDialPalette.surface,
                         in: Capsule()
                     )
                     .overlay {
                         Capsule().stroke(
                             rule.invert
-                                ? XDialPalette.selection.opacity(0.22)
-                                : Color.primary.opacity(0.07),
-                            lineWidth: 0.5
+                                ? XDialPalette.selection.opacity(0.72)
+                                : XDialPalette.divider,
+                            lineWidth: 0.8
                         )
                     }
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(state.tr("反向", "Invert"))
                 .help(state.tr(
                     "反向匹配：匹配该规则之外的流量",
                     "Invert: match traffic outside this rule"

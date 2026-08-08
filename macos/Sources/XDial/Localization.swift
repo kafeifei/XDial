@@ -1,5 +1,5 @@
+import AppKit
 import Foundation
-import SwiftUI
 
 enum Lang: String, Codable, CaseIterable {
     case zh = "zh-CN"
@@ -23,14 +23,37 @@ enum AppAppearance: String, Codable, CaseIterable, Hashable {
     case light
     case dark
 
-    var colorScheme: ColorScheme? {
+    /// `nil` means the window owns no override and continues following the
+    /// system after subsequent appearance changes.
+    var windowAppearance: NSAppearance? {
         switch self {
         case .system:
             return nil
         case .light:
-            return .light
+            return NSAppearance(named: .aqua)
         case .dark:
-            return .dark
+            return NSAppearance(named: .darkAqua)
         }
     }
+
+    static func persisted(in defaults: UserDefaults) -> AppAppearance {
+        defaults.string(forKey: "xdial.appearance")
+            .flatMap(AppAppearance.init(rawValue:))
+            ?? .system
+    }
+}
+
+@MainActor
+enum XDialWindowAppearanceController {
+    static func apply(_ appearance: AppAppearance, to window: NSWindow) {
+        window.appearance = appearance.windowAppearance
+    }
+
+    static func applyToApplication(_ appearance: AppAppearance) {
+        NSApp.appearance = appearance.windowAppearance
+        for window in NSApp.windows {
+            apply(appearance, to: window)
+        }
+    }
+
 }

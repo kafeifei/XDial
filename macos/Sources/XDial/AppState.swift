@@ -46,6 +46,7 @@ final class AppState: ObservableObject {
                 appearance.rawValue,
                 forKey: "xdial.appearance"
             )
+            XDialWindowAppearanceController.applyToApplication(appearance)
         }
     }
     @Published var launchAtLogin: Bool {
@@ -417,13 +418,7 @@ final class AppState: ObservableObject {
         } else {
             self.language = .system
         }
-        if let savedAppearance = xdialDefaults.string(
-            forKey: "xdial.appearance"
-        ), let appearance = AppAppearance(rawValue: savedAppearance) {
-            self.appearance = appearance
-        } else {
-            self.appearance = .system
-        }
+        self.appearance = AppAppearance.persisted(in: xdialDefaults)
         self.launchAtLogin = xdialDefaults.bool(forKey: "xdial.launchAtLogin")
         if let savedAutoConnect = xdialDefaults.object(
             forKey: "xdial.autoConnect"

@@ -79,12 +79,12 @@ struct CollapsibleCard<Header: View, Detail: View>: View {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(
                         accentBar
-                            ? XDialPalette.selection.opacity(0.10)
+                            ? XDialPalette.selection.opacity(0.13)
                             : XDialPalette.surface
                     )
                 if accentBar {
                     HStack(spacing: 0) {
-                        XDialPalette.selection.opacity(0.72)
+                        XDialPalette.selection.opacity(0.90)
                             .frame(width: 3)
                             .clipShape(RoundedRectangle(cornerRadius: 1.5))
                         Spacer()
@@ -97,9 +97,9 @@ struct CollapsibleCard<Header: View, Detail: View>: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(
                     accentBar
-                        ? XDialPalette.selection.opacity(0.18)
-                        : Color.primary.opacity(0.065),
-                    lineWidth: 0.5
+                        ? XDialPalette.selection.opacity(0.55)
+                        : XDialPalette.divider,
+                    lineWidth: 0.75
                 )
         }
     }
@@ -145,12 +145,12 @@ struct SettingsPanel<Content: View>: View {
             .padding(.horizontal, 11)
             .padding(.vertical, 9)
             .background(
-                Color(nsColor: .windowBackgroundColor),
+                XDialPalette.surface,
                 in: RoundedRectangle(cornerRadius: 10)
             )
             .overlay {
                 RoundedRectangle(cornerRadius: 10)
-                    .stroke(Color.primary.opacity(0.065), lineWidth: 0.5)
+                    .stroke(XDialPalette.divider, lineWidth: 0.75)
             }
     }
 }
