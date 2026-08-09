@@ -19,6 +19,7 @@ struct MainPopover: View {
     @ObservedObject private var networkInfo = NetworkInfo.shared
     @StateObject private var trafficInfo = TrafficInfo()
     @State private var hoveredScenarioID: String?
+    @State private var settingsButtonHovered = false
     @State private var showsConnectionDetails = true
     @State private var dismissedScenarioSwitchFailureID: String?
 
@@ -127,12 +128,33 @@ struct MainPopover: View {
                 openWindow(id: "settings")
                 NSApp.activate(ignoringOtherApps: true)
             } label: {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 16, weight: .regular))
-                    .frame(width: 24, height: 24)
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .symbolRenderingMode(.monochrome)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        XDialPalette.accent.opacity(
+                            settingsButtonHovered ? 0.18 : 0.11
+                        ),
+                        in: Circle()
+                    )
+                    .overlay {
+                        Circle().stroke(
+                            XDialPalette.accent.opacity(
+                                settingsButtonHovered ? 0.44 : 0.28
+                            ),
+                            lineWidth: 0.75
+                        )
+                    }
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.primary.opacity(0.82))
+            .foregroundStyle(XDialPalette.accent)
+            .contentShape(Circle())
+            .onHover { settingsButtonHovered = $0 }
+            .animation(
+                .easeOut(duration: 0.12),
+                value: settingsButtonHovered
+            )
             .help(state.tr("设置", "Settings"))
             .accessibilityLabel(state.tr("设置", "Settings"))
         }

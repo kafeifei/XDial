@@ -1,6 +1,173 @@
 import AppKit
 import SwiftUI
 
+private struct SettingsWindowChrome: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        SettingsWindowChromeView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+private final class SettingsWindowChromeView: NSView {
+    private struct PendingTabClick {
+        let index: Int
+        let initialScreenPoint: NSPoint
+    }
+
+    private var headerMouseMonitor: Any?
+    private var pendingTabClick: PendingTabClick?
+
+    deinit {
+        if let headerMouseMonitor {
+            NSEvent.removeMonitor(headerMouseMonitor)
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        DispatchQueue.main.async { [weak self] in
+            self?.configureWindow()
+        }
+    }
+
+    private func configureWindow() {
+        guard let window else { return }
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.styleMask.insert(.fullSizeContentView)
+        window.backgroundColor = XDialPalette.canvasNSColor
+        window.layoutIfNeeded()
+        installHeaderMouseMonitor()
+
+        guard let contentView = window.contentView else { return }
+        let targetCenter = NSPoint(
+            x: 0,
+            y: contentView.isFlipped
+                ? 24
+                : contentView.bounds.maxY - 24
+        )
+        let buttons: [(NSWindow.ButtonType, CGFloat)] = [
+            (.closeButton, 16),
+            (.miniaturizeButton, 37),
+            (.zoomButton, 57),
+        ]
+        for (kind, x) in buttons {
+            guard let button = window.standardWindowButton(kind),
+                  let buttonContainer = button.superview else { continue }
+            let center = buttonContainer.convert(
+                targetCenter,
+                from: contentView
+            )
+            var frame = button.frame
+            frame.origin.x = x
+            frame.origin.y += center.y - frame.midY
+            button.setFrameOrigin(frame.origin)
+        }
+    }
+
+    private func installHeaderMouseMonitor() {
+        guard headerMouseMonitor == nil else { return }
+        headerMouseMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseUp]
+        ) { [weak self] event in
+            guard let self else { return event }
+            switch event.type {
+            case .leftMouseDown:
+                return self.handleHeaderMouseDown(event)
+            case .leftMouseUp:
+                return self.handleHeaderMouseUp(event)
+            default:
+                return event
+            }
+        }
+    }
+
+    private func handleHeaderMouseDown(_ event: NSEvent) -> NSEvent? {
+        guard let window,
+              event.window === window,
+              let contentView = window.contentView else { return event }
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        let distanceFromTop = contentView.isFlipped
+            ? point.y
+            : contentView.bounds.maxY - point.y
+        guard (0 ... 48).contains(distanceFromTop),
+              point.x >= 80 else { return event }
+
+        pendingTabClick = nil
+        let initialWindowOrigin = window.frame.origin
+        let initialScreenPoint = window.convertPoint(
+            toScreen: event.locationInWindow
+        )
+        window.performDrag(with: event)
+
+        let finalWindowOrigin = window.frame.origin
+        let finalScreenPoint = NSEvent.mouseLocation
+        let windowDistance = hypot(
+            finalWindowOrigin.x - initialWindowOrigin.x,
+            finalWindowOrigin.y - initialWindowOrigin.y
+        )
+        let pointerDistance = hypot(
+            finalScreenPoint.x - initialScreenPoint.x,
+            finalScreenPoint.y - initialScreenPoint.y
+        )
+        if max(windowDistance, pointerDistance) < 3,
+           let index = settingsTabIndex(at: point.x) {
+            if NSEvent.pressedMouseButtons & 1 == 0 {
+                selectSettingsTab(index, in: window)
+            } else {
+                pendingTabClick = PendingTabClick(
+                    index: index,
+                    initialScreenPoint: initialScreenPoint
+                )
+            }
+        }
+        return nil
+    }
+
+    private func handleHeaderMouseUp(_ event: NSEvent) -> NSEvent? {
+        guard let pendingTabClick else { return event }
+        self.pendingTabClick = nil
+        guard let window,
+              event.window === window,
+              let contentView = window.contentView else { return nil }
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        let finalScreenPoint = window.convertPoint(
+            toScreen: event.locationInWindow
+        )
+        let pointerDistance = hypot(
+            finalScreenPoint.x - pendingTabClick.initialScreenPoint.x,
+            finalScreenPoint.y - pendingTabClick.initialScreenPoint.y
+        )
+        if pointerDistance < 3,
+           settingsTabIndex(at: point.x) == pendingTabClick.index {
+            selectSettingsTab(pendingTabClick.index, in: window)
+        }
+        return nil
+    }
+
+    private func selectSettingsTab(_ index: Int, in window: NSWindow) {
+        NotificationCenter.default.post(
+            name: .xdialSettingsSelectTab,
+            object: window,
+            userInfo: ["index": index]
+        )
+    }
+
+    private func settingsTabIndex(at x: CGFloat) -> Int? {
+        let mainStart: CGFloat = 126
+        let mainWidth: CGFloat = 260
+        if x >= mainStart, x < mainStart + mainWidth {
+            return min(Int((x - mainStart) / (mainWidth / 3)), 2)
+        }
+        if x >= 440, x < 524 {
+            return 3
+        }
+        return nil
+    }
+}
+
 extension Notification.Name {
     /// DebugServer 请求打开设置窗口。
     ///
@@ -8,6 +175,9 @@ extension Notification.Name {
     /// 图标才会出现 —— 那个图标是系统 status item，AXPress 和 System Events 都点不动。
     /// 所以调试时改由常驻渲染的菜单栏 label 代为 openWindow。
     static let xdialDebugOpenSettings = Notification.Name("xdial.debug.openSettings")
+    static let xdialSettingsSelectTab = Notification.Name(
+        "xdial.settings.selectTab"
+    )
 }
 
 /// 菜单栏图标。之所以单独成 View：它常驻渲染，是 DEBUG 下唯一能稳定拿到
@@ -66,9 +236,11 @@ struct XDialApp: App {
             SettingsView()
                 .environmentObject(state)
                 .tint(XDialPalette.accent)
+                .background(SettingsWindowChrome())
         }
-        .defaultSize(width: 540, height: 540)
+        .defaultSize(width: 540, height: 520)
         .windowResizability(.contentSize)
+        .windowStyle(.hiddenTitleBar)
 
         Window("XDial 安装与卸载", id: "installation") {
             InstallationView(
