@@ -197,10 +197,12 @@ targets:
     sources:
       - Tests
       - Shared
+      - Sources/XDial/AppIcon.swift
       - Sources/XDial/Models.swift
       - Sources/XDial/Localization.swift
       - Sources/XDial/ScenarioIconCatalog.swift
       - Sources/XDial/ScenarioGridLayout.swift
+      - Sources/XDial/XDialBrandPalette.swift
       - TransparentProxyExtension/ConnectionTransactionReporter.swift
     settings:
       base:

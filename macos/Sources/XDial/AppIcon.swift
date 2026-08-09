@@ -98,14 +98,12 @@ enum AppIcon {
             NSGraphicsContext.restoreGraphicsState()
         }
 
-        let surfaceLight = NSColor(
-            calibratedWhite: connected ? 0.98 : 0.78,
-            alpha: 1
-        )
-        let surfaceShade = NSColor(
-            calibratedWhite: connected ? 0.78 : 0.58,
-            alpha: 1
-        )
+        let surfaceLight = connected
+            ? XDialBrandPalette.surface
+            : XDialBrandPalette.canvas
+        let surfaceShade = connected
+            ? XDialBrandPalette.accentHighlight
+            : XDialBrandPalette.divider
         NSGradient(starting: surfaceShade, ending: surfaceLight)?
             .draw(in: lunarDisc, angle: 55)
 
@@ -113,9 +111,9 @@ enum AppIcon {
         lunarDisc.addClip()
 
         // 南极—艾特肯盆地是月背下方的大范围暗斑，不画成一枚边缘整齐的巨坑。
-        NSColor(
-            calibratedWhite: connected ? 0.60 : 0.40,
-            alpha: 0.9
+        (connected
+            ? XDialBrandPalette.accent.withAlphaComponent(0.86)
+            : XDialBrandPalette.disabled.withAlphaComponent(0.86)
         ).setFill()
         NSBezierPath(
             ovalIn: normalizedRect(
@@ -126,9 +124,9 @@ enum AppIcon {
                 in: rect
             )
         ).fill()
-        NSColor(
-            calibratedWhite: connected ? 0.68 : 0.47,
-            alpha: 0.78
+        (connected
+            ? XDialBrandPalette.accentHighlight.withAlphaComponent(0.78)
+            : XDialBrandPalette.divider.withAlphaComponent(0.78)
         ).setFill()
         NSBezierPath(
             ovalIn: normalizedRect(
@@ -163,9 +161,9 @@ enum AppIcon {
 
         NSGraphicsContext.restoreGraphicsState()
 
-        NSColor(
-            calibratedWhite: connected ? 0.96 : 0.72,
-            alpha: 0.9
+        (connected
+            ? XDialBrandPalette.success.withAlphaComponent(0.94)
+            : XDialBrandPalette.selection.withAlphaComponent(0.88)
         ).setStroke()
         lunarDisc.lineWidth = max(1, rect.width * 0.032)
         lunarDisc.stroke()
@@ -186,11 +184,11 @@ enum AppIcon {
         shadow.shadowBlurRadius = size * 0.022
         shadow.shadowOffset = NSSize(width: 0, height: -size * 0.012)
         shadow.set()
-        NSColor(calibratedWhite: 0.97, alpha: 0.98).setFill()
+        XDialBrandPalette.surface.withAlphaComponent(0.98).setFill()
         badge.fill()
         NSGraphicsContext.restoreGraphicsState()
 
-        NSColor(calibratedWhite: 0.62, alpha: 1).setStroke()
+        XDialBrandPalette.divider.setStroke()
         badge.lineWidth = max(1, size * 0.012)
         badge.stroke()
 
@@ -205,7 +203,7 @@ enum AppIcon {
             weight: .semibold
         )
         let paletteConfiguration = NSImage.SymbolConfiguration(
-            paletteColors: [NSColor(calibratedWhite: 0.27, alpha: 1)]
+            paletteColors: [XDialBrandPalette.accent]
         )
         guard let configured = symbol.withSymbolConfiguration(
             pointConfiguration.applying(paletteConfiguration)
@@ -266,14 +264,14 @@ enum AppIcon {
             height: radius * 2
         )
         let crater = NSBezierPath(ovalIn: rect)
-        NSColor(
-            calibratedWhite: connected ? 0.36 : 0.22,
-            alpha: 0.92
+        (connected
+            ? XDialBrandPalette.selection.withAlphaComponent(0.94)
+            : XDialBrandPalette.textSecondary.withAlphaComponent(0.94)
         ).setFill()
         crater.fill()
-        NSColor(
-            calibratedWhite: connected ? 0.88 : 0.66,
-            alpha: 0.95
+        (connected
+            ? XDialBrandPalette.canvas.withAlphaComponent(0.95)
+            : XDialBrandPalette.divider.withAlphaComponent(0.95)
         ).setStroke()
         crater.lineWidth = max(1, radius * 0.35)
         crater.stroke()

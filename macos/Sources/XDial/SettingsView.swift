@@ -41,6 +41,9 @@ struct SettingsView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
+                Spacer(minLength: 0)
+                    .frame(width: 56)
+
                 HStack {
                     Spacer(minLength: 0)
                     HStack(spacing: 4) {
@@ -61,7 +64,7 @@ struct SettingsView: View {
                         )
                     }
                     .padding(4)
-                    .frame(width: 292)
+                    .frame(width: 260)
                     .background(Color.primary.opacity(0.04), in: Capsule())
                     .overlay {
                         Capsule().stroke(
@@ -81,7 +84,7 @@ struct SettingsView: View {
                     )
                 }
                 .padding(4)
-                .frame(width: 92)
+                .frame(width: 84)
                 .background(Color.primary.opacity(0.04), in: Capsule())
                 .overlay {
                     Capsule().stroke(
@@ -91,7 +94,7 @@ struct SettingsView: View {
                 }
             }
             .padding(.horizontal, 16)
-            .frame(height: 54)
+            .frame(height: 48)
             .background {
                 LinearGradient(
                     colors: [
@@ -103,6 +106,10 @@ struct SettingsView: View {
                     endPoint: .trailing
                 )
             }
+            // fullSizeContentView 仍保留 32pt 的系统标题安全区。只让顶栏
+            // 覆盖这块区域，而不是把整个 520pt 内容上移；否则底部会空出
+            // 同样的 32pt。
+            .padding(.top, -32)
 
             if !state.installation.isReady {
                 installationBanner
@@ -123,6 +130,15 @@ struct SettingsView: View {
         }
         .frame(width: 540, height: 520)
         .background(XDialPalette.canvas)
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .xdialSettingsSelectTab
+            )
+        ) { notification in
+            guard let index = notification.userInfo?["index"] as? Int,
+                  (0 ... 3).contains(index) else { return }
+            tab = index
+        }
     }
 
     private var titleAccent: Color {
