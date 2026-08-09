@@ -193,19 +193,20 @@ type SubscriptionRule struct {
 
 // Subscription 订阅：通过 URL 批量导入的完整配置
 type Subscription struct {
-	ID           string             `json:"id"`
-	Name         string             `json:"name"`
-	URL          string             `json:"url"`
-	Format       string             `json:"format"`
-	Enabled      bool               `json:"enabled"`
-	Strategy     string             `json:"strategy"`
-	Selected     string             `json:"selected,omitempty"`
-	Lines        []Line             `json:"lines"`
-	ProxyGroups  []ProxyGroup       `json:"proxy_groups,omitempty"`
-	Rules        []SubscriptionRule `json:"rules,omitempty"`
-	UpdatedAt    int64              `json:"updated_at"`
-	TestURL      string             `json:"test_url,omitempty"`
-	TestInterval int                `json:"test_interval,omitempty"`
+	ID                      string             `json:"id"`
+	Name                    string             `json:"name"`
+	URL                     string             `json:"url"`
+	Format                  string             `json:"format"`
+	Enabled                 bool               `json:"enabled"`
+	Strategy                string             `json:"strategy"`
+	Selected                string             `json:"selected,omitempty"`
+	Lines                   []Line             `json:"lines"`
+	ProxyGroups             []ProxyGroup       `json:"proxy_groups,omitempty"`
+	Rules                   []SubscriptionRule `json:"rules,omitempty"`
+	GeoIPRuleSetURLTemplate string             `json:"geoip_rule_set_url_template,omitempty"`
+	UpdatedAt               int64              `json:"updated_at"`
+	TestURL                 string             `json:"test_url,omitempty"`
+	TestInterval            int                `json:"test_interval,omitempty"`
 }
 
 // TailscaleIdentity 是本机在 tailnet 中的身份，整个 Profile 全局唯一一份。

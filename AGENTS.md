@@ -144,7 +144,7 @@ Popover 只有在菜单栏图标被点开后才会出现在 AX 树中；设置�
   active Tailscale 出口就绪，再提交系统网络设置；`Connecting` 不是允许半接管用户
   流量的状态。
 - 若结构化状态同时满足 exit node 在线且已选中、存在于 netmap / magicsock / engine、
-  `tx > 0`、`rx = 0`、无握手，应报告 peer handshake 失败，不能改写成登录、REMOTE、
+  `tx > 0`、`rx = 0`、无握手，应报告 peer handshake 失败，不能改写成登录、外部网络限制、
   Underlay 或普通出口探测结论。需要定位 DERP 状态漂移时必须做同时间双端取证，分别
   比较控制图与 magicsock 实时 Relay；旧日志和上一次成功不能替代本轮状态。远端
   `tailscaled` 重启只会清除既有内存状态，未经用户明确授权不得执行，也不得把重启后

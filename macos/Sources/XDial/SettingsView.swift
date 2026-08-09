@@ -2991,6 +2991,28 @@ struct SubscriptionRow: View {
                             .textFieldStyle(.roundedBorder).font(.caption)
                             .onChange(of: sub.url) { _, _ in state.save() }
                     }
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(state.tr("GEOIP 模板", "GEOIP template"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 78, alignment: .leading)
+                        TextField(
+                            state.tr(
+                                "https://…/{code}.srs 或 file:///…/{code}.srs",
+                                "https://…/{code}.srs or file:///…/{code}.srs"
+                            ),
+                            text: $sub.geoIPRuleSetURLTemplate
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .onChange(of: sub.geoIPRuleSetURLTemplate) { _, _ in
+                            state.save()
+                        }
+                        .help(state.tr(
+                            "用于订阅中的 GEOIP 条目。仅接受 HTTPS 或绝对 file:// 模板，必须包含 {code}，且不得包含用户名或密码；订阅含非 LAN/private GEOIP 时，缺失或无效会拒绝连接。",
+                            "Used by GEOIP entries in the subscription. Use an HTTPS or absolute file:// template containing {code}, without a username or password. If the subscription contains GEOIP entries other than LAN/private, a missing or invalid template blocks the connection."
+                        ))
+                    }
 
                     // === 策略组 ===
                     if !sub.proxyGroups.isEmpty {

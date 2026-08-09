@@ -21,8 +21,8 @@ func testProfile() *Profile {
 		RuleSets: []RuleSet{
 			{ID: "internal", Name: "内部域名", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"example.com", "internal.corp"}},
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeURL, Enabled: true,
-				URL: "https://example.com/geosite-remote.srs"},
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeURL, Enabled: true,
+				URL: "https://rules.example/remote-policy.srs"},
 			{ID: "cnip", Name: "国内IP", Type: RuleSetTypeURL, Enabled: true,
 				URL: "https://example.com/geoip-cn.json", Format: "json"},
 		},
@@ -38,7 +38,7 @@ func testProfile() *Profile {
 				ID: "domestic", Name: "国内",
 				Bindings: []RuleBinding{
 					{RuleSetID: "internal", LineID: "vpn"},
-					{RuleSetID: "remote", LineID: "vpn"},
+					{RuleSetID: "remote-policy", LineID: "vpn"},
 				},
 				DefaultLineID: "direct",
 			},
@@ -46,7 +46,7 @@ func testProfile() *Profile {
 				ID: "domestic-ss", Name: "国内+SS",
 				Bindings: []RuleBinding{
 					{RuleSetID: "internal", LineID: "vpn"},
-					{RuleSetID: "remote", LineID: "ss"},
+					{RuleSetID: "remote-policy", LineID: "ss"},
 				},
 				DefaultLineID: "direct",
 			},
@@ -73,8 +73,8 @@ func TestProfileFinders(t *testing.T) {
 	if e := p.FindLine("vpn"); e == nil || e.Name != "VPN" {
 		t.Fatal("FindLine(vpn) failed")
 	}
-	if r := p.FindRuleSet("remote"); r == nil || r.URL == "" {
-		t.Fatal("FindRuleSet(remote) failed")
+	if r := p.FindRuleSet("remote-policy"); r == nil || r.URL == "" {
+		t.Fatal("FindRuleSet(remote-policy) failed")
 	}
 	if s := p.ActiveScenario(); s == nil || s.Name != "海外" {
 		t.Fatal("ActiveScenario failed")
@@ -429,12 +429,12 @@ func TestGenerateWithURLRuleSet_SRS(t *testing.T) {
 		t.Fatal("domestic scenario should have rule_sets")
 	}
 
-	remoteSet := rs[0].(map[string]interface{})
-	if remoteSet["format"] != "binary" {
-		t.Errorf("srs format should be binary, got %v", remoteSet["format"])
+	remotePolicySet := rs[0].(map[string]interface{})
+	if remotePolicySet["format"] != "binary" {
+		t.Errorf("srs format should be binary, got %v", remotePolicySet["format"])
 	}
-	if remoteSet["tag"] != "ruleset-remote" {
-		t.Errorf("tag should be ruleset-remote, got %v", remoteSet["tag"])
+	if remotePolicySet["tag"] != "ruleset-remote-policy" {
+		t.Errorf("tag should be ruleset-remote-policy, got %v", remotePolicySet["tag"])
 	}
 
 	t.Log(string(data))
@@ -489,9 +489,9 @@ func TestGenerateMultipleRuleSets(t *testing.T) {
 	rules := cfg.Route["rules"].([]interface{})
 	for _, rule := range rules {
 		r := rule.(map[string]interface{})
-		if rs, ok := r["rule_set"]; ok && rs == "ruleset-remote" {
+		if rs, ok := r["rule_set"]; ok && rs == "ruleset-remote-policy" {
 			if r["outbound"] != "proxy-ss" {
-				t.Errorf("REMOTE in domestic-ss should route to proxy-ss, got %v", r["outbound"])
+				t.Errorf("remote policy in domestic-ss should route to proxy-ss, got %v", r["outbound"])
 			}
 		}
 	}
@@ -552,7 +552,7 @@ func TestGenerateUsesConfiguredConnectivityProbeRules(t *testing.T) {
 			p.Scenarios[index].Bindings = append([]RuleBinding{
 				{RuleSetID: connectivityDirectID, LineID: "direct"},
 				{RuleSetID: connectivityAnyConnectID, LineID: "vpn"},
-				{RuleSetID: "remote", SubscriptionID: "probe-priority-sub"},
+				{RuleSetID: "remote-policy", SubscriptionID: "probe-priority-sub"},
 			}, p.Scenarios[index].Bindings...)
 		}
 	}
@@ -871,7 +871,10 @@ func TestSubscriptionGeoIPLANUsesPrivateMatcherWithoutRemoteResource(t *testing.
 	sub := Subscription{
 		ID: "sub", Rules: []SubscriptionRule{{Type: "GEOIP", Value: "LAN", Group: "DIRECT"}},
 	}
-	rules, sets := buildSubscriptionRules(&sub, map[string]string{})
+	rules, sets, err := buildSubscriptionRules(&sub, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(sets) != 0 {
 		t.Fatalf("GEOIP,LAN unexpectedly created remote resources: %v", sets)
 	}
@@ -1470,8 +1473,8 @@ func splitProfileWithProxy() *Profile {
 		RuleSets: []RuleSet{
 			{ID: "internal", Name: "内网", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"corp.example"}},
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeURL, Enabled: true,
-				URL: "https://example.com/geosite-remote.srs"},
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeURL, Enabled: true,
+				URL: "https://rules.example/remote-policy.srs"},
 			{ID: "oversea", Name: "手动出海", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"example.org"}},
 		},
@@ -1479,7 +1482,7 @@ func splitProfileWithProxy() *Profile {
 			ID: "split", Name: "分流",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
-				{RuleSetID: "remote", LineID: "px"},
+				{RuleSetID: "remote-policy", LineID: "px"},
 				{RuleSetID: "oversea", LineID: "px"},
 			},
 			DefaultLineID: "direct",
@@ -1489,7 +1492,7 @@ func splitProfileWithProxy() *Profile {
 }
 
 // 绑到代理型线路的域名，解析也必须经该线路出去。在本地问境内公共 DNS 拿到的是
-// 非权威或被篡改结果，再从境外出口连过去 —— 分流白做，还会连到非权威或被篡改的假地址。
+// 非权威或被篡改的应答，再从另一出口连接，会使解析视角与出口视角不一致。
 func TestGenerateDesktopResolvesProxyBoundDomainsThroughTheLine(t *testing.T) {
 	data, err := GenerateSingBoxDesktop(splitProfileWithProxy(), 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10"}, "en0")
 	if err != nil {
@@ -1526,7 +1529,7 @@ func TestGenerateDesktopResolvesProxyBoundDomainsThroughTheLine(t *testing.T) {
 		t.Fatalf("enterprise rule must come first: %v", rules)
 	}
 	urlRule := rules[1].(map[string]interface{})
-	if urlRule["server"] != "proxy-dns-proxy-px" || urlRule["rule_set"] != "ruleset-remote" {
+	if urlRule["server"] != "proxy-dns-proxy-px" || urlRule["rule_set"] != "ruleset-remote-policy" {
 		t.Fatalf("URL rule set must reuse the downloaded rule_set resource: %v", urlRule)
 	}
 	manualRule := rules[2].(map[string]interface{})
@@ -1542,7 +1545,7 @@ func TestGenerateDesktopKeepsDirectBoundRuleSetsOnPublicDNS(t *testing.T) {
 	p := splitProfileWithProxy()
 	p.Scenarios[0].Bindings = []RuleBinding{
 		{RuleSetID: "internal", LineID: "vpn"},
-		{RuleSetID: "remote", LineID: "direct"},
+		{RuleSetID: "remote-policy", LineID: "direct"},
 		{RuleSetID: "oversea", LineID: "direct"},
 	}
 
@@ -1555,14 +1558,14 @@ func TestGenerateDesktopKeepsDirectBoundRuleSetsOnPublicDNS(t *testing.T) {
 	}
 }
 
-// 预设场景"国内"就是这个组合：remotePolicy（URL 规则集）绑 AnyConnect 线路。
+// 受限路径场景就是这个组合：远程策略规则绑 AnyConnect 线路。
 // 它既不是内网名（enterprise-dns 只收手动规则集），又曾被当作"vpn 不是代理线路"
-// 跳过，于是落到 final 的境内解析器上被非权威或被篡改 —— 分流白做。
+// 跳过，于是落到 final 的受限解析环境并得到非权威或被篡改的应答。
 func TestGenerateDesktopResolvesVPNBoundURLRuleSetThroughTheTunnel(t *testing.T) {
 	p := splitProfileWithProxy()
 	p.Scenarios[0].Bindings = []RuleBinding{
 		{RuleSetID: "internal", LineID: "vpn"},
-		{RuleSetID: "remote", LineID: "vpn"},
+		{RuleSetID: "remote-policy", LineID: "vpn"},
 	}
 
 	data, err := GenerateSingBoxDesktop(p, 10800, "1.2.3.4", t.TempDir(), []string{"10.8.0.10"}, "en0")
@@ -1604,7 +1607,7 @@ func TestGenerateDesktopResolvesVPNBoundURLRuleSetThroughTheTunnel(t *testing.T)
 		t.Fatalf("manual rule set bound to vpn must stay on enterprise-dns: %v", enterpriseRule)
 	}
 	urlRule := rules[1].(map[string]interface{})
-	if urlRule["server"] != "proxy-dns-vpn" || urlRule["rule_set"] != "ruleset-remote" {
+	if urlRule["server"] != "proxy-dns-vpn" || urlRule["rule_set"] != "ruleset-remote-policy" {
 		t.Fatalf("URL rule set must resolve through the VPN resolver: %v", urlRule)
 	}
 }
@@ -1641,10 +1644,10 @@ func TestGenerateRuleSetDownloadDetourDefaultsToDirect(t *testing.T) {
 	}
 	sets := cfg.Route["rule_set"].([]interface{})
 	if len(sets) != 1 {
-		t.Fatalf("expected the remote rule set only, got %v", sets)
+		t.Fatalf("expected the remote policy rule set only, got %v", sets)
 	}
 	set := sets[0].(map[string]interface{})
-	if set["tag"] != "ruleset-remote" || set["download_detour"] != "direct" {
+	if set["tag"] != "ruleset-remote-policy" || set["download_detour"] != "direct" {
 		t.Fatalf("rule set must default to direct acquisition: %v", set)
 	}
 }
@@ -1652,7 +1655,7 @@ func TestGenerateRuleSetDownloadDetourDefaultsToDirect(t *testing.T) {
 func TestGenerateRuleSetDownloadDetourFollowsExplicitUpdateLine(t *testing.T) {
 	p := splitProfileWithProxy()
 	p.Scenarios[0].Bindings = []RuleBinding{{
-		RuleSetID: "remote",
+		RuleSetID: "remote-policy",
 		LineID:    "px",
 	}}
 	p.RuleSets[1].FetchLineID = "px"
@@ -1682,7 +1685,7 @@ func TestGenerateRuleSetDownloadDetourFallsBackToDirect(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := splitProfileWithProxy()
-			p.Scenarios[0].Bindings = []RuleBinding{{RuleSetID: "remote", LineID: tc.lineID}}
+			p.Scenarios[0].Bindings = []RuleBinding{{RuleSetID: "remote-policy", LineID: tc.lineID}}
 
 			data, err := GenerateSingBox(p, 10800, "1.2.3.4")
 			if err != nil {

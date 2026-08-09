@@ -5,7 +5,9 @@ set -euo pipefail
 probe_app="/Applications/XDialNEProbe.app"
 probe_binary="$probe_app/Contents/MacOS/XDialNEProbe"
 probe_extension_id="com.kafeifei.xdial.ne-probe.extension"
-controlled_host="git.corp.example"
+
+: "${XDIAL_NE_PROBE_HOST:?XDIAL_NE_PROBE_HOST is required}"
+controlled_host="$XDIAL_NE_PROBE_HOST"
 
 if [[ ! -x "$probe_binary" ]]; then
   print -u2 "signed probe is unavailable: $probe_binary"
@@ -54,7 +56,7 @@ verify_underlay() {
   fi
 }
 
-configure_output="$("$probe_binary" configure-dns)"
+configure_output="$("$probe_binary" configure-dns "$controlled_host")"
 print -r -- "$configure_output"
 trial_id="${configure_output##*trial=}"
 if [[ -z "$trial_id" || "$trial_id" == "$configure_output" || "$trial_id" == *' '* ]]; then

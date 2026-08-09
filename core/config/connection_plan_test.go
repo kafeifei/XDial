@@ -110,10 +110,11 @@ func TestBuildConnectionPlanIncludesDynamicTailscaleAndGeneratedSubscriptionRule
 	profile := invBaseProfile()
 	profile.Lines = append(profile.Lines, invTailscaleLine())
 	profile.Subscriptions = append(profile.Subscriptions, Subscription{
-		ID:       "sub",
-		Name:     "Surge",
-		Enabled:  true,
-		Strategy: "select",
+		ID:                      "sub",
+		Name:                    "Surge",
+		Enabled:                 true,
+		Strategy:                "select",
+		GeoIPRuleSetURLTemplate: "https://rules.example/geoip-{code}.srs",
 		Lines: []Line{{
 			ID: "us", Name: "US", Type: LineTypeTrojan, Enabled: true,
 			TrojanServer: "us.example.com", TrojanPort: 443,

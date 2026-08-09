@@ -23,13 +23,13 @@ func srsPayload() []byte {
 	return append(append([]byte{}, srsMagic...), 0x01, 0x02, 0x03)
 }
 
-// remoteProfile 复刻用户的真实场景：URL 规则集 remote 绑到指定线路。
-func remoteProfile(url string, line config.Line, binding config.RuleBinding) *config.Profile {
-	binding.RuleSetID = "remote"
+// remotePolicyProfile 构造 URL 远程策略规则绑定到指定线路的场景。
+func remotePolicyProfile(url string, line config.Line, binding config.RuleBinding) *config.Profile {
+	binding.RuleSetID = "remote-policy"
 	return &config.Profile{
 		Lines: []config.Line{line},
 		RuleSets: []config.RuleSet{{
-			ID: "remote", Name: "remotePolicy", Type: config.RuleSetTypeURL, Enabled: true, URL: url,
+			ID: "remote-policy", Name: "远程策略", Type: config.RuleSetTypeURL, Enabled: true, URL: url,
 		}},
 		Scenarios: []config.Scenario{{
 			ID: "m", Bindings: []config.RuleBinding{binding}, DefaultLineID: "direct",
@@ -57,7 +57,7 @@ func TestPrepareRuleSetsMaterializesDirectBoundSet(t *testing.T) {
 	}))
 	defer server.Close()
 
-	profile := remoteProfile(server.URL+"/remote.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
+	profile := remotePolicyProfile(server.URL+"/remote-policy.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	dir := t.TempDir()
 	prepared, problems := prepareForTest(t, profile, dir)
 	if len(problems) != 0 {
@@ -79,7 +79,7 @@ func TestPrepareRuleSetsMaterializesDirectBoundSet(t *testing.T) {
 		t.Fatalf("cached content mismatch")
 	}
 	// 调用方持有的 profile 必须原样不动。
-	if profile.RuleSets[0].URL != server.URL+"/remote.srs" {
+	if profile.RuleSets[0].URL != server.URL+"/remote-policy.srs" {
 		t.Fatalf("caller profile was mutated: %s", profile.RuleSets[0].URL)
 	}
 }
@@ -91,7 +91,7 @@ func TestPreparedRuleSetGeneratesLocalResource(t *testing.T) {
 	}))
 	defer server.Close()
 
-	profile := remoteProfile(server.URL+"/remote.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
+	profile := remotePolicyProfile(server.URL+"/remote-policy.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	prepared, _ := prepareForTest(t, profile, t.TempDir())
 
 	data, err := config.GenerateSingBoxDesktop(prepared, 0, "", t.TempDir(), nil, "en0")
@@ -128,7 +128,7 @@ func TestPrepareRuleSetsDisablesUnavailableSet(t *testing.T) {
 	}))
 	defer server.Close()
 
-	profile := remoteProfile(server.URL+"/remote.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
+	profile := remotePolicyProfile(server.URL+"/remote-policy.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	prepared, problems := prepareForTest(t, profile, t.TempDir())
 	if len(problems) != 1 {
 		t.Fatalf("problems = %v, want 1", problems)
@@ -158,7 +158,7 @@ func TestPrepareRuleSetsRejectsNonRuleSetContent(t *testing.T) {
 	defer server.Close()
 
 	dir := t.TempDir()
-	profile := remoteProfile(server.URL+"/remote.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
+	profile := remotePolicyProfile(server.URL+"/remote-policy.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	prepared, problems := prepareForTest(t, profile, dir)
 	if len(problems) != 1 || prepared.RuleSets[0].Enabled {
 		t.Fatalf("garbage content should be rejected, problems=%v", problems)
@@ -169,7 +169,7 @@ func TestPrepareRuleSetsRejectsNonRuleSetContent(t *testing.T) {
 	}
 }
 
-// 下载失败但有旧缓存：宁可用过期的 remotePolicy，也不让整条规则失效。
+// 下载失败但有旧缓存：宁可用过期的远程规则，也不让整条规则失效。
 func TestPrepareRuleSetsFallsBackToStaleCache(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusBadGateway)
@@ -177,7 +177,7 @@ func TestPrepareRuleSetsFallsBackToStaleCache(t *testing.T) {
 	defer server.Close()
 
 	dir := t.TempDir()
-	profile := remoteProfile(server.URL+"/remote.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
+	profile := remotePolicyProfile(server.URL+"/remote-policy.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	stalePath := ruleSetCachePath(dir, &profile.RuleSets[0], "binary")
 	if err := os.WriteFile(stalePath, srsPayload(), 0o600); err != nil {
 		t.Fatal(err)
@@ -206,7 +206,7 @@ func TestPrepareRuleSetsReusesFreshCache(t *testing.T) {
 	defer server.Close()
 
 	dir := t.TempDir()
-	profile := remoteProfile(server.URL+"/remote.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
+	profile := remotePolicyProfile(server.URL+"/remote-policy.srs", directRuleSetLine(), config.RuleBinding{LineID: "direct"})
 	if _, problems := prepareForTest(t, profile, dir); len(problems) != 0 {
 		t.Fatalf("first pass failed: %v", problems)
 	}
@@ -251,12 +251,12 @@ func TestPrepareRuleSetsSkipsProxyBoundSets(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			profile := remoteProfile(server.URL+"/remote.srs", tc.line, tc.binding)
+			profile := remotePolicyProfile(server.URL+"/remote-policy.srs", tc.line, tc.binding)
 			prepared, problems := prepareForTest(t, profile, t.TempDir())
 			if len(problems) != 0 {
 				t.Fatalf("problems = %v", problems)
 			}
-			if prepared.RuleSets[0].URL != server.URL+"/remote.srs" {
+			if prepared.RuleSets[0].URL != server.URL+"/remote-policy.srs" {
 				t.Fatalf("url = %s, want untouched remote URL", prepared.RuleSets[0].URL)
 			}
 		})
@@ -267,7 +267,7 @@ func TestPrepareRuleSetsSkipsProxyBoundSets(t *testing.T) {
 }
 
 // 绑到 VPN 线路但隧道不可用（fetcher 没有桥）时不能悄悄退回启动前 Underlay：
-// 那正是受限网络路径的那条路，而且用户要的是"经隧道取"。
+// Direct 正是不可达的受限路径，而且用户要的是“经隧道取”。
 func TestPrepareRuleSetsVPNBoundRequiresBridge(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -276,8 +276,8 @@ func TestPrepareRuleSetsVPNBoundRequiresBridge(t *testing.T) {
 	}))
 	defer server.Close()
 
-	profile := remoteProfile(
-		server.URL+"/remote.srs",
+	profile := remotePolicyProfile(
+		server.URL+"/remote-policy.srs",
 		config.Line{ID: "vpn", Type: config.LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		config.RuleBinding{LineID: "vpn"},
 	)
@@ -290,7 +290,7 @@ func TestPrepareRuleSetsVPNBoundRequiresBridge(t *testing.T) {
 	}
 }
 
-// 预设「国内」的形状：remote 规则集绑在 AnyConnect 线路上。下载要经隧道，而且域名
+// 受限路径场景的形状：远程策略规则绑在 AnyConnect 线路上。下载要经隧道，而且域名
 // 必须由企业 DNS（TCP 53）解析后按 IPv4 拨出去——这正是 sing-box 的 vpn outbound
 // 做不到、只能由 daemon 代抓的部分。
 func TestPrepareRuleSetsFetchesVPNBoundSetThroughTunnel(t *testing.T) {
@@ -321,8 +321,8 @@ func TestPrepareRuleSetsFetchesVPNBoundSetThroughTunnel(t *testing.T) {
 		vpn: &http.Client{Transport: newTunnelTransport(dial, dnsAddr)},
 	}
 
-	profile := remoteProfile(
-		"http://remote.test:"+parsed.Port()+"/remote.srs",
+	profile := remotePolicyProfile(
+		"http://policy-source.test:"+parsed.Port()+"/remote-policy.srs",
 		config.Line{ID: "vpn", Type: config.LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		config.RuleBinding{LineID: "vpn"},
 	)

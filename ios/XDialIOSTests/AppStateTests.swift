@@ -2490,6 +2490,8 @@ final class AppStateTests: XCTestCase {
                 url: "https://example.com/list?token=must-not-be-in-defaults"
         )
         subscription.testURL = "https://example.com/check?token=test-secret"
+        subscription.geoIPRuleSetURLTemplate =
+            "https://example.com/geo/{code}.srs?token=geo-secret"
         app.profile.subscriptions = [subscription]
 
         XCTAssertTrue(app.save())
@@ -2500,12 +2502,17 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(savedProfile.ruleSets[0].url, "")
         XCTAssertEqual(savedProfile.subscriptions[0].url, "")
         XCTAssertEqual(savedProfile.subscriptions[0].testURL, "")
+        XCTAssertEqual(
+            savedProfile.subscriptions[0].geoIPRuleSetURLTemplate,
+            ""
+        )
         XCTAssertEqual(savedProfile.lines[1].vpnServer, "")
         let savedJSON = try XCTUnwrap(String(data: savedData, encoding: .utf8))
         XCTAssertFalse(savedJSON.contains("path-secret"))
         XCTAssertFalse(savedJSON.contains("rule-secret"))
         XCTAssertFalse(savedJSON.contains("must-not-be-in-defaults"))
         XCTAssertFalse(savedJSON.contains("test-secret"))
+        XCTAssertFalse(savedJSON.contains("geo-secret"))
         XCTAssertFalse(savedJSON.contains("private-account-name"))
         XCTAssertFalse(savedJSON.contains("private-account-password"))
         XCTAssertFalse(savedJSON.contains("gateway.example.com"))
@@ -2514,6 +2521,10 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(app.profile.ruleSets[0].url, "https://example.com/rules/path-secret?token=rule-secret")
         XCTAssertEqual(app.profile.subscriptions[0].url, "https://example.com/list?token=must-not-be-in-defaults")
         XCTAssertEqual(app.profile.subscriptions[0].testURL, "https://example.com/check?token=test-secret")
+        XCTAssertEqual(
+            app.profile.subscriptions[0].geoIPRuleSetURLTemplate,
+            "https://example.com/geo/{code}.srs?token=geo-secret"
+        )
 
         let reloaded = AppState(engine: NoopTunnelEngine(), persistence: persistence)
         XCTAssertEqual(
@@ -2522,6 +2533,10 @@ final class AppStateTests: XCTestCase {
         )
         XCTAssertEqual(reloaded.profile.lines[1].vpnUsername, "private-account-name")
         XCTAssertEqual(reloaded.profile.lines[1].vpnPassword, "private-account-password")
+        XCTAssertEqual(
+            reloaded.profile.subscriptions[0].geoIPRuleSetURLTemplate,
+            "https://example.com/geo/{code}.srs?token=geo-secret"
+        )
     }
 
     func testPlaintextEnvelopeIsRewrittenIntoSecureVault() throws {

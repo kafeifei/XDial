@@ -1409,6 +1409,33 @@ private struct SubscriptionEditorView: View {
                 }
                 .disabled(app.hasActiveTunnel || app.isBusy)
 
+                Section {
+                    TextField(
+                        app.tr(
+                            "GEOIP 规则模板",
+                            "GEOIP rule-set template"
+                        ),
+                        text: subscriptionBinding(
+                            index,
+                            \.geoIPRuleSetURLTemplate
+                        ),
+                        axis: .vertical
+                    )
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .accessibilityIdentifier(
+                        "subscription-geoip-rule-set-url-template"
+                    )
+                } header: {
+                    Text(app.tr("GEOIP 规则资源", "GEOIP rule-set source"))
+                } footer: {
+                    Text(app.tr(
+                        "用于订阅中的 GEOIP 条目。仅接受 HTTPS 或绝对 file:// 模板，必须包含 {code}，且不得包含用户名或密码；订阅含非 LAN/private GEOIP 时，缺失或无效会拒绝连接。",
+                        "Used by GEOIP entries in the subscription. Use an HTTPS or absolute file:// template containing {code}, without a username or password. If the subscription contains GEOIP entries other than LAN/private, a missing or invalid template blocks the connection."
+                    ))
+                }
+                .disabled(app.hasActiveTunnel || app.isBusy)
+
                 if let operationError {
                     Section {
                         Label(operationError, systemImage: "exclamationmark.triangle.fill")

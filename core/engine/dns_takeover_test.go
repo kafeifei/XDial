@@ -987,7 +987,7 @@ func TestDNSRestoreRecognizesLegacyTakeoverAddress(t *testing.T) {
 }
 
 // 状态文件损坏 = 所有原值不可知。此时唯一安全的动作是把「当前正指着我们地址」的
-// 服务清回 DHCP：宁可退回可能被非权威或被篡改的 DHCP DNS，也绝不留下指向已消失 tun 的死
+// 服务清回 DHCP：宁可退回可能产生非权威或被篡改应答的 DHCP DNS，也绝不留下指向已消失 tun 的死
 // 地址。从没被我们改成功的服务（这里的 Surge 仍是 9.9.9.9）不许误伤。
 func TestDNSRestoreCorruptStateFallsBackToDHCP(t *testing.T) {
 	runner := newFakeDNSRunner(`Wi-Fi
@@ -1175,8 +1175,8 @@ func TestDNSRestoreRetriesOriginalValueOnce(t *testing.T) {
 	assertNoState(t, takeover)
 }
 
-// 原值两次都写不回去 → 第二级兜底改写 Empty。回 DHCP 拿到的可能是被非权威或被篡改的解析结
-// 果，但永远好过把系统留在指向已消失 tun 的死地址上。
+// 原值两次都写不回去 → 第二级兜底改写 Empty。回 DHCP 拿到的可能是非权威或被篡改的
+// 解析应答，但永远好过把系统留在指向已消失 tun 的死地址上。
 func TestDNSRestoreFallsBackToDHCPAfterOriginalKeepsFailing(t *testing.T) {
 	runner := newFakeDNSRunner("Wi-Fi")
 	runner.current["Wi-Fi"] = "1.1.1.1"

@@ -245,6 +245,7 @@ struct Subscription: Codable, Identifiable, Hashable {
     var updatedAt: Int = 0
     var testURL: String = "https://www.gstatic.com/generate_204"
     var testInterval: Int = 300
+    var geoIPRuleSetURLTemplate: String = ""
 
     enum CodingKeys: String, CodingKey {
         case id, name, url, format, enabled, strategy, selected, rules
@@ -253,15 +254,18 @@ struct Subscription: Codable, Identifiable, Hashable {
         case updatedAt = "updated_at"
         case testURL = "test_url"
         case testInterval = "test_interval"
+        case geoIPRuleSetURLTemplate = "geoip_rule_set_url_template"
     }
 
     init(id: String, name: String, url: String, format: String = "auto",
          strategy: String = "urltest", lines: [Line] = [],
-         proxyGroups: [SubProxyGroup] = [], rules: [SubRule] = [], selected: String = "") {
+         proxyGroups: [SubProxyGroup] = [], rules: [SubRule] = [], selected: String = "",
+         geoIPRuleSetURLTemplate: String = "") {
         self.id = id; self.name = name; self.url = url; self.format = format
         self.strategy = strategy; self.lines = lines
         self.selected = selected
         self.proxyGroups = proxyGroups; self.rules = rules
+        self.geoIPRuleSetURLTemplate = geoIPRuleSetURLTemplate
         self.updatedAt = Int(Date().timeIntervalSince1970)
     }
 
@@ -280,6 +284,10 @@ struct Subscription: Codable, Identifiable, Hashable {
         updatedAt = try c.decodeIfPresent(Int.self, forKey: .updatedAt) ?? 0
         testURL = try c.decodeIfPresent(String.self, forKey: .testURL) ?? "https://www.gstatic.com/generate_204"
         testInterval = try c.decodeIfPresent(Int.self, forKey: .testInterval) ?? 300
+        geoIPRuleSetURLTemplate = try c.decodeIfPresent(
+            String.self,
+            forKey: .geoIPRuleSetURLTemplate
+        ) ?? ""
     }
 }
 
@@ -589,13 +597,6 @@ extension Profile {
         ]
         p.ruleSets = [
             RuleSet(id: "internal", name: "内部域名", type: "manual"),
-            RuleSet(id: "remote", name: "REMOTE",
-                  type: "url",
-                  url: "https://config.corp.example/rule-set/remote-policy.srs",
-                  format: "srs"),
-            RuleSet(id: "cnip", name: "国内 IP", type: "url", enabled: false,
-                  url: "https://config.corp.example/rule-set/geoip-cn.srs",
-                  format: "srs"),
         ] + connectivityRuleSets
         return p
     }

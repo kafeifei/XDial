@@ -7,8 +7,11 @@ repo_root="${probe_dir:h:h}"
 probe_app="/Applications/XDialNEProbe.app"
 probe_binary="$probe_app/Contents/MacOS/XDialNEProbe"
 probe_extension_id="com.kafeifei.xdial.ne-probe.extension"
-controlled_host="git.corp.example"
-controlled_address="203.0.113.10"
+
+: "${XDIAL_NE_PROBE_HOST:?XDIAL_NE_PROBE_HOST is required}"
+: "${XDIAL_NE_PROBE_ADDRESS:?XDIAL_NE_PROBE_ADDRESS is required}"
+controlled_host="$XDIAL_NE_PROBE_HOST"
+controlled_address="$XDIAL_NE_PROBE_ADDRESS"
 
 if [[ ! -x "$probe_binary" ]]; then
   print -u2 "signed probe is unavailable: $probe_binary"
@@ -62,7 +65,9 @@ verify_underlay() {
   fi
 }
 
-configure_output="$("$probe_binary" configure-scoped)"
+configure_output="$(
+  "$probe_binary" configure-scoped "$controlled_host" "$controlled_address"
+)"
 print -r -- "$configure_output"
 trial_id="${configure_output##*trial=}"
 if [[ -z "$trial_id" || "$trial_id" == "$configure_output" || "$trial_id" == *' '* ]]; then

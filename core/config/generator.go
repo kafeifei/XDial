@@ -415,9 +415,15 @@ func generateSingBox(
 		if groupTags == nil {
 			continue
 		}
-		subRules, subSets := buildSubscriptionRules(&sub, groupTags)
+		subRules, subSets, err := buildSubscriptionRules(&sub, groupTags)
+		if err != nil {
+			return nil, fmt.Errorf("compile subscription %q rules: %w", sub.ID, err)
+		}
 		if platform.isTransparentProxy() {
-			subRules, subSets = buildTransparentProxySubscriptionRules(&sub, groupTags)
+			subRules, subSets, err = buildTransparentProxySubscriptionRules(&sub, groupTags)
+			if err != nil {
+				return nil, fmt.Errorf("compile subscription %q transparent proxy rules: %w", sub.ID, err)
+			}
 		}
 		routeRules = append(routeRules, subRules...)
 		for _, s := range subSets {
@@ -842,13 +848,13 @@ type proxyDNSTarget struct {
 }
 
 // collectProxyBoundDNSTargets 收集活动场景里"解析必须经该线路出去"的规则集。
-// 在本地用境内公共 DNS 解析拿到的是非权威或被篡改结果，再从隧道那头连过去，分流等于白做。
+// 若在本地解析得到非权威或被篡改的应答，再从另一出口连接，解析视角与出口视角就会不一致。
 //
 // direct 不在此列：它本就要本地视角。vpn 按规则集语义二分——手动规则集是内网名，
 // 归 enterprise-dns（企业 DNS 才有记录，见 collectVPNBoundDomains）；URL 规则集
-// （remotePolicy 之类）是公网名，企业 DNS 对它没有特殊记录，走和代理线路同一套经隧道
+// 远程策略规则通常是公网名，企业 DNS 对它没有特殊记录，走和代理线路同一套经隧道
 // 的公共 DoH。少了这一支，"URL 规则集绑 VPN 线路"（预设场景"国内"就是）两边都
-// 不管，域名落到 final 的境内解析器上被非权威或被篡改。
+// 不管，域名可能落到 final 的受限解析环境并得到非权威或被篡改的应答。
 func collectProxyBoundDNSTargets(
 	profile *Profile,
 	scenario *Scenario,
@@ -1017,7 +1023,7 @@ func buildDNS(
 	config := map[string]interface{}{
 		"servers": servers,
 		"final":   desktopPublicDNSTag,
-		// 按 (域名, server) 分别缓存，避免不同线路的解析视角互相非权威或被篡改。
+		// 按 (域名, server) 分别缓存，避免不同线路的解析视角互相混用。
 		"independent_cache": true,
 	}
 	if len(rules) > 0 {
@@ -1234,7 +1240,10 @@ func buildTransparentProxyDNS(
 		if groupTags == nil {
 			continue
 		}
-		compiled, _ := collectSubscriptionRules(&sub, groupTags)
+		compiled, _, err := collectSubscriptionRules(&sub, groupTags)
+		if err != nil {
+			return nil, fmt.Errorf("compile subscription %q DNS rules: %w", sub.ID, err)
+		}
 		for _, rule := range compiled {
 			if !rule.domain {
 				dnsRulesOpen = false
@@ -1832,8 +1841,8 @@ func sbCollectRuleSets(
 
 // sbDownloadDetour 选 remote 规则集的下载出口。
 //
-// 不能一律 direct：规则集描述的往往正是走不通的那批域名（remotePolicy 的 .srs 就托管
-// 在 raw.githubusercontent.com），从它自己描述的受限网络路径路径上下载必然失败。而首次
+// 不能一律 direct：远程规则集可能位于 Direct 不可达的受限路径，从同一路径下载会
+// 失败。而首次
 // 下载失败是硬失败不是降级 —— sing-box 的 router 在启动阶段直接 FATAL 退出。
 //
 // 但绑定线路不是都能用，能当 detour 的只有订阅节点/策略组和代理线路：
@@ -2321,7 +2330,7 @@ func subscriptionReadinessTags(
 	}
 
 	appendTag(mainTag)
-	compiled, _ := collectSubscriptionRules(subscription, groupTags)
+	compiled, _, _ := collectSubscriptionRules(subscription, groupTags)
 	for _, rule := range compiled {
 		appendTag(rule.outTag)
 	}
@@ -2335,32 +2344,54 @@ type subscriptionCompiledRule struct {
 	domain   bool
 }
 
+func subscriptionRuleOutboundTag(
+	group string,
+	groupTags map[string]string,
+) (string, bool) {
+	if outTag := groupTags[group]; outTag != "" {
+		return outTag, true
+	}
+	// 这些名称属于订阅语法本身，不依赖生成出来的策略组 outbound。
+	switch strings.ToUpper(group) {
+	case "DIRECT":
+		return "direct", true
+	case "REJECT", "REJECT-DROP", "REJECT-TINYGIF", "BLOCK":
+		return rejectTag, true
+	default:
+		return "", false
+	}
+}
+
 // collectSubscriptionRules 把订阅语法规范化成有序 matcher；桌面旧路径与
 // Transparent Proxy 的分阶段 DNS 编译共享这一份顺序事实。
 func collectSubscriptionRules(
 	sub *Subscription,
 	groupTags map[string]string,
-) ([]subscriptionCompiledRule, []map[string]interface{}) {
+) ([]subscriptionCompiledRule, []map[string]interface{}, error) {
 	var rules []subscriptionCompiledRule
 	var sets []map[string]interface{}
 	seenGeoIP := map[string]bool{}
+	effectiveGeoIPRules, err := collectEffectiveSubscriptionGeoIPRules(
+		sub,
+		groupTags,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	geoIPByRuleIndex := make(map[int]effectiveSubscriptionGeoIPRule, len(effectiveGeoIPRules))
+	for _, rule := range effectiveGeoIPRules {
+		geoIPByRuleIndex[rule.ruleIndex] = rule
+	}
 
-	for _, r := range sub.Rules {
-		outTag := groupTags[r.Group]
-		if outTag == "" {
+	for index, r := range sub.Rules {
+		outTag, effective := subscriptionRuleOutboundTag(r.Group, groupTags)
+		if !effective {
 			// 组名解析不到时：DIRECT→直连，REJECT 系→拦截哨兵，其余（含引用了被删的
 			// 空组）才丢弃。此前 REJECT 走 else 分支被静默丢弃，广告/追踪拦截规则整体失效。
-			switch strings.ToUpper(r.Group) {
-			case "DIRECT":
-				outTag = "direct"
-			case "REJECT", "REJECT-DROP", "REJECT-TINYGIF", "BLOCK":
-				outTag = rejectTag
-			default:
-				continue
-			}
+			continue
 		}
 
-		switch r.Type {
+		switch strings.ToUpper(strings.TrimSpace(r.Type)) {
 		case "RULE-SET":
 			// 原始未展开的 RULE-SET 占位（真正的展开在 subscription.ExpandRulesets
 			// 解析期就地完成）。这里出现的都是残留占位，跳过。
@@ -2382,9 +2413,16 @@ func collectSubscriptionRules(
 				matchKey: "ip_cidr", values: []string{r.Value}, outTag: outTag,
 			})
 		case "GEOIP":
-			// sing-box 1.12 移除了内置 geoip，转换为远程 rule-set
-			code := strings.ToLower(r.Value)
-			if code == "private" || code == "lan" {
+			// sing-box 1.12 移除了内置 geoip，转换为显式本地或远程 rule-set。
+			geoIPRule, exists := geoIPByRuleIndex[index]
+			if !exists {
+				return nil, nil, fmt.Errorf(
+					"subscription %q GEOIP rule #%d was not compiled",
+					sub.ID,
+					index+1,
+				)
+			}
+			if geoIPRule.private {
 				// Clash 常用 GEOIP,LAN 表达私有地址；sing-box 对应原生
 				// ip_is_private，不应为它构造一个不存在的远程国家规则集。
 				rules = append(rules, subscriptionCompiledRule{
@@ -2392,43 +2430,55 @@ func collectSubscriptionRules(
 				})
 				continue
 			}
-			setTag := "sub-geoip-" + sub.ID + "-" + code
-			if !seenGeoIP[setTag] {
-				seenGeoIP[setTag] = true
-				sets = append(sets, map[string]interface{}{
-					"type":            "remote",
-					"tag":             setTag,
-					"format":          "binary",
-					"url":             "https://config.corp.example/rule-set/geoip-" + code + ".srs",
-					"download_detour": "direct",
-				})
+			resource := geoIPRule.resource
+			if !seenGeoIP[resource.tag] {
+				seenGeoIP[resource.tag] = true
+				set := map[string]interface{}{
+					"tag":    resource.tag,
+					"format": "binary",
+				}
+				if resource.local {
+					set["type"] = "local"
+					set["path"] = resource.path
+				} else {
+					set["type"] = "remote"
+					set["url"] = resource.url
+					set["download_detour"] = "direct"
+				}
+				sets = append(sets, set)
 			}
 			rules = append(rules, subscriptionCompiledRule{
-				matchKey: "rule_set", values: setTag, outTag: outTag,
+				matchKey: "rule_set", values: resource.tag, outTag: outTag,
 			})
 		case "FINAL":
 			// FINAL 不生成 route rule，由 sing-box 的 "final" 字段处理
 			continue
 		}
 	}
-	return rules, sets
+	return rules, sets, nil
 }
 
 // buildSubscriptionRules 将订阅的规则转换为 sing-box route rules 和 rule_sets。
-func buildSubscriptionRules(sub *Subscription, groupTags map[string]string) ([]map[string]interface{}, []map[string]interface{}) {
-	compiled, sets := collectSubscriptionRules(sub, groupTags)
+func buildSubscriptionRules(sub *Subscription, groupTags map[string]string) ([]map[string]interface{}, []map[string]interface{}, error) {
+	compiled, sets, err := collectSubscriptionRules(sub, groupTags)
+	if err != nil {
+		return nil, nil, err
+	}
 	rules := make([]map[string]interface{}, 0, len(compiled))
 	for _, rule := range compiled {
 		rules = append(rules, subRouteRule(rule.matchKey, rule.values, rule.outTag))
 	}
-	return rules, sets
+	return rules, sets, nil
 }
 
 func buildTransparentProxySubscriptionRules(
 	sub *Subscription,
 	groupTags map[string]string,
-) ([]map[string]interface{}, []map[string]interface{}) {
-	compiled, sets := collectSubscriptionRules(sub, groupTags)
+) ([]map[string]interface{}, []map[string]interface{}, error) {
+	compiled, sets, err := collectSubscriptionRules(sub, groupTags)
+	if err != nil {
+		return nil, nil, err
+	}
 	var rules []map[string]interface{}
 	for _, rule := range compiled {
 		route := subRouteRule(rule.matchKey, rule.values, rule.outTag)
@@ -2446,7 +2496,7 @@ func buildTransparentProxySubscriptionRules(
 		}
 		rules = append(rules, transparentProxySystemResolveRule(), route)
 	}
-	return rules, sets
+	return rules, sets, nil
 }
 
 func transparentProxyResolverForOutbound(outTag string) string {

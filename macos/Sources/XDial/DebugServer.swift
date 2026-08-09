@@ -232,31 +232,10 @@ final class DebugServer {
     }
 
     // 密码/凭据字段一律打码；订阅 url 内嵌 token，同样按凭据处理
-    private static let secretKeys: Set<String> = [
-        "vpn_password", "trojan_password", "ss_password", "vmess_uuid",
-        "anytls_password",
-        "tailscale_auth_key", "auth_key",
-    ]
+    private static let secretKeys = DebugStateRedactor.secretKeys
 
     private static func redactSecrets(_ value: Any) -> Any {
-        if var dict = value as? [String: Any] {
-            // Subscription 对象（有 lines + url）的 url 是带 token 的机场地址
-            let isSubscription = dict["lines"] != nil && dict["url"] != nil
-            for (k, v) in dict {
-                if secretKeys.contains(k), let s = v as? String, !s.isEmpty {
-                    dict[k] = "***"
-                } else if k == "url", isSubscription, let s = v as? String, !s.isEmpty {
-                    dict[k] = "***"
-                } else {
-                    dict[k] = redactSecrets(v)
-                }
-            }
-            return dict
-        }
-        if let arr = value as? [Any] {
-            return arr.map { redactSecrets($0) }
-        }
-        return value
+        DebugStateRedactor.redactSecrets(value, secretKeys: secretKeys)
     }
 
     // MARK: - AX Tree

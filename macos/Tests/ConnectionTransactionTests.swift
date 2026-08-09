@@ -48,7 +48,7 @@ final class ConnectionTransactionTests: XCTestCase {
             "line:vpn",
         ])
         XCTAssertEqual(
-            report.tasks.first { $0.id == "rule-set:cnip" }?.state,
+            report.tasks.first { $0.id == "rule-set:remote-policy" }?.state,
             .pending
         )
         XCTAssertEqual(
@@ -357,7 +357,7 @@ final class ConnectionTransactionTests: XCTestCase {
             scenario: ConnectionPlanScenario(id: "scenario", name: "Test"),
             tasks: [
                 task("underlay:system", kind: "underlay"),
-                task("rule-set:cnip", kind: "rule_set"),
+                task("rule-set:remote-policy", kind: "rule_set"),
                 task("line:vpn", kind: "line"),
                 ConnectionPlanTask(
                     id: "line:tailscale",

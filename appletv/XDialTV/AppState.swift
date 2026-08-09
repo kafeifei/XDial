@@ -1475,6 +1475,14 @@ final class AppState: ObservableObject {
                 &sanitized.subscriptions[subscriptionIndex].testURL,
                 key: Self.vaultKey("subscription", subID, "test-url")
             )
+            store(
+                &sanitized.subscriptions[subscriptionIndex].geoIPRuleSetURLTemplate,
+                key: Self.vaultKey(
+                    "subscription",
+                    subID,
+                    "geoip-rule-set-url-template"
+                )
+            )
             for groupIndex in sanitized.subscriptions[subscriptionIndex].proxyGroups.indices {
                 store(
                     &sanitized.subscriptions[subscriptionIndex].proxyGroups[groupIndex].url,
@@ -1655,6 +1663,7 @@ final class AppState: ObservableObject {
         if profile.ruleSets.contains(where: { $0.type == "url" && !$0.url.isEmpty }) { return true }
         return profile.subscriptions.contains { subscription in
             !subscription.url.isEmpty || !subscription.testURL.isEmpty
+                || !subscription.geoIPRuleSetURLTemplate.isEmpty
                 || subscription.proxyGroups.contains(where: { !$0.url.isEmpty })
                 || subscription.rules.contains(where: {
                     $0.type.uppercased() == "RULE-SET" && !$0.value.isEmpty
@@ -1695,6 +1704,14 @@ final class AppState: ObservableObject {
             restore(
                 &profile.subscriptions[subscriptionIndex].testURL,
                 key: Self.vaultKey("subscription", subID, "test-url")
+            )
+            restore(
+                &profile.subscriptions[subscriptionIndex].geoIPRuleSetURLTemplate,
+                key: Self.vaultKey(
+                    "subscription",
+                    subID,
+                    "geoip-rule-set-url-template"
+                )
             )
             for groupIndex in profile.subscriptions[subscriptionIndex].proxyGroups.indices {
                 restore(
@@ -2671,7 +2688,7 @@ final class AppState: ObservableObject {
         let manualRules = profile.ruleSets
             .filter { $0.type == "manual" && $0.enabled && !$0.isConnectivityTestRule }
             .map { $0.id }
-        let remoteRule = profile.ruleSets
+        let remoteRuleSet = profile.ruleSets
             .first(where: { $0.type == "url" && $0.enabled })?.id ?? ""
 
         var s: Scenario
@@ -2685,14 +2702,14 @@ final class AppState: ObservableObject {
         case .domestic:
             s = Profile.templateDomestic(
                 ruleSetIDs: manualRules,
-                remoteRuleSetID: remoteRule,
+                remoteRuleSetID: remoteRuleSet,
                 vpnLineID: vpn,
                 directLineID: direct
             )
         case .domesticSS:
             s = Profile.templateDomesticSS(
                 ruleSetIDs: manualRules,
-                remoteRuleSetID: remoteRule,
+                remoteRuleSetID: remoteRuleSet,
                 vpnLineID: vpn,
                 ssLineID: ss,
                 directLineID: direct

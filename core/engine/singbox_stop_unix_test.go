@@ -52,7 +52,7 @@ func startWatched(t *testing.T, script string, onExit func(error)) *SingBoxProce
 // 没有退出监听，engine 会一直停在"已连接"，用户看到的是"已连接但整机没网"。
 func TestSingBoxUnexpectedExitReportsStderrTail(t *testing.T) {
 	exitErr := make(chan error, 1)
-	startWatched(t, `echo "FATAL[0000] initial rule-set: ruleset-remote: dial tcp: i/o timeout" >&2; exit 1`,
+	startWatched(t, `echo "FATAL[0000] initial rule-set: ruleset-remote-policy: dial tcp: i/o timeout" >&2; exit 1`,
 		func(err error) { exitErr <- err })
 
 	select {
@@ -60,7 +60,7 @@ func TestSingBoxUnexpectedExitReportsStderrTail(t *testing.T) {
 		if !strings.Contains(err.Error(), "exit status 1") {
 			t.Fatalf("exit status must be reported: %v", err)
 		}
-		if !strings.Contains(err.Error(), "initial rule-set: ruleset-remote") {
+		if !strings.Contains(err.Error(), "initial rule-set: ruleset-remote-policy") {
 			t.Fatalf("sing-box own error must be carried out: %v", err)
 		}
 	case <-time.After(5 * time.Second):

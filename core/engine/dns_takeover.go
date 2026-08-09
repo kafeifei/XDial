@@ -266,7 +266,7 @@ func (t *dnsTakeover) Takeover() error {
 	defer cancel()
 
 	// 路由没就绪就不接管：指过去的查询会掉进黑洞。跳过接管只是退回"查询绕过 tun、
-	// 结果可能被非权威或被篡改、分流不准"，比整机没网好得多。
+	// 结果可能是非权威或被篡改的应答、分流不准"，比整机没网好得多。
 	if err := t.waitTunRoute(ctx); err != nil {
 		return err
 	}
@@ -679,7 +679,7 @@ func dropService(entries []dnsServiceState, service string) []dnsServiceState {
 
 // restoreService 单个服务的两级兜底：原值 → 原值重试一次 → Empty（回 DHCP）。
 // networksetup 的失败多是 SystemConfiguration 一时忙，重试一次就好；真的写不回原
-// 值时，回 DHCP 得到的可能是被非权威或被篡改的解析结果，但永远好过把系统留在指向已消失 tun
+// 值时，回 DHCP 得到的可能是非权威或被篡改的应答，但永远好过把系统留在指向已消失 tun
 // 的死地址上。两级都失败才算这个服务没救回来。
 func (t *dnsTakeover) restoreService(ctx context.Context, entry dnsServiceState) error {
 	var lastErr error
@@ -754,8 +754,8 @@ func (t *dnsTakeover) cancelRetryLocked() {
 
 // restoreTargets 决定「恢复成什么」。正常路径读状态文件按原值恢复；文件不见了或
 // 内容坏了就进兜底：原值不可知时，把「当前 DNS 正指着我们那个地址」的服务清成
-// Empty（回到 DHCP 下发）。宁可退回可能被非权威或被篡改的 DHCP DNS，也绝不把系统留在指向
-// 已消失 tun 的整机断网状态。只挑「指着我们地址」的服务是为了不误伤用户自己手
+// Empty（回到 DHCP 下发）。宁可退回可能产生非权威或被篡改应答的 DHCP DNS，也绝不
+// 把系统留在指向已消失 tun 的整机断网状态。只挑「指着我们地址」的服务是为了不误伤用户自己手
 // 工配过、我们从没碰过的服务。
 //
 // 「文件不存在就当没事」这个静默出口的闸门要同时满足三条：!active、takenAddress == ""、

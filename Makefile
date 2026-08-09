@@ -33,7 +33,7 @@ MACOS_BRAND_PALETTE_SOURCE := macos/Sources/XDial/XDialBrandPalette.swift
 SIGN_IDENTITY ?= Apple Development
 MACOS_TEST_XCODEBUILD_FLAGS ?=
 
-.PHONY: all cli app ci-macos-build release restart inspector clean prepare-patched-go go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
+.PHONY: all cli app ci-macos-build release restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
 
 macos/AppIcon.icns: $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
 	@rm -rf "$(BUILD_DIR)/AppIcon.iconset" "$(BUILD_DIR)/generate-app-icon"
@@ -77,6 +77,9 @@ $(PATCHED_WORKFILE):
 
 prepare-patched-go: $(PATCHED_WORKFILE)
 
+public-content-gate:
+	bash scripts/check-public-content.sh
+
 go-vet: $(PATCHED_WORKFILE)
 	$(PATCHED_GO_ENV) go vet ./...
 
@@ -104,7 +107,7 @@ test-patched-sslcon: $(PATCHED_WORKFILE)
 		GOWORK='$(PATCHED_WORKFILE)' GOFLAGS= go test -race \
 			./session ./vpn -count=1
 
-test: $(PATCHED_WORKFILE) test-patched-tailscale test-patched-sing-box test-patched-sslcon sing-box-test-validator
+test: public-content-gate $(PATCHED_WORKFILE) test-patched-tailscale test-patched-sing-box test-patched-sslcon sing-box-test-validator
 	PATH="$(dir $(SING_BOX_TEST_BINARY)):$(PATH)" $(PATCHED_GO_ENV) go test -tags '$(MOBILE_LIBBOX_TAGS)' ./core/... -v -count=1
 
 test-macos-transaction:

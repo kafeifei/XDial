@@ -28,33 +28,63 @@ private final class ProbeHost: NSObject, NSApplicationDelegate, OSSystemExtensio
         case "activate":
             activateExtension()
         case "configure-scoped":
-            configure(scope: "scoped")
+            let arguments = Array(CommandLine.arguments.dropFirst(2))
+            guard arguments.count == 2 else {
+                finish(
+                    "configure-scoped requires a domain and IPv4 address",
+                    code: 2
+                )
+                return
+            }
+            configure(
+                scope: "scoped",
+                domain: arguments[0],
+                address: arguments[1]
+            )
         case "configure-dns":
-            configure(scope: "dns")
+            let arguments = Array(CommandLine.arguments.dropFirst(2))
+            guard arguments.count == 1, !arguments[0].isEmpty
+            else {
+                finish("configure-dns requires a domain", code: 2)
+                return
+            }
+            configure(scope: "dns", domain: arguments[0])
         case "configure-relay-tcp":
+            let arguments = Array(CommandLine.arguments.dropFirst(2))
             guard
-                let rawPort = CommandLine.arguments.dropFirst(2).first,
-                let port = Int(rawPort),
+                arguments.count == 3,
+                let port = Int(arguments[0]),
                 (1 ... 65535).contains(port)
             else {
-                finish("configure-relay-tcp requires a SOCKS port", code: 2)
+                finish(
+                    "configure-relay-tcp requires a SOCKS port, domain, and IPv4 address",
+                    code: 2
+                )
                 return
             }
-            configure(scope: "relay-tcp", socksPort: port)
+            configure(
+                scope: "relay-tcp",
+                socksPort: port,
+                domain: arguments[1],
+                address: arguments[2]
+            )
         case "configure-relay-domain":
+            let arguments = Array(CommandLine.arguments.dropFirst(2))
             guard
-                let rawPort = CommandLine.arguments.dropFirst(2).first,
-                let port = Int(rawPort),
+                arguments.count == 2,
+                let port = Int(arguments[0]),
                 (1 ... 65535).contains(port)
             else {
-                finish("configure-relay-domain requires a SOCKS port", code: 2)
+                finish(
+                    "configure-relay-domain requires a SOCKS port and domain",
+                    code: 2
+                )
                 return
             }
-            let domain = CommandLine.arguments.dropFirst(3).first
             configure(
                 scope: "relay-domain",
                 socksPort: port,
-                domain: domain
+                domain: arguments[1]
             )
         case "configure-relay-all":
             guard
@@ -102,7 +132,8 @@ private final class ProbeHost: NSObject, NSApplicationDelegate, OSSystemExtensio
     private func configure(
         scope: String,
         socksPort: Int? = nil,
-        domain: String? = nil
+        domain: String? = nil,
+        address: String? = nil
     ) {
         let trialID = UUID().uuidString
         loadManager { result in
@@ -121,6 +152,9 @@ private final class ProbeHost: NSObject, NSApplicationDelegate, OSSystemExtensio
                 }
                 if let domain, !domain.isEmpty {
                     providerConfiguration["domain"] = domain
+                }
+                if let address, !address.isEmpty {
+                    providerConfiguration["address"] = address
                 }
                 providerProtocol.providerConfiguration = providerConfiguration
                 providerProtocol.serverAddress = configurationName

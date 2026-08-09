@@ -407,13 +407,13 @@ func TestSmoke_DefaultVPN(t *testing.T) {
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
 		RuleSets: []RuleSet{
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeManual, Enabled: true,
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", LineID: "my-vpn"},
+				{RuleSetID: "remote-policy", LineID: "my-vpn"},
 			},
 			DefaultLineID: "my-vpn",
 		}},
@@ -437,14 +437,14 @@ func TestSmoke_MultipleRuleSets(t *testing.T) {
 		RuleSets: []RuleSet{
 			{ID: "corp", Name: "公司", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"corp.example.com"}, CIDRs: []string{"10.0.0.0/8"}},
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeManual, Enabled: true,
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com", "youtube.com"}},
 		},
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
 				{RuleSetID: "corp", LineID: "my-vpn"},
-				{RuleSetID: "remote", LineID: "my-ss"},
+				{RuleSetID: "remote-policy", LineID: "my-ss"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -537,7 +537,7 @@ func TestSmoke_URLJsonRuleSet(t *testing.T) {
 	ruleSetJSON := map[string]interface{}{
 		"version": 1,
 		"rules": []map[string]interface{}{
-			{"domain_suffix": []string{"test-remote.local", "blocked.local"}},
+			{"domain_suffix": []string{"restricted-path.test", "blocked.local"}},
 		},
 	}
 	ruleBytes, _ := json.Marshal(ruleSetJSON)
@@ -549,13 +549,13 @@ func TestSmoke_URLJsonRuleSet(t *testing.T) {
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
 		RuleSets: []RuleSet{
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeURL, Enabled: true,
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeURL, Enabled: true,
 				URL: "file://" + localRuleFile, Format: "json"},
 		},
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", LineID: "my-vpn"},
+				{RuleSetID: "remote-policy", LineID: "my-vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -565,7 +565,7 @@ func TestSmoke_URLJsonRuleSet(t *testing.T) {
 	r := newSmokeRunner(t, profile)
 	defer r.stop()
 
-	r.requestAndAssert("test-remote.local", "vpn")
+	r.requestAndAssert("restricted-path.test", "vpn")
 	r.requestAndAssert("blocked.local", "vpn")
 	r.requestAndAssert("normal.local", "direct")
 }
@@ -576,14 +576,14 @@ func TestSmoke_URLSrsRuleSet(t *testing.T) {
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
 		RuleSets: []RuleSet{
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeURL, Enabled: true,
-				URL:    "https://config.corp.example/rule-set/remote-policy.srs",
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeURL, Enabled: true,
+				URL:    "https://rules.example/remote-policy.srs",
 				Format: "srs"},
 		},
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", LineID: "my-vpn"},
+				{RuleSetID: "remote-policy", LineID: "my-vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -639,7 +639,7 @@ func TestSmoke_URLJsonFormat(t *testing.T) {
 }
 
 func TestSmoke_AutoFormat(t *testing.T) {
-	ruleSet := &RuleSet{Format: "auto", URL: "https://example.com/geosite-remote.srs"}
+	ruleSet := &RuleSet{Format: "auto", URL: "https://rules.example/remote-policy.srs"}
 	if f := sbResolveRuleSetFormat(ruleSet); f != "binary" {
 		t.Errorf("auto + .srs URL: expected binary, got %s", f)
 	}
@@ -668,13 +668,13 @@ func TestSmoke_URLRuleSetDedup(t *testing.T) {
 				TrojanServer: "tr.example.com", TrojanPort: 443, TrojanPassword: "p", TrojanSNI: "tr.example.com"},
 		},
 		RuleSets: []RuleSet{
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeURL, Enabled: true,
-				URL: "https://example.com/geosite-remote.srs", Format: "srs"},
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeURL, Enabled: true,
+				URL: "https://rules.example/remote-policy.srs", Format: "srs"},
 		},
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", LineID: "my-vpn"},
+				{RuleSetID: "remote-policy", LineID: "my-vpn"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -692,12 +692,12 @@ func TestSmoke_URLRuleSetDedup(t *testing.T) {
 	count := 0
 	for _, rs := range rss {
 		rsMap := rs.(map[string]interface{})
-		if rsMap["tag"] == "ruleset-remote" {
+		if rsMap["tag"] == "ruleset-remote-policy" {
 			count++
 		}
 	}
 	if count != 1 {
-		t.Errorf("expected 1 ruleset-remote, got %d", count)
+		t.Errorf("expected 1 ruleset-remote-policy, got %d", count)
 	}
 }
 
@@ -804,7 +804,7 @@ func TestSmoke_SubscribeBasic(t *testing.T) {
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
 		RuleSets: []RuleSet{
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeManual, Enabled: true,
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com", "youtube.com"}},
 		},
 		Subscriptions: []Subscription{{
@@ -822,7 +822,7 @@ func TestSmoke_SubscribeBasic(t *testing.T) {
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", SubscriptionID: "sub1"},
+				{RuleSetID: "remote-policy", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -845,7 +845,7 @@ func TestSmoke_SubscribeWithGroups(t *testing.T) {
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
 		RuleSets: []RuleSet{
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeManual, Enabled: true,
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
 		Subscriptions: []Subscription{{
@@ -874,7 +874,7 @@ func TestSmoke_SubscribeWithGroups(t *testing.T) {
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", SubscriptionID: "sub1"},
+				{RuleSetID: "remote-policy", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -942,7 +942,7 @@ func TestSmoke_SubscribeMixed(t *testing.T) {
 		RuleSets: []RuleSet{
 			{ID: "corp", Name: "公司", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"corp.example.com"}},
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeManual, Enabled: true,
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
 		Subscriptions: []Subscription{{
@@ -957,8 +957,8 @@ func TestSmoke_SubscribeMixed(t *testing.T) {
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "corp", LineID: "my-vpn"},      // 手动线路
-				{RuleSetID: "remote", SubscriptionID: "sub1"}, // 订阅
+				{RuleSetID: "corp", LineID: "my-vpn"},                // 手动线路
+				{RuleSetID: "remote-policy", SubscriptionID: "sub1"}, // 订阅
 			},
 			DefaultLineID: "direct",
 		}},
@@ -970,7 +970,7 @@ func TestSmoke_SubscribeMixed(t *testing.T) {
 
 	// corp 走手动 VPN
 	r.requestAndAssert("corp.example.com", "vpn")
-	// remote 走订阅节点
+	// 远程策略走订阅节点
 	r.requestAndAssert("google.com", "proxy-sub1-n1")
 	// 未匹配走 direct
 	r.requestAndAssert("unmatched.test", "direct")
@@ -1022,7 +1022,7 @@ func TestSmoke_SubscribeDisabled(t *testing.T) {
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
 		RuleSets: []RuleSet{
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeManual, Enabled: true,
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
 		Subscriptions: []Subscription{{
@@ -1037,7 +1037,7 @@ func TestSmoke_SubscribeDisabled(t *testing.T) {
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", SubscriptionID: "sub1"},
+				{RuleSetID: "remote-policy", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -1047,7 +1047,7 @@ func TestSmoke_SubscribeDisabled(t *testing.T) {
 	r := newSmokeRunner(t, profile)
 	defer r.stop()
 
-	// 订阅禁用，remote 无法匹配，走 direct
+	// 订阅禁用，远程策略无法匹配，走 direct
 	r.requestAndAssert("google.com", "direct")
 }
 
@@ -1059,7 +1059,7 @@ func TestSmoke_SubscribeEmptyNodes(t *testing.T) {
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
 		RuleSets: []RuleSet{
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeManual, Enabled: true,
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
 		Subscriptions: []Subscription{{
@@ -1069,7 +1069,7 @@ func TestSmoke_SubscribeEmptyNodes(t *testing.T) {
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", SubscriptionID: "sub1"},
+				{RuleSetID: "remote-policy", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -1093,7 +1093,7 @@ func TestSmoke_SubscribeMultiSubscription(t *testing.T) {
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
 		RuleSets: []RuleSet{
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeManual, Enabled: true,
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 			{ID: "streaming", Name: "流媒体", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"netflix.com"}},
@@ -1121,7 +1121,7 @@ func TestSmoke_SubscribeMultiSubscription(t *testing.T) {
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", SubscriptionID: "sub-a"},
+				{RuleSetID: "remote-policy", SubscriptionID: "sub-a"},
 				{RuleSetID: "streaming", SubscriptionID: "sub-b"},
 			},
 			DefaultLineID: "direct",
@@ -1144,7 +1144,7 @@ func TestSmoke_SubscribeUrltest(t *testing.T) {
 			{ID: "my-vpn", Type: LineTypeVPN, Enabled: true, VPNServer: "vpn.example.com"},
 		},
 		RuleSets: []RuleSet{
-			{ID: "remote", Name: "REMOTE", Type: RuleSetTypeManual, Enabled: true,
+			{ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeManual, Enabled: true,
 				Domains: []string{"google.com"}},
 		},
 		Subscriptions: []Subscription{{
@@ -1163,7 +1163,7 @@ func TestSmoke_SubscribeUrltest(t *testing.T) {
 		Scenarios: []Scenario{{
 			ID: "main",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", SubscriptionID: "sub1"},
+				{RuleSetID: "remote-policy", SubscriptionID: "sub1"},
 			},
 			DefaultLineID: "direct",
 		}},

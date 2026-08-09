@@ -142,6 +142,7 @@ enum MobileConfigurationService {
         for subscriptionIndex in sanitized.subscriptions.indices {
             sanitized.subscriptions[subscriptionIndex].url = ""
             sanitized.subscriptions[subscriptionIndex].testURL = ""
+            sanitized.subscriptions[subscriptionIndex].geoIPRuleSetURLTemplate = ""
             for groupIndex in sanitized.subscriptions[subscriptionIndex].proxyGroups.indices {
                 sanitized.subscriptions[subscriptionIndex].proxyGroups[groupIndex].url = ""
             }
@@ -456,6 +457,9 @@ enum MobileDiagnosticsService {
         for subscription in profile.subscriptions {
             if !subscription.url.isEmpty { values.insert(subscription.url) }
             if !subscription.testURL.isEmpty { values.insert(subscription.testURL) }
+            if !subscription.geoIPRuleSetURLTemplate.isEmpty {
+                values.insert(subscription.geoIPRuleSetURLTemplate)
+            }
             for group in subscription.proxyGroups where !group.url.isEmpty {
                 values.insert(group.url)
             }

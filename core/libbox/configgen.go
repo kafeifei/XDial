@@ -1438,6 +1438,7 @@ func materializeGeneratedNERuleSetsWithEvents(
 	}
 
 	remaining := maxNERuleSetBytes
+	changed := false
 	countedPaths := make(map[string]bool)
 	for _, rawSet := range rawSets {
 		set, _ := rawSet.(map[string]interface{})
@@ -1445,25 +1446,89 @@ func materializeGeneratedNERuleSetsWithEvents(
 			continue
 		}
 		localPath, _ := set["path"].(string)
-		if localPath == "" || countedPaths[localPath] {
-			continue
+		tag, _ := set["tag"].(string)
+		format, _ := set["format"].(string)
+		generatedTaskID := ""
+		if strings.HasPrefix(tag, "sub-geoip-") {
+			generatedTaskID = "rule-set:generated:" + tag
+			emitConnectionPreparation(
+				progress,
+				connectionPreparationEvent{
+					TaskID: generatedTaskID,
+					State:  "running",
+				},
+			)
 		}
-		relative, relativeErr := filepath.Rel(ruleDir, localPath)
-		if relativeErr != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			continue
+		failLocal := func() ([]byte, error) {
+			if generatedTaskID != "" {
+				emitConnectionPreparationFailure(
+					progress,
+					generatedTaskID,
+					"generated-rule-set-unavailable",
+				)
+				return nil, fmt.Errorf(
+					"generated rule set %q is unavailable or invalid",
+					tag,
+				)
+			}
+			return nil, fmt.Errorf(
+				"local rule set %q is unavailable or invalid",
+				tag,
+			)
 		}
-		info, statErr := os.Stat(localPath)
-		if statErr != nil {
-			return nil, fmt.Errorf("read local rule-set: %w", statErr)
+		if localPath == "" || tag == "" ||
+			(format != "source" && format != "binary") {
+			return failLocal()
 		}
-		countedPaths[localPath] = true
-		remaining -= info.Size()
+
+		managedPath := localPath
+		if generatedTaskID != "" {
+			managedPath = neRuleSetCachePath(
+				ruleDir,
+				"generated-local",
+				tag,
+				"file://"+localPath,
+				format,
+				format,
+			)
+		}
+		limit := remaining
+		if countedPaths[managedPath] {
+			limit = maxNERuleSetBytes
+		}
+		content, _, _, readErr := readValidatedNERuleSet(
+			localPath,
+			format,
+			limit,
+		)
+		if readErr != nil {
+			return failLocal()
+		}
+		if generatedTaskID != "" && managedPath != localPath {
+			if err := writeNERuleSetCache(managedPath, content); err != nil {
+				return failLocal()
+			}
+			set["path"] = managedPath
+			changed = true
+		}
+		if !countedPaths[managedPath] {
+			countedPaths[managedPath] = true
+			remaining -= int64(len(content))
+		}
+		if generatedTaskID != "" {
+			emitConnectionPreparation(
+				progress,
+				connectionPreparationEvent{
+					TaskID: generatedTaskID,
+					State:  "ready",
+				},
+			)
+		}
 	}
 	if remaining < 0 {
 		return nil, fmt.Errorf("remote rule sets exceed the total size limit")
 	}
 
-	changed := false
 	for _, rawSet := range rawSets {
 		set, _ := rawSet.(map[string]interface{})
 		if set == nil || set["type"] != "remote" {

@@ -10,9 +10,10 @@ final class ProbeProxyProvider: NETransparentProxyProvider {
         category: "flows"
     )
     private var trialID = "-"
-    private var scope = "scoped"
+    private var scope = ""
     private var socksPort: UInt16 = 0
-    private var domain = "git.corp.example"
+    private var domain = ""
+    private var address = ""
     private var embeddedSingBox: EmbeddedSingBox?
 
     override func startProxy(
@@ -20,13 +21,26 @@ final class ProbeProxyProvider: NETransparentProxyProvider {
         completionHandler: @escaping (Error?) -> Void
     ) {
         let providerProtocol = protocolConfiguration as? NETunnelProviderProtocol
-        scope = providerProtocol?.providerConfiguration?["scope"] as? String ?? "scoped"
-        socksPort = UInt16(
-            providerProtocol?.providerConfiguration?["socksPort"] as? Int ?? 0
-        )
-        domain = providerProtocol?.providerConfiguration?["domain"] as? String
-            ?? "git.corp.example"
+        scope = providerProtocol?.providerConfiguration?["scope"] as? String ?? ""
+        if let configuredPort = providerProtocol?
+            .providerConfiguration?["socksPort"] as? Int,
+           let parsedPort = UInt16(exactly: configuredPort)
+        {
+            socksPort = parsedPort
+        } else {
+            socksPort = 0
+        }
+        domain = providerProtocol?.providerConfiguration?["domain"] as? String ?? ""
+        address = providerProtocol?.providerConfiguration?["address"] as? String ?? ""
         trialID = providerProtocol?.providerConfiguration?["trialID"] as? String ?? "-"
+
+        if ["relay-tcp", "relay-domain", "relay-all", "embedded-all"].contains(scope),
+           socksPort == 0
+        {
+            completionHandler(ProbeProviderError.invalidSOCKSPort)
+            return
+        }
+
         let settings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
 
         if scope == "all" || scope == "relay-all" || scope == "embedded-all" {
@@ -41,6 +55,10 @@ final class ProbeProxyProvider: NETransparentProxyProvider {
                 ),
             ]
         } else if scope == "dns" || scope == "relay-domain" {
+            guard !domain.isEmpty else {
+                completionHandler(ProbeProviderError.missingDomain)
+                return
+            }
             settings.includedNetworkRules = [
                 NENetworkRule(
                     destinationHostEndpoint: NWEndpoint.hostPort(
@@ -50,24 +68,31 @@ final class ProbeProxyProvider: NETransparentProxyProvider {
                     protocol: .any
                 ),
             ]
-        } else {
+        } else if scope == "scoped" || scope == "relay-tcp" {
+            guard !domain.isEmpty else {
+                completionHandler(ProbeProviderError.missingDomain)
+                return
+            }
+            guard IPv4Address(address) != nil else {
+                completionHandler(ProbeProviderError.invalidIPv4Address)
+                return
+            }
             settings.includedNetworkRules = [
                 NENetworkRule(
                     destinationNetworkEndpoint: NWEndpoint.hostPort(
-                        host: NWEndpoint.Host("203.0.113.10"),
+                        host: NWEndpoint.Host(address),
                         port: .any
                     ),
                     prefix: 32,
                     protocol: .any
                 ),
             ]
+        } else {
+            completionHandler(ProbeProviderError.invalidScope)
+            return
         }
 
         if scope == "embedded-all" {
-            guard socksPort != 0 else {
-                completionHandler(ProbeProviderError.invalidSOCKSPort)
-                return
-            }
             let embedded = EmbeddedSingBox(logger: logger)
             do {
                 try embedded.start(port: socksPort)
@@ -207,4 +232,7 @@ final class ProbeProxyProvider: NETransparentProxyProvider {
 
 private enum ProbeProviderError: Error {
     case invalidSOCKSPort
+    case missingDomain
+    case invalidIPv4Address
+    case invalidScope
 }

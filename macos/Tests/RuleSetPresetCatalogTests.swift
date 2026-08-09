@@ -55,4 +55,21 @@ final class RuleSetPresetCatalogTests: XCTestCase {
 
         XCTAssertThrowsError(try RuleSetPresetCatalog.decode(data))
     }
+
+    func testPublicExampleStaysSchemaCompatibleAndContainsNoCredential() throws {
+        let exampleURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Examples/RuleSetPresets.example.json")
+        let data = try Data(contentsOf: exampleURL)
+
+        let catalog = try RuleSetPresetCatalog.decode(data)
+
+        XCTAssertEqual(catalog.schemaVersion, 1)
+        XCTAssertTrue(catalog.presets.contains { $0.id == "blank" })
+        XCTAssertTrue(catalog.presets.allSatisfy {
+            URLComponents(string: $0.url)?.user == nil
+                && URLComponents(string: $0.url)?.password == nil
+        })
+    }
 }

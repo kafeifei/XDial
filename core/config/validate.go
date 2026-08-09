@@ -202,6 +202,14 @@ func inspectScenarioReferences(profile *Profile, scenario *Scenario) ([]ProfileW
 					subscription.ID,
 				)
 			}
+			if err := validateSubscriptionGeoIPRuleSetResources(subscription); err != nil {
+				return nil, fmt.Errorf(
+					"scenario %q uses an invalid subscription %q: %w",
+					scenario.ID,
+					subscription.ID,
+					err,
+				)
+			}
 			continue
 		}
 		if line == nil {
@@ -251,6 +259,13 @@ func inspectScenarioReferences(profile *Profile, scenario *Scenario) ([]ProfileW
 				"scenario %q uses enabled subscription %q as its default, but the subscription cannot generate an outbound",
 				scenario.ID,
 				subscription.ID,
+			)
+		} else if err := validateSubscriptionGeoIPRuleSetResources(subscription); err != nil {
+			return nil, fmt.Errorf(
+				"scenario %q uses an invalid default subscription %q: %w",
+				scenario.ID,
+				subscription.ID,
+				err,
 			)
 		}
 	case scenario.DefaultLineID == builtinDirectLineID:

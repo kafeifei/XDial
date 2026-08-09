@@ -17,7 +17,12 @@ final class MobileConfigurationSupportTests: XCTestCase {
         profile.lines[1].vpnPassword = "sensitive-password"
         profile.lines[2].trojanPassword = "sensitive-node-key"
         profile.lines[2].vmessUUID = "sensitive-uuid"
-        profile.ruleSets[1].url = "https://rule-user:rule-password@rules.example.com/rule-path-secret/list.srs?token=rule-query"
+        profile.ruleSets.append(RuleSet(
+            id: "remote-policy",
+            name: "Remote Policy",
+            type: "url",
+            url: "https://rule-user:rule-password@rules.example.com/rule-path-secret/list.srs?token=rule-query"
+        ))
         profile.subscriptions = [
             Subscription(
                 id: "sub-1",
@@ -36,6 +41,8 @@ final class MobileConfigurationSupportTests: XCTestCase {
             ),
         ]
         profile.subscriptions[0].testURL = "https://health.example.com/ping?token=health-secret"
+        profile.subscriptions[0].geoIPRuleSetURLTemplate =
+            "https://geo.example.com/{code}.srs?token=geo-secret"
 
         let data = try MobileConfigurationService.exportData(for: profile)
         let text = try XCTUnwrap(String(data: data, encoding: .utf8))
@@ -56,6 +63,7 @@ final class MobileConfigurationSupportTests: XCTestCase {
         XCTAssertFalse(text.contains("probe-secret"))
         XCTAssertFalse(text.contains("rule-secret"))
         XCTAssertFalse(text.contains("health-secret"))
+        XCTAssertFalse(text.contains("geo-secret"))
 
         let imported = try MobileConfigurationService.importProfile(from: data)
         XCTAssertEqual(imported.lines[1].vpnServer, "gateway.example.com")
@@ -64,10 +72,14 @@ final class MobileConfigurationSupportTests: XCTestCase {
         XCTAssertEqual(imported.subscriptions[0].url, "")
         XCTAssertEqual(imported.subscriptions[0].lines[0].ssPassword, "")
         XCTAssertEqual(imported.subscriptions[0].testURL, "")
+        XCTAssertEqual(imported.subscriptions[0].geoIPRuleSetURLTemplate, "")
         XCTAssertEqual(imported.subscriptions[0].proxyGroups[0].url, "")
         XCTAssertTrue(imported.subscriptions[0].rules.isEmpty)
-        XCTAssertEqual(imported.ruleSets[1].url, "")
-        XCTAssertFalse(imported.ruleSets[1].enabled)
+        let remotePolicy = try XCTUnwrap(
+            imported.ruleSets.first { $0.id == "remote-policy" }
+        )
+        XCTAssertEqual(remotePolicy.url, "")
+        XCTAssertFalse(remotePolicy.enabled)
     }
 
     func testImportAcceptsRawProfileAndKeepsStructure() throws {
@@ -221,7 +233,7 @@ final class MobileConfigurationSupportTests: XCTestCase {
         XCTAssertTrue(report.contains("Version: 1.2.3 (45)"))
         XCTAssertTrue(report.contains("Status: Not connected"))
         XCTAssertTrue(report.contains("System profile: Installed"))
-        XCTAssertTrue(report.contains("Object counts: lines 3, rules 5, scenarios 0, subscriptions 1"))
+        XCTAssertTrue(report.contains("Object counts: lines 3, rules 3, scenarios 0, subscriptions 1"))
         XCTAssertTrue(report.contains("Egress probe: Direct: 203.0.113.1; AnyConnect: 198.51.100.2"))
         XCTAssertTrue(report.contains("Last error:"))
         XCTAssertFalse(report.contains("private-user"))

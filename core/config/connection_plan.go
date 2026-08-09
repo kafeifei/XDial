@@ -78,6 +78,7 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 	seen := map[string]bool{"underlay:system": true}
 	var ruleTaskIDs []string
 	var targetTaskIDs []string
+	var planErr error
 	add := func(task ConnectionPlanTask) {
 		if task.ID == "" || seen[task.ID] {
 			return
@@ -162,7 +163,7 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 		return taskID, name, directRuntimeConfigurationTarget()
 	}
 	addSubscription := func(subscription *Subscription) (string, string, runtimeConfigurationTarget, bool) {
-		if subscription == nil || !subscription.Enabled ||
+		if planErr != nil || subscription == nil || !subscription.Enabled ||
 			!subscriptionHasUsableOutbound(subscription) {
 			return "", "", runtimeConfigurationTarget{}, false
 		}
@@ -178,8 +179,14 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 			ResourceType: strings.TrimSpace(subscription.Strategy),
 		})
 		targetTaskIDs = appendUniqueString(targetTaskIDs, taskID)
-		addGeneratedSubscriptionRuleSets(plan, seen, subscription, &ruleTaskIDs)
-		fingerprint.includeSubscription(subscription)
+		if err := addGeneratedSubscriptionRuleSets(plan, seen, subscription, &ruleTaskIDs); err != nil {
+			planErr = fmt.Errorf("compile subscription %q rule-set tasks: %w", subscription.ID, err)
+			return "", "", runtimeConfigurationTarget{}, false
+		}
+		if err := fingerprint.includeSubscription(subscription); err != nil {
+			planErr = fmt.Errorf("fingerprint subscription %q: %w", subscription.ID, err)
+			return "", "", runtimeConfigurationTarget{}, false
+		}
 		return taskID, subscriptionLabel(subscription),
 			subscriptionRuntimeConfigurationTarget(subscription), true
 	}
@@ -210,6 +217,9 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 		addRuleSet(ruleSet, targetName)
 		fingerprint.addBinding(ruleSet.ID, target)
 	}
+	if planErr != nil {
+		return nil, planErr
+	}
 
 	_, _, defaultTarget, effective := resolveTarget(
 		scenario.DefaultLineID,
@@ -217,6 +227,9 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 	)
 	if !effective {
 		_, _, defaultTarget = addDirect()
+	}
+	if planErr != nil {
+		return nil, planErr
 	}
 	fingerprint.setDefaultTarget(defaultTarget)
 
@@ -266,33 +279,47 @@ func addGeneratedSubscriptionRuleSets(
 	seen map[string]bool,
 	subscription *Subscription,
 	ruleTaskIDs *[]string,
-) {
-	for _, rule := range subscription.Rules {
-		if !strings.EqualFold(strings.TrimSpace(rule.Type), "GEOIP") {
+) error {
+	_, _, groupTags := buildSubscriptionOutbounds(subscription, PlatformMacOS)
+	geoIPRules, err := collectEffectiveSubscriptionGeoIPRules(
+		subscription,
+		groupTags,
+	)
+	if err != nil {
+		return err
+	}
+	for _, rule := range geoIPRules {
+		if rule.private {
 			continue
 		}
-		code := strings.ToLower(strings.TrimSpace(rule.Value))
-		if code == "" || code == "private" || code == "lan" {
-			continue
-		}
-		resourceID := "sub-geoip-" + subscription.ID + "-" + code
+		resource := rule.resource
+		resourceID := resource.tag
 		taskID := "rule-set:generated:" + resourceID
 		if seen[taskID] {
 			continue
 		}
 		seen[taskID] = true
+		preparation := "cache-or-download"
+		detail := "订阅 " + subscriptionLabel(subscription) + " 需要的远程规则"
+		resourceType := "remote"
+		if resource.local {
+			preparation = "load-local"
+			detail = "订阅 " + subscriptionLabel(subscription) + " 需要的本地规则"
+			resourceType = "local"
+		}
 		plan.Tasks = append(plan.Tasks, ConnectionPlanTask{
 			ID:           taskID,
 			Kind:         ConnectionTaskRuleSet,
-			Name:         "GEOIP " + strings.ToUpper(code),
-			Detail:       "订阅 " + subscriptionLabel(subscription) + " 需要的远程规则",
-			Preparation:  "cache-or-download",
+			Name:         "GEOIP " + strings.ToUpper(rule.code),
+			Detail:       detail,
+			Preparation:  preparation,
 			Dependencies: []string{"underlay:system"},
 			ResourceID:   resourceID,
-			ResourceType: "generated",
+			ResourceType: resourceType,
 		})
 		*ruleTaskIDs = appendUniqueString(*ruleTaskIDs, taskID)
 	}
+	return nil
 }
 
 func appendUniqueString(values []string, value string) []string {

@@ -403,7 +403,7 @@ extension AppState {
     ///   1. VPN 类型 Line 凭据为空则填入演示值。
     ///   2. 没有场景则种入 2 条（海外 / 国内），并设一个为 active。
     ///
-    /// 只在 RootView 的 Simulator 分支调用，不非权威或被篡改真实路径的 AppState 逻辑。
+    /// 只在 RootView 的 Simulator 分支调用，不影响真实路径的 AppState 逻辑。
     /// 幂等：已填过凭据 / 已有场景就不重复写，避免每次启动都改动。
     func seedDemoDataForSimulator() {
         var changed = false

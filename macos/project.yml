@@ -199,7 +199,9 @@ targets:
       - Shared
       - Sources/XDial/AppIcon.swift
       - Sources/XDial/AppVersion.swift
+      - Sources/XDial/DebugStateRedactor.swift
       - Sources/XDial/Models.swift
+      - Sources/XDial/ProfileVaultProjection.swift
       - Sources/XDial/Localization.swift
       - Sources/XDial/ScenarioIconCatalog.swift
       - Sources/XDial/ScenarioGridLayout.swift

@@ -67,10 +67,10 @@ func internalRuleSet() RuleSet {
 	}
 }
 
-func remoteRuleSet() RuleSet {
+func remotePolicyRuleSet() RuleSet {
 	return RuleSet{
-		ID: "remote", Name: "RemotePolicy", Type: RuleSetTypeURL, Enabled: true,
-		URL:    "https://config.corp.example/rule-set/remote-policy.srs",
+		ID: "remote-policy", Name: "Remote Policy", Type: RuleSetTypeURL, Enabled: true,
+		URL:    "https://rules.example/remote-policy.srs",
 		Format: "srs",
 	}
 }
@@ -78,7 +78,7 @@ func remoteRuleSet() RuleSet {
 func cnipRuleSet() RuleSet {
 	return RuleSet{
 		ID: "cnip", Name: "国内IP", Type: RuleSetTypeURL, Enabled: true,
-		URL:    "https://config.corp.example/rule-set/geoip-cn.srs",
+		URL:    "https://rules.example/geoip-cn.srs",
 		Format: "srs",
 	}
 }
@@ -111,6 +111,7 @@ func testSubscription() Subscription {
 			{Type: "GEOIP", Value: "CN", Group: "Direct"}, // 应该被跳过
 			{Type: "FINAL", Group: "Proxies"},
 		},
+		GeoIPRuleSetURLTemplate: "https://rules.example/geoip-{code}.srs",
 	}
 }
 
@@ -158,12 +159,12 @@ func TestGenerate_DesktopUserSplitCombination(t *testing.T) {
 	}
 	p := &Profile{
 		Lines:    []Line{directLine(), vpnLine(), trojanLine()},
-		RuleSets: []RuleSet{internalRuleSet(), remoteRuleSet()},
+		RuleSets: []RuleSet{internalRuleSet(), remotePolicyRuleSet()},
 		Scenarios: []Scenario{{
 			ID: "split", Name: "分流",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
-				{RuleSetID: "remote", LineID: "trojan-1"},
+				{RuleSetID: "remote-policy", LineID: "trojan-1"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -267,12 +268,12 @@ func TestGenerate_NETailscale(t *testing.T) {
 func TestGenerate_ManualOnly(t *testing.T) {
 	p := &Profile{
 		Lines:    []Line{directLine(), vpnLine(), trojanLine()},
-		RuleSets: []RuleSet{internalRuleSet(), remoteRuleSet(), cnipRuleSet()},
+		RuleSets: []RuleSet{internalRuleSet(), remotePolicyRuleSet(), cnipRuleSet()},
 		Scenarios: []Scenario{{
 			ID: "c1", Name: "海外",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
-				{RuleSetID: "remote", LineID: "direct"},
+				{RuleSetID: "remote-policy", LineID: "direct"},
 				{RuleSetID: "cnip", LineID: "trojan-1"},
 			},
 			DefaultLineID: "direct",
@@ -286,12 +287,12 @@ func TestGenerate_ManualOnly(t *testing.T) {
 func TestGenerate_ManualOnlyVMess(t *testing.T) {
 	p := &Profile{
 		Lines:    []Line{directLine(), vpnLine(), vmessLine()},
-		RuleSets: []RuleSet{internalRuleSet(), remoteRuleSet(), cnipRuleSet()},
+		RuleSets: []RuleSet{internalRuleSet(), remotePolicyRuleSet(), cnipRuleSet()},
 		Scenarios: []Scenario{{
 			ID: "c1", Name: "国内",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
-				{RuleSetID: "remote", LineID: "direct"},
+				{RuleSetID: "remote-policy", LineID: "direct"},
 				{RuleSetID: "cnip", LineID: "vmess-1"},
 			},
 			DefaultLineID: "direct",
@@ -305,13 +306,13 @@ func TestGenerate_ManualOnlyVMess(t *testing.T) {
 func TestGenerate_BindingToSubscription(t *testing.T) {
 	p := &Profile{
 		Lines:         []Line{directLine(), vpnLine()},
-		RuleSets:      []RuleSet{internalRuleSet(), remoteRuleSet()},
+		RuleSets:      []RuleSet{internalRuleSet(), remotePolicyRuleSet()},
 		Subscriptions: []Subscription{testSubscription()},
 		Scenarios: []Scenario{{
 			ID: "c1", Name: "国内",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
-				{RuleSetID: "remote", SubscriptionID: "sub-test"}, // REMOTE → 订阅
+				{RuleSetID: "remote-policy", SubscriptionID: "sub-test"}, // 远程策略 → 订阅
 			},
 			DefaultLineID: "direct",
 		}},
@@ -342,14 +343,14 @@ func TestGenerate_DefaultToSubscription(t *testing.T) {
 func TestGenerate_Mixed(t *testing.T) {
 	p := &Profile{
 		Lines:         []Line{directLine(), vpnLine(), trojanLine()},
-		RuleSets:      []RuleSet{internalRuleSet(), remoteRuleSet(), cnipRuleSet()},
+		RuleSets:      []RuleSet{internalRuleSet(), remotePolicyRuleSet(), cnipRuleSet()},
 		Subscriptions: []Subscription{testSubscription()},
 		Scenarios: []Scenario{{
 			ID: "c1", Name: "混合",
 			Bindings: []RuleBinding{
-				{RuleSetID: "internal", LineID: "vpn"},         // 手动
-				{RuleSetID: "remote", SubscriptionID: "sub-test"}, // 订阅
-				{RuleSetID: "cnip", LineID: "trojan-1"},        // 手动
+				{RuleSetID: "internal", LineID: "vpn"},                   // 手动
+				{RuleSetID: "remote-policy", SubscriptionID: "sub-test"}, // 订阅
+				{RuleSetID: "cnip", LineID: "trojan-1"},                  // 手动
 			},
 			DefaultLineID: "direct",
 		}},
@@ -362,12 +363,12 @@ func TestGenerate_Mixed(t *testing.T) {
 func TestGenerate_PlainSubscription(t *testing.T) {
 	p := &Profile{
 		Lines:         []Line{directLine()},
-		RuleSets:      []RuleSet{remoteRuleSet()},
+		RuleSets:      []RuleSet{remotePolicyRuleSet()},
 		Subscriptions: []Subscription{testSubscriptionNoGroups()},
 		Scenarios: []Scenario{{
 			ID: "c1", Name: "Plain",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", SubscriptionID: "sub-plain"},
+				{RuleSetID: "remote-policy", SubscriptionID: "sub-plain"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -383,13 +384,13 @@ func TestGenerate_DisabledSubscription(t *testing.T) {
 
 	p := &Profile{
 		Lines:         []Line{directLine(), vpnLine()},
-		RuleSets:      []RuleSet{internalRuleSet(), remoteRuleSet()},
+		RuleSets:      []RuleSet{internalRuleSet(), remotePolicyRuleSet()},
 		Subscriptions: []Subscription{sub},
 		Scenarios: []Scenario{{
 			ID: "c1", Name: "Disabled",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
-				{RuleSetID: "remote", SubscriptionID: "sub-test"}, // 订阅禁用，应跳过
+				{RuleSetID: "remote-policy", SubscriptionID: "sub-test"}, // 订阅禁用，应跳过
 			},
 			DefaultLineID: "direct",
 		}},
@@ -407,12 +408,12 @@ func TestGenerate_EmptySubscriptionFailsClosed(t *testing.T) {
 
 	p := &Profile{
 		Lines:         []Line{directLine()},
-		RuleSets:      []RuleSet{remoteRuleSet()},
+		RuleSets:      []RuleSet{remotePolicyRuleSet()},
 		Subscriptions: []Subscription{sub},
 		Scenarios: []Scenario{{
 			ID: "c1", Name: "Empty",
 			Bindings: []RuleBinding{
-				{RuleSetID: "remote", SubscriptionID: "sub-empty"},
+				{RuleSetID: "remote-policy", SubscriptionID: "sub-empty"},
 			},
 			DefaultLineID: "direct",
 		}},
@@ -443,6 +444,7 @@ func TestGenerate_MultipleSubscriptions(t *testing.T) {
 		{Type: "GEOIP", Value: "CN", Group: "Auto"},
 		{Type: "FINAL", Group: "Auto"},
 	}
+	sub2.GeoIPRuleSetURLTemplate = "https://rules.example/geoip-{code}.srs"
 
 	p := &Profile{
 		Lines:         []Line{directLine(), vpnLine()},
@@ -468,12 +470,12 @@ func TestGenerate_DisabledPortReferences(t *testing.T) {
 
 	p := &Profile{
 		Lines:    []Line{directLine(), vpnLine(), disabledTrojan},
-		RuleSets: []RuleSet{internalRuleSet(), remoteRuleSet()},
+		RuleSets: []RuleSet{internalRuleSet(), remotePolicyRuleSet()},
 		Scenarios: []Scenario{{
 			ID: "c1", Name: "Disabled-Refs",
 			Bindings: []RuleBinding{
 				{RuleSetID: "internal", LineID: "vpn"},
-				{RuleSetID: "remote", LineID: "trojan-disabled"}, // 引用禁用 port，应跳过
+				{RuleSetID: "remote-policy", LineID: "trojan-disabled"}, // 引用禁用 port，应跳过
 			},
 			DefaultLineID: "trojan-disabled", // 默认出口禁用，应 fallback 到 direct
 		}},

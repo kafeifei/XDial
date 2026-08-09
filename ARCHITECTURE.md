@@ -151,8 +151,8 @@ CIDR 或默认路由。
 
 这三步的顺序**不可交换**，理由是一条严格的因果链：
 
-1. **分流只需要名字。** 判断 `google.com` 该走哪条线，不需要知道它的 IP。规则匹配的输入是域名。
-2. **解析的正确答案取决于从哪出去。** `oa.corp.example` 在企业 DNS 有记录、在公共 DNS 是 NXDOMAIN；`google.com` 经本地 resolver 解析可能被中间层改写、经隧道那头解析则是权威结果。**同一个名字，从不同出口解析得到不同且都"正确"的答案。**
+1. **分流只需要名字。** 判断 `service.example` 该走哪条线，不需要知道它的 IP。规则匹配的输入是域名。
+2. **解析的正确答案取决于从哪出去。** `oa.corp.example` 在企业 DNS 有记录、在公共 DNS 是 NXDOMAIN；`service.example` 经本地 resolver 解析可能被中间层改写、经隧道那头解析则是权威结果。**同一个名字，从不同出口解析得到不同且都"正确"的答案。**
 3. 所以：**先按名字选线路，再按线路选解析器，最后才拿到地址。** 反过来（先解析再分流）等于用一个任意选定的解析器的答案去做本该由线路决定的判断，结论必然错。
 
 推论：**解析权随线路走。** Line 只声明解析能力（例如企业 DNS 或经隧道的 DoH），
@@ -191,7 +191,7 @@ DNS；官方 VPN 存在时可以就是该 VPN 的 DNS，绝不等于绕过所有
 
 fake IP 常被误解成一种分流机制。它不是。
 
-问题的本质是一条**失忆缝隙**：应用先 `resolve("google.com")` 拿到一个地址，然后 `connect(地址)`。到了 connect 这一刻，"这个连接是发给 google.com 的"这个信息已经丢了——内核只看得见一个 IP。sing-box 在 connect 侧只能靠 sniff（读 TLS SNI / HTTP Host）把名字找回来，而 sniff 对非 TLS/HTTP 协议无效。
+问题的本质是一条**失忆缝隙**：应用先 `resolve("service.example")` 拿到一个地址，然后 `connect(地址)`。到了 connect 这一刻，"这个连接是发给 service.example 的"这个信息已经丢了——内核只看得见一个 IP。sing-box 在 connect 侧只能靠 sniff（读 TLS SNI / HTTP Host）把名字找回来，而 sniff 对非 TLS/HTTP 协议无效。
 
 fake IP 的作用是：在 resolve 时刻返回一个**唯一的假地址**作为凭证，并记住"这个假地址 ↔ 这个域名"。connect 到来时，凭假地址查回域名。
 
@@ -250,6 +250,11 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
 ### D28 — 供给源模型
 
 - **决策**：Line 和订阅可以"自带规则"，但供给出的规则必须以一等公民身份进入 Scenario 裁决：可见、可禁用、可排序、可不用。供给是申报制，不是注入制。
+- **规则资源边界**：订阅中的 GEOIP 规则只能使用用户或部署方显式提供的
+  `geoip_rule_set_url_template`，模板必须包含 `{code}`，且只能指向 HTTPS 资源或规范化的
+  本地绝对 `file://` 路径。缺失、非法或无法读取时在生成阶段 fail-closed；实现不得内置
+  公共下载源，也不得在失败后回退到公共资源。企业构建可从私有仓库注入非秘密模板，本地
+  配置则留在受忽略目录或系统安全存储中；认证凭据不得烘进应用资源或提交到源码仓库。
 - **理由**：现实中的订阅和未来适配器可能携带路由知识，硬堵会让功能不可用；但直接注入会摧毁定律二，且产生的 bug 无法在配置里定位。申报制在保留能力的同时把裁决权留在 Scenario。
 - **被否决的替代方案**：(a) 完全禁止自带规则——订阅会失去核心能力；(b) 自带规则直接注入生成配置——已实证会摧毁 Scenario 默认出口；(c) 给供给规则一个固定的低优先级——用户无法表达"我就是要订阅规则优先"，且顺序仍不可见。
 
@@ -328,7 +333,7 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   DNS 规则必须在 Scenario 显式 DNS 规则之前，禁用缓存，且对归属命名空间权威失败；
   route 侧的 Scenario 显式规则仍优先于 peer / subnet 能力规则。流量是否走 Tailscale、是否
   使用 exit node，仍由用户可见的 Line 参数和 Scenario 决定。
-- **与 Underlay 的边界**：官方 Tailscale、CorpVPN、企业 VPN、Wi-Fi 和网线仍共同组成
+- **与 Underlay 的边界**：官方 Tailscale、其他企业 VPN、Wi-Fi 和网线仍共同组成
   不透明 Underlay。内置 Tailscale Line 是 XDial 自己选择的出口，不能识别、关闭或
   重排任何已存在产品，也不能改变 D32 的系统默认接口快照规则。
 - **身份与并发**：一个 Profile 只有一份持久 Tailscale 身份和 state 目录，所有
@@ -348,18 +353,16 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
 
 ### D34 — 全流量 Network Extension Underlay 不能靠普通路由表强行叠加
 
-- **实机证据（2026-07-28）**：官方 Tailscale exit node 作为启动前 Underlay 时，
-  `utun13` 持有 `default ... UCSg`（`RTF_GLOBAL`）和接口作用域 DNS
-  `100.100.100.100`。XDial 原生 TUN 在 `utun14` 正常创建
-  `1.0.0.0/8 ... 128.0.0.0/1 → 198.18.0.1` 后，
-  `route -n get 198.18.0.2` 仍命中 `utun13` 的 link route，系统 DNS 也继续留在
-  Tailscale。结果是公司域名无法进入企业 DNS，任何基于域名的 Scenario binding 都没有
-  可靠生效条件。
+- **实机证据**：一个全流量 Network Extension 作为启动前 Underlay 时，其虚拟接口
+  持有 `default ... UCSg`（`RTF_GLOBAL`）和接口作用域 DNS。XDial 原生 TUN 正常创建
+  split-default 路由后，`route -n get 198.18.0.2` 仍命中下层虚拟接口的 link route，
+  系统 DNS 也继续留在下层。结果是企业内网域名无法进入企业 DNS，任何基于域名的
+  Scenario binding 都没有可靠生效条件。
 - **被否决的修补实验**：临时给 sing-tun 的 Darwin route message 增加公开的
   `RTF_GLOBAL`，并把内置 Tailscale 的底层 socket 固定到启动前 Underlay。内置
   Tailscale Exit Node 随后能通过真实 HTTPS 就绪探测，普通目标的 `route get` 也一度
-  指向 `utun14`；但 `198.18.0.2` 仍被 `utun13` 的接口作用域路由接走，真实 TCP
-  SYN 在 `utun14` 超时。说明失败层级不只是最长前缀匹配，还包含 Network Extension
+  指向 XDial TUN；但 `198.18.0.2` 仍被下层接口作用域路由接走，真实 TCP SYN 在
+  XDial TUN 超时。说明失败层级不只是最长前缀匹配，还包含 Network Extension
   的连接/接口作用域；继续堆路由 flag 不是可靠方案。
 - **决策**：当前原生 TUN 遇到上述边界必须 fail-closed，保持原 Underlay 可用并给出
   明确错误。`RTF_GLOBAL` 是数据面入口的连接前置条件：Engine 必须在建立 AnyConnect
@@ -422,7 +425,7 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   的 2 / 5 / 10 / 20 / 30 秒有界重试；等待必须在 UI 显示结构化倒计时并允许用户立即
   消费当前已排定的尝试。用户显式点击连接失败不得自动循环拉起；用户显式断开后，系统
   回到原 Underlay，并立即取消倒计时与恢复意图。
-- **MagicDNS 系统接入事故证据（2026-08-01）**：已提交事务中，Tailscale endpoint 与
+- **MagicDNS 系统接入事故证据**：已提交事务中，Tailscale endpoint 与
   当时的内部 tag `dns:mode`（现领域名为 Scenario）曾被标记为 ready，但系统解析器仍把
   启动前 Wi-Fi resolver 作为查询目的地，
   成员短名得到 NXDOMAIN；仅凭 ready 状态不能证明系统 DNS 已进入 XDial。Apple 为
@@ -434,52 +437,52 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   冒充系统查询已经能进入 XDial。该列表只是 Ingress 捕获事实，不参与 Scenario 裁决；
   记录与地址仅在 Provider 内存中注入 sing-box hosts server，macOS Transparent Proxy 的
   Tailscale DNS transport 和默认
-  resolver 都不得成为 XDial 查询链的一部分。实机曾从当前 endpoint
-  导入 87 条捕获名；直发 DNS 得到成员地址，且未被旧 NXDOMAIN 缓存非权威或被篡改的新成员短名可由
-  `dscacheutil` 解析。macOS 可能继续缓存修复前的 NXDOMAIN；验收应使用新名称或在用户授权
-  下刷新 mDNSResponder，不能把旧负缓存误判为当前数据面失败。
-- **入口演进证据（2026-07-29）**：build 21 正确签名、嵌入并激活 System Extension，
-  但 Provider 内捕获的 `NWPath` 把已有全流量 VPN 折叠成物理接口；build 22 能收到宿主
-  的虚拟默认接口快照，但生成配置还没有把它写入 `route.default_interface`。两次都只
-  证明安装、激活和失败关闭，不能证明数据通路。build 23 起，Provider 日志中的接口
-  快照与 sing-box `direct` 精确 outbound 的真实 HTTPS 探测同时成功，才证明盒内出站
-  延续了启动前 Underlay。
-- **Tailscale peer 事故证据（2026-07-29 至 2026-07-30）**：build 24 首次记录所选
-  exit node 已进入 netmap、magicsock 和 engine，发送计数持续增加，但接收计数为零且
-  没有握手。build 57/58 的同时间双端取证进一步确认：XDial 本机控制连接存在，当前
+  resolver 都不得成为 XDial 查询链的一部分。实机曾从当前 endpoint 导入一组有界捕获名；
+  直发 DNS 得到成员地址，且不受旧 NXDOMAIN 负缓存影响的新成员短名可由 `dscacheutil`
+  解析。macOS 可能继续缓存修复前的 NXDOMAIN；验收应使用新名称或在用户授权下刷新
+  mDNSResponder，不能把旧负缓存误判为当前数据面失败。
+- **入口演进证据**：首次试验正确签名、嵌入并激活 System Extension，但 Provider 内捕获
+  的 `NWPath` 把已有全流量 VPN 折叠成物理接口；后续试验能收到宿主的虚拟默认接口快照，
+  但生成配置还没有把它写入 `route.default_interface`。这些结果都只证明安装、激活和
+  失败关闭，不能证明数据通路。最终只有 Provider 接收的接口快照与 sing-box `direct`
+  精确 outbound 的真实 HTTPS 探测同时成功，才证明盒内出站延续了启动前 Underlay。
+- **Tailscale peer 事故证据**：初始取证记录到所选 exit node 已进入 netmap、magicsock
+  和 engine，发送计数持续增加，但接收计数为零且没有握手。同时间双端取证进一步确认：
+  XDial 本机控制连接存在，当前
   control client 已接收 NetInfo 发布调用，Home DERP 协议在采样时刻就绪且节点已选中；
   远端 `tailscaled` 收到每次 WireGuard initiation 并生成 response，却仍把 response
   发往已经过期的 peer DERP，DERP 明确返回“不认识该 peer”。这不是 XDial Underlay、
   登录态或出口探测超时。
-- **确定的状态一致性链**：远端 magicsock 的完整 peer 快照为 DERP 2，随后
-  `NodeMutationDERPHome(3)` 只把实时 endpoint 改为 DERP 3，没有同步完整快照；下一张
-  full map 又报告 DERP 2 时，输入恰好等于旧快照，`updateNodes` 的无变化 fast path
-  提前返回，实时 endpoint 因而错误地永久留在 DERP 3。重启远端 `tailscaled` 会从当前
-  full map 同时重建快照和 endpoint，所以曾让链路立即恢复；它只是清除已经非权威或被篡改的进程
-  状态，不是修复，也不能作为 XDial 的验收步骤。
+- **确定的状态一致性链**：远端 magicsock 的完整 peer 快照指向 relay A，随后增量 mutation
+  只把实时 endpoint 改为 relay B，没有同步完整快照；下一张 full map 又报告 relay A 时，
+  输入恰好等于旧快照，`updateNodes` 的无变化 fast path 提前返回，实时 endpoint 因而
+  错误地永久留在 relay B。重启远端 `tailscaled` 会从当前 full map 同时重建快照和
+  endpoint，所以曾让链路立即恢复；它只是清除错误的进程内状态，不是修复，也不能作为
+  XDial 的验收步骤。
 - **本地防护与失败语义**：vendored Tailscale 通过仓库补丁记录“实时 endpoint 已收到
   增量 mutation”。下一次 full map 即使与快照相等也必须执行完整 endpoint upsert，
   同时重算 relay candidate，完成后才能清除 dirty 状态。回归测试固定复刻
-  `snapshot=2 / endpoint=2 → delta(3) → full(2)`，并要求最终 endpoint 回到 2、随后
-  才恢复 fast path。build 58 在远端既有脏状态仍未清除时，必须准确报告
+  `snapshot=A / endpoint=A → delta(B) → full(A)`，并要求最终 endpoint 回到 A、随后
+  才恢复 fast path。远端既有脏状态仍未清除时，必须准确报告
   `tailscale-peer-handshake-failed`，在 Transparent Proxy Commit 前完整回滚。
   XDial 不得自动重启远端、固定 DERP、遍历 DERP 或回落 direct 来掩盖该故障；远端一次性
   恢复属于显式运维动作，必须另行授权。
-- **控制发布的确认边界（build 64，2026-07-30）**：本地 NetInfo 发布调用返回，只证明
+- **控制发布的确认边界**：本地 NetInfo 发布调用返回，只证明
   调用开始时捕获的当前 control client 已接收该调用，且同步调用已经返回；携带对应
   NetInfo 修订的 lite map 请求获得成功 HTTP 应答，只证明该请求被 control 的 HTTP
   接口接受。二者都不能证明远端 peer 已消费更新后的 map。远端 peer map 消费、fresh
   WireGuard handshake 与真实出口分别是独立事实，必须由同时间的远端结构化状态、握手
   事实和真实出口探测分别证明；前一级不得替代后一级。
-- **启动恢复边界**：build 64 证明，本地 Home DERP 提升、本地 NetInfo 发布调用返回和
+- **启动恢复边界**：同轮证据证明，本地 Home DERP 提升、本地 NetInfo 发布调用返回和
   lite map HTTP 接受，可以与持续发送、没有接收且没有握手同时成立。因此 Home DERP
   重选不再是连接启动事务中的自动恢复动作；满足 peer handshake failure 条件时必须失败，
   并在 Commit 前回滚。若未来保留重选能力，它只能是用户显式启动的诊断或维护动作，
   不得成为 Prepare 的成功条件，也不得据此宣告链路已经恢复。
-- **身份级 A/B 边界（build 70 至 72，2026-07-30）**：在相同代码、相同官方
+- **身份级 A/B 边界**：在相同代码、相同官方
   Tailscale Underlay、相同 Exit Node 和相同 Scenario 下，旧持久身份持续发送但接收为零，
   独立临时身份则在数秒内完成握手并通过真实出口探测。这证明该轮失败绑定于旧身份对应的
-  peer / DERP 会话状态，而不是首次控制面访问、RuleSet、DNS 或 CorpVPN。换身份能够清除
+  peer / DERP 会话状态，而不是首次控制面访问、RuleSet、DNS 或其他 Underlay VPN。
+  换身份能够清除
   该轮状态，但不是协议修复：不得据此宣称旧身份已经自愈，也不得在连接事务中静默轮换
   身份。旧身份必须保留以供取证；建立新身份仍是用户显式登录或运维恢复动作。
 - **DERP readiness 快照语义**：DERP client 数与 protocol-ready 数只是采样时刻的汇总；
@@ -507,22 +510,20 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   快照只返回固定闭集的 RuleSet / outbound / active Line 关系和有界 sequence，不回传
   目标域名或 IP、原始规则内容、URL、凭据及普通浏览历史；超时或事务结束后自动失效。
   它是观察器，不得参与裁决。
-- **build 66 可观测性事故证据（2026-07-30）**：同一已提交事务中，`youtube.com`、
-  `git.corp.example` 和 `ip.cn` 的 TCP flow 均被系统交给 Provider 且 accepted；公司
-  域名通过三个 resolver 入口得到相同私网答案，随后真实 HTTP 返回 200。这些事实分别
-  证明 Transparent Proxy 接管、盒内 DNS 归因和公司线路可达，却仍不能证明三个 flow
-  各自命中了哪个 RuleSet / outbound。build 66 的运行版本没有逐 flow 的 matched
+- **可观测性事故证据**：同一已提交事务中，两个保留域名的公网目标与
+  `corp.example` 企业目标的 TCP flow 均被系统交给 Provider 且 accepted；企业域名通过
+  三个 resolver 入口得到相同私网答案，随后真实 HTTP 返回成功。这些事实分别证明
+  Transparent Proxy 接管、盒内 DNS 归因和企业线路可达，却仍不能证明三个 flow 各自命中
+  了哪个 RuleSet / outbound。当时的运行版本没有逐 flow 的 matched
   RuleSet / outbound 结构化观察；active Scenario 配置只能表达期望，禁止据此倒推出实际
   Line 并冒充运行时证据。
-- **基础三出口验收（build 26 首次通过、build 29 重验，2026-07-29）**：官方
-  Tailscale 全程保持 `Running`，
-  默认接口仍是其虚拟接口。相同 active Scenario 下，默认 `direct` 得到美国 Underlay
-  出口；解析到中国移动地址的专用 IP 检测服务经内置 Tailscale 得到日本 exit node
-  出口；公司域名经 AnyConnect 分域解析得到私网地址并返回有效 HTTP 重定向。对公司
+- **基础三出口验收**：官方 Tailscale 全程保持 `Running`，默认接口仍是其虚拟接口。
+  相同 active Scenario 下，默认 `direct` 与内置 Tailscale 分别得到不同的公网出口观测；
+  `corp.example` 经 AnyConnect 分域解析得到私网地址并返回有效 HTTP 重定向。对该企业
   域名分别向公共 DNS、不可达的测试地址和 MagicDNS 名义地址发查询，三者返回相同私网
   应答，证明 DNS 包被盒内 `hijack-dns` 接管，而不是碰巧由 Underlay resolver 回答。
   TCP、DNS UDP、保持 flow 存活的普通 UDP nonce 及一条立即关闭发送端的短命 UDP
-  nonce 均实际穿过 Provider。build 29 将 `flow.open` 提前到 UDP relay 准备之前，
+  nonce 均实际穿过 Provider。后续修正将 `flow.open` 提前到 UDP relay 准备之前，
   消除了短 flow 在接管确认前被系统 reset 的错误风暴；后续 SOCKS relay 失败仍关闭
   flow，不得回落直连。
 - **仍未完成的门禁**：Underlay 自动重连的代码存在不等于实机验收完成；仍需分别验证

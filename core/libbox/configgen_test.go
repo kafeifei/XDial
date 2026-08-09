@@ -808,6 +808,147 @@ func TestMaterializeGeneratedNERuleSetsRemovesRemoteURL(t *testing.T) {
 	}
 }
 
+func TestMaterializeGeneratedNELocalRuleSetCopiesValidatedSourceAndReportsReady(t *testing.T) {
+	ruleDir, err := prepareNERuleSetDirectory(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(t.TempDir(), "geoip-jp.srs")
+	content := encodeRuleSetBinary(
+		t,
+		[]byte(`{"version":1,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}`),
+	)
+	if err := os.WriteFile(sourcePath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	input := generatedLocalGeoIPConfig(t, sourcePath)
+	var events []connectionPreparationEvent
+	output, err := materializeGeneratedNERuleSetsWithEvents(
+		input,
+		ruleDir,
+		nil,
+		func(event connectionPreparationEvent) {
+			events = append(events, event)
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 ||
+		events[0].TaskID != "rule-set:generated:sub-geoip-enterprise-jp" ||
+		events[0].State != "running" ||
+		events[1].TaskID != "rule-set:generated:sub-geoip-enterprise-jp" ||
+		events[1].State != "ready" {
+		t.Fatalf("events = %#v", events)
+	}
+
+	var document map[string]interface{}
+	if err := json.Unmarshal(output, &document); err != nil {
+		t.Fatal(err)
+	}
+	set := document["route"].(map[string]interface{})["rule_set"].([]interface{})[0].(map[string]interface{})
+	managedPath, _ := set["path"].(string)
+	if managedPath == "" || managedPath == sourcePath {
+		t.Fatalf("local source was not copied to a managed path: %#v", set)
+	}
+	relative, err := filepath.Rel(ruleDir, managedPath)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		t.Fatalf("managed path escaped the rule directory: %q", managedPath)
+	}
+	stored, err := os.ReadFile(managedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(stored, content) {
+		t.Fatal("managed local rule set does not match the validated source")
+	}
+	if strings.Contains(string(output), sourcePath) {
+		t.Fatalf("extension config retained the unmanaged source path: %s", output)
+	}
+}
+
+func TestMaterializeGeneratedNELocalRuleSetFailsBeforeBoxStart(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T) string
+	}{
+		{
+			name: "malformed SRS",
+			prepare: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "malformed.srs")
+				if err := os.WriteFile(path, []byte("not-an-srs"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+		{
+			name: "unavailable path",
+			prepare: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "not-readable-by-provider.srs")
+			},
+		},
+		{
+			name: "non-regular path",
+			prepare: func(t *testing.T) string {
+				return t.TempDir()
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sourcePath := test.prepare(t)
+			ruleDir, err := prepareNERuleSetDirectory(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var events []connectionPreparationEvent
+			_, err = materializeGeneratedNERuleSetsWithEvents(
+				generatedLocalGeoIPConfig(t, sourcePath),
+				ruleDir,
+				nil,
+				func(event connectionPreparationEvent) {
+					events = append(events, event)
+				},
+			)
+			if err == nil {
+				t.Fatal("invalid local GEOIP source reached Box startup")
+			}
+			if strings.Contains(err.Error(), sourcePath) {
+				t.Fatalf("failure leaked the local source path: %v", err)
+			}
+			if len(events) != 2 ||
+				events[0].TaskID != "rule-set:generated:sub-geoip-enterprise-jp" ||
+				events[0].State != "running" ||
+				events[1].TaskID != "rule-set:generated:sub-geoip-enterprise-jp" ||
+				events[1].State != "failed" ||
+				events[1].Code != "generated-rule-set-unavailable" {
+				t.Fatalf("events = %#v", events)
+			}
+		})
+	}
+}
+
+func generatedLocalGeoIPConfig(t *testing.T, sourcePath string) []byte {
+	t.Helper()
+	data, err := json.Marshal(map[string]interface{}{
+		"route": map[string]interface{}{
+			"rule_set": []map[string]interface{}{{
+				"type":   "local",
+				"tag":    "sub-geoip-enterprise-jp",
+				"format": "binary",
+				"path":   sourcePath,
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 func TestStartVPNConfigCarriesAllowInsecure(t *testing.T) {
 	cfg := startVPNConfig("example.com", "203.0.113.1", "user", "secret", true)
 	if !cfg.AllowInsecure {

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "presets": [
+    {
+      "id": "blank",
+      "name_zh": "空白配置",
+      "name_en": "Blank",
+      "url": "",
+      "format": "auto"
+    },
+    {
+      "id": "enterprise-remote",
+      "name_zh": "企业远程规则",
+      "name_en": "Enterprise Remote Rules",
+      "url": "https://rules.example.invalid/company.srs",
+      "format": "srs"
+    }
+  ]
+}

@@ -208,12 +208,12 @@ func (builder *runtimeConfigurationBuilder) includeLine(line *Line) {
 
 func (builder *runtimeConfigurationBuilder) includeSubscription(
 	subscription *Subscription,
-) {
+) error {
 	if subscription == nil || !subscription.Enabled {
-		return
+		return nil
 	}
 	if _, exists := builder.subscriptions[subscription.ID]; exists {
-		return
+		return nil
 	}
 
 	outbounds, mainTag, groupTags := buildSubscriptionOutbounds(
@@ -221,9 +221,12 @@ func (builder *runtimeConfigurationBuilder) includeSubscription(
 		PlatformMacOS,
 	)
 	if mainTag == "" {
-		return
+		return nil
 	}
-	rules, ruleSets := buildSubscriptionRules(subscription, groupTags)
+	rules, ruleSets, err := buildSubscriptionRules(subscription, groupTags)
+	if err != nil {
+		return err
+	}
 	builder.subscriptions[subscription.ID] = runtimeConfigurationSubscription{
 		ID:        subscription.ID,
 		MainTag:   mainTag,
@@ -231,6 +234,7 @@ func (builder *runtimeConfigurationBuilder) includeSubscription(
 		Rules:     rules,
 		RuleSets:  ruleSets,
 	}
+	return nil
 }
 
 func (builder *runtimeConfigurationBuilder) fingerprint() (string, error) {

@@ -52,8 +52,7 @@ var srsMagic = []byte{0x53, 0x52, 0x53}
 //     CONNECT 过去，桥用 net.ResolveIPAddr("ip", …) 走启动前 Underlay 的系统 DNS
 //     解析（也可能返回 IPv6，而 VPNBridge.DialTCP 只收 IPv4），解出来的地址还可能
 //     与隧道内的解析视角不一致。
-//   - direct：规则集描述的往往正是走不通的那批域名（remotePolicy 的 .srs 就托管在
-//     raw.githubusercontent.com），从它自己描述的受限网络路径路径上下载必然失败。
+//   - direct：远程规则资源可能位于 Direct 不可达的受限路径，从该路径下载会失败。
 //
 // daemon 这一侧没有上述限制：绑 VPN 的规则集经企业 DNS + 隧道抓，其余用启动前
 // 已存在的 Underlay 抓。落盘后写成 file:// URL，
@@ -193,7 +192,7 @@ func tunnelDNSServer(enterpriseDNS []string) string {
 // （TCP 53——桥只实现了 TCP，UDP 拨不出去），再拿解析出的 IPv4 走 dial。
 // 这两步正是 sing-box 的 vpn outbound 做不到的部分（见 prepareRuleSets 注释）。
 //
-// dnsServer 为空（服务端没下发 DNS）时退回本机解析器：解出的地址可能被非权威或被篡改，
+// dnsServer 为空（服务端没下发 DNS）时退回本机解析器：应答可能非权威或被篡改，
 // 但连接仍然经隧道出去，比整条规则不可用好。
 func newTunnelTransport(dial tunnelDialer, dnsServer string) *http.Transport {
 	resolver := &net.Resolver{PreferGo: true}
@@ -236,7 +235,7 @@ func newTunnelTransport(dial tunnelDialer, dnsServer string) *http.Transport {
 }
 
 // materialize 返回规则集可用的本地文件路径与格式：缓存够新就直接用，否则下载；
-// 下载失败但有旧缓存时用旧的（过期的 remotePolicy 也远好过整条规则失效）。
+// 下载失败但有旧缓存时用旧的（过期的远程规则也远好过整条规则失效）。
 func (f *ruleSetFetcher) materialize(
 	ctx context.Context,
 	cacheDir string,

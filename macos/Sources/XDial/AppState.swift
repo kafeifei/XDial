@@ -1804,6 +1804,10 @@ final class AppState: ObservableObject {
                 }
             }
         }
+        ProfileVaultProjection.splitSubscriptionGeoIPRuleSetURLTemplates(
+            from: &sanitized,
+            into: &vault
+        )
 
         if vault != cachedVault {
             KeychainStore.saveVault(vault)
@@ -1868,9 +1872,14 @@ final class AppState: ObservableObject {
         }
 
         // 从 vault（单条目）恢复密码，回退到旧的逐条方式（迁移）
+        let containedPlaintextGeoIPRuleSetURLTemplate =
+            loaded.subscriptions.contains {
+                !$0.geoIPRuleSetURLTemplate.isEmpty
+            }
         var vault = KeychainStore.loadVault()
         cachedVault = vault
         var didMigrate = didKeyRewrite
+            || containedPlaintextGeoIPRuleSetURLTemplate
         if vault.isEmpty {
             didMigrate = true
             // 迁移：从旧的逐条 Keychain 读取（含旧的 "xdial-port-" 前缀）
@@ -1906,6 +1915,10 @@ final class AppState: ObservableObject {
                 if let v = vault[k + "-anytls"] { loaded.subscriptions[si].lines[pi].anytlsPassword = v }
             }
         }
+        ProfileVaultProjection.restoreSubscriptionGeoIPRuleSetURLTemplates(
+            from: vault,
+            into: &loaded
+        )
 
         // 自愈：清洗存量数据里混入的控制/格式字符。老输入层只 trim 空白，
         // 粘贴带入的 \u{03} 等会存进 profile 并写进 domain_suffix（永远匹配
@@ -2177,7 +2190,7 @@ final class AppState: ObservableObject {
         let manualRules = profile.ruleSets
             .filter { $0.type == "manual" && $0.enabled }
             .map { $0.id }
-        let remoteRule = profile.ruleSets
+        let remoteRuleSet = profile.ruleSets
             .first(where: { $0.type == "url" && $0.enabled })?.id ?? ""
 
         var s: Scenario
@@ -2191,14 +2204,14 @@ final class AppState: ObservableObject {
         case .domestic:
             s = Profile.templateDomestic(
                 ruleSetIDs: manualRules,
-                remoteRuleSetID: remoteRule,
+                remoteRuleSetID: remoteRuleSet,
                 vpnLineID: vpn,
                 directLineID: direct
             )
         case .domesticSS:
             s = Profile.templateDomesticSS(
                 ruleSetIDs: manualRules,
-                remoteRuleSetID: remoteRule,
+                remoteRuleSetID: remoteRuleSet,
                 vpnLineID: vpn,
                 ssLineID: ss,
                 directLineID: direct

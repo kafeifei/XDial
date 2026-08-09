@@ -409,6 +409,39 @@ final class HomeViewUITests: XCTestCase {
         )).firstMatch.waitForExistence(timeout: 2))
     }
 
+    func testSubscriptionGeoIPTemplateIsEditableAndRestored() {
+        let template =
+            "https://rules.example.invalid/geoip/{code}.srs?token=ui-private"
+        let app = launchApp()
+        openSubscriptionEditor(in: app)
+
+        let field = app.textFields[
+            "subscription-geoip-rule-set-url-template"
+        ]
+        for _ in 0..<4 where !field.exists {
+            app.swipeUp()
+        }
+        XCTAssertTrue(field.waitForExistence(timeout: 2))
+        XCTAssertTrue(field.isEnabled)
+        field.tap()
+        field.typeText(template)
+        XCTAssertTrue((field.value as? String)?.contains("{code}") == true)
+
+        app.terminate()
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 5))
+
+        let relaunched = launchApp(reset: false)
+        openSubscriptionEditor(in: relaunched)
+        let restored = relaunched.textFields[
+            "subscription-geoip-rule-set-url-template"
+        ]
+        for _ in 0..<4 where !restored.exists {
+            relaunched.swipeUp()
+        }
+        XCTAssertTrue(restored.waitForExistence(timeout: 2))
+        XCTAssertEqual(restored.value as? String, template)
+    }
+
     func testTailscaleLineCanBeCreatedAndOpened() {
         let app = launchApp()
 
@@ -708,6 +741,20 @@ final class HomeViewUITests: XCTestCase {
         XCTAssertTrue(line.waitForExistence(timeout: 2))
         line.tap()
         XCTAssertTrue(app.navigationBars["编辑线路"].waitForExistence(timeout: 2))
+    }
+
+    private func openSubscriptionEditor(in app: XCUIApplication) {
+        app.tabBars.buttons["配置"].tap()
+        app.segmentedControls.buttons["订阅"].tap()
+        let subscription = app.buttons.matching(NSPredicate(
+            format: "label CONTAINS %@",
+            "UI 测试订阅"
+        )).firstMatch
+        XCTAssertTrue(subscription.waitForExistence(timeout: 2))
+        subscription.tap()
+        XCTAssertTrue(
+            app.navigationBars["编辑订阅"].waitForExistence(timeout: 2)
+        )
     }
 
     private func launchApp(
