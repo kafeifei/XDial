@@ -185,15 +185,21 @@ extension Notification.Name {
 private struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
     let connected: Bool
+    let hasError: Bool
+    let updateAvailable: Bool
 
     var body: some View {
-        Image(nsImage: AppIcon.menuBar(connected: connected))
+        Image(nsImage: AppIcon.menuBar(
+            connected: connected,
+            hasError: hasError,
+            updateAvailable: updateAvailable
+        ))
             .resizable()
             .interpolation(.high)
-            .frame(width: 18, height: 18)
+            .frame(width: 20, height: 20)
             // 系统 status item 还会增加自身左右 inset；缩窄
-            // label 布局宽度，但不裁剪 18pt 的月球。
-            .frame(width: 13, height: 18)
+            // label 布局宽度，但不裁剪 20pt 的月球。
+            .frame(width: 16, height: 22)
             .accessibilityLabel("XDial")
             .onAppear {
                 AppIcon.applyDockState(connected: connected)
@@ -221,6 +227,7 @@ private struct MenuBarLabel: View {
 struct XDialApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var state = AppState()
+    @StateObject private var updateChecker = AppUpdateChecker()
 
     var body: some Scene {
         MenuBarExtra {
@@ -228,7 +235,14 @@ struct XDialApp: App {
                 .environmentObject(state)
                 .tint(XDialPalette.accent)
         } label: {
-            MenuBarLabel(connected: state.isConnected)
+            MenuBarLabel(
+                connected: state.isConnected,
+                hasError: state.hasMenuBarError,
+                updateAvailable: updateChecker.isUpdateAvailable
+            )
+            .task {
+                await updateChecker.checkIfNeeded()
+            }
         }
         .menuBarExtraStyle(.window)
 

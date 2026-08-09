@@ -55,18 +55,27 @@ enum AppIcon {
 
     /// 菜单栏使用 2x 像素密度单独绘制；最终布局尺寸由
     /// `MenuBarLabel` 控制，这里不引入额外透明边距。
-    static func menuBar(connected: Bool) -> NSImage {
-        let canvas: CGFloat = 32
+    static func menuBar(
+        connected: Bool,
+        hasError: Bool = false,
+        updateAvailable: Bool = false
+    ) -> NSImage {
+        let canvas: CGFloat = 44
         let image = NSImage(size: NSSize(width: canvas, height: canvas))
         image.lockFocus()
         NSGraphicsContext.current?.shouldAntialias = true
         drawMoon(
-            in: NSRect(x: 1, y: 1, width: 30, height: 30),
+            in: NSRect(x: 1, y: 1, width: 42, height: 42),
             connected: connected,
             castsShadow: false
         )
+        if hasError {
+            drawErrorBadge(in: NSRect(x: 27, y: 1, width: 16, height: 16))
+        } else if updateAvailable {
+            drawUpdateBadge(in: NSRect(x: 34, y: 34, width: 9, height: 9))
+        }
         image.unlockFocus()
-        image.size = NSSize(width: 16, height: 16)
+        image.size = NSSize(width: 20, height: 20)
         image.isTemplate = false
         return image
     }
@@ -100,10 +109,10 @@ enum AppIcon {
 
         let surfaceLight = connected
             ? XDialBrandPalette.surface
-            : XDialBrandPalette.canvas
+            : XDialBrandPalette.divider
         let surfaceShade = connected
             ? XDialBrandPalette.accentHighlight
-            : XDialBrandPalette.divider
+            : XDialBrandPalette.disabled
         NSGradient(starting: surfaceShade, ending: surfaceLight)?
             .draw(in: lunarDisc, angle: 55)
 
@@ -113,7 +122,7 @@ enum AppIcon {
         // 南极—艾特肯盆地是月背下方的大范围暗斑，不画成一枚边缘整齐的巨坑。
         (connected
             ? XDialBrandPalette.accent.withAlphaComponent(0.86)
-            : XDialBrandPalette.disabled.withAlphaComponent(0.86)
+            : XDialBrandPalette.disabled.withAlphaComponent(0.94)
         ).setFill()
         NSBezierPath(
             ovalIn: normalizedRect(
@@ -126,7 +135,7 @@ enum AppIcon {
         ).fill()
         (connected
             ? XDialBrandPalette.accentHighlight.withAlphaComponent(0.78)
-            : XDialBrandPalette.divider.withAlphaComponent(0.78)
+            : XDialBrandPalette.disabled.withAlphaComponent(0.82)
         ).setFill()
         NSBezierPath(
             ovalIn: normalizedRect(
@@ -161,12 +170,51 @@ enum AppIcon {
 
         NSGraphicsContext.restoreGraphicsState()
 
-        (connected
-            ? XDialBrandPalette.success.withAlphaComponent(0.94)
-            : XDialBrandPalette.selection.withAlphaComponent(0.88)
-        ).setStroke()
-        lunarDisc.lineWidth = max(1, rect.width * 0.032)
+        // 外沿只是月球轮廓，不承担连接语义；连接状态只由整个月面的
+        // 明暗表达，避免在菜单栏出现一圈突兀的成功绿。
+        XDialBrandPalette.selection.withAlphaComponent(0.82).setStroke()
+        lunarDisc.lineWidth = max(1, rect.width * 0.028)
         lunarDisc.stroke()
+    }
+
+    /// 错误与更新都只是菜单栏的附加状态。错误优先级更高，并通过
+    /// “实心徽标 + 叹号”表达，避免只靠红色与更新圆点区分。
+    private static func drawErrorBadge(in rect: NSRect) {
+        let badge = NSBezierPath(ovalIn: rect)
+        XDialBrandPalette.surface.setStroke()
+        badge.lineWidth = 2.2
+        badge.stroke()
+        XDialBrandPalette.danger.setFill()
+        badge.fill()
+
+        XDialBrandPalette.surface.setFill()
+        NSBezierPath(
+            roundedRect: NSRect(
+                x: rect.midX - 1.05,
+                y: rect.minY + rect.height * 0.39,
+                width: 2.1,
+                height: rect.height * 0.34
+            ),
+            xRadius: 1.05,
+            yRadius: 1.05
+        ).fill()
+        NSBezierPath(
+            ovalIn: NSRect(
+                x: rect.midX - 1.15,
+                y: rect.minY + rect.height * 0.19,
+                width: 2.3,
+                height: 2.3
+            )
+        ).fill()
+    }
+
+    private static func drawUpdateBadge(in rect: NSRect) {
+        let badge = NSBezierPath(ovalIn: rect)
+        XDialBrandPalette.surface.setStroke()
+        badge.lineWidth = 2
+        badge.stroke()
+        XDialBrandPalette.danger.setFill()
+        badge.fill()
     }
 
     private static func drawGearBadge(size: CGFloat) {

@@ -127,6 +127,11 @@ final class AppState: ObservableObject {
     }
 
     var isConnected: Bool { engine.isConnected }
+    var hasMenuBarError: Bool {
+        if installation.report.state == .failed { return true }
+        if presentedConnectionReport?.error != nil { return true }
+        return !(engine.lastError?.isEmpty ?? true)
+    }
     var isBusy: Bool {
         engine.isBusy || wakeReconnectPhase != nil
             || scenarioSwitchTargetID != nil
