@@ -9,23 +9,18 @@ private extension UTType {
     )
 }
 
-private struct SettingsReorderItem: Codable, Equatable {
+struct SettingsReorderItem: Codable, Equatable {
     let kind: String
     let id: String
 
     func itemProvider() -> NSItemProvider {
-        let provider = NSItemProvider()
         guard let data = try? JSONEncoder().encode(self) else {
-            return provider
+            return NSItemProvider()
         }
-        provider.registerDataRepresentation(
-            forTypeIdentifier: UTType.xdialSettingsEntry.identifier,
-            visibility: .ownProcess
-        ) { completion in
-            completion(data, nil)
-            return nil
-        }
-        return provider
+        return NSItemProvider(
+            item: data as NSData,
+            typeIdentifier: UTType.xdialSettingsEntry.identifier
+        )
     }
 }
 
@@ -33,6 +28,7 @@ private struct SettingsReorderDropDelegate: DropDelegate {
     let target: SettingsReorderItem
     let draggedItem: SwiftUI.Binding<SettingsReorderItem?>
     let move: (SettingsReorderItem, String) -> Bool
+    let onDrop: () -> Void
 
     func validateDrop(info: DropInfo) -> Bool {
         guard let dragged = draggedItem.wrappedValue else { return false }
@@ -46,9 +42,7 @@ private struct SettingsReorderDropDelegate: DropDelegate {
         guard validateDrop(info: info),
               let dragged = draggedItem.wrappedValue,
               dragged.id != target.id else { return }
-        withAnimation(.easeInOut(duration: 0.16)) {
-            _ = move(dragged, target.id)
-        }
+        _ = move(dragged, target.id)
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
@@ -60,104 +54,58 @@ private struct SettingsReorderDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         guard draggedItem.wrappedValue != nil else { return false }
-        draggedItem.wrappedValue = nil
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            draggedItem.wrappedValue = nil
+        }
+        onDrop()
         return true
     }
 }
 
-private struct SettingsReorderPlaceholder: View {
-    @EnvironmentObject private var state: AppState
-
-    var body: some View {
-        RoundedRectangle(cornerRadius: 10, style: .continuous)
-            .fill(XDialPalette.selection.opacity(0.07))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(
-                        XDialPalette.selection.opacity(0.72),
-                        lineWidth: 1
-                    )
-            }
-            .overlay {
-                Label(
-                    state.tr("松开后放在这里", "Drop here"),
-                    systemImage: "arrow.down.to.line.compact"
-                )
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(XDialPalette.selection)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(.ultraThinMaterial, in: Capsule())
-            }
-            .padding(.vertical, 1)
-            .accessibilityHidden(true)
-    }
-}
-
-private struct SettingsReorderContentModifier: ViewModifier {
+private struct SettingsReorderModifier: ViewModifier {
     let item: SettingsReorderItem
     let draggedItem: SwiftUI.Binding<SettingsReorderItem?>
+    let allowsDragging: Bool
     let move: (SettingsReorderItem, String) -> Bool
+    let onDrop: () -> Void
 
     private var isPlaceholder: Bool {
         draggedItem.wrappedValue == item
     }
 
     func body(content: Content) -> some View {
-        content
-            .onDrag {
-                let provider = item.itemProvider()
-                // 先让 AppKit 截取原卡片作为拖拽预览，下一轮 RunLoop 再把
-                // 列表中的原卡片切成占位槽；否则拖动预览本身也会变成空槽。
-                DispatchQueue.main.async {
-                    draggedItem.wrappedValue = item
-                }
-                return provider
+        Group {
+            if allowsDragging {
+                content
+                    .onDrag {
+                        let provider = item.itemProvider()
+                        DispatchQueue.main.async {
+                            draggedItem.wrappedValue = item
+                        }
+                        return provider
+                    }
+            } else {
+                content
             }
+        }
             .onDrop(
                 of: [UTType.xdialSettingsEntry],
                 delegate: SettingsReorderDropDelegate(
                     target: item,
                     draggedItem: draggedItem,
-                    move: move
+                    move: move,
+                    onDrop: onDrop
                 )
             )
             .opacity(isPlaceholder ? 0 : 1)
-            .overlay {
-                if isPlaceholder {
-                    SettingsReorderPlaceholder()
-                        .transition(
-                            .opacity.combined(
-                                with: .scale(scale: 0.98)
-                            )
-                        )
-                }
-            }
-            .animation(
-                .easeInOut(duration: 0.14),
-                value: isPlaceholder
-            )
-    }
-}
-
-private extension View {
-    func settingsReorderable(
-        _ item: SettingsReorderItem,
-        draggedItem: SwiftUI.Binding<SettingsReorderItem?>,
-        move: @escaping (SettingsReorderItem, String) -> Bool
-    ) -> some View {
-        modifier(
-            SettingsReorderContentModifier(
-                item: item,
-                draggedItem: draggedItem,
-                move: move
-            )
-        )
     }
 }
 
 private struct SettingsReorderListDropDelegate: DropDelegate {
     let draggedItem: SwiftUI.Binding<SettingsReorderItem?>
+    let onDrop: () -> Void
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
         DropProposal(operation: .move)
@@ -165,30 +113,46 @@ private struct SettingsReorderListDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         guard draggedItem.wrappedValue != nil else { return false }
-        draggedItem.wrappedValue = nil
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            draggedItem.wrappedValue = nil
+        }
+        onDrop()
         return true
     }
 }
 
-private extension View {
-    /// 接住卡片间隙中的 mouse-up，让实时占位不会因为指针松在 8pt 间距中而残留。
-    func settingsReorderDropArea(
-        draggedItem: SwiftUI.Binding<SettingsReorderItem?>
+extension View {
+    func settingsReorderable(
+        _ item: SettingsReorderItem,
+        draggedItem: SwiftUI.Binding<SettingsReorderItem?>,
+        allowsDragging: Bool = true,
+        onDrop: @escaping () -> Void = {},
+        move: @escaping (SettingsReorderItem, String) -> Bool
     ) -> some View {
-        onDrop(
+        modifier(SettingsReorderModifier(
+            item: item,
+            draggedItem: draggedItem,
+            allowsDragging: allowsDragging,
+            move: move,
+            onDrop: onDrop
+        ))
+    }
+
+    func settingsReorderDropArea(
+        draggedItem: SwiftUI.Binding<SettingsReorderItem?>,
+        onDrop: @escaping () -> Void = {}
+    ) -> some View {
+        self.onDrop(
             of: [UTType.xdialSettingsEntry],
             delegate: SettingsReorderListDropDelegate(
-                draggedItem: draggedItem
+                draggedItem: draggedItem,
+                onDrop: onDrop
             )
         )
     }
 }
-
-/*
- The live placeholder deliberately remains part of the list's layout. SwiftUI
- therefore animates surrounding cards into their final slots as dropEntered
- updates the in-memory order; mouse-up only ends the drag session.
- */
 
 @discardableResult
 private func reorder<Item>(
@@ -2380,7 +2344,8 @@ struct ScenariosTab: View {
                                 kind: "scenario",
                                 id: scenarioID
                             ),
-                            draggedItem: $draggedItem
+                            draggedItem: $draggedItem,
+                            allowsDragging: expandedID != scenarioID
                         ) { item, targetID in
                             moveScenario(item, to: targetID)
                         }
@@ -2432,7 +2397,6 @@ struct ScenarioRow: View {
     @EnvironmentObject var state: AppState
     @State private var newSSID = ""
     @State private var ssidError: String?
-    @State private var draggedBindingItem: SettingsReorderItem?
     @State private var showsIconPicker = false
 
     private var bindingSummary: String {
@@ -2642,18 +2606,24 @@ struct ScenarioRow: View {
                     Divider()
 
                     HStack {
-                        Text(state.tr("规则", "Rule")).font(.caption).foregroundStyle(.secondary)
-                            .frame(width: 200, alignment: .leading)
+                        HStack(spacing: 6) {
+                            Color.clear
+                                .frame(width: 28, height: 1)
+                                .accessibilityHidden(true)
+                            Text(state.tr("规则", "Rule"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 166, alignment: .leading)
+                        }
+                        .frame(width: 200, alignment: .leading)
                         Text(state.tr("线路", "Line")).font(.caption).foregroundStyle(.secondary)
                     }
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(scenario.bindings) { binding in
-                            bindingRow(binding)
-                        }
-                    }
-                    .settingsReorderDropArea(
-                        draggedItem: $draggedBindingItem
+                    ScenarioBindingList(
+                        bindings: $scenario.bindings,
+                        scenarioID: scenario.id,
+                        state: state,
+                        onSave: { state.save() }
                     )
 
                     Divider()
@@ -2744,47 +2714,6 @@ struct ScenarioRow: View {
             state.tr("Wi-Fi：\(ssid)", "Wi-Fi: \(ssid)")
         )
         .accessibilityValue(ssid)
-    }
-
-    @ViewBuilder
-    private func bindingRow(_ binding: RuleBinding) -> some View {
-        if let idx = scenario.bindings.firstIndex(where: { $0.ruleSetID == binding.ruleSetID }) {
-            let isEmpty = binding.lineID.isEmpty && binding.subscriptionID.isEmpty
-            HStack {
-                HStack(spacing: 4) {
-                    if isEmpty {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.caption2).foregroundStyle(XDialPalette.warning)
-                    }
-                    Text(state.profile.ruleSets.first(where: { $0.id == binding.ruleSetID })?.name ?? "（已删除）")
-                }
-                .frame(width: 200, alignment: .leading)
-                exitPicker(selectedID: $scenario.bindings[idx].targetID)
-                Button {
-                    scenario.bindings.removeAll { $0.ruleSetID == binding.ruleSetID }
-                    state.save()
-                } label: {
-                    Image(systemName: "minus.circle").foregroundStyle(XDialPalette.danger)
-                }
-                .buttonStyle(.plain)
-            }
-            .settingsReorderable(
-                SettingsReorderItem(
-                    kind: "scenario-binding:\(scenario.id)",
-                    id: binding.ruleSetID
-                ),
-                draggedItem: $draggedBindingItem
-            ) { item, targetID in
-                guard reorder(
-                        &scenario.bindings,
-                        draggedID: item.id,
-                        targetID: targetID,
-                        id: { $0.ruleSetID }
-                      ) else { return false }
-                state.saveVisualOrderAsync()
-                return true
-            }
-        }
     }
 
     private func exitPicker(selectedID: SwiftUI.Binding<String>) -> some View {
