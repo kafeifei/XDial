@@ -85,10 +85,17 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
         LSUIElement: true
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。
         NSLocationWhenInUseUsageDescription: XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.kafeifei.xdial.settings-entry
+            UTTypeConformsTo:
+              - public.data
+            UTTypeDescription: XDial Settings Reorder Item
         XDialTransparentProxyBundleIdentifier: "$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)"
     settings:
       base:

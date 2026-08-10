@@ -4,6 +4,134 @@ import Foundation
 import ServiceManagement
 import SwiftUI
 
+private struct ProfilePersistenceProjection {
+    var profile: Profile
+    var vault: [String: String]
+}
+
+private func makeProfilePersistenceProjection(
+    _ source: Profile
+) -> ProfilePersistenceProjection {
+    var vault = [String: String]()
+    var sanitized = source
+
+    for i in sanitized.lines.indices {
+        let id = sanitized.lines[i].id
+        if !sanitized.lines[i].vpnPassword.isEmpty {
+            vault[id + "-vpn"] = sanitized.lines[i].vpnPassword
+            sanitized.lines[i].vpnPassword = ""
+        }
+        if !sanitized.lines[i].trojanPassword.isEmpty {
+            vault[id + "-trojan"] = sanitized.lines[i].trojanPassword
+            sanitized.lines[i].trojanPassword = ""
+        }
+        if !sanitized.lines[i].ssPassword.isEmpty {
+            vault[id + "-ss"] = sanitized.lines[i].ssPassword
+            sanitized.lines[i].ssPassword = ""
+        }
+        if !sanitized.lines[i].vmessUUID.isEmpty {
+            vault[id + "-vmess"] = sanitized.lines[i].vmessUUID
+            sanitized.lines[i].vmessUUID = ""
+        }
+        if !sanitized.lines[i].anytlsPassword.isEmpty {
+            vault[id + "-anytls"] = sanitized.lines[i].anytlsPassword
+            sanitized.lines[i].anytlsPassword = ""
+        }
+    }
+    for si in sanitized.subscriptions.indices {
+        let subID = sanitized.subscriptions[si].id
+        for pi in sanitized.subscriptions[si].lines.indices {
+            let lineID = sanitized.subscriptions[si].lines[pi].id
+            let key = subID + "-" + lineID
+            let line = sanitized.subscriptions[si].lines[pi]
+            if !line.trojanPassword.isEmpty {
+                vault[key + "-trojan"] = line.trojanPassword
+                sanitized.subscriptions[si].lines[pi].trojanPassword = ""
+            }
+            if !line.ssPassword.isEmpty {
+                vault[key + "-ss"] = line.ssPassword
+                sanitized.subscriptions[si].lines[pi].ssPassword = ""
+            }
+            if !line.vmessUUID.isEmpty {
+                vault[key + "-vmess"] = line.vmessUUID
+                sanitized.subscriptions[si].lines[pi].vmessUUID = ""
+            }
+            if !line.anytlsPassword.isEmpty {
+                vault[key + "-anytls"] = line.anytlsPassword
+                sanitized.subscriptions[si].lines[pi].anytlsPassword = ""
+            }
+        }
+    }
+    ProfileVaultProjection.splitSubscriptionGeoIPRuleSetURLTemplates(
+        from: &sanitized,
+        into: &vault
+    )
+    return ProfilePersistenceProjection(
+        profile: sanitized,
+        vault: vault
+    )
+}
+
+private final class ProfilePersistenceWriter: @unchecked Sendable {
+    private let defaults: UserDefaults
+    private let profileKey: String
+    private let queue = DispatchQueue(
+        label: "com.kafeifei.xdial.profile-persistence",
+        qos: .utility
+    )
+    private let generationLock = NSLock()
+    private var latestRequestedGeneration: UInt64 = 0
+
+    init(defaults: UserDefaults, profileKey: String) {
+        self.defaults = defaults
+        self.profileKey = profileKey
+    }
+
+    func persistVisualOrderAsync(
+        profile: Profile,
+        generation: UInt64
+    ) {
+        announce(generation)
+        // 拖动跨过多张卡片时会产生连续的实时排序快照。短暂合并这些请求，
+        // 只编码并写入最后一个落点；UI 的内存排序完全不等待这里。
+        queue.asyncAfter(
+            deadline: .now() + .milliseconds(180)
+        ) { [self] in
+            guard isLatest(generation) else { return }
+            let projection = makeProfilePersistenceProjection(profile)
+            guard let data = try? JSONEncoder().encode(projection.profile),
+                  isLatest(generation) else { return }
+            defaults.set(data, forKey: profileKey)
+        }
+    }
+
+    func persistSynchronously(
+        data: Data,
+        generation: UInt64
+    ) {
+        announce(generation)
+        queue.sync { [self] in
+            guard isLatest(generation) else { return }
+            defaults.set(data, forKey: profileKey)
+        }
+    }
+
+    private func announce(_ generation: UInt64) {
+        generationLock.lock()
+        latestRequestedGeneration = max(
+            latestRequestedGeneration,
+            generation
+        )
+        generationLock.unlock()
+    }
+
+    private func isLatest(_ generation: UInt64) -> Bool {
+        generationLock.lock()
+        defer { generationLock.unlock() }
+        return generation == latestRequestedGeneration
+    }
+}
+
 @MainActor
 final class AppState: ObservableObject {
     #if DEBUG
@@ -104,6 +232,11 @@ final class AppState: ObservableObject {
     )
 
     private let profileKey = "xdial.profile"
+    private let profilePersistenceWriter = ProfilePersistenceWriter(
+        defaults: xdialDefaults,
+        profileKey: "xdial.profile"
+    )
+    private var profilePersistenceGeneration: UInt64 = 0
     private let keychainPrefix = "xdial-line-"
     private let subKeychainPrefix = "xdial-sub-"
     private var cachedVault: [String: String] = [:]
@@ -1724,6 +1857,7 @@ final class AppState: ObservableObject {
     ///   内部写入传 false：连接前的落盘（马上就下发了），以及 verified 这类纯展示
     ///   标记的回写（不影响数据面行为）。
     func save(markDirty: Bool = true) {
+        let persistenceGeneration = nextProfilePersistenceGeneration()
         if profile.lines.contains(where: { $0.type == "tailscale" }),
            profile.tailscale.hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             profile.tailscale.hostname = Self.newTailscaleHostname()
@@ -1754,60 +1888,9 @@ final class AppState: ObservableObject {
         }
 
         // 所有密码收集到一个 vault dict，一次性存入 Keychain（只弹一次授权）
-        var vault = [String: String]()
-        var sanitized = profile
-
-        for i in sanitized.lines.indices {
-            let id = sanitized.lines[i].id
-            if !sanitized.lines[i].vpnPassword.isEmpty {
-                vault[id + "-vpn"] = sanitized.lines[i].vpnPassword
-                sanitized.lines[i].vpnPassword = ""
-            }
-            if !sanitized.lines[i].trojanPassword.isEmpty {
-                vault[id + "-trojan"] = sanitized.lines[i].trojanPassword
-                sanitized.lines[i].trojanPassword = ""
-            }
-            if !sanitized.lines[i].ssPassword.isEmpty {
-                vault[id + "-ss"] = sanitized.lines[i].ssPassword
-                sanitized.lines[i].ssPassword = ""
-            }
-            if !sanitized.lines[i].vmessUUID.isEmpty {
-                vault[id + "-vmess"] = sanitized.lines[i].vmessUUID
-                sanitized.lines[i].vmessUUID = ""
-            }
-            if !sanitized.lines[i].anytlsPassword.isEmpty {
-                vault[id + "-anytls"] = sanitized.lines[i].anytlsPassword
-                sanitized.lines[i].anytlsPassword = ""
-            }
-        }
-        for si in sanitized.subscriptions.indices {
-            let subID = sanitized.subscriptions[si].id
-            for pi in sanitized.subscriptions[si].lines.indices {
-                let lineID = sanitized.subscriptions[si].lines[pi].id
-                let k = subID + "-" + lineID
-                let line = sanitized.subscriptions[si].lines[pi]
-                if !line.trojanPassword.isEmpty {
-                    vault[k + "-trojan"] = line.trojanPassword
-                    sanitized.subscriptions[si].lines[pi].trojanPassword = ""
-                }
-                if !line.ssPassword.isEmpty {
-                    vault[k + "-ss"] = line.ssPassword
-                    sanitized.subscriptions[si].lines[pi].ssPassword = ""
-                }
-                if !line.vmessUUID.isEmpty {
-                    vault[k + "-vmess"] = line.vmessUUID
-                    sanitized.subscriptions[si].lines[pi].vmessUUID = ""
-                }
-                if !line.anytlsPassword.isEmpty {
-                    vault[k + "-anytls"] = line.anytlsPassword
-                    sanitized.subscriptions[si].lines[pi].anytlsPassword = ""
-                }
-            }
-        }
-        ProfileVaultProjection.splitSubscriptionGeoIPRuleSetURLTemplates(
-            from: &sanitized,
-            into: &vault
-        )
+        let projection = makeProfilePersistenceProjection(profile)
+        let sanitized = projection.profile
+        let vault = projection.vault
 
         if vault != cachedVault {
             KeychainStore.saveVault(vault)
@@ -1815,7 +1898,10 @@ final class AppState: ObservableObject {
         }
 
         guard let data = try? JSONEncoder().encode(sanitized) else { return }
-        xdialDefaults.set(data, forKey: profileKey)
+        profilePersistenceWriter.persistSynchronously(
+            data: data,
+            generation: persistenceGeneration
+        )
 
         configurationChanges.recordSave(
             runtimeConfigurationSignature(),
@@ -1827,6 +1913,23 @@ final class AppState: ObservableObject {
             status: engine.status,
             report: engine.connectionReport
         )
+    }
+
+    /// 视觉排序先更新内存，再在后台持久化完整的脱敏快照。
+    ///
+    /// 所有 profile 写入共用 generation 与串行 writer：更晚的普通编辑会使尚未
+    /// 落盘的排序快照失效，排序写入不会反过来覆盖字段编辑或凭据更新。
+    func saveVisualOrderAsync() {
+        let generation = nextProfilePersistenceGeneration()
+        profilePersistenceWriter.persistVisualOrderAsync(
+            profile: profile,
+            generation: generation
+        )
+    }
+
+    private func nextProfilePersistenceGeneration() -> UInt64 {
+        profilePersistenceGeneration &+= 1
+        return profilePersistenceGeneration
     }
 
     private func loadSaved() {

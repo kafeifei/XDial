@@ -4,18 +4,191 @@ import UniformTypeIdentifiers
 
 private extension UTType {
     static let xdialSettingsEntry = UTType(
-        exportedAs: "com.kafeifei.xdial.settings-entry"
+        exportedAs: "com.kafeifei.xdial.settings-entry",
+        conformingTo: .data
     )
 }
 
-private struct SettingsReorderItem: Codable, Transferable {
+private struct SettingsReorderItem: Codable, Equatable {
     let kind: String
     let id: String
 
-    static var transferRepresentation: some TransferRepresentation {
-        CodableRepresentation(contentType: .xdialSettingsEntry)
+    func itemProvider() -> NSItemProvider {
+        let provider = NSItemProvider()
+        guard let data = try? JSONEncoder().encode(self) else {
+            return provider
+        }
+        provider.registerDataRepresentation(
+            forTypeIdentifier: UTType.xdialSettingsEntry.identifier,
+            visibility: .ownProcess
+        ) { completion in
+            completion(data, nil)
+            return nil
+        }
+        return provider
     }
 }
+
+private struct SettingsReorderDropDelegate: DropDelegate {
+    let target: SettingsReorderItem
+    let draggedItem: SwiftUI.Binding<SettingsReorderItem?>
+    let move: (SettingsReorderItem, String) -> Bool
+
+    func validateDrop(info: DropInfo) -> Bool {
+        guard let dragged = draggedItem.wrappedValue else { return false }
+        return dragged.kind == target.kind
+            && info.hasItemsConforming(
+                to: [UTType.xdialSettingsEntry]
+            )
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard validateDrop(info: info),
+              let dragged = draggedItem.wrappedValue,
+              dragged.id != target.id else { return }
+        withAnimation(.easeInOut(duration: 0.16)) {
+            _ = move(dragged, target.id)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard validateDrop(info: info) else {
+            return DropProposal(operation: .forbidden)
+        }
+        return DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard draggedItem.wrappedValue != nil else { return false }
+        draggedItem.wrappedValue = nil
+        return true
+    }
+}
+
+private struct SettingsReorderPlaceholder: View {
+    @EnvironmentObject private var state: AppState
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(XDialPalette.selection.opacity(0.07))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(
+                        XDialPalette.selection.opacity(0.72),
+                        lineWidth: 1
+                    )
+            }
+            .overlay {
+                Label(
+                    state.tr("松开后放在这里", "Drop here"),
+                    systemImage: "arrow.down.to.line.compact"
+                )
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(XDialPalette.selection)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(.ultraThinMaterial, in: Capsule())
+            }
+            .padding(.vertical, 1)
+            .accessibilityHidden(true)
+    }
+}
+
+private struct SettingsReorderContentModifier: ViewModifier {
+    let item: SettingsReorderItem
+    let draggedItem: SwiftUI.Binding<SettingsReorderItem?>
+    let move: (SettingsReorderItem, String) -> Bool
+
+    private var isPlaceholder: Bool {
+        draggedItem.wrappedValue == item
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .onDrag {
+                let provider = item.itemProvider()
+                // 先让 AppKit 截取原卡片作为拖拽预览，下一轮 RunLoop 再把
+                // 列表中的原卡片切成占位槽；否则拖动预览本身也会变成空槽。
+                DispatchQueue.main.async {
+                    draggedItem.wrappedValue = item
+                }
+                return provider
+            }
+            .onDrop(
+                of: [UTType.xdialSettingsEntry],
+                delegate: SettingsReorderDropDelegate(
+                    target: item,
+                    draggedItem: draggedItem,
+                    move: move
+                )
+            )
+            .opacity(isPlaceholder ? 0 : 1)
+            .overlay {
+                if isPlaceholder {
+                    SettingsReorderPlaceholder()
+                        .transition(
+                            .opacity.combined(
+                                with: .scale(scale: 0.98)
+                            )
+                        )
+                }
+            }
+            .animation(
+                .easeInOut(duration: 0.14),
+                value: isPlaceholder
+            )
+    }
+}
+
+private extension View {
+    func settingsReorderable(
+        _ item: SettingsReorderItem,
+        draggedItem: SwiftUI.Binding<SettingsReorderItem?>,
+        move: @escaping (SettingsReorderItem, String) -> Bool
+    ) -> some View {
+        modifier(
+            SettingsReorderContentModifier(
+                item: item,
+                draggedItem: draggedItem,
+                move: move
+            )
+        )
+    }
+}
+
+private struct SettingsReorderListDropDelegate: DropDelegate {
+    let draggedItem: SwiftUI.Binding<SettingsReorderItem?>
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard draggedItem.wrappedValue != nil else { return false }
+        draggedItem.wrappedValue = nil
+        return true
+    }
+}
+
+private extension View {
+    /// 接住卡片间隙中的 mouse-up，让实时占位不会因为指针松在 8pt 间距中而残留。
+    func settingsReorderDropArea(
+        draggedItem: SwiftUI.Binding<SettingsReorderItem?>
+    ) -> some View {
+        onDrop(
+            of: [UTType.xdialSettingsEntry],
+            delegate: SettingsReorderListDropDelegate(
+                draggedItem: draggedItem
+            )
+        )
+    }
+}
+
+/*
+ The live placeholder deliberately remains part of the list's layout. SwiftUI
+ therefore animates surrounding cards into their final slots as dropEntered
+ updates the in-memory order; mouse-up only ends the drag session.
+ */
 
 @discardableResult
 private func reorder<Item>(
@@ -492,6 +665,7 @@ struct GeneralTab: View {
 struct LinesTab: View {
     @EnvironmentObject var state: AppState
     @State private var showAddSub = false
+    @State private var draggedItem: SettingsReorderItem?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -499,21 +673,32 @@ struct LinesTab: View {
                 VStack(spacing: 8) {
                     ForEach($state.profile.lines) { $line in
                         LineRow(line: $line, onDelete: { delete(line) })
-                            .draggable(SettingsReorderItem(kind: "line", id: line.id))
-                            .dropDestination(for: SettingsReorderItem.self) { items, _ in
-                                moveLine(items.first, to: line.id)
+                            .settingsReorderable(
+                                SettingsReorderItem(
+                                    kind: "line",
+                                    id: line.id
+                                ),
+                                draggedItem: $draggedItem
+                            ) { item, targetID in
+                                moveLine(item, to: targetID)
                             }
                     }
                     ForEach($state.profile.subscriptions) { $sub in
                         SubscriptionRow(sub: $sub, onDelete: { deleteSub(sub) })
-                            .draggable(SettingsReorderItem(kind: "subscription", id: sub.id))
-                            .dropDestination(for: SettingsReorderItem.self) { items, _ in
-                                moveSubscription(items.first, to: sub.id)
+                            .settingsReorderable(
+                                SettingsReorderItem(
+                                    kind: "subscription",
+                                    id: sub.id
+                                ),
+                                draggedItem: $draggedItem
+                            ) { item, targetID in
+                                moveSubscription(item, to: targetID)
                             }
                     }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
+                .settingsReorderDropArea(draggedItem: $draggedItem)
             }
             Divider()
             AddBar {
@@ -618,7 +803,7 @@ struct LinesTab: View {
                 targetID: targetID,
                 id: { $0.id }
               ) else { return false }
-        state.save()
+        state.saveVisualOrderAsync()
         return true
     }
 
@@ -633,7 +818,7 @@ struct LinesTab: View {
                 targetID: targetID,
                 id: { $0.id }
               ) else { return false }
-        state.save()
+        state.saveVisualOrderAsync()
         return true
     }
 }
@@ -1702,6 +1887,7 @@ struct RulesTab: View {
     @EnvironmentObject var state: AppState
     private let presetCatalog = RuleSetPresetCatalog.load()
     @State private var applicationSelectionError: String?
+    @State private var draggedItem: SettingsReorderItem?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1709,14 +1895,20 @@ struct RulesTab: View {
                 VStack(spacing: 8) {
                     ForEach($state.profile.ruleSets) { $rule in
                         RuleSetRow(rule: $rule, onDelete: { delete(rule) })
-                            .draggable(SettingsReorderItem(kind: "rule", id: rule.id))
-                            .dropDestination(for: SettingsReorderItem.self) { items, _ in
-                                moveRule(items.first, to: rule.id)
+                            .settingsReorderable(
+                                SettingsReorderItem(
+                                    kind: "rule",
+                                    id: rule.id
+                                ),
+                                draggedItem: $draggedItem
+                            ) { item, targetID in
+                                moveRule(item, to: targetID)
                             }
                     }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
+                .settingsReorderDropArea(draggedItem: $draggedItem)
             }
             Divider()
             AddBar {
@@ -1825,7 +2017,7 @@ struct RulesTab: View {
                 targetID: targetID,
                 id: { $0.id }
               ) else { return false }
-        state.save()
+        state.saveVisualOrderAsync()
         return true
     }
 }
@@ -2156,6 +2348,7 @@ struct ScenariosTab: View {
     @State private var showTemplate = false
     @State private var newName = ""
     @State private var expandedID: String? = nil
+    @State private var draggedItem: SettingsReorderItem?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2182,14 +2375,20 @@ struct ScenariosTab: View {
                                 state.deleteScenario(id: scenarioID)
                             }
                         )
-                        .draggable(SettingsReorderItem(kind: "scenario", id: scenarioID))
-                        .dropDestination(for: SettingsReorderItem.self) { items, _ in
-                            moveScenario(items.first, to: scenarioID)
+                        .settingsReorderable(
+                            SettingsReorderItem(
+                                kind: "scenario",
+                                id: scenarioID
+                            ),
+                            draggedItem: $draggedItem
+                        ) { item, targetID in
+                            moveScenario(item, to: targetID)
                         }
                     }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
+                .settingsReorderDropArea(draggedItem: $draggedItem)
             }
             Divider()
             AddBar {
@@ -2217,7 +2416,7 @@ struct ScenariosTab: View {
                 targetID: targetID,
                 id: { $0.id }
               ) else { return false }
-        state.save()
+        state.saveVisualOrderAsync()
         return true
     }
 
@@ -2233,6 +2432,7 @@ struct ScenarioRow: View {
     @EnvironmentObject var state: AppState
     @State private var newSSID = ""
     @State private var ssidError: String?
+    @State private var draggedBindingItem: SettingsReorderItem?
     @State private var showsIconPicker = false
 
     private var bindingSummary: String {
@@ -2447,9 +2647,14 @@ struct ScenarioRow: View {
                         Text(state.tr("线路", "Line")).font(.caption).foregroundStyle(.secondary)
                     }
 
-                    ForEach(scenario.bindings) { binding in
-                        bindingRow(binding)
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(scenario.bindings) { binding in
+                            bindingRow(binding)
+                        }
                     }
+                    .settingsReorderDropArea(
+                        draggedItem: $draggedBindingItem
+                    )
 
                     Divider()
 
@@ -2563,20 +2768,20 @@ struct ScenarioRow: View {
                 }
                 .buttonStyle(.plain)
             }
-            .draggable(SettingsReorderItem(
-                kind: "scenario-binding:\(scenario.id)",
-                id: binding.ruleSetID
-            ))
-            .dropDestination(for: SettingsReorderItem.self) { items, _ in
-                guard let item = items.first,
-                      item.kind == "scenario-binding:\(scenario.id)",
-                      reorder(
+            .settingsReorderable(
+                SettingsReorderItem(
+                    kind: "scenario-binding:\(scenario.id)",
+                    id: binding.ruleSetID
+                ),
+                draggedItem: $draggedBindingItem
+            ) { item, targetID in
+                guard reorder(
                         &scenario.bindings,
                         draggedID: item.id,
-                        targetID: binding.ruleSetID,
+                        targetID: targetID,
                         id: { $0.ruleSetID }
                       ) else { return false }
-                state.save()
+                state.saveVisualOrderAsync()
                 return true
             }
         }

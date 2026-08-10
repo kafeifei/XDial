@@ -620,6 +620,8 @@ final class DebugServer {
             ]
             return ok(result)
         case "open-settings":
+            ApplicationWindowLifecycleController.shared
+                .prepareToPresentWindow()
             NSApp.activate(ignoringOtherApps: true)
             if let w = settingsWindow() {
                 w.makeKeyAndOrderFront(nil)

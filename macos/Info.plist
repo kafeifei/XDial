@@ -31,10 +31,27 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
-	<key>NSSystemExtensionUsageDescription</key>
-	<string>XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。</string>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+	<key>NSSystemExtensionUsageDescription</key>
+	<string>XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。</string>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>XDial Settings Reorder Item</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.kafeifei.xdial.settings-entry</string>
+		</dict>
+	</array>
 	<key>XDialTransparentProxyBundleIdentifier</key>
 	<string>$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)</string>
 </dict>

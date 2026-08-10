@@ -212,11 +212,15 @@ private struct MenuBarLabel: View {
                     for: .xdialOpenInstallation
                 )
             ) { _ in
+                ApplicationWindowLifecycleController.shared
+                    .prepareToPresentWindow()
                 openWindow(id: "installation")
                 NSApp.activate(ignoringOtherApps: true)
             }
         #if DEBUG
             .onReceive(NotificationCenter.default.publisher(for: .xdialDebugOpenSettings)) { _ in
+                ApplicationWindowLifecycleController.shared
+                    .prepareToPresentWindow()
                 openWindow(id: "settings")
                 NSApp.activate(ignoringOtherApps: true)
             }
@@ -268,49 +272,109 @@ struct XDialApp: App {
     }
 }
 
+@MainActor
+final class ApplicationWindowLifecycleController {
+    static let shared = ApplicationWindowLifecycleController()
+
+    private static let managedWindowIDs: Set<String> = [
+        "settings",
+        "installation",
+    ]
+
+    private var observers: [NSObjectProtocol] = []
+
+    private init() {}
+
+    func start() {
+        guard observers.isEmpty else { return }
+
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification,
+                object: nil,
+                queue: .main
+            ) { notification in
+                MainActor.assumeIsolated {
+                    self.windowDidBecomeKey(notification)
+                }
+            }
+        )
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: nil,
+                queue: .main
+            ) { notification in
+                MainActor.assumeIsolated {
+                    self.windowWillClose(notification)
+                }
+            }
+        )
+    }
+
+    func prepareToPresentWindow() {
+        AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
+        NSApp.setActivationPolicy(.regular)
+    }
+
+    private func windowDidBecomeKey(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              isManaged(window) else { return }
+        window.hidesOnDeactivate = false
+        prepareToPresentWindow()
+    }
+
+    private func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              isManaged(window) else { return }
+
+        // willClose 触发时窗口仍被 AppKit 视为可见。等本轮关闭事件完成后再统一
+        // 核对所有受管窗口，避免 activationPolicy 已改变但 Dock 仍保留 active app。
+        DispatchQueue.main.async { [weak self] in
+            self?.reconcileAfterWindowClose()
+        }
+    }
+
+    private func reconcileAfterWindowClose() {
+        let hasOpenWindow = NSApp.windows.contains { window in
+            isManaged(window) && (window.isVisible || window.isMiniaturized)
+        }
+        guard !hasOpenWindow else { return }
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.deactivate()
+    }
+
+    private func isManaged(_ window: NSWindow) -> Bool {
+        guard let identifier = window.identifier?.rawValue else {
+            return false
+        }
+        return Self.managedWindowIDs.contains(identifier)
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminationTask: Task<Void, Never>?
     private var terminationApproved = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // XDial 的最后一个普通窗口关闭后仍必须作为菜单栏网络控制面常驻。
+        // SwiftUI/AppKit 在无普通窗口时可能重新允许 automatic termination；
+        // 对网络托管进程明确保持禁止，不能用保留 Dock 图标来间接续命。
+        ProcessInfo.processInfo.disableAutomaticTermination(
+            "XDial must remain available after its settings windows close"
+        )
+        ProcessInfo.processInfo.disableSuddenTermination()
         XDialWindowAppearanceController.applyToApplication(
             AppAppearance.persisted(in: xdialDefaults)
         )
         AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
+        ApplicationWindowLifecycleController.shared.start()
+    }
 
-        // 设置窗口：不随失焦隐藏 + 出现在 Cmd+Tab
-        NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { n in
-            MainActor.assumeIsolated {
-                guard let w = n.object as? NSWindow,
-                      w.title.contains("设置")
-                        || w.title.contains("Settings")
-                        || w.title.contains("安装")
-                        || w.title.contains("Installation") else { return }
-                w.hidesOnDeactivate = false
-                AppIcon.applyDockState(
-                    connected: GoEngine.shared.isConnected
-                )
-                NSApp.setActivationPolicy(.regular)
-            }
-        }
-        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { n in
-            guard let w = n.object as? NSWindow,
-                  w.title.contains("设置")
-                    || w.title.contains("Settings")
-                    || w.title.contains("安装")
-                    || w.title.contains("Installation") else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                let hasSettings = NSApp.windows.contains {
-                    $0.isVisible && (
-                        $0.title.contains("设置")
-                            || $0.title.contains("Settings")
-                            || $0.title.contains("安装")
-                            || $0.title.contains("Installation")
-                    )
-                }
-                if !hasSettings { NSApp.setActivationPolicy(.accessory) }
-            }
-        }
+    func applicationShouldTerminateAfterLastWindowClosed(
+        _ sender: NSApplication
+    ) -> Bool {
+        false
     }
 
     func applicationShouldTerminate(

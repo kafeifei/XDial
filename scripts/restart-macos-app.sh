@@ -96,12 +96,13 @@ elif pgrep -x XDial >/dev/null 2>&1; then
 fi
 
 if [[ -n "${old_pid}" ]]; then
-	for _ in {1..120}; do
-		kill -0 "${old_pid}" 2>/dev/null || break
+	# AppKit 可能要等当前窗口/拖放事件退出后才真正完成 terminate。
+	# 守护进程不能设置超时后先放弃，否则旧实例可能在脚本退出后才结束，
+	# 留下无人接棒的断网窗口。只要旧实例仍在，现有数据面也仍由它托管；
+	# 等它真正退出后，必须由同一个本机进程立即完成安装和启动。
+	while kill -0 "${old_pid}" 2>/dev/null; do
 		sleep 0.25
 	done
-	kill -0 "${old_pid}" 2>/dev/null \
-		&& fail "old XDial did not complete graceful shutdown"
 fi
 
 # 旧事务一旦回滚，必须立即安装并启动新 App。不得在两个
