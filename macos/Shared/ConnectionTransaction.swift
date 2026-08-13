@@ -745,8 +745,37 @@ struct ConnectionReport: Codable, Equatable {
         }
     }
 
+    /// A host seed may enter the Provider only before the transaction has
+    /// failed or begun rollback.  This prevents a late host callback from
+    /// reviving a terminal report and appending a second success path to it.
+    var canStartPreparation: Bool {
+        [.planning, .preparing].contains(state)
+            && error == nil
+            && rollbackError == nil
+            && !rollbackComplete
+            && systemTakeoverRemoved
+    }
+
     var isReadyForCommit: Bool {
-        incompletePrepareTaskIDs.isEmpty
+        state == .preparing
+            && error == nil
+            && rollbackError == nil
+            && !rollbackComplete
+            && systemTakeoverRemoved
+            && incompletePrepareTaskIDs.isEmpty
+    }
+
+    var canCommitSystemTakeover: Bool {
+        state == .committing
+            && error == nil
+            && rollbackError == nil
+            && !rollbackComplete
+            && systemTakeoverRemoved
+            && tasks.contains {
+                $0.id == "ingress:transparent-proxy"
+                    && $0.kind == "ingress"
+                    && $0.state == .committing
+            }
     }
 
     func task(
@@ -1039,6 +1068,23 @@ struct ConnectionReport: Codable, Equatable {
             message: message,
             facts: facts
         ))
+    }
+}
+
+/// Binds an asynchronous host start result to the exact user/runtime intent
+/// and transaction that created it.  A result from an older Network Extension
+/// attempt must not mutate whichever transaction happens to be current when
+/// the callback eventually arrives.
+struct ConnectionStartAttemptScope: Equatable {
+    let intentID: UUID
+    let transactionID: String
+
+    func matches(
+        currentIntentID: UUID?,
+        currentTransactionID: String?
+    ) -> Bool {
+        intentID == currentIntentID
+            && transactionID == currentTransactionID
     }
 }
 

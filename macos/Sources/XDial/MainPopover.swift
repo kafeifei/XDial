@@ -126,7 +126,7 @@ struct MainPopover: View {
             Spacer()
             Button {
                 ApplicationWindowLifecycleController.shared
-                    .prepareToPresentWindow()
+                    .prepareToPresentSettingsWindow()
                 openWindow(id: "settings")
                 NSApp.activate(ignoringOtherApps: true)
             } label: {

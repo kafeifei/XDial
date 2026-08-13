@@ -62,6 +62,7 @@ final class ConnectionTransactionTests: XCTestCase {
 
     func testCommitGateRequiresEveryPreparedTaskAndPendingIngress() {
         var report = makeReport()
+        report.setState(.preparing)
         for task in report.tasks where task.kind != "ingress" {
             report.updateTask(id: task.id, state: .ready)
         }
@@ -73,6 +74,34 @@ final class ConnectionTransactionTests: XCTestCase {
             report.incompletePrepareTaskIDs,
             ["line:tailscale"]
         )
+    }
+
+    func testFailedReportCannotReturnToCommitReady() {
+        var report = makeReport()
+        report.setState(.preparing)
+        for task in report.tasks where task.kind != "ingress" {
+            report.updateTask(id: task.id, state: .ready)
+        }
+        report.fail(
+            code: "host-start-failed",
+            message: "previous attempt failed",
+            taskID: "underlay:system"
+        )
+        report.setState(.rollingBack)
+        report.rollbackSessionTasks(
+            systemTakeoverRemoved: true,
+            cleanupComplete: true,
+            finalState: .failed
+        )
+
+        // Reproduce the observed race: a late success callback made the
+        // failed Underlay task ready and moved the report back to preparing.
+        report.updateTask(id: "underlay:system", state: .ready)
+        report.setState(.preparing)
+
+        XCTAssertFalse(report.canStartPreparation)
+        XCTAssertFalse(report.isReadyForCommit)
+        XCTAssertEqual(report.error?.code, "host-start-failed")
     }
 
     func testFailurePointSurvivesRollbackReport() {

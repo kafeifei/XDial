@@ -21,6 +21,10 @@ final class ConnectionTransactionReporterCandidateTests: XCTestCase {
         reporter.setTask(id: "dns:scenario", state: .ready)
         reporter.setTask(id: "data-plane:sing-box", state: .ready)
         reporter.setState(.readyToCommit)
+        reporter.setTask(
+            id: "ingress:transparent-proxy",
+            state: .committing
+        )
         reporter.setState(.committing)
         try reporter.markCommitted()
         try reporter.stageCandidate()
@@ -70,6 +74,43 @@ final class ConnectionTransactionReporterCandidateTests: XCTestCase {
                 $0.id == "underlay:system"
             }?.state,
             .ready
+        )
+    }
+
+    func testFailedCandidateCannotCrossCommitGate() throws {
+        let reporter = try ConnectionTransactionReporter(
+            candidate: makeReport(transactionID: UUID().uuidString)
+        )
+        reporter.setState(.preparing)
+        reporter.markUnderlaySnapshotReady()
+        reporter.setTask(id: "line:test", state: .ready)
+        reporter.setTask(id: "dns:scenario", state: .ready)
+        reporter.setTask(id: "data-plane:sing-box", state: .ready)
+        reporter.fail(
+            NSError(
+                domain: "ConnectionTransactionReporterTests",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "previous attempt failed",
+                ]
+            ),
+            code: "host-start-failed",
+            taskID: "underlay:system"
+        )
+        reporter.setTask(id: "underlay:system", state: .ready)
+
+        XCTAssertThrowsError(try reporter.ensureReadyForCommit())
+
+        reporter.setTask(
+            id: "ingress:transparent-proxy",
+            state: .committing
+        )
+        reporter.setState(.committing)
+        XCTAssertThrowsError(try reporter.markCommitted())
+        XCTAssertNotEqual(reporter.currentReport()?.state, .committed)
+        XCTAssertEqual(
+            reporter.currentReport()?.error?.code,
+            "host-start-failed"
         )
     }
 

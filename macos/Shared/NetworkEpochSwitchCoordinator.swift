@@ -191,3 +191,51 @@ struct NetworkEpochSwitchCoordinator {
         pending?.revision = nextRevision
     }
 }
+
+enum NetworkEpochTransitionAction: Equatable {
+    case none
+    case rebuildCurrentConnection
+    case switchScenario(requiresUnderlayRefresh: Bool)
+    case persistScenario
+}
+
+/// A network epoch can carry two independent facts: the host Underlay changed,
+/// and the SSID selected a Scenario. Rebuilding an unchanged Scenario is an
+/// Underlay recovery, not a Scenario Switch; only a different desired Scenario
+/// may enter the staged Switch transaction.
+struct NetworkEpochTransitionPolicy {
+    static func decide(
+        desiredScenarioID: String,
+        currentDesiredScenarioID: String,
+        committedScenarioID: String,
+        underlayChanged: Bool,
+        keepsConnection: Bool,
+        runtimeStatus: String,
+        hasPendingScenarioSwitch: Bool
+    ) -> NetworkEpochTransitionAction {
+        let unchangedCommittedScenario =
+            !desiredScenarioID.isEmpty
+            && desiredScenarioID == currentDesiredScenarioID
+            && desiredScenarioID == committedScenarioID
+            && !hasPendingScenarioSwitch
+
+        if unchangedCommittedScenario {
+            guard underlayChanged,
+                  keepsConnection,
+                  runtimeStatus == "connected" else {
+                return .none
+            }
+            return .rebuildCurrentConnection
+        }
+
+        if !underlayChanged,
+           desiredScenarioID == currentDesiredScenarioID {
+            return .none
+        }
+        return keepsConnection
+            ? .switchScenario(
+                requiresUnderlayRefresh: underlayChanged
+            )
+            : .persistScenario
+    }
+}

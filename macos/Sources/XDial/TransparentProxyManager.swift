@@ -67,6 +67,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var recoveringTransactionID: String?
     private var requestedProfileJSON: String?
     private var activeUnderlay: HostUnderlaySnapshot?
+    private var latestCapturedUnderlay: HostUnderlaySnapshot?
     private var underlayMonitor: HostUnderlayMonitor?
     private var automaticReconnectInProgress = false
     private var automaticReconnectTrigger: AutomaticReconnectTrigger?
@@ -75,7 +76,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var networkExtensionSessionTransactionID: String?
     private let automaticReconnectRetryPolicy =
         AutomaticReconnectRetryPolicy()
-    private var automaticReconnectAttemptsUsed = 0
+    private lazy var automaticReconnectAttemptBudget =
+        AutomaticReconnectAttemptBudget(
+            maxAttempts: automaticReconnectRetryPolicy.maxAttempts
+        )
     private var automaticReconnectRetryWorkItem: DispatchWorkItem?
     private var automaticReconnectRetryToken: UUID?
     private var automaticReconnectRetryAt: Date?
@@ -106,7 +110,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         AutomaticReconnectRuntimeState(
             inProgress: automaticReconnectInProgress,
             trigger: automaticReconnectTrigger,
-            attemptsUsed: automaticReconnectAttemptsUsed,
+            attemptsUsed: automaticReconnectAttemptBudget.attemptsUsed,
             maxAttempts: automaticReconnectRetryPolicy.maxAttempts,
             stableResetAt: stableConnectionResetAt,
             retryAt: automaticReconnectRetryAt,
@@ -382,9 +386,106 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     func captureCurrentUnderlayFingerprint(
         completion: @escaping (Result<String, Error>) -> Void
     ) {
-        HostUnderlayCapture.start { result in
+        HostUnderlayCapture.start { [weak self] result in
+            if case let .success(snapshot) = result {
+                self?.latestCapturedUnderlay = snapshot
+            }
             completion(result.map(\.epochFingerprint))
         }
+    }
+
+    /// Rebuild the current committed Scenario with the settled host Underlay.
+    /// This is D36 recovery: it replaces only the runtime Underlay snapshot and
+    /// must never be represented as a staged Scenario Switch.
+    @discardableResult
+    func rebuildCurrentConnectionForUnderlayChange(
+        expectedFingerprint: String
+    ) -> Bool {
+        guard
+            let underlay = latestCapturedUnderlay,
+            underlay.epochFingerprint == expectedFingerprint,
+            let profileJSON = requestedProfileJSON,
+            let manager,
+            let sourceReport = ConnectionReportJournal.read(),
+            sourceReport.transactionID == currentTransactionID,
+            sourceReport.state == .committed,
+            !sourceReport.systemTakeoverRemoved,
+            startIntentID != nil,
+            manager.connection.status == .connected,
+            activeScenarioSwitch == nil,
+            !automaticReconnectInProgress,
+            let attempt = automaticReconnectAttemptBudget.nextAttempt
+        else {
+            return false
+        }
+
+        let transactionID: String
+        do {
+            transactionID = try beginTransaction(
+                profileJSON: profileJSON
+            )
+        } catch {
+            appLog(
+                "Transparent Proxy Underlay rebuild planning failed: "
+                    + error.localizedDescription
+            )
+            return false
+        }
+        guard automaticReconnectAttemptBudget.recordStarted(attempt) else {
+            return false
+        }
+
+        cancelStableConnectionReset()
+        stopUnderlayMonitoring()
+        cancelAutomaticReconnectRetry(resetAttempts: false)
+        let intentID = UUID()
+        startIntentID = intentID
+        automaticReconnectInProgress = true
+        automaticReconnectTrigger = .underlayChange
+        automaticReconnectTransactionID = transactionID
+        connectedSessionTransactionID = nil
+        updateReport(transactionID: transactionID) {
+            $0.updateTask(id: "underlay:system", state: .ready)
+            $0.setState(.preparing)
+        }
+
+        let incidentID = ReconnectIncidentJournal.begin(
+            at: Date(),
+            trigger: .underlayChange,
+            report: sourceReport,
+            reasonCode: "underlay-changed",
+            reasonMessage: "Host Underlay changed"
+        )
+        activeReconnectIncidentID = incidentID.isEmpty
+            ? nil
+            : incidentID
+        if let activeReconnectIncidentID {
+            ReconnectIncidentJournal.append(
+                incidentID: activeReconnectIncidentID,
+                type: "retry-started",
+                attempt: attempt,
+                transactionID: transactionID
+            )
+        }
+
+        let changeKinds = activeUnderlay?
+            .differenceKinds(comparedTo: underlay)
+            .joined(separator: ",") ?? "unknown"
+        appLog(
+            "Transparent Proxy underlay changed "
+                + "\(activeUnderlay?.defaultInterface.name ?? "unknown")"
+                + " -> \(underlay.defaultInterface.name) "
+                + "kinds=\(changeKinds); rebuilding current Scenario"
+        )
+        publishRuntimeStatus("reconnecting", error: nil)
+        startConnection(
+            manager,
+            profileJSON: profileJSON,
+            underlay: underlay,
+            intentID: intentID,
+            debugFailureStage: nil
+        )
+        return true
     }
 
     private func continueScenarioSwitchAfterUnderlayCapture(
@@ -776,6 +877,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         startIntentID = nil
         requestedProfileJSON = nil
         activeUnderlay = nil
+        latestCapturedUnderlay = nil
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
         pendingInitialRetryTrigger = nil
@@ -2042,6 +2144,21 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         case .invalid, .disconnected:
             let disconnectedAt = Date()
             let reportBeforeRecovery = ConnectionReportJournal.read()
+            let failedStartScope: ConnectionStartAttemptScope? = {
+                guard
+                    startAttemptID != nil,
+                    let intentID = startIntentID,
+                    let transactionID =
+                        networkExtensionSessionTransactionID
+                        ?? currentTransactionID
+                else {
+                    return nil
+                }
+                return ConnectionStartAttemptScope(
+                    intentID: intentID,
+                    transactionID: transactionID
+                )
+            }()
             let lostCommittedSession =
                 startIntentID != nil
                 && requestedProfileJSON != nil
@@ -2090,15 +2207,32 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 )
                 return
             }
-            guard startAttemptID != nil else {
+            guard startAttemptID != nil,
+                  let failedStartScope else {
                 publishRuntimeStatus("disconnected", error: nil)
                 return
             }
             startAttemptID = nil
             manager.connection.fetchLastDisconnectError { [weak self] error in
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard
+                        let self,
+                        failedStartScope.matches(
+                            currentIntentID: self.startIntentID,
+                            currentTransactionID:
+                                self.currentTransactionID
+                        )
+                    else {
+                        return
+                    }
                     self.publishLatestReport()
+                    guard failedStartScope.matches(
+                        currentIntentID: self.startIntentID,
+                        currentTransactionID:
+                            self.currentTransactionID
+                    ) else {
+                        return
+                    }
                     self.publishFailure(
                         error ?? ManagerError.providerStartFailed
                     )
@@ -2519,7 +2653,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         transactionID: String
     ) {
         cancelStableConnectionReset(clearIncident: false)
-        guard automaticReconnectAttemptsUsed > 0 else {
+        guard automaticReconnectAttemptBudget.attemptsUsed > 0 else {
             stableResetIncidentID = nil
             return
         }
@@ -2540,7 +2674,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             else {
                 return
             }
-            self.automaticReconnectAttemptsUsed = 0
+            self.automaticReconnectAttemptBudget.reset()
             if let incidentID {
                 ReconnectIncidentJournal.append(
                     incidentID: incidentID,
@@ -2742,6 +2876,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         else {
             return
         }
+        latestCapturedUnderlay = underlay
         let changeKinds = activeUnderlay?
             .differenceKinds(comparedTo: underlay)
             .joined(separator: ",") ?? "unknown"
@@ -2749,7 +2884,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             "Transparent Proxy underlay changed "
                 + "\(activeUnderlay?.defaultInterface.name ?? "unknown")"
                 + " -> \(underlay.defaultInterface.name) "
-                + "kinds=\(changeKinds); scheduling staged switch"
+                + "kinds=\(changeKinds); scheduling network epoch"
         )
         // HostUnderlayMonitor has already stopped itself at this point. Start
         // a fresh observer from the newest sample so another physical change
@@ -2788,7 +2923,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         if let delay = automaticReconnectRetryPolicy.delay(
             after: report,
-            attemptsUsed: automaticReconnectAttemptsUsed,
+            attemptsUsed: automaticReconnectAttemptBudget.attemptsUsed,
             trigger: trigger
         ) {
             scheduleAutomaticReconnectRetry(
@@ -2807,22 +2942,21 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
 
     private func scheduleAutomaticReconnectRetry(
         failedTransactionID: String,
-        delay: TimeInterval
+        delay: TimeInterval,
+        recordSchedule: Bool = true
     ) {
         guard automaticReconnectRetryWorkItem == nil else {
             return
         }
-        guard automaticReconnectAttemptsUsed
-            < automaticReconnectRetryPolicy.maxAttempts else {
+        guard let retryNumber =
+            automaticReconnectAttemptBudget.nextAttempt else {
             finishAutomaticReconnect(
                 report: ConnectionReportJournal.read(),
                 message: ConnectionReportJournal.read()?.error?.message
             )
             return
         }
-        let retryNumber = automaticReconnectAttemptsUsed + 1
-        automaticReconnectAttemptsUsed = retryNumber
-        if let incidentID = activeReconnectIncidentID {
+        if recordSchedule, let incidentID = activeReconnectIncidentID {
             ReconnectIncidentJournal.append(
                 incidentID: incidentID,
                 type: "retry-scheduled",
@@ -2831,10 +2965,12 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 message: "Retry scheduled after \(delay)s"
             )
         }
-        appLog(
-            "Transparent Proxy automatic reconnect retry "
-                + "\(retryNumber) scheduled after \(delay)s"
-        )
+        if recordSchedule {
+            appLog(
+                "Transparent Proxy automatic reconnect retry "
+                    + "\(retryNumber) scheduled after \(delay)s"
+            )
+        }
         let token = UUID()
         automaticReconnectRetryToken = token
         automaticReconnectRetryAt = Date().addingTimeInterval(delay)
@@ -2899,6 +3035,11 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             }
             switch result {
             case let .success(snapshot):
+                guard self.automaticReconnectAttemptBudget.recordStarted(
+                    retryNumber
+                ) else {
+                    return
+                }
                 do {
                     let transactionID = try self.beginTransaction(
                         profileJSON: profileJSON
@@ -2938,21 +3079,15 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                     debugFailureStage: nil
                 )
             case let .failure(error):
-                guard let nextDelay =
-                    self.automaticReconnectRetryPolicy
-                    .delayForNextAttempt(
-                        attemptsUsed: self.automaticReconnectAttemptsUsed
-                    )
-                else {
-                    self.finishAutomaticReconnect(
-                        report: ConnectionReportJournal.read(),
-                        message: error.localizedDescription
-                    )
-                    return
-                }
+                appLog(
+                    "Transparent Proxy automatic reconnect waiting for "
+                        + "usable Underlay: \(error.localizedDescription)"
+                )
                 self.scheduleAutomaticReconnectRetry(
                     failedTransactionID: failedTransactionID,
-                    delay: nextDelay
+                    delay: self.automaticReconnectRetryPolicy
+                        .underlayWaitRetryDelay,
+                    recordSchedule: false
                 )
             }
         }
@@ -2963,7 +3098,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         message: String?
     ) {
         let exhausted =
-            automaticReconnectAttemptsUsed
+            automaticReconnectAttemptBudget.attemptsUsed
                 >= automaticReconnectRetryPolicy.maxAttempts
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
@@ -2996,7 +3131,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         automaticReconnectRetryAttempt = nil
         automaticReconnectRetryFailedTransactionID = nil
         if resetAttempts {
-            automaticReconnectAttemptsUsed = 0
+            automaticReconnectAttemptBudget.reset()
         }
     }
 

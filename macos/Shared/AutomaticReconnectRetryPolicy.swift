@@ -37,6 +37,30 @@ struct AutomaticReconnectRuntimeState: Codable, Equatable {
     }
 }
 
+/// Counts only retries which actually reached a new connection transaction.
+/// Waiting for macOS to expose a usable Underlay snapshot is preparation for
+/// an attempt, not an attempt itself, and therefore must not exhaust recovery.
+struct AutomaticReconnectAttemptBudget {
+    let maxAttempts: Int
+    private(set) var attemptsUsed = 0
+
+    var nextAttempt: Int? {
+        guard attemptsUsed < maxAttempts else { return nil }
+        return attemptsUsed + 1
+    }
+
+    @discardableResult
+    mutating func recordStarted(_ attempt: Int) -> Bool {
+        guard attempt == nextAttempt else { return false }
+        attemptsUsed = attempt
+        return true
+    }
+
+    mutating func reset() {
+        attemptsUsed = 0
+    }
+}
+
 /// 自动重连是同一份用户连接意图的有界恢复，不是静默无限拉起。
 ///
 /// Underlay 改变后的自动重建仍只重试结构化的 Underlay 瞬态故障；
@@ -56,6 +80,12 @@ struct AutomaticReconnectRetryPolicy {
 
     var maxAttempts: Int {
         delays.count
+    }
+
+    /// A failed host snapshot has not started another data-plane attempt.
+    /// Poll it at the shortest retry cadence until the Underlay is usable.
+    var underlayWaitRetryDelay: TimeInterval {
+        delays.first ?? 2
     }
 
     func delay(

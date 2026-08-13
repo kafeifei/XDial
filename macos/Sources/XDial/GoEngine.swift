@@ -169,6 +169,15 @@ final class GoEngine: ObservableObject {
         }
     }
 
+    @discardableResult
+    func rebuildCurrentConnectionForUnderlayChange(
+        expectedFingerprint: String
+    ) -> Bool {
+        transparentProxy.rebuildCurrentConnectionForUnderlayChange(
+            expectedFingerprint: expectedFingerprint
+        )
+    }
+
     func runtimeConfigurationFingerprint(
         profileJSON: String
     ) -> Result<String, Error> {

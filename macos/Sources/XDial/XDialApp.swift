@@ -168,6 +168,26 @@ private final class SettingsWindowChromeView: NSView {
     }
 }
 
+private struct InstallationWindowChrome: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        InstallationWindowChromeView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+private final class InstallationWindowChromeView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        DispatchQueue.main.async { [weak self] in
+            guard let window = self?.window else { return }
+            window.level = .floating
+            window.hidesOnDeactivate = false
+            window.styleMask.remove(.miniaturizable)
+        }
+    }
+}
+
 extension Notification.Name {
     /// DebugServer 请求打开设置窗口。
     ///
@@ -213,14 +233,14 @@ private struct MenuBarLabel: View {
                 )
             ) { _ in
                 ApplicationWindowLifecycleController.shared
-                    .prepareToPresentWindow()
+                    .prepareToPresentInstallationWindow()
                 openWindow(id: "installation")
                 NSApp.activate(ignoringOtherApps: true)
             }
         #if DEBUG
             .onReceive(NotificationCenter.default.publisher(for: .xdialDebugOpenSettings)) { _ in
                 ApplicationWindowLifecycleController.shared
-                    .prepareToPresentWindow()
+                    .prepareToPresentSettingsWindow()
                 openWindow(id: "settings")
                 NSApp.activate(ignoringOtherApps: true)
             }
@@ -266,6 +286,7 @@ struct XDialApp: App {
             )
             .environmentObject(state)
             .tint(XDialPalette.accent)
+            .background(InstallationWindowChrome())
         }
         .defaultSize(width: 480, height: 420)
         .windowResizability(.contentSize)
@@ -276,10 +297,10 @@ struct XDialApp: App {
 final class ApplicationWindowLifecycleController {
     static let shared = ApplicationWindowLifecycleController()
 
-    private static let managedWindowIDs: Set<String> = [
-        "settings",
-        "installation",
-    ]
+    private enum ManagedWindowKind: String {
+        case settings
+        case installation
+    }
 
     private var observers: [NSObjectProtocol] = []
 
@@ -312,21 +333,33 @@ final class ApplicationWindowLifecycleController {
         )
     }
 
-    func prepareToPresentWindow() {
+    func prepareToPresentSettingsWindow() {
         AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
         NSApp.setActivationPolicy(.regular)
     }
 
+    func prepareToPresentInstallationWindow() {
+        guard !hasOpenWindow(.settings) else { return }
+        NSApp.setActivationPolicy(.accessory)
+    }
+
     private func windowDidBecomeKey(_ notification: Notification) {
         guard let window = notification.object as? NSWindow,
-              isManaged(window) else { return }
+              let kind = kind(of: window) else { return }
         window.hidesOnDeactivate = false
-        prepareToPresentWindow()
+        switch kind {
+        case .settings:
+            prepareToPresentSettingsWindow()
+        case .installation:
+            window.level = .floating
+            window.styleMask.remove(.miniaturizable)
+            prepareToPresentInstallationWindow()
+        }
     }
 
     private func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow,
-              isManaged(window) else { return }
+              kind(of: window) != nil else { return }
 
         // willClose 触发时窗口仍被 AppKit 视为可见。等本轮关闭事件完成后再统一
         // 核对所有受管窗口，避免 activationPolicy 已改变但 Dock 仍保留 active app。
@@ -336,19 +369,29 @@ final class ApplicationWindowLifecycleController {
     }
 
     private func reconcileAfterWindowClose() {
-        let hasOpenWindow = NSApp.windows.contains { window in
-            isManaged(window) && (window.isVisible || window.isMiniaturized)
+        if hasOpenWindow(.settings) {
+            NSApp.setActivationPolicy(.regular)
+            return
         }
-        guard !hasOpenWindow else { return }
+
         NSApp.setActivationPolicy(.accessory)
-        NSApp.deactivate()
+        if !hasOpenWindow(.installation) {
+            NSApp.deactivate()
+        }
     }
 
-    private func isManaged(_ window: NSWindow) -> Bool {
-        guard let identifier = window.identifier?.rawValue else {
-            return false
+    private func hasOpenWindow(_ kind: ManagedWindowKind) -> Bool {
+        NSApp.windows.contains { window in
+            self.kind(of: window) == kind
+                && (window.isVisible || window.isMiniaturized)
         }
-        return Self.managedWindowIDs.contains(identifier)
+    }
+
+    private func kind(of window: NSWindow) -> ManagedWindowKind? {
+        guard let identifier = window.identifier?.rawValue else {
+            return nil
+        }
+        return ManagedWindowKind(rawValue: identifier)
     }
 }
 

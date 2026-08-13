@@ -27,7 +27,8 @@ final class ConnectionTransactionReporter {
     init(candidate report: ConnectionReport) throws {
         guard
             !report.transactionID.isEmpty,
-            report.state == .planning
+            report.state == .planning,
+            report.canStartPreparation
         else {
             throw ReporterError.invalidCandidateReport
         }
@@ -155,6 +156,12 @@ final class ConnectionTransactionReporter {
         guard let report = currentReport() else {
             throw ReporterError.transactionNotFound
         }
+        if let failure = report.error {
+            throw ReporterError.transactionFailed(failure.code)
+        }
+        guard report.state == .preparing else {
+            throw ReporterError.invalidTransactionState(report.state)
+        }
         guard report.isReadyForCommit else {
             throw ReporterError.incompletePlan(
                 report.incompletePrepareTaskIDs
@@ -255,15 +262,23 @@ final class ConnectionTransactionReporter {
     }
 
     func markCommitted() throws {
+        var didCommit = false
         update { report in
+            guard report.canCommitSystemTakeover else {
+                return
+            }
             report.updateTask(
                 id: "ingress:transparent-proxy",
                 state: .committed
             )
             report.systemTakeoverRemoved = false
             report.setState(.committed)
+            didCommit = true
         }
         try ensureHealthy()
+        guard didCommit else {
+            throw ReporterError.transactionNotCommittable
+        }
     }
 
     func currentReport() -> ConnectionReport? {
@@ -402,6 +417,9 @@ private enum ReporterError: LocalizedError {
     case candidateNotCommitted
     case planChanged
     case reportUnavailable
+    case transactionFailed(String)
+    case invalidTransactionState(ConnectionTransactionState)
+    case transactionNotCommittable
     case incompletePlan([String])
 
     var errorDescription: String? {
@@ -418,6 +436,12 @@ private enum ReporterError: LocalizedError {
             "XDial 连接计划在宿主与数据面之间发生变化"
         case .reportUnavailable:
             "XDial 连接事务报告无法可靠写入"
+        case let .transactionFailed(code):
+            "XDial 连接事务已经失败（\(code)）"
+        case let .invalidTransactionState(state):
+            "XDial 连接事务状态不允许提交（\(state.rawValue)）"
+        case .transactionNotCommittable:
+            "XDial 连接事务未满足系统接管提交条件"
         case let .incompletePlan(taskIDs):
             "XDial 连接计划尚未全部就绪（\(taskIDs.joined(separator: ", "))）"
         }

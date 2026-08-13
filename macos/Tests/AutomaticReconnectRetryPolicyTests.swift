@@ -149,6 +149,42 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
         XCTAssertNil(policy.delayForNextAttempt(attemptsUsed: 5))
     }
 
+    func testUnderlayWaitDoesNotConsumeConnectionAttemptBudget() {
+        var budget = AutomaticReconnectAttemptBudget(maxAttempts: 5)
+
+        XCTAssertEqual(budget.nextAttempt, 1)
+        XCTAssertEqual(budget.attemptsUsed, 0)
+
+        // Repeated host snapshot failures reserve the same first attempt;
+        // no connection transaction has started yet.
+        XCTAssertEqual(budget.nextAttempt, 1)
+        XCTAssertEqual(budget.nextAttempt, 1)
+        XCTAssertEqual(budget.attemptsUsed, 0)
+
+        XCTAssertTrue(budget.recordStarted(1))
+        XCTAssertEqual(budget.attemptsUsed, 1)
+        XCTAssertEqual(budget.nextAttempt, 2)
+        XCTAssertFalse(budget.recordStarted(1))
+        XCTAssertFalse(budget.recordStarted(3))
+
+        for attempt in 2 ... 5 {
+            XCTAssertTrue(budget.recordStarted(attempt))
+        }
+        XCTAssertNil(budget.nextAttempt)
+
+        budget.reset()
+        XCTAssertEqual(budget.attemptsUsed, 0)
+        XCTAssertEqual(budget.nextAttempt, 1)
+    }
+
+    func testUnderlayWaitUsesShortestRetryCadence() {
+        let policy = AutomaticReconnectRetryPolicy(
+            delays: [2, 5, 10, 20, 30]
+        )
+
+        XCTAssertEqual(policy.underlayWaitRetryDelay, 2)
+    }
+
     private func failedReport(code: String) -> ConnectionReport {
         let plan = ConnectionPlan(
             schemaVersion: 3,

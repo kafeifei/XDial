@@ -181,6 +181,27 @@ final class AutomaticConnectionPolicyTests: XCTestCase {
         XCTAssertFalse(gate.isCurrent(attempt))
     }
 
+    func testLateStartResultCannotMutateANewerTransaction() {
+        let originalIntentID = UUID()
+        let scope = ConnectionStartAttemptScope(
+            intentID: originalIntentID,
+            transactionID: "transaction-old"
+        )
+
+        XCTAssertTrue(scope.matches(
+            currentIntentID: originalIntentID,
+            currentTransactionID: "transaction-old"
+        ))
+        XCTAssertFalse(scope.matches(
+            currentIntentID: originalIntentID,
+            currentTransactionID: "transaction-new"
+        ))
+        XCTAssertFalse(scope.matches(
+            currentIntentID: UUID(),
+            currentTransactionID: "transaction-old"
+        ))
+    }
+
     func testExplicitDisconnectBlocksLateAutomaticConnection() {
         var desired = ConnectionDesiredState()
 

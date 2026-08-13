@@ -1,6 +1,66 @@
 import XCTest
 
 final class NetworkEpochSwitchCoordinatorTests: XCTestCase {
+    func testSameCommittedScenarioRebuildsUnderlayWithoutScenarioSwitch() {
+        XCTAssertEqual(
+            NetworkEpochTransitionPolicy.decide(
+                desiredScenarioID: "home",
+                currentDesiredScenarioID: "home",
+                committedScenarioID: "home",
+                underlayChanged: true,
+                keepsConnection: true,
+                runtimeStatus: "connected",
+                hasPendingScenarioSwitch: false
+            ),
+            .rebuildCurrentConnection
+        )
+    }
+
+    func testSameScenarioDoesNothingWhileAutomaticRecoveryOwnsRuntime() {
+        XCTAssertEqual(
+            NetworkEpochTransitionPolicy.decide(
+                desiredScenarioID: "home",
+                currentDesiredScenarioID: "home",
+                committedScenarioID: "home",
+                underlayChanged: true,
+                keepsConnection: true,
+                runtimeStatus: "reconnecting",
+                hasPendingScenarioSwitch: false
+            ),
+            .none
+        )
+    }
+
+    func testDifferentSSIDScenarioUsesOneSwitchWithFreshUnderlay() {
+        XCTAssertEqual(
+            NetworkEpochTransitionPolicy.decide(
+                desiredScenarioID: "office",
+                currentDesiredScenarioID: "home",
+                committedScenarioID: "home",
+                underlayChanged: true,
+                keepsConnection: true,
+                runtimeStatus: "connected",
+                hasPendingScenarioSwitch: false
+            ),
+            .switchScenario(requiresUnderlayRefresh: true)
+        )
+    }
+
+    func testDuplicateSSIDResolutionWithoutUnderlayChangeIsNoOp() {
+        XCTAssertEqual(
+            NetworkEpochTransitionPolicy.decide(
+                desiredScenarioID: "home",
+                currentDesiredScenarioID: "home",
+                committedScenarioID: "home",
+                underlayChanged: false,
+                keepsConnection: true,
+                runtimeStatus: "connected",
+                hasPendingScenarioSwitch: false
+            ),
+            .none
+        )
+    }
+
     func testUnderlayThenSSIDSettlesAsOneEpochWithLatestScenario() {
         var coordinator = NetworkEpochSwitchCoordinator()
         let stale = coordinator.observeUnderlayChange(

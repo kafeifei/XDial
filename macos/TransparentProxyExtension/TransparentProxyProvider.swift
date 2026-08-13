@@ -214,6 +214,10 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             completionHandler(ProviderError.missingTransaction)
             return
         }
+        guard initialReport.canStartPreparation else {
+            completionHandler(ProviderError.invalidTransaction)
+            return
+        }
         guard
             let interfacesJSON =
                 options?[Self.underlayInterfacesOption] as? String,
@@ -2779,6 +2783,7 @@ private final class ProviderScenarioSwitchOperation:
 private enum ProviderError: Error {
     case missingProfile
     case missingTransaction
+    case invalidTransaction
     case invalidUnderlaySnapshot
     case deallocated
     case rollbackTimedOut
@@ -2806,6 +2811,8 @@ extension ProviderError: LocalizedError {
             "XDial 配置为空"
         case .missingTransaction:
             "XDial 连接事务为空"
+        case .invalidTransaction:
+            "XDial 连接事务已经结束，不能重新进入准备阶段"
         case .invalidUnderlaySnapshot:
             "XDial 启动前的系统网络快照无效"
         case .deallocated:

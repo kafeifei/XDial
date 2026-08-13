@@ -1753,20 +1753,47 @@ final class AppState: ObservableObject {
             ?? connectionDesired.scenarioID
             ?? engine.connectionReport?.scenario.id
             ?? profile.activeScenarioID
-        if !intent.underlayChanged,
-           intent.desiredScenarioID == currentDesiredScenarioID {
-            return
-        }
-        appLog(
-            "Network epoch \(intent.epoch) selected Scenario "
-                + intent.desiredScenarioID
+        let action = NetworkEpochTransitionPolicy.decide(
+            desiredScenarioID: intent.desiredScenarioID,
+            currentDesiredScenarioID: currentDesiredScenarioID,
+            committedScenarioID:
+                engine.connectionReport?.scenario.id ?? "",
+            underlayChanged: intent.underlayChanged,
+            keepsConnection: automaticScenarioChangeKeepsConnection,
+            runtimeStatus: engine.status,
+            hasPendingScenarioSwitch:
+                scenarioSwitchTargetID != nil
+                    || scenarioSwitchInFlight != nil
         )
-        if automaticScenarioChangeKeepsConnection {
+        switch action {
+        case .none:
+            return
+        case .rebuildCurrentConnection:
+            appLog(
+                "Network epoch \(intent.epoch) retained Scenario "
+                    + intent.desiredScenarioID
+                    + "; rebuilding Underlay"
+            )
+            let started = engine
+                .rebuildCurrentConnectionForUnderlayChange(
+                expectedFingerprint: intent.underlayFingerprint
+            )
+            if !started {
+                appLog(
+                    "Network epoch \(intent.epoch) Underlay rebuild "
+                        + "was superseded by newer runtime state"
+                )
+            }
+        case let .switchScenario(requiresUnderlayRefresh):
+            appLog(
+                "Network epoch \(intent.epoch) selected Scenario "
+                    + intent.desiredScenarioID
+            )
             _ = enqueueScenarioSwitch(
                 to: intent.desiredScenarioID,
-                requiresUnderlayRefresh: intent.underlayChanged
+                requiresUnderlayRefresh: requiresUnderlayRefresh
             )
-        } else {
+        case .persistScenario:
             _ = persistActiveScenario(intent.desiredScenarioID)
         }
     }
