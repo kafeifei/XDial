@@ -13,8 +13,10 @@ final class ScenarioSwitchIPCTests: XCTestCase {
                 "[{\"name\":\"en0\",\"index\":7,\"type\":\"wifi\"}]",
             underlayDefaultName: "en0",
             underlayDefaultIndex: 7,
-            systemDNSJSON: "[\"192.0.2.53\"]"
+            systemDNSJSON: "[\"192.0.2.53\"]",
+            refreshLineRuntimes: true
         )
+        XCTAssertEqual(request.refreshLineRuntimes, true)
 
         XCTAssertEqual(
             try ProviderScenarioSwitchCodec.decodeRequest(

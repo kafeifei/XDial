@@ -208,6 +208,8 @@ final class AppState: ObservableObject {
     private var launchAutoConnectPending = false
     private var connectionAttempts = ConnectionAttemptGate()
     @Published private(set) var scenarioSwitchTargetID: String?
+    @Published private var scenarioSwitchFailureAcknowledgement:
+        ScenarioSwitchFailureAcknowledgement?
     private var scenarioSwitchGeneration = 0
     private var scenarioSwitchInFlight: ScenarioSwitchAttempt?
     private var scenarioSwitchCancellationRequested = false
@@ -261,9 +263,19 @@ final class AppState: ObservableObject {
 
     var isConnected: Bool { engine.isConnected }
     var hasMenuBarError: Bool {
-        if installation.report.state == .failed { return true }
-        if presentedConnectionReport?.error != nil { return true }
-        return !(engine.lastError?.isEmpty ?? true)
+        MenuBarErrorPresentationPolicy.hasError(
+            installationFailed: installation.report.state == .failed,
+            connectionReportHasError:
+                presentedConnectionReport?.error != nil,
+            visibleScenarioSwitchFailureID:
+                presentedScenarioSwitchFailureProjection?
+                    .candidateTransactionID,
+            currentScenarioSwitchFailureID:
+                currentScenarioSwitchFailureProjection?
+                    .candidateTransactionID,
+            engineError: engine.lastError,
+            acknowledgement: scenarioSwitchFailureAcknowledgement
+        )
     }
     var isBusy: Bool {
         engine.isBusy || wakeReconnectPhase != nil
@@ -279,6 +291,72 @@ final class AppState: ObservableObject {
             return nil
         }
         return engine.presentedConnectionReport
+    }
+
+    /// The failed candidate is a presentation sidecar to the still-committed
+    /// source transaction. It is current only while every transaction and
+    /// Scenario identity still agrees with that source.
+    private var currentScenarioSwitchFailureProjection:
+        HostScenarioSwitchProjection? {
+        guard
+            let projection = engine.scenarioSwitchProjection,
+            !projection.inFlight,
+            projection.status == "failed"
+                || projection.status == "timed-out",
+            isConnected,
+            let report = presentedConnectionReport,
+            report.state == .committed,
+            !report.systemTakeoverRemoved,
+            report.transactionID
+                == projection.sourceCommittedTransactionID,
+            report.transactionID
+                == projection.activeCommittedTransactionID,
+            report.scenario.id == projection.fromScenarioID
+        else {
+            return nil
+        }
+        return projection
+    }
+
+    var presentedScenarioSwitchFailureProjection:
+        HostScenarioSwitchProjection? {
+        guard let projection = currentScenarioSwitchFailureProjection,
+              projection.candidateTransactionID
+                != scenarioSwitchFailureAcknowledgement?
+                    .candidateTransactionID else {
+            return nil
+        }
+        return projection
+    }
+
+    func dismissScenarioSwitchFailure(
+        candidateTransactionID: String
+    ) {
+        guard
+            let projection = currentScenarioSwitchFailureProjection,
+            projection.candidateTransactionID == candidateTransactionID
+        else {
+            return
+        }
+        let acknowledgement = ScenarioSwitchFailureAcknowledgement(
+            candidateTransactionID: candidateTransactionID,
+            messages: [
+                engine.lastError,
+                projection.message,
+                projection.candidateReport.error?.message,
+            ]
+        )
+        scenarioSwitchFailureAcknowledgement = acknowledgement
+        if acknowledgement.suppresses(
+            candidateTransactionID: candidateTransactionID,
+            engineError: engine.lastError
+        ) {
+            engine.lastError = nil
+        }
+    }
+
+    var dismissedScenarioSwitchFailureIDForDiagnostics: String? {
+        scenarioSwitchFailureAcknowledgement?.candidateTransactionID
     }
 
     func tailscaleConfigurationStatus(
@@ -573,9 +651,11 @@ final class AppState: ObservableObject {
         engine.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &engineSubs)
-        engine.underlayChangeHandler = { [weak self] fingerprint in
+        engine.underlayChangeHandler = {
+            [weak self] fingerprint, connectivityRestored in
             self?.handleUnderlayChange(
-                underlayFingerprint: fingerprint
+                underlayFingerprint: fingerprint,
+                forceNewEpoch: connectivityRestored
             )
         }
         installation.objectWillChange
@@ -909,7 +989,9 @@ final class AppState: ObservableObject {
         wakeStatusSyncGeneration += 1
         let generation = wakeStatusSyncGeneration
         appLog("wake signal \(trigger): synchronizing runtime status")
-        engine.systemDidWake { [weak self] in
+        engine.systemDidWake(
+            isSystemWake: trigger == "workspace_did_wake"
+        ) { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self,
                       generation == self.wakeStatusSyncGeneration else {
@@ -1418,7 +1500,10 @@ final class AppState: ObservableObject {
         )
         scenarioSwitchRequiresUnderlayRefresh = false
         scenarioSwitchCancellationRequested = false
-        engine.switchScenario(profileJSON: profileJSON) {
+        engine.switchScenario(
+            profileJSON: profileJSON,
+            refreshLineRuntimes: requiresUnderlayRefresh
+        ) {
             [weak self] result in
             guard let self else { return }
             self.finishScenarioSwitch(
@@ -1650,7 +1735,8 @@ final class AppState: ObservableObject {
     }
 
     private func handleUnderlayChange(
-        underlayFingerprint: String
+        underlayFingerprint: String,
+        forceNewEpoch: Bool
     ) {
         guard automaticScenarioChangeKeepsConnection else {
             return
@@ -1662,7 +1748,8 @@ final class AppState: ObservableObject {
         guard let token =
             networkEpochSwitchCoordinator.observeUnderlayChange(
                 currentDesiredScenarioID: desiredScenarioID,
-                underlayFingerprint: underlayFingerprint
+                underlayFingerprint: underlayFingerprint,
+                forceNewEpoch: forceNewEpoch
             ) else {
             return
         }
@@ -1768,22 +1855,6 @@ final class AppState: ObservableObject {
         switch action {
         case .none:
             return
-        case .rebuildCurrentConnection:
-            appLog(
-                "Network epoch \(intent.epoch) retained Scenario "
-                    + intent.desiredScenarioID
-                    + "; rebuilding Underlay"
-            )
-            let started = engine
-                .rebuildCurrentConnectionForUnderlayChange(
-                expectedFingerprint: intent.underlayFingerprint
-            )
-            if !started {
-                appLog(
-                    "Network epoch \(intent.epoch) Underlay rebuild "
-                        + "was superseded by newer runtime state"
-                )
-            }
         case let .switchScenario(requiresUnderlayRefresh):
             appLog(
                 "Network epoch \(intent.epoch) selected Scenario "

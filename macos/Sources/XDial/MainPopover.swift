@@ -21,7 +21,6 @@ struct MainPopover: View {
     @State private var hoveredScenarioID: String?
     @State private var settingsButtonHovered = false
     @State private var showsConnectionDetails = true
-    @State private var dismissedScenarioSwitchFailureID: String?
 
     private let minimumPopoverWidth: CGFloat = 340
     private let maximumScenariosPerRow = 4
@@ -150,6 +149,7 @@ struct MainPopover: View {
                     }
             }
             .buttonStyle(.plain)
+            .keyboardShortcut(",", modifiers: .command)
             .foregroundStyle(XDialPalette.accent)
             .contentShape(Circle())
             .onHover { settingsButtonHovered = $0 }
@@ -528,8 +528,10 @@ struct MainPopover: View {
             }
             Spacer(minLength: 6)
             Button {
-                dismissedScenarioSwitchFailureID =
-                    projection.candidateTransactionID
+                state.dismissScenarioSwitchFailure(
+                    candidateTransactionID:
+                        projection.candidateTransactionID
+                )
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .semibold))
@@ -628,26 +630,7 @@ struct MainPopover: View {
 
     private var scenarioSwitchFailureProjection:
         HostScenarioSwitchProjection? {
-        guard
-            let projection = state.engine.scenarioSwitchProjection,
-            !projection.inFlight,
-            projection.status == "failed"
-                || projection.status == "timed-out",
-            projection.candidateTransactionID
-                != dismissedScenarioSwitchFailureID,
-            state.isConnected,
-            let report = state.presentedConnectionReport,
-            report.state == .committed,
-            !report.systemTakeoverRemoved,
-            report.transactionID
-                == projection.sourceCommittedTransactionID,
-            report.transactionID
-                == projection.activeCommittedTransactionID,
-            report.scenario.id == projection.fromScenarioID
-        else {
-            return nil
-        }
-        return projection
+        state.presentedScenarioSwitchFailureProjection
     }
 
     private var connectionDetailsSymbol: String {

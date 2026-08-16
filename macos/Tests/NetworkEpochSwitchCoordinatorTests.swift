@@ -1,7 +1,7 @@
 import XCTest
 
 final class NetworkEpochSwitchCoordinatorTests: XCTestCase {
-    func testSameCommittedScenarioRebuildsUnderlayWithoutScenarioSwitch() {
+    func testSameCommittedScenarioSwitchesWithFreshUnderlay() {
         XCTAssertEqual(
             NetworkEpochTransitionPolicy.decide(
                 desiredScenarioID: "home",
@@ -12,7 +12,7 @@ final class NetworkEpochSwitchCoordinatorTests: XCTestCase {
                 runtimeStatus: "connected",
                 hasPendingScenarioSwitch: false
             ),
-            .rebuildCurrentConnection
+            .switchScenario(requiresUnderlayRefresh: true)
         )
     }
 
@@ -221,6 +221,140 @@ final class NetworkEpochSwitchCoordinatorTests: XCTestCase {
             underlayFingerprint: "underlay-2"
         ))
         XCTAssertFalse(coordinator.hasPendingIntent)
+    }
+
+    func testConnectivityRestorationCreatesNewEpochForSameTuple() {
+        var coordinator = NetworkEpochSwitchCoordinator()
+        let first = coordinator.observeUnderlayChange(
+            currentDesiredScenarioID: "home",
+            underlayFingerprint: "same-underlay"
+        )!
+        XCTAssertNotNil(coordinator.settle(first))
+
+        let restored = coordinator.observeUnderlayChange(
+            currentDesiredScenarioID: "home",
+            underlayFingerprint: "same-underlay",
+            forceNewEpoch: true
+        )!
+        XCTAssertEqual(
+            coordinator.settle(restored),
+            .init(
+                epoch: restored.epoch,
+                desiredScenarioID: "home",
+                underlayFingerprint: "same-underlay",
+                underlayChanged: true
+            )
+        )
+    }
+
+    func testPathRestorationRefreshesEquivalentSnapshot() {
+        var state = UnderlayPathTransitionState()
+        XCTAssertEqual(
+            state.observe(
+                isSatisfied: true,
+                hasCompleteSnapshot: true,
+                snapshotMatchesBaseline: true
+            ),
+            .cancelPending
+        )
+        XCTAssertEqual(
+            state.observe(
+                isSatisfied: false,
+                hasCompleteSnapshot: false,
+                snapshotMatchesBaseline: false
+            ),
+            .cancelPending
+        )
+        XCTAssertEqual(
+            state.observe(
+                isSatisfied: true,
+                hasCompleteSnapshot: true,
+                snapshotMatchesBaseline: true
+            ),
+            .scheduleRefresh(allowEquivalentSnapshot: true)
+        )
+    }
+
+    func testIncompleteRestorationKeepsRefreshRequirement() {
+        var state = UnderlayPathTransitionState()
+        _ = state.observe(
+            isSatisfied: false,
+            hasCompleteSnapshot: false,
+            snapshotMatchesBaseline: false
+        )
+        XCTAssertEqual(
+            state.observe(
+                isSatisfied: true,
+                hasCompleteSnapshot: false,
+                snapshotMatchesBaseline: false
+            ),
+            .none
+        )
+        XCTAssertEqual(
+            state.observe(
+                isSatisfied: true,
+                hasCompleteSnapshot: true,
+                snapshotMatchesBaseline: true
+            ),
+            .scheduleRefresh(allowEquivalentSnapshot: true)
+        )
+    }
+
+    func testRestorationBecomesAvailableAfterSchedulingOneRefresh() {
+        var state = UnderlayPathTransitionState()
+        _ = state.observe(
+            isSatisfied: false,
+            hasCompleteSnapshot: false,
+            snapshotMatchesBaseline: false
+        )
+        XCTAssertEqual(
+            state.observe(
+                isSatisfied: true,
+                hasCompleteSnapshot: true,
+                snapshotMatchesBaseline: true
+            ),
+            .scheduleRefresh(allowEquivalentSnapshot: true)
+        )
+        XCTAssertEqual(
+            state.observe(
+                isSatisfied: true,
+                hasCompleteSnapshot: true,
+                snapshotMatchesBaseline: true
+            ),
+            .cancelPending
+        )
+    }
+
+    func testSystemWakeSuppressesEquivalentConnectivityRestoration() {
+        XCTAssertTrue(
+            SystemWakeUnderlayPolicy.suppressesEquivalentRestoration(
+                connectivityRestored: true,
+                snapshotMatchesBaseline: true,
+                secondsSinceSystemWake: 9
+            )
+        )
+    }
+
+    func testSystemWakeDoesNotSuppressMaterialUnderlayChange() {
+        XCTAssertFalse(
+            SystemWakeUnderlayPolicy.suppressesEquivalentRestoration(
+                connectivityRestored: true,
+                snapshotMatchesBaseline: false,
+                secondsSinceSystemWake: 9
+            )
+        )
+    }
+
+    func testOldWakeDoesNotSuppressLaterConnectivityRestoration() {
+        XCTAssertFalse(
+            SystemWakeUnderlayPolicy.suppressesEquivalentRestoration(
+                connectivityRestored: true,
+                snapshotMatchesBaseline: true,
+                secondsSinceSystemWake:
+                    SystemWakeUnderlayPolicy
+                        .equivalentRestorationWindow + 0.001
+            )
+        )
     }
 
     func testRealUnmatchedSSIDSeparatesReturnToSameTuple() {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	boxTailscale "github.com/sagernet/sing-box/protocol/tailscale"
@@ -316,9 +317,13 @@ func (l *Libbox) PrepareTailscaleDNS(endpointTag string, dnsServerTag string) (s
 		l.runtimeCtx.Err() != nil || l.switchCommitInProgress {
 		return "", fmt.Errorf("connection is not running")
 	}
-	rawEndpoint, found := l.box.Endpoint().Get(strings.TrimSpace(endpointTag))
-	endpoint, ok := rawEndpoint.(*boxTailscale.Endpoint)
-	if !found || !ok {
+	endpoint, found := activeTailscaleRuntimeEndpoint(
+		l.activeTailscaleCapability,
+		l.tailscaleEndpointTag,
+		l.box,
+		strings.TrimSpace(endpointTag),
+	)
+	if !found {
 		return "", fmt.Errorf("Tailscale endpoint is unavailable")
 	}
 	snapshot, err := endpoint.DNSMemorySnapshot()
@@ -358,11 +363,13 @@ func (l *Libbox) PreparePreparedSwitchTailscaleDNS(
 		l.mu.Unlock()
 		return "", fmt.Errorf("switch candidate is not prepared")
 	}
-	rawEndpoint, found := candidate.box.Endpoint().Get(
+	endpoint, found := activeTailscaleRuntimeEndpoint(
+		candidate.tailscaleCapability,
+		candidate.tailscaleEndpointTag,
+		candidate.box,
 		strings.TrimSpace(endpointTag),
 	)
-	endpoint, ok := rawEndpoint.(*boxTailscale.Endpoint)
-	if !found || !ok {
+	if !found {
 		l.mu.Unlock()
 		return "", fmt.Errorf("prepared Tailscale endpoint is unavailable")
 	}
@@ -682,7 +689,12 @@ func (l *Libbox) tailscaleRuntime(
 		l.mu.Unlock()
 		return nil, nil, nil, nil, fmt.Errorf("connection is not running")
 	}
-	endpoint, found := l.box.Endpoint().Get(strings.TrimSpace(endpointTag))
+	tailscaleEndpoint, found := activeTailscaleRuntimeEndpoint(
+		l.activeTailscaleCapability,
+		l.tailscaleEndpointTag,
+		l.box,
+		strings.TrimSpace(endpointTag),
+	)
 	runtimeCtx := l.runtimeCtx
 	// Commit sets switchCommitInProgress while holding l.mu before it waits.
 	// Therefore this Add can never race a zero-counter Wait, and the source
@@ -691,8 +703,7 @@ func (l *Libbox) tailscaleRuntime(
 	l.mu.Unlock()
 	release := func() { l.runtimeUsers.Done() }
 
-	tailscaleEndpoint, ok := endpoint.(*boxTailscale.Endpoint)
-	if !found || !ok {
+	if !found {
 		release()
 		return nil, nil, nil, nil, fmt.Errorf("Tailscale endpoint is unavailable")
 	}
@@ -723,7 +734,10 @@ func (l *Libbox) preparedSwitchTailscaleRuntime(
 			"switch candidate is not prepared",
 		)
 	}
-	rawEndpoint, found := candidate.box.Endpoint().Get(
+	endpoint, found := activeTailscaleRuntimeEndpoint(
+		candidate.tailscaleCapability,
+		candidate.tailscaleEndpointTag,
+		candidate.box,
 		strings.TrimSpace(endpointTag),
 	)
 	runtimeCtx := candidate.runtimeCtx
@@ -731,8 +745,7 @@ func (l *Libbox) preparedSwitchTailscaleRuntime(
 	l.mu.Unlock()
 	release := func() { l.switchCandidateUsers.Done() }
 
-	endpoint, ok := rawEndpoint.(*boxTailscale.Endpoint)
-	if !found || !ok {
+	if !found {
 		release()
 		return nil, nil, nil, nil, fmt.Errorf(
 			"prepared Tailscale endpoint is unavailable",
@@ -746,6 +759,26 @@ func (l *Libbox) preparedSwitchTailscaleRuntime(
 		)
 	}
 	return endpoint, client, runtimeCtx, release, nil
+}
+
+func activeTailscaleRuntimeEndpoint(
+	capability pooledTailscaleRuntime,
+	capabilityEndpointTag string,
+	consumerBox *box.Box,
+	endpointTag string,
+) (*boxTailscale.Endpoint, bool) {
+	if pooled, ok := capability.(*tailscaleRuntimeCapability); ok {
+		if endpointTag == "" || endpointTag != capabilityEndpointTag {
+			return nil, false
+		}
+		return pooled.runtimeEndpoint()
+	}
+	if consumerBox == nil {
+		return nil, false
+	}
+	rawEndpoint, found := consumerBox.Endpoint().Get(endpointTag)
+	endpoint, ok := rawEndpoint.(*boxTailscale.Endpoint)
+	return endpoint, found && ok
 }
 
 func (l *Libbox) tailscaleLocalClient(

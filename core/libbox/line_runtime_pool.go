@@ -22,7 +22,10 @@ const (
 
 type lineRuntimeCapabilityKind string
 
-const lineRuntimeCapabilityAnyConnect lineRuntimeCapabilityKind = "anyconnect"
+const (
+	lineRuntimeCapabilityAnyConnect lineRuntimeCapabilityKind = "anyconnect"
+	lineRuntimeCapabilityTailscale  lineRuntimeCapabilityKind = "tailscale"
+)
 
 var (
 	errLineRuntimeCandidateExists = errors.New("a Line runtime candidate already exists")

@@ -444,6 +444,120 @@ func (p *xdPlatformInterface) switchCandidate(
 	return candidate, nil
 }
 
+// lineRuntimeCapability returns a PlatformInterface snapshot owned by a
+// process-level Line capability. It must not share networkManager or monitor
+// ownership with the consumer Box that happened to create the capability:
+// that Box is retired after a successful Switch while the capability may keep
+// serving later generations.
+func (p *xdPlatformInterface) lineRuntimeCapability() *xdPlatformInterface {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return &xdPlatformInterface{
+		tunFD:              p.tunFD,
+		opener:             p.opener,
+		defaultInterface:   cloneInterface(p.defaultInterface),
+		networkInterfaces:  cloneNetworkInterfaces(p.networkInterfaces),
+		ownInterfaceName:   p.ownInterfaceName,
+		bindUnderlaySocket: p.bindUnderlaySocket,
+	}
+}
+
+// syncLineRuntimeUnderlayFrom moves a shared process-level Line capability to
+// the latest host NWPath snapshot before candidate readiness. The capability
+// is shared by source and candidate, so this is a Line-level Underlay update,
+// not a second endpoint or a mutation of either immutable consumer Box.
+func (p *xdPlatformInterface) syncLineRuntimeUnderlayFrom(
+	source *xdPlatformInterface,
+	force bool,
+) {
+	if p == nil || source == nil || p == source {
+		return
+	}
+	source.mu.Lock()
+	updatedDefault := cloneInterface(source.defaultInterface)
+	updatedInterfaces := cloneNetworkInterfaces(source.networkInterfaces)
+	updatedOwnInterface := source.ownInterfaceName
+	updatedBinding := source.bindUnderlaySocket
+	source.mu.Unlock()
+
+	p.mu.Lock()
+	changed := !samePlatformDefaultInterface(
+		p.defaultInterface,
+		updatedDefault,
+	) || !samePlatformNetworkInterfaces(
+		p.networkInterfaces,
+		updatedInterfaces,
+	) || p.ownInterfaceName != updatedOwnInterface ||
+		p.bindUnderlaySocket != updatedBinding
+	if !changed && !force {
+		p.mu.Unlock()
+		return
+	}
+	p.defaultInterface = updatedDefault
+	p.networkInterfaces = updatedInterfaces
+	p.ownInterfaceName = updatedOwnInterface
+	p.bindUnderlaySocket = updatedBinding
+	networkManager := p.networkManager
+	monitor := p.monitor
+	p.mu.Unlock()
+
+	if networkManager != nil {
+		if err := networkManager.UpdateInterfaces(); err != nil &&
+			monitor != nil && monitor.logger != nil {
+			monitor.logger.Error(E.Cause(
+				err,
+				"update Line runtime platform interfaces",
+			))
+		}
+	}
+	if monitor != nil {
+		monitor.notify(cloneInterface(updatedDefault))
+	}
+}
+
+func cloneNetworkInterfaces(
+	interfaces []adapter.NetworkInterface,
+) []adapter.NetworkInterface {
+	cloned := make([]adapter.NetworkInterface, len(interfaces))
+	for index, networkInterface := range interfaces {
+		cloned[index] = networkInterface
+		if clonedInterface := cloneInterface(&networkInterface.Interface); clonedInterface != nil {
+			cloned[index].Interface = *clonedInterface
+		}
+		cloned[index].DNSServers = append(
+			[]string(nil),
+			networkInterface.DNSServers...,
+		)
+	}
+	return cloned
+}
+
+func samePlatformDefaultInterface(left, right *control.Interface) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Name == right.Name && left.Index == right.Index
+}
+
+func samePlatformNetworkInterfaces(
+	left,
+	right []adapter.NetworkInterface,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].Name != right[index].Name ||
+			left[index].Index != right[index].Index ||
+			left[index].Type != right[index].Type ||
+			left[index].Expensive != right[index].Expensive ||
+			left[index].Constrained != right[index].Constrained {
+			return false
+		}
+	}
+	return true
+}
+
 type platformNetworkInterfaceSnapshot struct {
 	Name  string `json:"name"`
 	Index int    `json:"index"`

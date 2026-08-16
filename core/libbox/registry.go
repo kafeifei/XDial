@@ -64,6 +64,7 @@ func outboundRegistry() *outbound.Registry {
 	vmess.RegisterOutbound(registry)
 	anytls.RegisterOutbound(registry)
 	registerVPNOutbound(registry)
+	registerTailscaleRuntimeOutbound(registry)
 
 	return registry
 }

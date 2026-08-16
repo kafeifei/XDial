@@ -14,8 +14,10 @@ settings:
   configs:
     Debug:
       XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
+      XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.settings-ui
     Release:
       XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.transparent-proxy
+      XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.settings-ui
 
 targets:
   XDialTransparentProxy:
@@ -67,6 +69,47 @@ targets:
       - sdk: libresolv.tbd
       - sdk: NetworkExtension.framework
       - sdk: Security.framework
+
+  XDialSettingsUI:
+    type: application
+    platform: macOS
+    sources:
+      - SettingsDockUI
+      - Sources/XDial/AppIcon.swift
+      - Sources/XDial/SettingsDockProxyProtocol.swift
+      - Sources/XDial/XDialBrandPalette.swift
+      - path: SettingsDockIcon.icns
+        buildPhase: resources
+    info:
+      path: SettingsDockUI/Info.plist
+      properties:
+        CFBundleDisplayName: XDial
+        CFBundleName: XDial
+        CFBundleIconFile: SettingsDockIcon.icns
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        LSUIElement: false
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+    settings:
+      base:
+        PRODUCT_NAME: XDial Settings UI
+        PRODUCT_BUNDLE_IDENTIFIER: "$(XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER)"
+        MARKETING_VERSION: "0.7.0"
+        CURRENT_PROJECT_VERSION: "94"
+        ENABLE_APP_SANDBOX: NO
+        SKIP_INSTALL: YES
+      configs:
+        Debug:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Development
+        Release:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
+          ENABLE_HARDENED_RUNTIME: YES
 
   XDial:
     type: application
@@ -120,6 +163,8 @@ targets:
           OTHER_CODE_SIGN_FLAGS: "--timestamp"
           ENABLE_HARDENED_RUNTIME: YES
     dependencies:
+      - target: XDialSettingsUI
+        embed: false
       - framework: ../build/frameworks/macos/Libbox.xcframework
         embed: false
       - sdk: libresolv.tbd
@@ -129,6 +174,34 @@ targets:
       - sdk: CoreLocation.framework
       - sdk: CoreWLAN.framework
     postBuildScripts:
+      - name: Embed settings UI Dock carrier
+        script: |
+          set -eu
+          carrier_source="${BUILT_PRODUCTS_DIR}/XDial Settings UI.app"
+          carrier_dir="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers"
+          carrier_destination="${carrier_dir}/XDial Settings UI.app"
+          test -d "${carrier_source}"
+          mkdir -p "${carrier_dir}"
+          rm -rf "${carrier_destination}"
+          /usr/bin/ditto "${carrier_source}" "${carrier_destination}"
+          if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ]; then
+            exit 0
+          fi
+          if [ "${CONFIGURATION}" = "Release" ]; then
+            /usr/bin/codesign --force --options runtime --timestamp \
+              --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              "${carrier_destination}"
+          else
+            /usr/bin/codesign --force \
+              --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              "${carrier_destination}"
+          fi
+          /usr/bin/codesign --verify --deep --strict \
+            "${carrier_destination}"
+        inputFiles:
+          - "$(BUILT_PRODUCTS_DIR)/XDial Settings UI.app"
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/XDial Settings UI.app"
       - name: Embed private RuleSet presets
         script: |
           set -eu
@@ -205,6 +278,7 @@ targets:
       - Tests
       - Shared
       - Sources/XDial/AppIcon.swift
+      - Sources/XDial/ApplicationLaunchPolicy.swift
       - Sources/XDial/AppVersion.swift
       - Sources/XDial/DebugStateRedactor.swift
       - Sources/XDial/Models.swift

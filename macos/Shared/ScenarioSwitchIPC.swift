@@ -29,6 +29,7 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
     let underlayDefaultName: String?
     let underlayDefaultIndex: Int?
     let systemDNSJSON: String?
+    let refreshLineRuntimes: Bool?
 
     enum CodingKeys: String, CodingKey {
         case v
@@ -42,6 +43,7 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
         case underlayDefaultName = "underlay_default_name"
         case underlayDefaultIndex = "underlay_default_index"
         case systemDNSJSON = "system_dns"
+        case refreshLineRuntimes = "refresh_line_runtimes"
     }
 
     static func switchScenario(
@@ -53,7 +55,8 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
         underlayInterfacesJSON: String,
         underlayDefaultName: String,
         underlayDefaultIndex: Int,
-        systemDNSJSON: String
+        systemDNSJSON: String,
+        refreshLineRuntimes: Bool
     ) -> ProviderScenarioSwitchRequest {
         ProviderScenarioSwitchRequest(
             v: ProviderScenarioSwitchCodec.version,
@@ -66,7 +69,8 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
             underlayInterfacesJSON: underlayInterfacesJSON,
             underlayDefaultName: underlayDefaultName,
             underlayDefaultIndex: underlayDefaultIndex,
-            systemDNSJSON: systemDNSJSON
+            systemDNSJSON: systemDNSJSON,
+            refreshLineRuntimes: refreshLineRuntimes
         )
     }
 
@@ -85,7 +89,8 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
             underlayInterfacesJSON: nil,
             underlayDefaultName: nil,
             underlayDefaultIndex: nil,
-            systemDNSJSON: nil
+            systemDNSJSON: nil,
+            refreshLineRuntimes: nil
         )
     }
 
@@ -105,7 +110,8 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
             underlayInterfacesJSON: nil,
             underlayDefaultName: nil,
             underlayDefaultIndex: nil,
-            systemDNSJSON: nil
+            systemDNSJSON: nil,
+            refreshLineRuntimes: nil
         )
     }
 }
@@ -245,7 +251,7 @@ enum ProviderScenarioSwitchCodec {
                 "target_transaction_id", "profile_json",
                 "connection_report_json", "underlay_interfaces",
                 "underlay_default_name", "underlay_default_index",
-                "system_dns",
+                "system_dns", "refresh_line_runtimes",
             ])
         } else if command == .reconcileSwitch {
             allowedKeys.insert("target_transaction_id")
@@ -284,7 +290,8 @@ enum ProviderScenarioSwitchCodec {
                 defaultIndex > 0,
                 defaultIndex <= Int(Int32.max),
                 let systemDNSJSON = request.systemDNSJSON,
-                isJSONArray(systemDNSJSON)
+                isJSONArray(systemDNSJSON),
+                request.refreshLineRuntimes != nil
             else {
                 throw ProviderScenarioSwitchCodecError.malformed
             }

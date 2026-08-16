@@ -10,6 +10,28 @@ enum ApplicationLaunchPreparation {
 
 /// XDial 的平台安装入口。它只复制并验证 app bundle，不注册网络配置，也不启动数据面。
 enum ApplicationRelocator {
+    private final class LaunchResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var application: NSRunningApplication?
+        private var error: Error?
+
+        func record(
+            application: NSRunningApplication?,
+            error: Error?
+        ) {
+            lock.lock()
+            self.application = application
+            self.error = error
+            lock.unlock()
+        }
+
+        func snapshot() -> (NSRunningApplication?, Error?) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (application, error)
+        }
+    }
+
     private static let destinationURL = URL(
         fileURLWithPath: "/Applications/XDial.app",
         isDirectory: true
@@ -216,12 +238,22 @@ enum ApplicationRelocator {
     }
 
     private static func relaunchInstalledApplication() throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-n", destinationURL.path]
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
+        let configuration = NSWorkspace.OpenConfiguration()
+        ApplicationLaunchPolicy.configure(configuration)
+        let completion = DispatchSemaphore(value: 0)
+        let result = LaunchResult()
+        NSWorkspace.shared.openApplication(
+            at: destinationURL,
+            configuration: configuration
+        ) { application, error in
+            result.record(application: application, error: error)
+            completion.signal()
+        }
+        guard completion.wait(timeout: .now() + 30) == .success else {
+            throw InstallationError.relaunchFailed
+        }
+        let (application, error) = result.snapshot()
+        guard application != nil, error == nil else {
             throw InstallationError.relaunchFailed
         }
     }

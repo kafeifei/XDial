@@ -228,6 +228,34 @@ func TestSetNetworkInterfacesRejectsMalformedSnapshot(t *testing.T) {
 	}
 }
 
+func TestLineRuntimeUnderlayForceRefreshNotifiesUnchangedNetworkEpoch(
+	t *testing.T,
+) {
+	source := &xdPlatformInterface{}
+	if err := source.setNetworkInterfaces([]platformNetworkInterfaceSnapshot{{
+		Name: "en0", Index: 7, Type: "wifi",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	source.setDefaultInterface("en0", 7)
+	runtime := source.lineRuntimeCapability()
+	monitor := &platformInterfaceMonitor{platform: runtime}
+	runtime.monitor = monitor
+	notifications := 0
+	monitor.RegisterCallback(func(*control.Interface, int) {
+		notifications++
+	})
+
+	runtime.syncLineRuntimeUnderlayFrom(source, false)
+	if notifications != 0 {
+		t.Fatalf("unchanged ordinary sync notified %d times", notifications)
+	}
+	runtime.syncLineRuntimeUnderlayFrom(source, true)
+	if notifications != 1 {
+		t.Fatalf("forced network epoch refresh notified %d times, want 1", notifications)
+	}
+}
+
 func assertInterfaceUpdate(t *testing.T, updates <-chan *control.Interface, name string, index int) {
 	t.Helper()
 	value := <-updates

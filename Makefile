@@ -25,8 +25,12 @@ PATCHED_GO_INPUTS_CURRENT := $(shell bash $(PATCHED_GO_SCRIPT) --check >/dev/nul
 PATCHED_GO_ENV = GOWORK='$(PATCHED_WORKFILE)' GOFLAGS=
 SING_BOX_TEST_BINARY := $(abspath $(BUILD_DIR)/tools/sing-box)
 MACOS_ICON_GENERATOR := scripts/generate-macos-app-icon/main.swift
+MACOS_ICON_GENERATOR_BINARY := $(BUILD_DIR)/generate-app-icon
 MACOS_ICON_SOURCE := macos/Sources/XDial/AppIcon.swift
 MACOS_BRAND_PALETTE_SOURCE := macos/Sources/XDial/XDialBrandPalette.swift
+MACOS_APP_LAUNCH_POLICY_SOURCE := macos/Sources/XDial/ApplicationLaunchPolicy.swift
+MACOS_APP_LAUNCHER_SOURCE := tools/launch-macos-app.swift
+MACOS_APP_LAUNCHER := $(BUILD_DIR)/launch-macos-app
 # SMAppService 要求签名身份跨构建稳定：ad-hoc 签名每次构建身份都变，
 # 系统会把重编后的 daemon 当新程序、要求重新批准。默认用开发者证书
 # （partial match，本机唯一），无证书环境可 SIGN_IDENTITY=- 回落 ad-hoc。
@@ -35,14 +39,30 @@ MACOS_TEST_XCODEBUILD_FLAGS ?=
 
 .PHONY: all cli app ci-macos-build release restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
 
-macos/AppIcon.icns: $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
-	@rm -rf "$(BUILD_DIR)/AppIcon.iconset" "$(BUILD_DIR)/generate-app-icon"
-	@mkdir -p "$(BUILD_DIR)/AppIcon.iconset"
+$(MACOS_ICON_GENERATOR_BINARY): $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
+	@mkdir -p "$(BUILD_DIR)"
 	xcrun swiftc $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR) \
-		-o "$(BUILD_DIR)/generate-app-icon"
-	"$(BUILD_DIR)/generate-app-icon" "$(BUILD_DIR)/AppIcon.iconset"
+		-o "$(MACOS_ICON_GENERATOR_BINARY)"
+
+macos/AppIcon.icns: $(MACOS_ICON_GENERATOR_BINARY)
+	@rm -rf "$(BUILD_DIR)/AppIcon.iconset"
+	@mkdir -p "$(BUILD_DIR)/AppIcon.iconset"
+	"$(MACOS_ICON_GENERATOR_BINARY)" "$(BUILD_DIR)/AppIcon.iconset"
 	iconutil -c icns "$(BUILD_DIR)/AppIcon.iconset" \
 		-o macos/AppIcon.icns
+
+macos/SettingsDockIcon.icns: $(MACOS_ICON_GENERATOR_BINARY)
+	@rm -rf "$(BUILD_DIR)/SettingsDockIcon.iconset"
+	@mkdir -p "$(BUILD_DIR)/SettingsDockIcon.iconset"
+	"$(MACOS_ICON_GENERATOR_BINARY)" \
+		"$(BUILD_DIR)/SettingsDockIcon.iconset" --dock
+	iconutil -c icns "$(BUILD_DIR)/SettingsDockIcon.iconset" \
+		-o macos/SettingsDockIcon.icns
+
+$(MACOS_APP_LAUNCHER): $(MACOS_APP_LAUNCH_POLICY_SOURCE) $(MACOS_APP_LAUNCHER_SOURCE)
+	@mkdir -p "$(BUILD_DIR)"
+	xcrun swiftc -O $(MACOS_APP_LAUNCH_POLICY_SOURCE) $(MACOS_APP_LAUNCHER_SOURCE) \
+		-o "$(MACOS_APP_LAUNCHER)"
 
 # 组装 .app bundle。$(1)=swift 产物目录(debug/release) $(2)=bundle 路径
 define assemble_app
@@ -113,6 +133,22 @@ test: public-content-gate $(PATCHED_WORKFILE) test-patched-tailscale test-patche
 test-macos-transaction:
 	@! rg -n 'probeNetwork|127\.0\.0\.1:9090|test-out' macos/Sources/XDial
 	@! rg -n 'willSleepNotification|screensDidSleepNotification|systemIsSleeping|sawUnavailablePath' macos/Sources/XDial macos/Shared
+	@test "$$(rg -l 'setActivationPolicy\(' macos/Sources/XDial macos/SettingsDockUI --glob '*.swift' | sort)" = "$$(printf '%s\n' macos/SettingsDockUI/main.swift macos/Sources/XDial/XDialApp.swift)"
+	@! rg -n 'NSApp\.setActivationPolicy\(\.regular\)' macos/Sources/XDial/XDialApp.swift
+	@rg -q 'NSApp\.setActivationPolicy\(\.accessory\)' macos/Sources/XDial/XDialApp.swift
+	@rg -q 'setActivationPolicy\(\.regular\)' macos/SettingsDockUI/main.swift
+	@rg -q 'SettingsDockProxyCoordinator\.shared\.present' macos/Sources/XDial/XDialApp.swift
+	@rg -q 'SettingsDockProxyCoordinator\.shared\.dismiss' macos/Sources/XDial/XDialApp.swift
+	@! rg -n 'NSApp\.hide\(' macos/Sources/XDial/XDialApp.swift
+	@rg -q 'NSApp\.deactivate\(\)' macos/Sources/XDial/XDialApp.swift
+	@! rg -n '/usr/bin/open|open -n' scripts/restart-macos-app.sh macos/Sources/XDial/ApplicationRelocator.swift
+	@rg -q 'ApplicationLaunchPolicy\.configure' tools/launch-macos-app.swift macos/Sources/XDial/ApplicationRelocator.swift macos/Sources/XDial/SettingsDockProxyCoordinator.swift
+	@rg -q 'addsToRecentItems = false' macos/Sources/XDial/ApplicationLaunchPolicy.swift
+	@! rg -n '@State[^\n]*dismissedScenarioSwitchFailure' macos/Sources/XDial/MainPopover.swift
+	@rg -q 'state\.dismissScenarioSwitchFailure\(' macos/Sources/XDial/MainPopover.swift
+	@rg -q 'MenuBarErrorPresentationPolicy\.hasError\(' macos/Sources/XDial/AppState.swift
+	@test "$$(plutil -extract LSUIElement raw macos/Info.plist)" = true
+	@rg -q '^[[:space:]]+LSUIElement: true$$' macos/project.yml
 	@! rg -n 'URLSession|ip-api\.com' macos/Sources/XDial/NetworkInfo.swift
 	@! rg -U -n '\.on(Appear|Disappear)[[:space:]]*\{[^}]{0,500}(probeNetwork|prepareTailscale|closeTailscaleSetup|URLSession|127\.0\.0\.1:9090)' macos/Sources/XDial/SettingsView.swift
 	@test "$$(rg -U -o 'AXUIElementCopyAttributeValue\([^)]*kAXValueAttribute' macos/Sources/XDial/DebugServer.swift | wc -l | tr -d ' ')" -eq 1
@@ -138,7 +174,7 @@ cli: $(PATCHED_WORKFILE)
 	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS)" -o $(BUILD_DIR)/xdial ./cmd/xdial/
 
 # debug 构建(含 DebugServer,仅本地开发用,不得分发)
-app: cli libbox-macos-xcframework macos/AppIcon.icns
+app: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER)
 	cd macos && xcodegen generate
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Debug \
 		-destination 'platform=macOS,arch=arm64' \
@@ -150,12 +186,17 @@ app: cli libbox-macos-xcframework macos/AppIcon.icns
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
 		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		build
+	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Info.plist')" = true
+	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = false
+	@test "$$(plutil -extract CFBundleDisplayName raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = XDial
+	@test -f '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Helpers/XDial Settings UI.app/Contents/Resources/SettingsDockIcon.icns'
 	rm -rf "$(APP_BUNDLE)"
 	ditto "$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app" "$(APP_BUNDLE)"
+	@test "$$(plutil -extract LSUIElement raw '$(APP_BUNDLE)/Contents/Info.plist')" = true
 
 # GitHub 托管 runner 不持有 System Extension 的签名证书和 provisioning profile。
 # 这里分别编译 Debug / Release 的扩展与宿主，只验证源码和链接；产物没有签名、不可分发。
-ci-macos-build: cli libbox-macos-xcframework macos/AppIcon.icns
+ci-macos-build: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns
 	cd macos && xcodegen generate
 	@set -e; for configuration in Debug Release; do \
 		xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy \
@@ -164,11 +205,12 @@ ci-macos-build: cli libbox-macos-xcframework macos/AppIcon.icns
 		xcodebuild -project macos/XDial.xcodeproj -scheme XDial \
 			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
 			-derivedDataPath $(BUILD_DIR)/macos-xcode-ci CODE_SIGNING_ALLOWED=NO build; \
+		test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode-ci/Build/Products/'"$$configuration"'/XDial.app/Contents/Info.plist')" = true; \
 	done
 
 # release 构建:swift -c release 使 #if DEBUG 的 DebugServer 整体排除,
 # go -trimpath -s -w 去符号并注入版本。分发一律用这个产物。
-release: libbox-macos-xcframework macos/AppIcon.icns
+release: libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns
 	@mkdir -p $(BUILD_DIR)
 	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -trimpath -ldflags "$(GO_LDFLAGS) -s -w" -o $(BUILD_DIR)/xdial ./cmd/xdial/
 	cd macos && xcodegen generate
@@ -180,8 +222,10 @@ release: libbox-macos-xcframework macos/AppIcon.icns
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode-release \
 		build
+	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode-release/Build/Products/Release/XDial.app/Contents/Info.plist')" = true
 	rm -rf "$(RELEASE_BUNDLE)"
 	ditto "$(BUILD_DIR)/macos-xcode-release/Build/Products/Release/XDial.app" "$(RELEASE_BUNDLE)"
+	@test "$$(plutil -extract LSUIElement raw '$(RELEASE_BUNDLE)/Contents/Info.plist')" = true
 	@echo "release bundle: $(RELEASE_BUNDLE) (version $(PLIST_VERSION))"
 
 # 一键重启：先完整构建并签名新版本，成功后才让旧实例完成网络回滚并退出。
@@ -191,7 +235,8 @@ release: libbox-macos-xcframework macos/AppIcon.icns
 # 构建失败不得影响正在运行的旧实例。
 restart:
 	@$(MAKE) app DEBUG_BUILD_VERSION=$(DEBUG_BUILD_VERSION)
-	@bash scripts/restart-macos-app.sh "$(abspath $(APP_BUNDLE))"
+	@bash scripts/restart-macos-app.sh "$(abspath $(APP_BUNDLE))" \
+		"$(abspath $(MACOS_APP_LAUNCHER))"
 
 inspector:
 	@mkdir -p $(BUILD_DIR)

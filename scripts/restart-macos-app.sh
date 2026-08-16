@@ -3,6 +3,7 @@
 set -euo pipefail
 
 source_bundle="${1:-}"
+application_launcher="${2:-}"
 destination_bundle="/Applications/XDial.app"
 health_url="http://127.0.0.1:19876/health"
 state_url="http://127.0.0.1:19876/state"
@@ -59,6 +60,9 @@ print("|".join(str(value) for value in values))
 [[ -x "${source_bundle}/Contents/MacOS/XDial" ]] \
 	|| fail "source app executable is missing"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+[[ -n "${application_launcher}" ]] || fail "missing application launcher"
+[[ -x "${application_launcher}" ]] \
+	|| fail "application launcher is not executable"
 
 # Swift 的 JSONEncoder 使用 2001-01-01 作为 Date 基准。向前留一秒只用于
 # 容纳序列化到整数秒时的取整；transaction ID 是有旧实例时的首选边界。
@@ -112,11 +116,12 @@ fi
 #
 # 仅安装：该进程不创建 AppState、Debug Server 或网络连接。
 if ! "${source_bundle}/Contents/MacOS/XDial" --install-only; then
-	[[ -d "${destination_bundle}" ]] && open -n "${destination_bundle}"
+	[[ -d "${destination_bundle}" ]] \
+		&& "${application_launcher}" "${destination_bundle}"
 	fail "atomic app replacement failed"
 fi
 
-open -n "${destination_bundle}"
+"${application_launcher}" "${destination_bundle}"
 
 new_pid=""
 for _ in {1..60}; do

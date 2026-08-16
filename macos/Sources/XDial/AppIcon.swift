@@ -28,7 +28,7 @@ enum AppIcon {
         return image
     }
 
-    /// 设置/安装窗口打开时 XDial 才临时出现在 Dock，这个
+    /// 设置窗口打开时 XDial 才临时出现在 Dock，这个
     /// 运行时图标在同一月背指纹右下角叠加齿轮。
     static func dock(size: CGFloat, connected: Bool = false) -> NSImage {
         let image = NSImage(size: NSSize(width: size, height: size))

@@ -3,11 +3,13 @@ import Foundation
 
 guard (2...3).contains(CommandLine.arguments.count) else {
     fputs(
-        "usage: generate-app-icon <AppIcon.iconset> [dock-preview.png]\n",
+        "usage: generate-app-icon <AppIcon.iconset> [dock-preview.png|--dock]\n",
         stderr
     )
     exit(2)
 }
+
+let rendersDockIcon = CommandLine.arguments.dropFirst(2).contains("--dock")
 
 let outputDirectory = URL(
     fileURLWithPath: CommandLine.arguments[1],
@@ -76,13 +78,15 @@ func writePNG(
 for representation in representations {
     let pixels = representation.pixels
     try writePNG(
-        AppIcon.primary(size: CGFloat(pixels), connected: true),
+        rendersDockIcon
+            ? AppIcon.dock(size: CGFloat(pixels), connected: true)
+            : AppIcon.primary(size: CGFloat(pixels), connected: true),
         pixels: pixels,
         to: outputDirectory.appendingPathComponent(representation.name)
     )
 }
 
-if CommandLine.arguments.count == 3 {
+if CommandLine.arguments.count == 3 && !rendersDockIcon {
     let previewSize = 512
     try writePNG(
         AppIcon.dock(size: CGFloat(previewSize), connected: true),

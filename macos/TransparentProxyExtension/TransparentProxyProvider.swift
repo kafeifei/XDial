@@ -1209,6 +1209,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 let prepared = try runtime.prepareSwitch(
                     profileJSON: profileJSON,
                     networkSnapshot: networkSnapshot,
+                    refreshLineRuntimes:
+                        request.refreshLineRuntimes == true,
                     sourceSession: sourceSession,
                     reporter: candidateReporter,
                     cancellation: operation.cancellation

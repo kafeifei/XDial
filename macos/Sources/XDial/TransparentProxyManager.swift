@@ -36,7 +36,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     var reportHandler: ReportHandler?
     var scenarioSwitchHandler: ScenarioSwitchHandler?
     var activationStatusHandler: ActivationStatusHandler?
-    var underlayChangeHandler: ((String) -> Void)?
+    var underlayChangeHandler: ((String, Bool) -> Void)?
     var activeTransactionID: String? {
         TransparentProxyRuntimeGate.connectionProofTransactionID(
             currentTransactionID: currentTransactionID,
@@ -251,6 +251,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     /// never written into `ConnectionReportJournal`.
     func switchScenario(
         profileJSON: String,
+        refreshLineRuntimes: Bool,
         completion: @escaping (Result<ConnectionReport, Error>) -> Void
     ) {
         guard activeScenarioSwitch == nil else {
@@ -312,6 +313,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 plan.configurationFingerprint,
             profileJSON: profileJSON,
             targetReportJSON: targetReportJSON,
+            refreshLineRuntimes: refreshLineRuntimes,
             candidateReport: targetReport,
             completionGate: HostCompletionGate(completion),
             cancellationRequested: false,
@@ -394,100 +396,6 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
     }
 
-    /// Rebuild the current committed Scenario with the settled host Underlay.
-    /// This is D36 recovery: it replaces only the runtime Underlay snapshot and
-    /// must never be represented as a staged Scenario Switch.
-    @discardableResult
-    func rebuildCurrentConnectionForUnderlayChange(
-        expectedFingerprint: String
-    ) -> Bool {
-        guard
-            let underlay = latestCapturedUnderlay,
-            underlay.epochFingerprint == expectedFingerprint,
-            let profileJSON = requestedProfileJSON,
-            let manager,
-            let sourceReport = ConnectionReportJournal.read(),
-            sourceReport.transactionID == currentTransactionID,
-            sourceReport.state == .committed,
-            !sourceReport.systemTakeoverRemoved,
-            startIntentID != nil,
-            manager.connection.status == .connected,
-            activeScenarioSwitch == nil,
-            !automaticReconnectInProgress,
-            let attempt = automaticReconnectAttemptBudget.nextAttempt
-        else {
-            return false
-        }
-
-        let transactionID: String
-        do {
-            transactionID = try beginTransaction(
-                profileJSON: profileJSON
-            )
-        } catch {
-            appLog(
-                "Transparent Proxy Underlay rebuild planning failed: "
-                    + error.localizedDescription
-            )
-            return false
-        }
-        guard automaticReconnectAttemptBudget.recordStarted(attempt) else {
-            return false
-        }
-
-        cancelStableConnectionReset()
-        stopUnderlayMonitoring()
-        cancelAutomaticReconnectRetry(resetAttempts: false)
-        let intentID = UUID()
-        startIntentID = intentID
-        automaticReconnectInProgress = true
-        automaticReconnectTrigger = .underlayChange
-        automaticReconnectTransactionID = transactionID
-        connectedSessionTransactionID = nil
-        updateReport(transactionID: transactionID) {
-            $0.updateTask(id: "underlay:system", state: .ready)
-            $0.setState(.preparing)
-        }
-
-        let incidentID = ReconnectIncidentJournal.begin(
-            at: Date(),
-            trigger: .underlayChange,
-            report: sourceReport,
-            reasonCode: "underlay-changed",
-            reasonMessage: "Host Underlay changed"
-        )
-        activeReconnectIncidentID = incidentID.isEmpty
-            ? nil
-            : incidentID
-        if let activeReconnectIncidentID {
-            ReconnectIncidentJournal.append(
-                incidentID: activeReconnectIncidentID,
-                type: "retry-started",
-                attempt: attempt,
-                transactionID: transactionID
-            )
-        }
-
-        let changeKinds = activeUnderlay?
-            .differenceKinds(comparedTo: underlay)
-            .joined(separator: ",") ?? "unknown"
-        appLog(
-            "Transparent Proxy underlay changed "
-                + "\(activeUnderlay?.defaultInterface.name ?? "unknown")"
-                + " -> \(underlay.defaultInterface.name) "
-                + "kinds=\(changeKinds); rebuilding current Scenario"
-        )
-        publishRuntimeStatus("reconnecting", error: nil)
-        startConnection(
-            manager,
-            profileJSON: profileJSON,
-            underlay: underlay,
-            intentID: intentID,
-            debugFailureStage: nil
-        )
-        return true
-    }
-
     private func continueScenarioSwitchAfterUnderlayCapture(
         requestID: String,
         result: Result<HostUnderlaySnapshot, Error>
@@ -555,7 +463,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         if liveSourceReport.scenario.id == active.targetScenarioID,
            liveSourceReport.configurationFingerprint ==
             active.targetConfigurationFingerprint,
-           activeUnderlay?.isEquivalent(to: underlay) == true {
+           activeUnderlay?.isEquivalent(to: underlay) == true,
+           !active.refreshLineRuntimes {
             activeScenarioSwitch = nil
             recordScenarioSwitch(
                 active,
@@ -583,7 +492,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             underlayInterfacesJSON: underlay.interfacesJSON,
             underlayDefaultName: underlay.defaultInterface.name,
             underlayDefaultIndex: underlay.defaultInterface.index,
-            systemDNSJSON: underlay.systemDNSJSON
+            systemDNSJSON: underlay.systemDNSJSON,
+            refreshLineRuntimes: active.refreshLineRuntimes
         )
         sendScenarioSwitchMessage(request) { [weak self] switchResult in
             self?.finishScenarioSwitch(
@@ -985,6 +895,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 self.publishStatus(for: manager)
             }
         }
+    }
+
+    func noteSystemWake() {
+        underlayMonitor?.noteSystemWake()
     }
 
     private func activateExtension(
@@ -2854,8 +2768,11 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             return
         }
         let monitor = HostUnderlayMonitor(baseline: baseline) {
-            [weak self] snapshot in
-            self?.handleUnderlayChange(snapshot)
+            [weak self] snapshot, connectivityRestored in
+            self?.handleUnderlayChange(
+                snapshot,
+                connectivityRestored: connectivityRestored
+            )
         }
         underlayMonitor = monitor
         monitor.start()
@@ -2867,7 +2784,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     }
 
     private func handleUnderlayChange(
-        _ underlay: HostUnderlaySnapshot
+        _ underlay: HostUnderlaySnapshot,
+        connectivityRestored: Bool
     ) {
         guard
             requestedProfileJSON != nil,
@@ -2877,21 +2795,28 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             return
         }
         latestCapturedUnderlay = underlay
-        let changeKinds = activeUnderlay?
+        var changeKinds = activeUnderlay?
             .differenceKinds(comparedTo: underlay)
-            .joined(separator: ",") ?? "unknown"
+            ?? []
+        if connectivityRestored {
+            changeKinds.append("connectivity-restored")
+        }
         appLog(
             "Transparent Proxy underlay changed "
                 + "\(activeUnderlay?.defaultInterface.name ?? "unknown")"
                 + " -> \(underlay.defaultInterface.name) "
-                + "kinds=\(changeKinds); scheduling network epoch"
+                + "kinds=\(changeKinds.joined(separator: ",")); "
+                + "scheduling network epoch"
         )
         // HostUnderlayMonitor has already stopped itself at this point. Start
         // a fresh observer from the newest sample so another physical change
         // can supersede a candidate that is still preparing.
         underlayMonitor = nil
         startUnderlayMonitoring(baseline: underlay)
-        underlayChangeHandler?(underlay.epochFingerprint)
+        underlayChangeHandler?(
+            underlay.epochFingerprint,
+            connectivityRestored
+        )
     }
 
     private func handleAutomaticReconnectAfterDisconnect(
@@ -3475,18 +3400,21 @@ private final class HostUnderlayCapture {
 }
 
 /// 只观察 macOS 已经裁决完成的网络事实。它不识别接口类型或产品；
-/// 短暂不可用不等于 Underlay 已变化。只有恢复后的接口 / DNS 事实与会话
-/// 基线确实不同，才交给宿主做完整数据面重建。
+/// 真正的路径恢复是新的 network epoch，即使接口 / DNS 快照未变也要交给
+/// 宿主刷新运行时。唯一例外是紧邻系统唤醒且快照完全等价的电源生命周期
+/// 抖动；该情况继续由已提交事务及 Line 局部恢复负责。
 private final class HostUnderlayMonitor {
     private let monitor = NWPathMonitor()
     private let baseline: HostUnderlaySnapshot
-    private let onChange: (HostUnderlaySnapshot) -> Void
+    private let onChange: (HostUnderlaySnapshot, Bool) -> Void
+    private var pathTransition = UnderlayPathTransitionState()
     private var pendingChange: DispatchWorkItem?
+    private var lastSystemWakeAt: Date?
     private var cancelled = false
 
     init(
         baseline: HostUnderlaySnapshot,
-        onChange: @escaping (HostUnderlaySnapshot) -> Void
+        onChange: @escaping (HostUnderlaySnapshot, Bool) -> Void
     ) {
         self.baseline = baseline
         self.onChange = onChange
@@ -3509,34 +3437,57 @@ private final class HostUnderlayMonitor {
         monitor.cancel()
     }
 
-    private func consume(_ path: Network.NWPath) {
+    func noteSystemWake(at date: Date = Date()) {
         guard !cancelled else { return }
-        guard path.status == .satisfied else {
-            pendingChange?.cancel()
-            pendingChange = nil
-            return
-        }
-        guard
-            let result = HostUnderlayCapture.snapshotResult(for: path),
-            case let .success(snapshot) = result
-        else {
-            return
-        }
-        guard !snapshot.isEquivalent(to: baseline) else {
-            pendingChange?.cancel()
-            pendingChange = nil
-            return
-        }
-
-        // 路由、NWPath 与 DNS 通知并非原子到达。短暂防抖后只使用最后一份
-        // 三者一致的快照，避免在切换中间态连续重建。
-        scheduleChange()
+        lastSystemWakeAt = date
     }
 
-    private func scheduleChange() {
+    private func consume(_ path: Network.NWPath) {
+        guard !cancelled else { return }
+        let snapshot: HostUnderlaySnapshot?
+        if path.status == .satisfied,
+            let result = HostUnderlayCapture.snapshotResult(for: path),
+            case let .success(value) = result
+        {
+            snapshot = value
+        } else {
+            snapshot = nil
+        }
+        let action = pathTransition.observe(
+            isSatisfied: path.status == .satisfied,
+            hasCompleteSnapshot: snapshot != nil,
+            snapshotMatchesBaseline:
+                snapshot?.isEquivalent(to: baseline) == true
+        )
+        switch action {
+        case .none:
+            return
+        case .cancelPending:
+            pendingChange?.cancel()
+            pendingChange = nil
+            return
+        case let .scheduleRefresh(allowEquivalentSnapshot):
+            scheduleChange(
+                allowEquivalentSnapshot: allowEquivalentSnapshot
+            )
+        }
+    }
+
+    private func scheduleChange(
+        allowEquivalentSnapshot: Bool
+    ) {
         pendingChange?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.cancelled else { return }
+            guard self.monitor.currentPath.status == .satisfied else {
+                _ = self.pathTransition.observe(
+                    isSatisfied: false,
+                    hasCompleteSnapshot: false,
+                    snapshotMatchesBaseline: false
+                )
+                self.pendingChange = nil
+                return
+            }
             guard
                 let result = HostUnderlayCapture.snapshotResult(
                     for: self.monitor.currentPath
@@ -3545,17 +3496,39 @@ private final class HostUnderlayMonitor {
             else {
                 // DNS、默认路由和 NWPath 仍处于中间态；继续等待同一轮变化
                 // 收敛，不拿旧快照启动，也不回落到任意接口。
-                self.scheduleChange()
+                self.scheduleChange(
+                    allowEquivalentSnapshot: allowEquivalentSnapshot
+                )
                 return
             }
-            guard !snapshot.isEquivalent(to: self.baseline) else {
+            let snapshotMatchesBaseline = snapshot.isEquivalent(
+                to: self.baseline
+            )
+            let secondsSinceSystemWake = self.lastSystemWakeAt.map {
+                Date().timeIntervalSince($0)
+            }
+            if SystemWakeUnderlayPolicy.suppressesEquivalentRestoration(
+                connectivityRestored: allowEquivalentSnapshot,
+                snapshotMatchesBaseline: snapshotMatchesBaseline,
+                secondsSinceSystemWake: secondsSinceSystemWake
+            ) {
+                self.lastSystemWakeAt = nil
+                self.pendingChange = nil
+                appLog(
+                    "Transparent Proxy equivalent Underlay restoration "
+                        + "suppressed after system wake; committed runtime "
+                        + "remains authoritative"
+                )
+                return
+            }
+            guard allowEquivalentSnapshot || !snapshotMatchesBaseline else {
                 self.pendingChange = nil
                 return
             }
             self.cancelled = true
             self.monitor.pathUpdateHandler = nil
             self.monitor.cancel()
-            self.onChange(snapshot)
+            self.onChange(snapshot, allowEquivalentSnapshot)
         }
         pendingChange = work
         DispatchQueue.main.asyncAfter(
@@ -3680,6 +3653,7 @@ private struct HostScenarioSwitch {
     let targetConfigurationFingerprint: String
     let profileJSON: String
     let targetReportJSON: String
+    let refreshLineRuntimes: Bool
     var candidateReport: ConnectionReport
     let completionGate: HostCompletionGate<ConnectionReport>
     var cancellationRequested: Bool

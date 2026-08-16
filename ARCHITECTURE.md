@@ -394,7 +394,11 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   不得为单条 outbound 生成 `bind_interface`。只有当前 XDial 会话自己登记的接口可以排除。
 - **Underlay 生命周期**：宿主 App 在会话成功后继续观察系统路径。路径曾不可用，或默认
   接口、候选接口集合、系统 DNS 快照发生变化时，等待路由 / `NWPath` / DNS 通知收敛后，
-  用同一份用户 Profile 触发一次完整数据面重连。它不得热改某条 outbound，也不得按接口
+  用同一份用户 Profile 触发一次完整数据面重连。系统休眠会制造一次假的
+  `unsatisfied → satisfied`；若该恢复紧邻 `didWake`、Provider 仍为 connected，且收敛后的
+  Underlay 快照与已提交基线完全等价，则它只是电源生命周期边界，不得创建同 Scenario
+  候选事务，现有事务及 Line 局部恢复继续负责。快照真实变化，或唤醒合并窗口之外的真实
+  断网恢复，仍必须进入 network epoch。它不得热改某条 outbound，也不得按接口
   名、类型或 VPN 产品决定策略。重连只替换运行时 Underlay 快照，不修改 Line / RuleSet /
   Scenario。D39 中用户显式配置的 SSID 触发器可以选择另一 Scenario，但它必须走完整
   场景切换事务，且不能选择、过滤或改写 Underlay。系统路径收敛不等于下层数据面已经恢复真实出口；仅当本次失败被结构化归因为
@@ -687,6 +691,10 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   Scenario, Underlay fingerprint)` 启动一次 Switch；不得先因 Underlay 重建一次，再因
   SSID 变化重建第二次。快速 A→B→C 只允许 C 成为候选。自动触发的瞬态失败可以在同一
   epoch 和预算内重试；用户手动切换失败不自动循环，凭据/证书/配置等终止错误也不重试。
+- **休眠不是网络切换**：紧邻系统 `didWake` 的等价 Underlay 恢复不得仅凭
+  `NWPath` 的不可用/恢复边沿创建同 Scenario Switch。只要 Provider 仍 connected，当前
+  generation 保持权威，AnyConnect 等 Line 按 D35 的局部恢复语义自行处理休眠期间失效的
+  会话；局部预算耗尽后才升级为完整断线恢复。实际 Underlay 指纹变化不受此规则抑制。
 - **验收门禁**：至少证明：(a) 两个 Scenario 共享同一 AnyConnect Line 时切换不产生第二
   次认证或会话；(b) 候选失败后旧 Scenario 的 DNS、TCP、UDP 与真实出口仍可用；(c)
   配置身份变化不会误复用；(d) A→B→C、取消、显式断开和迟到回调均遵守 latest-wins；

@@ -44,7 +44,9 @@ final class EmbeddedSingBoxRuntime {
         /// generation. `nil` means the generation does not use AnyConnect.
         /// The value is opaque and must never leave Provider memory.
         let anyConnectRuntimeIdentity: String?
-        let containsTailscale: Bool
+        /// Opaque identity of the process-owned Tailscale capability borrowed
+        /// by this generation. `nil` means the generation has no Tailscale Line.
+        let tailscaleRuntimeIdentity: String?
     }
 
     struct PreparedSwitch {
@@ -489,6 +491,7 @@ final class EmbeddedSingBoxRuntime {
         let anyConnectRuntimeIdentity = try self.anyConnectRuntimeIdentity(
             in: envelope
         )
+        let tailscaleRuntime = try self.tailscaleRuntime(in: envelope)
         callback.attach(
             engine: instance,
             taskID: anyConnectTaskID ?? "data-plane:sing-box",
@@ -521,13 +524,35 @@ final class EmbeddedSingBoxRuntime {
                 if let resolveError {
                     throw resolveError
                 }
-                try instance.startResolved(
-                    withInsecureAndRuntimeIdentity: anyConnect.server,
-                    dialAddress: dialAddress,
-                    username: anyConnect.username,
-                    password: anyConnect.password,
-                    allowInsecure: anyConnect.allowInsecure,
-                    runtimeIdentity: anyConnectRuntimeIdentity,
+                if let tailscaleRuntime {
+                    try instance.startResolved(
+                        withLineRuntimes: anyConnect.server,
+                        dialAddress: dialAddress,
+                        username: anyConnect.username,
+                        password: anyConnect.password,
+                        allowInsecure: anyConnect.allowInsecure,
+                        anyConnectRuntimeIdentity:
+                            anyConnectRuntimeIdentity,
+                        tailscaleLineID: tailscaleRuntime.lineID,
+                        tailscaleRuntimeIdentity:
+                            tailscaleRuntime.identity,
+                        configJSON: envelope.configJSON
+                    )
+                } else {
+                    try instance.startResolved(
+                        withInsecureAndRuntimeIdentity: anyConnect.server,
+                        dialAddress: dialAddress,
+                        username: anyConnect.username,
+                        password: anyConnect.password,
+                        allowInsecure: anyConnect.allowInsecure,
+                        runtimeIdentity: anyConnectRuntimeIdentity,
+                        configJSON: envelope.configJSON
+                    )
+                }
+            } else if let tailscaleRuntime {
+                try instance.startStandalone(
+                    withTailscaleLineID: tailscaleRuntime.lineID,
+                    runtimeIdentity: tailscaleRuntime.identity,
                     configJSON: envelope.configJSON
                 )
             } else {
@@ -708,7 +733,8 @@ final class EmbeddedSingBoxRuntime {
                     preparedTailscaleDNS?.recordCount ?? 0,
                 anyConnectRuntimeIdentity:
                     anyConnectRuntimeIdentity,
-                containsTailscale: envelope.tailscale != nil
+                tailscaleRuntimeIdentity:
+                    tailscaleRuntime?.identity
             )
         } catch {
             callback.markStopped()
@@ -723,6 +749,7 @@ final class EmbeddedSingBoxRuntime {
     func prepareSwitch(
         profileJSON: String,
         networkSnapshot: InterfaceSnapshot,
+        refreshLineRuntimes: Bool,
         sourceSession: Session,
         reporter: ConnectionTransactionReporter,
         cancellation: ConnectionCancellation
@@ -867,15 +894,6 @@ final class EmbeddedSingBoxRuntime {
         else {
             throw RuntimeError.invalidSessionEnvelope
         }
-        // Tailscale state cannot be borrowed by two concurrent Boxes. A source
-        // without Tailscale may safely prepare a new candidate endpoint; a
-        // source which already owns the state directory must keep running and
-        // report the capability boundary before Go acquires anything.
-        guard !(sourceSession.containsTailscale &&
-            envelope.tailscale != nil) else {
-            throw RuntimeError.switchTailscaleUnavailable
-        }
-
         try reporter.validate(plan: envelope.plan)
         reporter.setPendingTasks(kind: "rule_set", state: .ready)
         reporter.setTasks(kind: "line", state: .running)
@@ -889,6 +907,7 @@ final class EmbeddedSingBoxRuntime {
         let targetAnyConnectIdentity = try anyConnectRuntimeIdentity(
             in: envelope
         )
+        let targetTailscaleRuntime = try tailscaleRuntime(in: envelope)
         do {
             if let anyConnect = envelope.anyConnect {
                 guard let targetAnyConnectIdentity else {
@@ -900,11 +919,14 @@ final class EmbeddedSingBoxRuntime {
                         throw RuntimeError.switchRequiresAnyConnectRebuild
                     }
                     try instance.prepareSwitch(
-                        withLineID:
-                        envelope.configJSON,
+                        withLineRuntimeIDs: envelope.configJSON,
                         anyConnectLineID: anyConnect.lineID,
                         anyConnectRuntimeIdentity:
                             targetAnyConnectIdentity,
+                        tailscaleLineID:
+                            targetTailscaleRuntime?.lineID ?? "",
+                        tailscaleRuntimeIdentity:
+                            targetTailscaleRuntime?.identity ?? "",
                         networkInterfacesJSON:
                             networkSnapshot.interfacesJSON,
                         defaultInterfaceName:
@@ -922,7 +944,8 @@ final class EmbeddedSingBoxRuntime {
                         throw resolveError
                     }
                     try instance.prepareSwitch(
-                        withAnyConnectAndLineID: anyConnect.server,
+                        withAnyConnectAndLineRuntimeIDs:
+                            anyConnect.server,
                         dialAddress: dialAddress,
                         username: anyConnect.username,
                         password: anyConnect.password,
@@ -930,6 +953,10 @@ final class EmbeddedSingBoxRuntime {
                         anyConnectLineID: anyConnect.lineID,
                         anyConnectRuntimeIdentity:
                             targetAnyConnectIdentity,
+                        tailscaleLineID:
+                            targetTailscaleRuntime?.lineID ?? "",
+                        tailscaleRuntimeIdentity:
+                            targetTailscaleRuntime?.identity ?? "",
                         configJSON: envelope.configJSON,
                         networkInterfacesJSON:
                             networkSnapshot.interfacesJSON,
@@ -941,8 +968,13 @@ final class EmbeddedSingBoxRuntime {
                 }
             } else {
                 try instance.prepareSwitch(
-                    envelope.configJSON,
+                    withLineRuntimeIDs: envelope.configJSON,
+                    anyConnectLineID: "",
                     anyConnectRuntimeIdentity: "",
+                    tailscaleLineID:
+                        targetTailscaleRuntime?.lineID ?? "",
+                    tailscaleRuntimeIdentity:
+                        targetTailscaleRuntime?.identity ?? "",
                     networkInterfacesJSON:
                         networkSnapshot.interfacesJSON,
                     defaultInterfaceName:
@@ -950,6 +982,9 @@ final class EmbeddedSingBoxRuntime {
                     defaultInterfaceIndex:
                         networkSnapshot.defaultInterface.index
                 )
+            }
+            if refreshLineRuntimes {
+                try instance.refreshPreparedSwitchLineRuntimes()
             }
             var reusedLineIDsError: NSError?
             let reusedLineIDsJSON =
@@ -972,7 +1007,8 @@ final class EmbeddedSingBoxRuntime {
                     !lineID.isEmpty &&
                         envelope.plan.tasks.contains(where: { task in
                             task.kind == "line" &&
-                                task.resourceType == "vpn" &&
+                            (task.resourceType == "vpn" ||
+                                task.resourceType == "tailscale") &&
                                 task.resourceID == lineID &&
                                 task.id == "line:\(lineID)"
                         })
@@ -1114,7 +1150,8 @@ final class EmbeddedSingBoxRuntime {
                     preparedTailscaleDNS?.recordCount ?? 0,
                 anyConnectRuntimeIdentity:
                     targetAnyConnectIdentity,
-                containsTailscale: envelope.tailscale != nil
+                tailscaleRuntimeIdentity:
+                    targetTailscaleRuntime?.identity
             )
             engineLock.lock()
             let mayPublish = engine === instance &&
@@ -1245,6 +1282,39 @@ final class EmbeddedSingBoxRuntime {
             throw RuntimeError.invalidSessionEnvelope
         }
         return identity
+    }
+
+    private struct TailscaleRuntimeReference {
+        let lineID: String
+        let identity: String
+    }
+
+    private func tailscaleRuntime(
+        in envelope: SessionEnvelope
+    ) throws -> TailscaleRuntimeReference? {
+        let lineIDs = envelope.plan.tasks.compactMap { task in
+            task.kind == "line" && task.resourceType == "tailscale"
+                ? task.resourceID
+                : nil
+        }
+        if envelope.tailscale == nil {
+            guard lineIDs.isEmpty else {
+                throw RuntimeError.invalidSessionEnvelope
+            }
+            return nil
+        }
+        guard
+            lineIDs.count == 1,
+            let lineID = lineIDs.first,
+            envelope.tailscale?.endpointTag == "tailscale-\(lineID)",
+            let identity = envelope.lineRuntimeIdentities[lineID]
+        else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        return TailscaleRuntimeReference(
+            lineID: lineID,
+            identity: identity
+        )
     }
 
     private func isValidRuleSetBootstrapSession(
@@ -1618,6 +1688,7 @@ final class EmbeddedSingBoxRuntime {
             TailscalePeerDERPPathObservation?
         var finalDERPPathObservation:
             TailscalePeerDERPPathObservation?
+        var runtimeRefreshAttempted = false
         while Date() < deadline {
             try checkCancellation(cancellation)
             var statusError: NSError?
@@ -1642,6 +1713,13 @@ final class EmbeddedSingBoxRuntime {
             lastState = status.backendState
             lastMagicDNSReady =
                 status.backendState == "Running" && status.magicDNSReady
+            if generation == .preparedSwitch,
+                !runtimeRefreshAttempted,
+                status.backendState != "Running"
+            {
+                try instance.refreshPreparedSwitchLineRuntimes()
+                runtimeRefreshAttempted = true
+            }
             let readinessSummary =
                 "controlGeneration=\(status.readiness.control.generation) " +
                 "controlClient=\(status.readiness.control.clientPresent) " +
@@ -1784,6 +1862,12 @@ final class EmbeddedSingBoxRuntime {
                         finalDERPPathObservation = nil
                     }
                     lastProbeError = probeError
+                    if generation == .preparedSwitch,
+                        !runtimeRefreshAttempted
+                    {
+                        try instance.refreshPreparedSwitchLineRuntimes()
+                        runtimeRefreshAttempted = true
+                    }
                 }
             } else {
                 lastObservedExitNode = nil
@@ -2321,7 +2405,6 @@ private enum RuntimeError: Error {
     case switchAlreadyPreparing
     case switchCandidateUnavailable
     case switchRuleSetPreflightUnavailable
-    case switchTailscaleUnavailable
     case switchRequiresAnyConnectRebuild
 }
 
@@ -2382,8 +2465,6 @@ extension RuntimeError: LocalizedError {
             "场景切换候选数据面已经失效"
         case .switchRuleSetPreflightUnavailable:
             "目标场景需要冷获取规则，当前连接暂不支持无断流准备"
-        case .switchTailscaleUnavailable:
-            "目标场景包含 Tailscale，当前运行时无法安全并行准备，原场景保持连接"
         case .switchRequiresAnyConnectRebuild:
             "目标场景需要重建不同的 AnyConnect 线路，原场景保持连接"
         }
@@ -2413,8 +2494,6 @@ extension RuntimeError: LocalizedError {
             "tailscale-peer-handshake-failed"
         case .anyConnectRecoveryTimedOut:
             "anyconnect-line-reconnect-timeout"
-        case .switchTailscaleUnavailable:
-            "switch-tailscale-capability-unavailable"
         case .switchRequiresAnyConnectRebuild:
             "switch-anyconnect-rebuild-required"
         case .switchRuleSetPreflightUnavailable:

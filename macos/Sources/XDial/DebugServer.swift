@@ -157,6 +157,12 @@ final class DebugServer {
             s.scenarioSwitchTargetID ?? ""
         dict["scenarioSwitchInFlight"] =
             s.scenarioSwitchInFlightForDiagnostics
+        dict["menuBarHasError"] = s.hasMenuBarError
+        dict["presentedScenarioSwitchFailureID"] =
+            s.presentedScenarioSwitchFailureProjection?
+                .candidateTransactionID ?? ""
+        dict["dismissedScenarioSwitchFailureID"] =
+            s.dismissedScenarioSwitchFailureIDForDiagnostics ?? ""
         dict["scenarioSwitchSourceTransactionID"] =
             s.scenarioSwitchSourceTransactionIDForDiagnostics
         if let switchProjection = s.engine.scenarioSwitchProjection {
@@ -216,6 +222,8 @@ final class DebugServer {
             "transactionID": net.transactionID ?? "",
             "perLine": perLine,
         ] as [String: Any]
+        dict["applicationLifecycle"] =
+            ApplicationWindowLifecycleController.shared.diagnostics
 
         dict["windows"] = NSApp.windows.map { w -> [String: Any] in
             [

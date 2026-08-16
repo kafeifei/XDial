@@ -223,9 +223,15 @@ private struct MenuBarLabel: View {
             .accessibilityLabel("XDial")
             .onAppear {
                 AppIcon.applyDockState(connected: connected)
+                SettingsDockProxyCoordinator.shared.updateConnected(
+                    connected
+                )
             }
             .onChange(of: connected) { _, isConnected in
                 AppIcon.applyDockState(connected: isConnected)
+                SettingsDockProxyCoordinator.shared.updateConnected(
+                    isConnected
+                )
             }
             .onReceive(
                 NotificationCenter.default.publisher(
@@ -303,11 +309,18 @@ final class ApplicationWindowLifecycleController {
     }
 
     private var observers: [NSObjectProtocol] = []
+    private(set) var lastPolicyTransitionSucceeded = true
 
     private init() {}
 
     func start() {
         guard observers.isEmpty else { return }
+
+        SettingsDockProxyCoordinator.shared.dismiss()
+        SettingsDockProxyCoordinator.shared.activationRequested = {
+            [weak self] in
+            self?.bringSettingsWindowForward()
+        }
 
         observers.append(
             NotificationCenter.default.addObserver(
@@ -335,12 +348,19 @@ final class ApplicationWindowLifecycleController {
 
     func prepareToPresentSettingsWindow() {
         AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
-        NSApp.setActivationPolicy(.regular)
+        SettingsDockProxyCoordinator.shared.present(
+            connected: GoEngine.shared.isConnected
+        )
+        _ = NSApp.setActivationPolicy(.accessory)
+        lastPolicyTransitionSucceeded =
+            NSApp.activationPolicy() == .accessory
     }
 
     func prepareToPresentInstallationWindow() {
         guard !hasOpenWindow(.settings) else { return }
-        NSApp.setActivationPolicy(.accessory)
+        _ = NSApp.setActivationPolicy(.accessory)
+        lastPolicyTransitionSucceeded =
+            NSApp.activationPolicy() == .accessory
     }
 
     private func windowDidBecomeKey(_ notification: Notification) {
@@ -362,7 +382,7 @@ final class ApplicationWindowLifecycleController {
               kind(of: window) != nil else { return }
 
         // willClose 触发时窗口仍被 AppKit 视为可见。等本轮关闭事件完成后再统一
-        // 核对所有受管窗口，避免 activationPolicy 已改变但 Dock 仍保留 active app。
+        // 核对受管窗口，随后恢复 agent policy 并让出 active 状态。
         DispatchQueue.main.async { [weak self] in
             self?.reconcileAfterWindowClose()
         }
@@ -370,13 +390,64 @@ final class ApplicationWindowLifecycleController {
 
     private func reconcileAfterWindowClose() {
         if hasOpenWindow(.settings) {
-            NSApp.setActivationPolicy(.regular)
+            prepareToPresentSettingsWindow()
             return
         }
-
-        NSApp.setActivationPolicy(.accessory)
+        SettingsDockProxyCoordinator.shared.dismiss()
+        _ = NSApp.setActivationPolicy(.accessory)
+        lastPolicyTransitionSucceeded =
+            NSApp.activationPolicy() == .accessory
         if !hasOpenWindow(.installation) {
             NSApp.deactivate()
+        }
+    }
+
+    private func bringSettingsWindowForward() {
+        guard let settingsWindow = NSApp.windows.first(where: { window in
+            kind(of: window) == .settings
+                && (window.isVisible || window.isMiniaturized)
+        }) else { return }
+        if settingsWindow.isMiniaturized {
+            settingsWindow.deminiaturize(nil)
+        }
+        settingsWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    var diagnostics: [String: Any] {
+        [
+            "desiredDockPresentation": hasOpenWindow(.settings)
+                ? "settings" : "hidden",
+            "activationPolicy": Self.activationPolicyName(
+                NSApp.activationPolicy()
+            ),
+            "isActive": NSApp.isActive,
+            "lastPolicyTransitionSucceeded":
+                lastPolicyTransitionSucceeded,
+            "settingsDockProxyDesired":
+                SettingsDockProxyCoordinator.shared.isDesiredVisible,
+            "settingsDockProxyRunning":
+                SettingsDockProxyCoordinator.shared.isRunning,
+            "settingsDockProxyLaunchInFlight":
+                SettingsDockProxyCoordinator.shared.isLaunchInFlight,
+            "isAgent": Bundle.main.object(
+                forInfoDictionaryKey: "LSUIElement"
+            ) as? Bool ?? false,
+        ]
+    }
+
+    private static func activationPolicyName(
+        _ policy: NSApplication.ActivationPolicy
+    ) -> String {
+        switch policy {
+        case .regular:
+            return "regular"
+        case .accessory:
+            return "accessory"
+        case .prohibited:
+            return "prohibited"
+        @unknown default:
+            return "unknown"
         }
     }
 
@@ -418,6 +489,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         _ sender: NSApplication
     ) -> Bool {
         false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        SettingsDockProxyCoordinator.shared.dismiss()
     }
 
     func applicationShouldTerminate(

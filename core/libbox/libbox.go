@@ -142,6 +142,9 @@ type Libbox struct {
 	lineRuntimeGeneration       uint64
 	activeLineRuntimeGeneration uint64
 	activeAnyConnectCapability  *anyConnectRuntimeCapability
+	activeTailscaleCapability   pooledTailscaleRuntime
+	tailscaleRuntimeIdentity    string
+	tailscaleEndpointTag        string
 	preparedSwitch              *preparedBoxSwitch
 	retiredSwitch               *retiredBoxGeneration
 	startPreparing              bool
@@ -161,6 +164,27 @@ type Libbox struct {
 		outboundAddressProbeEndpoint,
 		int,
 	) (string, error)
+	createTailscaleRuntimeCapabilityFunc func(
+		context.Context,
+		*tailscaleRuntimeSpec,
+		*xdPlatformInterface,
+	) (pooledTailscaleRuntime, error)
+}
+
+func (l *Libbox) createTailscaleRuntime(
+	ctx context.Context,
+	spec *tailscaleRuntimeSpec,
+	platform *xdPlatformInterface,
+) (pooledTailscaleRuntime, error) {
+	capabilityPlatform := platform.lineRuntimeCapability()
+	if l.createTailscaleRuntimeCapabilityFunc != nil {
+		return l.createTailscaleRuntimeCapabilityFunc(
+			ctx,
+			spec,
+			capabilityPlatform,
+		)
+	}
+	return createTailscaleRuntimeCapability(ctx, spec, capabilityPlatform)
 }
 
 // preparedBoxSwitch owns a fully started but not yet published immutable
@@ -179,6 +203,10 @@ type preparedBoxSwitch struct {
 	usesAnyConnect            bool
 	anyConnectRuntimeIdentity string
 	anyConnectCapability      *anyConnectRuntimeCapability
+	usesTailscale             bool
+	tailscaleRuntimeIdentity  string
+	tailscaleEndpointTag      string
+	tailscaleCapability       pooledTailscaleRuntime
 	reusedLineIDs             []string
 }
 
@@ -222,8 +250,12 @@ func (l *Libbox) SetTunFD(fd int) {
 func (l *Libbox) SetDefaultInterface(name string, index int) {
 	l.mu.Lock()
 	platform := l.platform
+	tailscalePlatform := activeTailscalePlatform(l.activeTailscaleCapability)
 	l.mu.Unlock()
 	platform.setDefaultInterface(name, index)
+	if tailscalePlatform != nil && tailscalePlatform != platform {
+		tailscalePlatform.setDefaultInterface(name, index)
+	}
 }
 
 // SetUnderlayInterfaceBinding controls whether sockets opened internally by
@@ -260,8 +292,24 @@ func (l *Libbox) SetNetworkInterfaces(interfacesJSON string) error {
 	}
 	l.mu.Lock()
 	platform := l.platform
+	tailscalePlatform := activeTailscalePlatform(l.activeTailscaleCapability)
 	l.mu.Unlock()
-	return platform.setNetworkInterfaces(snapshots)
+	if err := platform.setNetworkInterfaces(snapshots); err != nil {
+		return err
+	}
+	if tailscalePlatform != nil && tailscalePlatform != platform {
+		return tailscalePlatform.setNetworkInterfaces(snapshots)
+	}
+	return nil
+}
+
+func activeTailscalePlatform(
+	capability pooledTailscaleRuntime,
+) *xdPlatformInterface {
+	if capability == nil || !capability.available() {
+		return nil
+	}
+	return capability.platformInterface()
 }
 
 // SetTunOpener 替换 TUN 打开器(默认走 dup(tunFD)+tun.New 的真实路径)。
@@ -746,20 +794,20 @@ func (l *Libbox) Diagnostics() string {
 // inbound 段在 Phase 2 改为 NE 模式),outbounds 里 "vpn" 类型的条目会
 // 路由到本次连接建立的 VPNBridge。
 func (l *Libbox) Start(server, username, password, configJSON string) error {
-	return l.start(server, "", username, password, false, "", configJSON)
+	return l.start(server, "", username, password, false, "", "", "", configJSON)
 }
 
 // StartResolved is the NetworkExtension-safe Start variant. dialAddress must
 // be the numeric IPv4 resolved before the system default route enters the TUN;
 // server is retained separately for TLS certificate validation and HTTP Host.
 func (l *Libbox) StartResolved(server, dialAddress, username, password, configJSON string) error {
-	return l.start(server, dialAddress, username, password, false, "", configJSON)
+	return l.start(server, dialAddress, username, password, false, "", "", "", configJSON)
 }
 
 // StartResolvedWithInsecure 保留数值地址直拨，并把所选线路的显式证书策略带过
 // gomobile 边界。旧入口继续使用 false，保持默认验证证书。
 func (l *Libbox) StartResolvedWithInsecure(server, dialAddress, username, password string, allowInsecure bool, configJSON string) error {
-	return l.start(server, dialAddress, username, password, allowInsecure, "", configJSON)
+	return l.start(server, dialAddress, username, password, allowInsecure, "", "", "", configJSON)
 }
 
 // StartResolvedWithInsecureAndRuntimeIdentity is the switch-capable start
@@ -784,6 +832,36 @@ func (l *Libbox) StartResolvedWithInsecureAndRuntimeIdentity(
 		password,
 		allowInsecure,
 		runtimeIdentity,
+		"",
+		"",
+		configJSON,
+	)
+}
+
+// StartResolvedWithLineRuntimes starts the primary macOS generation with
+// process-owned AnyConnect and Tailscale identities. The Tailscale Line ID is
+// retained only for redacted switch evidence; the pool is keyed by the opaque
+// identity.
+func (l *Libbox) StartResolvedWithLineRuntimes(
+	server,
+	dialAddress,
+	username,
+	password string,
+	allowInsecure bool,
+	anyConnectRuntimeIdentity,
+	tailscaleLineID,
+	tailscaleRuntimeIdentity,
+	configJSON string,
+) error {
+	return l.start(
+		server,
+		dialAddress,
+		username,
+		password,
+		allowInsecure,
+		anyConnectRuntimeIdentity,
+		tailscaleLineID,
+		tailscaleRuntimeIdentity,
 		configJSON,
 	)
 }
@@ -792,7 +870,18 @@ func (l *Libbox) StartResolvedWithInsecureAndRuntimeIdentity(
 // AnyConnect bridge. Direct, proxy, subscription and Tailscale outbounds are
 // fully owned by sing-box and therefore do not need tunnel credentials.
 func (l *Libbox) StartStandalone(configJSON string) error {
-	return l.coldStart(configJSON, nil, "")
+	return l.coldStart(configJSON, nil, "", "", "")
+}
+
+// StartStandaloneWithTailscaleLineID starts a primary generation whose real
+// Tailscale endpoint is owned by the Line runtime pool instead of the consumer
+// Box. This makes the endpoint borrowable by a staged Scenario switch.
+func (l *Libbox) StartStandaloneWithTailscaleLineID(
+	lineID,
+	runtimeIdentity,
+	configJSON string,
+) error {
+	return l.coldStart(configJSON, nil, "", lineID, runtimeIdentity)
 }
 
 func (l *Libbox) start(
@@ -802,6 +891,8 @@ func (l *Libbox) start(
 	password string,
 	allowInsecure bool,
 	runtimeIdentity,
+	tailscaleLineID,
+	tailscaleRuntimeIdentity,
 	configJSON string,
 ) error {
 	anyConnectConfig := startVPNConfig(
@@ -811,7 +902,13 @@ func (l *Libbox) start(
 		password,
 		allowInsecure,
 	)
-	return l.coldStart(configJSON, &anyConnectConfig, runtimeIdentity)
+	return l.coldStart(
+		configJSON,
+		&anyConnectConfig,
+		runtimeIdentity,
+		tailscaleLineID,
+		tailscaleRuntimeIdentity,
+	)
 }
 
 // coldStart prepares every potentially blocking Line and sing-box resource
@@ -822,6 +919,8 @@ func (l *Libbox) coldStart(
 	configJSON string,
 	anyConnectConfig *engine.VPNConfig,
 	runtimeIdentity string,
+	tailscaleLineID string,
+	tailscaleRuntimeIdentity string,
 ) error {
 	l.mu.Lock()
 	failLocked := func(code int, err error) error {
@@ -892,24 +991,64 @@ func (l *Libbox) coldStart(
 	l.anyConnectLine = nil
 	l.anyConnectConfig = engine.VPNConfig{}
 	l.anyConnectRuntimeIdentity = ""
+	l.activeTailscaleCapability = nil
+	l.tailscaleRuntimeIdentity = ""
+	l.tailscaleEndpointTag = ""
 	l.mu.Unlock()
 
 	stopLineRuntimeCapabilities(staleLineRuntimes)
 
 	var (
-		startErr           error
-		startErrorCode     = ErrCodeState
-		stateLocks         []*os.File
-		capability         *anyConnectRuntimeCapability
-		capabilitySnapshot anyConnectRuntimeSnapshot
-		instance           *box.Box
-		routingProbe       *routingProbeTracker
+		startErr            error
+		startErrorCode      = ErrCodeState
+		stateLocks          []*os.File
+		capability          *anyConnectRuntimeCapability
+		capabilitySnapshot  anyConnectRuntimeSnapshot
+		tailscaleSpec       *tailscaleRuntimeSpec
+		tailscaleCapability pooledTailscaleRuntime
+		instance            *box.Box
+		routingProbe        *routingProbeTracker
 	)
 	if err := baseCtx.Err(); err != nil {
 		startErr = err
 	}
-	if startErr == nil {
+	usesTailscale := strings.TrimSpace(tailscaleRuntimeIdentity) != "" ||
+		strings.TrimSpace(tailscaleLineID) != ""
+	if startErr == nil && usesTailscale {
+		tailscaleSpec, startErr = prepareTailscaleRuntimeSpec(
+			configJSON,
+			tailscaleLineID,
+			tailscaleRuntimeIdentity,
+		)
+	}
+	if startErr == nil && tailscaleSpec == nil {
 		stateLocks, startErr = acquireTailscaleStateLocks(configJSON)
+	}
+	if startErr == nil && tailscaleSpec != nil {
+		startErrorCode = ErrCodeNetwork
+		var pooledCapability lineRuntimeCapability
+		pooledCapability, _, startErr = l.lineRuntimes.acquireCandidate(
+			runtimeGeneration,
+			tailscaleSpec.identity,
+			lineRuntimeCapabilityTailscale,
+			true,
+			func() (lineRuntimeCapability, error) {
+				return l.createTailscaleRuntime(
+					baseCtx,
+					tailscaleSpec,
+					platform,
+				)
+			},
+		)
+		if startErr == nil {
+			var ok bool
+			tailscaleCapability, ok = pooledCapability.(pooledTailscaleRuntime)
+			if !ok || !tailscaleCapability.available() {
+				startErr = fmt.Errorf("Tailscale capability is unavailable")
+			} else {
+				configJSON = tailscaleSpec.consumerConfigJSON
+			}
+		}
 	}
 	if startErr == nil && anyConnectConfig != nil {
 		startErrorCode = ErrCodeNetwork
@@ -942,6 +1081,12 @@ func (l *Libbox) coldStart(
 		ctx = service.ContextWith[*anyConnectLineRuntime](
 			ctx,
 			capabilitySnapshot.line,
+		)
+	}
+	if startErr == nil && tailscaleCapability != nil {
+		ctx = service.ContextWith[*tailscaleLineRuntime](
+			ctx,
+			tailscaleCapability.lineHandle(),
 		)
 	}
 	ctx = service.ContextWith[adapter.PlatformInterface](
@@ -988,7 +1133,15 @@ func (l *Libbox) coldStart(
 				runtimeIdentity,
 				capability,
 			))
+	tailscaleCapabilityIsCurrent := tailscaleSpec == nil ||
+		(tailscaleCapability != nil && tailscaleCapability.available() &&
+			l.lineRuntimes.candidateIs(
+				runtimeGeneration,
+				tailscaleSpec.identity,
+				tailscaleCapability,
+			))
 	if startErr == nil && preparationIsCurrent && capabilityIsCurrent &&
+		tailscaleCapabilityIsCurrent &&
 		l.lineRuntimes.generationIsCandidate(runtimeGeneration) {
 		if err := l.lineRuntimes.promoteCandidate(runtimeGeneration); err != nil {
 			startErr = err
@@ -1002,6 +1155,11 @@ func (l *Libbox) coldStart(
 			l.stateLocks = stateLocks
 			l.activeLineRuntimeGeneration = runtimeGeneration
 			l.activeAnyConnectCapability = capability
+			l.activeTailscaleCapability = tailscaleCapability
+			if tailscaleSpec != nil {
+				l.tailscaleRuntimeIdentity = tailscaleSpec.identity
+				l.tailscaleEndpointTag = tailscaleSpec.endpointTag
+			}
 			if capability != nil {
 				l.bridge = capabilitySnapshot.bridge
 				l.session = capabilitySnapshot.session
@@ -1045,6 +1203,11 @@ func (l *Libbox) coldStart(
 	}
 	if startErr == nil && preparationIsCurrent && !capabilityIsCurrent {
 		startErr = fmt.Errorf("AnyConnect capability is unavailable")
+		startErrorCode = ErrCodeNetwork
+	}
+	if startErr == nil && preparationIsCurrent &&
+		!tailscaleCapabilityIsCurrent {
+		startErr = fmt.Errorf("Tailscale capability is unavailable")
 		startErrorCode = ErrCodeNetwork
 	}
 	if startErr == nil && preparationIsCurrent {
@@ -1159,11 +1322,9 @@ func (l *Libbox) installRoutingProbe(instance *box.Box) *routingProbeTracker {
 // only reuse rule.  The caller must use a different ingress listen address for
 // the candidate and must probe it before CommitPreparedSwitch.
 //
-// Tailscale state ownership remains protected by acquireTailscaleStateLocks.
-// Consequently a candidate that would create a second endpoint for the active
-// state directory is rejected during Prepare while the old generation remains
-// untouched.  This is intentional until Tailscale itself has a borrowable
-// runtime capability.
+// Tailscale candidates use the Line-runtime-aware entrypoints below. Legacy
+// callers keep native per-Box endpoint ownership and therefore cannot borrow a
+// running Tailscale endpoint across generations.
 func (l *Libbox) PrepareSwitch(
 	configJSON,
 	anyConnectRuntimeIdentity,
@@ -1176,6 +1337,8 @@ func (l *Libbox) PrepareSwitch(
 		"",
 		anyConnectRuntimeIdentity,
 		nil,
+		"",
+		"",
 		networkInterfacesJSON,
 		defaultInterfaceName,
 		defaultInterfaceIndex,
@@ -1202,6 +1365,8 @@ func (l *Libbox) PrepareSwitchWithLineID(
 		strings.TrimSpace(anyConnectLineID),
 		anyConnectRuntimeIdentity,
 		nil,
+		"",
+		"",
 		networkInterfacesJSON,
 		defaultInterfaceName,
 		defaultInterfaceIndex,
@@ -1242,6 +1407,8 @@ func (l *Libbox) PrepareSwitchWithAnyConnect(
 		"",
 		anyConnectRuntimeIdentity,
 		&targetConfig,
+		"",
+		"",
 		networkInterfacesJSON,
 		defaultInterfaceName,
 		defaultInterfaceIndex,
@@ -1282,6 +1449,82 @@ func (l *Libbox) PrepareSwitchWithAnyConnectAndLineID(
 		strings.TrimSpace(anyConnectLineID),
 		anyConnectRuntimeIdentity,
 		&targetConfig,
+		"",
+		"",
+		networkInterfacesJSON,
+		defaultInterfaceName,
+		defaultInterfaceIndex,
+	)
+}
+
+// PrepareSwitchWithLineRuntimeIDs prepares a candidate that may borrow both
+// the active AnyConnect and Tailscale process capabilities. Caller-supplied
+// Line IDs are used only for redacted reuse evidence.
+func (l *Libbox) PrepareSwitchWithLineRuntimeIDs(
+	configJSON,
+	anyConnectLineID,
+	anyConnectRuntimeIdentity,
+	tailscaleLineID,
+	tailscaleRuntimeIdentity,
+	networkInterfacesJSON,
+	defaultInterfaceName string,
+	defaultInterfaceIndex int,
+) error {
+	if anyConnectRuntimeIdentity != "" &&
+		strings.TrimSpace(anyConnectLineID) == "" {
+		return fmt.Errorf("AnyConnect Line ID is required")
+	}
+	return l.prepareSwitch(
+		configJSON,
+		strings.TrimSpace(anyConnectLineID),
+		anyConnectRuntimeIdentity,
+		nil,
+		strings.TrimSpace(tailscaleLineID),
+		tailscaleRuntimeIdentity,
+		networkInterfacesJSON,
+		defaultInterfaceName,
+		defaultInterfaceIndex,
+	)
+}
+
+// PrepareSwitchWithAnyConnectAndLineRuntimeIDs prepares a candidate that
+// creates AnyConnect only when no matching active capability exists, while
+// independently borrowing or creating the target Tailscale capability.
+func (l *Libbox) PrepareSwitchWithAnyConnectAndLineRuntimeIDs(
+	server,
+	dialAddress,
+	username,
+	password string,
+	allowInsecure bool,
+	anyConnectLineID,
+	anyConnectRuntimeIdentity,
+	tailscaleLineID,
+	tailscaleRuntimeIdentity,
+	configJSON,
+	networkInterfacesJSON,
+	defaultInterfaceName string,
+	defaultInterfaceIndex int,
+) error {
+	if strings.TrimSpace(anyConnectLineID) == "" {
+		return fmt.Errorf("AnyConnect Line ID is required")
+	}
+	if anyConnectRuntimeIdentity == "" {
+		return fmt.Errorf("AnyConnect runtime identity is required")
+	}
+	targetConfig := startVPNConfig(
+		server,
+		dialAddress,
+		username,
+		password,
+		allowInsecure,
+	)
+	return l.prepareSwitch(
+		configJSON,
+		strings.TrimSpace(anyConnectLineID),
+		anyConnectRuntimeIdentity,
+		&targetConfig,
+		strings.TrimSpace(tailscaleLineID),
+		tailscaleRuntimeIdentity,
 		networkInterfacesJSON,
 		defaultInterfaceName,
 		defaultInterfaceIndex,
@@ -1293,6 +1536,8 @@ func (l *Libbox) prepareSwitch(
 	anyConnectLineID,
 	anyConnectRuntimeIdentity string,
 	targetAnyConnectConfig *engine.VPNConfig,
+	tailscaleLineID,
+	tailscaleRuntimeIdentity string,
 	networkInterfacesJSON,
 	defaultInterfaceName string,
 	defaultInterfaceIndex int,
@@ -1316,9 +1561,12 @@ func (l *Libbox) prepareSwitch(
 	}
 
 	usesAnyConnect := anyConnectRuntimeIdentity != ""
+	usesTailscale := strings.TrimSpace(tailscaleRuntimeIdentity) != "" ||
+		strings.TrimSpace(tailscaleLineID) != ""
 	sourceGeneration := l.boxGeneration
 	sourceLineRuntimeGeneration := l.activeLineRuntimeGeneration
 	sourceAnyConnectCapability := l.activeAnyConnectCapability
+	sourceTailscaleCapability := l.activeTailscaleCapability
 	sourcePlatform := l.platform
 	candidatePlatform, err := sourcePlatform.switchCandidate(
 		networkInterfacesJSON,
@@ -1350,9 +1598,65 @@ func (l *Libbox) prepareSwitch(
 
 	var candidate *preparedBoxSwitch
 	var candidateAnyConnect *anyConnectRuntimeCapability
+	var candidateTailscale pooledTailscaleRuntime
 	reusesAnyConnect := false
+	reusesTailscale := false
 	var reusedLineIDs []string
-	stateLocks, err := acquireTailscaleStateLocks(configJSON)
+	var tailscaleSpec *tailscaleRuntimeSpec
+	if usesTailscale {
+		tailscaleSpec, err = prepareTailscaleRuntimeSpec(
+			configJSON,
+			tailscaleLineID,
+			tailscaleRuntimeIdentity,
+		)
+	}
+	var stateLocks []*os.File
+	if err == nil && tailscaleSpec == nil {
+		stateLocks, err = acquireTailscaleStateLocks(configJSON)
+	}
+	if err == nil && tailscaleSpec != nil {
+		var pooled lineRuntimeCapability
+		pooled, reusesTailscale, err = l.lineRuntimes.acquireCandidate(
+			candidateLineRuntimeGeneration,
+			tailscaleSpec.identity,
+			lineRuntimeCapabilityTailscale,
+			true,
+			func() (lineRuntimeCapability, error) {
+				return l.createTailscaleRuntime(
+					baseCtx,
+					tailscaleSpec,
+					candidatePlatform,
+				)
+			},
+		)
+		if errors.Is(err, errLineRuntimeExclusive) {
+			err = fmt.Errorf("Tailscale runtime identity is not reusable")
+		}
+		if err == nil {
+			var ok bool
+			candidateTailscale, ok = pooled.(pooledTailscaleRuntime)
+			if !ok || !candidateTailscale.available() {
+				err = fmt.Errorf("Tailscale capability is unavailable")
+			} else {
+				runtimePlatform := candidateTailscale.platformInterface()
+				if runtimePlatform == nil {
+					err = fmt.Errorf("Tailscale capability platform is unavailable")
+				} else {
+					runtimePlatform.syncLineRuntimeUnderlayFrom(
+						candidatePlatform,
+						false,
+					)
+					configJSON = tailscaleSpec.consumerConfigJSON
+					if reusesTailscale && tailscaleSpec.lineID != "" {
+						reusedLineIDs = append(
+							reusedLineIDs,
+							tailscaleSpec.lineID,
+						)
+					}
+				}
+			}
+		}
+	}
 	if err == nil && usesAnyConnect {
 		var factory func() (lineRuntimeCapability, error)
 		if targetAnyConnectConfig != nil {
@@ -1378,7 +1682,7 @@ func (l *Libbox) prepareSwitch(
 			if !ok || !candidateAnyConnect.available() {
 				err = fmt.Errorf("AnyConnect capability is unavailable")
 			} else if reusesAnyConnect && anyConnectLineID != "" {
-				reusedLineIDs = []string{anyConnectLineID}
+				reusedLineIDs = append(reusedLineIDs, anyConnectLineID)
 			}
 		}
 	}
@@ -1388,6 +1692,12 @@ func (l *Libbox) prepareSwitch(
 		ctx = service.ContextWith[*anyConnectLineRuntime](
 			ctx,
 			candidateAnyConnect.snapshot().line,
+		)
+	}
+	if usesTailscale && err == nil {
+		ctx = service.ContextWith[*tailscaleLineRuntime](
+			ctx,
+			candidateTailscale.lineHandle(),
 		)
 	}
 	ctx = service.ContextWith[adapter.PlatformInterface](
@@ -1439,6 +1749,10 @@ func (l *Libbox) prepareSwitch(
 						usesAnyConnect:            usesAnyConnect,
 						anyConnectRuntimeIdentity: anyConnectRuntimeIdentity,
 						anyConnectCapability:      candidateAnyConnect,
+						usesTailscale:             usesTailscale,
+						tailscaleRuntimeIdentity:  strings.TrimSpace(tailscaleRuntimeIdentity),
+						tailscaleEndpointTag:      tailscaleSpecEndpointTag(tailscaleSpec),
+						tailscaleCapability:       candidateTailscale,
 						reusedLineIDs:             reusedLineIDs,
 					}
 				}
@@ -1489,7 +1803,25 @@ func (l *Libbox) prepareSwitch(
 					candidateAnyConnect,
 				)) &&
 			(!usesAnyConnect || reusesAnyConnect ||
-				sourceAnyConnectCapability == nil)
+				sourceAnyConnectCapability == nil) &&
+			(!reusesTailscale ||
+				(l.activeTailscaleCapability == candidateTailscale &&
+					candidateTailscale.available() &&
+					l.tailscaleRuntimeIdentity ==
+						strings.TrimSpace(tailscaleRuntimeIdentity) &&
+					l.lineRuntimes.committedIs(
+						sourceLineRuntimeGeneration,
+						strings.TrimSpace(tailscaleRuntimeIdentity),
+						candidateTailscale,
+					))) &&
+			(!usesTailscale ||
+				l.lineRuntimes.candidateIs(
+					candidateLineRuntimeGeneration,
+					strings.TrimSpace(tailscaleRuntimeIdentity),
+					candidateTailscale,
+				)) &&
+			(!usesTailscale || reusesTailscale ||
+				sourceTailscaleCapability == nil)
 	if err == nil && candidate != nil && activeIsUnchanged {
 		l.preparedSwitch = candidate
 		l.mu.Unlock()
@@ -1504,6 +1836,13 @@ func (l *Libbox) prepareSwitch(
 		return err
 	}
 	return fmt.Errorf("connection changed during switch preparation")
+}
+
+func tailscaleSpecEndpointTag(spec *tailscaleRuntimeSpec) string {
+	if spec == nil {
+		return ""
+	}
+	return spec.endpointTag
 }
 
 // prepareSwitchCacheFile keeps the candidate from opening the active Box's
@@ -1567,6 +1906,46 @@ func (l *Libbox) PreparedSwitchReusedLineIDs() (string, error) {
 		return "", fmt.Errorf("encode reused Line evidence: %w", err)
 	}
 	return string(encoded), nil
+}
+
+// RefreshPreparedSwitchLineRuntimes forces process-owned Line capabilities to
+// observe the candidate's current Underlay even when interface name and index
+// are unchanged. This is required for Wi-Fi "connected but no Internet" →
+// recovered transitions, where a new network epoch has no interface diff for
+// ordinary snapshot comparison to detect.
+func (l *Libbox) RefreshPreparedSwitchLineRuntimes() error {
+	l.mu.Lock()
+	candidate := l.preparedSwitch
+	if candidate == nil || candidate.box == nil ||
+		candidate.runtimeCtx == nil || candidate.runtimeCtx.Err() != nil ||
+		l.switchCommitInProgress {
+		l.mu.Unlock()
+		return fmt.Errorf("switch candidate is not prepared")
+	}
+	capability := candidate.tailscaleCapability
+	platform := candidate.platform
+	if capability == nil {
+		l.mu.Unlock()
+		return nil
+	}
+	if !capability.available() {
+		l.mu.Unlock()
+		return fmt.Errorf("Line runtime ownership is unavailable")
+	}
+	runtimePlatform := capability.platformInterface()
+	if runtimePlatform == nil || platform == nil {
+		l.mu.Unlock()
+		return fmt.Errorf("Line runtime platform is unavailable")
+	}
+	l.switchCandidateUsers.Add(1)
+	l.mu.Unlock()
+	defer l.switchCandidateUsers.Done()
+
+	runtimePlatform.syncLineRuntimeUnderlayFrom(platform, true)
+	if !l.preparedSwitchIsCurrent(candidate) || !capability.available() {
+		return fmt.Errorf("switch candidate changed during Line runtime refresh")
+	}
+	return nil
 }
 
 func preparedAnyConnectSessionAlive(cSess *session.ConnSession) bool {
@@ -1744,6 +2123,9 @@ func (l *Libbox) CommitPreparedSwitch() error {
 	sourceLineRuntimeGeneration := l.activeLineRuntimeGeneration
 	sourceAnyConnectCapability := l.activeAnyConnectCapability
 	sourceAnyConnectRuntimeIdentity := l.anyConnectRuntimeIdentity
+	sourceTailscaleCapability := l.activeTailscaleCapability
+	sourceTailscaleRuntimeIdentity := l.tailscaleRuntimeIdentity
+	sourceTailscaleEndpointTag := l.tailscaleEndpointTag
 
 	l.switchCommitInProgress = true
 	l.switchCommitDone = make(chan struct{})
@@ -1763,6 +2145,9 @@ func (l *Libbox) CommitPreparedSwitch() error {
 		l.activeLineRuntimeGeneration != sourceLineRuntimeGeneration ||
 		l.activeAnyConnectCapability != sourceAnyConnectCapability ||
 		l.anyConnectRuntimeIdentity != sourceAnyConnectRuntimeIdentity ||
+		l.activeTailscaleCapability != sourceTailscaleCapability ||
+		l.tailscaleRuntimeIdentity != sourceTailscaleRuntimeIdentity ||
+		l.tailscaleEndpointTag != sourceTailscaleEndpointTag ||
 		!sameStateLockFiles(l.stateLocks, sourceStateLocks) {
 		l.restorePreparedSwitchAfterCommitFailureLocked(candidate)
 		l.mu.Unlock()
@@ -1830,6 +2215,14 @@ func (l *Libbox) CommitPreparedSwitch() error {
 		l.anyConnectDiagnostics = nil
 		l.lastError = ""
 	}
+	l.activeTailscaleCapability = candidate.tailscaleCapability
+	if candidate.tailscaleCapability != nil {
+		l.tailscaleRuntimeIdentity = candidate.tailscaleRuntimeIdentity
+		l.tailscaleEndpointTag = candidate.tailscaleEndpointTag
+	} else {
+		l.tailscaleRuntimeIdentity = ""
+		l.tailscaleEndpointTag = ""
+	}
 	l.retiredSwitch = retired
 	l.switchCommitInProgress = false
 	commitDone := l.switchCommitDone
@@ -1876,6 +2269,27 @@ func (l *Libbox) validatePreparedSwitchCommitLocked(
 		candidate.anyConnectRuntimeIdentity != "" {
 		return fmt.Errorf("switch candidate Line runtime state is inconsistent")
 	}
+	if candidate.usesTailscale {
+		if candidate.tailscaleRuntimeIdentity == "" ||
+			candidate.tailscaleEndpointTag == "" ||
+			candidate.tailscaleCapability == nil ||
+			!candidate.tailscaleCapability.available() ||
+			!l.lineRuntimes.candidateIs(
+				candidate.lineRuntimeGeneration,
+				candidate.tailscaleRuntimeIdentity,
+				candidate.tailscaleCapability,
+			) ||
+			(l.activeTailscaleCapability != nil &&
+				l.activeTailscaleCapability != candidate.tailscaleCapability) {
+			return fmt.Errorf(
+				"Tailscale capability is unavailable before commit",
+			)
+		}
+	} else if candidate.tailscaleCapability != nil ||
+		candidate.tailscaleRuntimeIdentity != "" ||
+		candidate.tailscaleEndpointTag != "" {
+		return fmt.Errorf("switch candidate Line runtime state is inconsistent")
+	}
 	if !l.running || l.box == nil || l.runtimeCtx == nil ||
 		l.runtimeCtx.Err() != nil || l.activeLineRuntimeGeneration == 0 ||
 		!l.lineRuntimes.generationIsCommitted(
@@ -1892,6 +2306,17 @@ func (l *Libbox) validatePreparedSwitchCommitLocked(
 				l.activeAnyConnectCapability,
 			)) {
 		return fmt.Errorf("source AnyConnect capability is unavailable before commit")
+	}
+	if l.activeTailscaleCapability != nil &&
+		(!l.activeTailscaleCapability.available() ||
+			l.tailscaleRuntimeIdentity == "" ||
+			l.tailscaleEndpointTag == "" ||
+			!l.lineRuntimes.committedIs(
+				l.activeLineRuntimeGeneration,
+				l.tailscaleRuntimeIdentity,
+				l.activeTailscaleCapability,
+			)) {
+		return fmt.Errorf("source Tailscale capability is unavailable before commit")
 	}
 	return nil
 }
@@ -2377,6 +2802,9 @@ func (l *Libbox) detachRunningLocked() (
 	l.anyConnectConfig = engine.VPNConfig{}
 	l.anyConnectRuntimeIdentity = ""
 	l.activeAnyConnectCapability = nil
+	l.activeTailscaleCapability = nil
+	l.tailscaleRuntimeIdentity = ""
+	l.tailscaleEndpointTag = ""
 	l.activeLineRuntimeGeneration = 0
 	l.stateLocks = nil
 	l.session = nil

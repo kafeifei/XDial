@@ -1,3 +1,5 @@
+import Foundation
+
 /// Coalesces the host-side signals emitted by one physical network change.
 ///
 /// NWPath/default-route/DNS and SSID notifications arrive independently and
@@ -22,6 +24,7 @@ struct NetworkEpochSwitchCoordinator {
         var desiredScenarioID: String
         var underlayFingerprint: String?
         var underlayChanged: Bool
+        var permitsRepeatedTuple: Bool
         var revision: UInt64
     }
 
@@ -39,14 +42,15 @@ struct NetworkEpochSwitchCoordinator {
 
     mutating func observeUnderlayChange(
         currentDesiredScenarioID: String,
-        underlayFingerprint: String
+        underlayFingerprint: String,
+        forceNewEpoch: Bool = false
     ) -> QuietToken? {
         guard !currentDesiredScenarioID.isEmpty,
               !underlayFingerprint.isEmpty else {
             return nil
         }
         if pending == nil {
-            if lastSettledTuple == SettledTuple(
+            if !forceNewEpoch, lastSettledTuple == SettledTuple(
                 desiredScenarioID: currentDesiredScenarioID,
                 underlayFingerprint: underlayFingerprint
             ) {
@@ -55,12 +59,16 @@ struct NetworkEpochSwitchCoordinator {
             let created = makePending(
                 desiredScenarioID: currentDesiredScenarioID,
                 underlayFingerprint: underlayFingerprint,
-                underlayChanged: true
+                underlayChanged: true,
+                permitsRepeatedTuple: forceNewEpoch
             )
             pending = created
         } else {
             pending?.underlayFingerprint = underlayFingerprint
             pending?.underlayChanged = true
+            if forceNewEpoch {
+                pending?.permitsRepeatedTuple = true
+            }
             bumpRevision()
         }
         return currentToken
@@ -78,7 +86,8 @@ struct NetworkEpochSwitchCoordinator {
             let created = makePending(
                 desiredScenarioID: desiredScenarioID,
                 underlayFingerprint: nil,
-                underlayChanged: false
+                underlayChanged: false,
+                permitsRepeatedTuple: false
             )
             pending = created
         } else {
@@ -100,7 +109,8 @@ struct NetworkEpochSwitchCoordinator {
             pending = makePending(
                 desiredScenarioID: currentDesiredScenarioID,
                 underlayFingerprint: nil,
-                underlayChanged: false
+                underlayChanged: false,
+                permitsRepeatedTuple: false
             )
         } else {
             bumpRevision()
@@ -149,7 +159,9 @@ struct NetworkEpochSwitchCoordinator {
             desiredScenarioID: pending.desiredScenarioID,
             underlayFingerprint: underlayFingerprint
         )
-        guard tuple != lastSettledTuple else { return nil }
+        guard pending.permitsRepeatedTuple || tuple != lastSettledTuple else {
+            return nil
+        }
         lastSettledTuple = tuple
         return Intent(
             epoch: pending.epoch,
@@ -173,7 +185,8 @@ struct NetworkEpochSwitchCoordinator {
     private mutating func makePending(
         desiredScenarioID: String,
         underlayFingerprint: String?,
-        underlayChanged: Bool
+        underlayChanged: Bool,
+        permitsRepeatedTuple: Bool
     ) -> Pending {
         nextEpoch &+= 1
         nextRevision &+= 1
@@ -182,6 +195,7 @@ struct NetworkEpochSwitchCoordinator {
             desiredScenarioID: desiredScenarioID,
             underlayFingerprint: underlayFingerprint,
             underlayChanged: underlayChanged,
+            permitsRepeatedTuple: permitsRepeatedTuple,
             revision: nextRevision
         )
     }
@@ -192,17 +206,83 @@ struct NetworkEpochSwitchCoordinator {
     }
 }
 
+enum UnderlayPathTransitionAction: Equatable {
+    case none
+    case cancelPending
+    case scheduleRefresh(allowEquivalentSnapshot: Bool)
+}
+
+/// Separates a connectivity epoch from an interface snapshot change. A Wi-Fi
+/// network can lose and regain Internet while its interface, route and DNS
+/// snapshot remain byte-for-byte identical.
+struct UnderlayPathTransitionState {
+    private enum Availability {
+        case initial
+        case available
+        case unavailable
+        case restoring
+    }
+
+    private var availability: Availability = .initial
+
+    mutating func observe(
+        isSatisfied: Bool,
+        hasCompleteSnapshot: Bool,
+        snapshotMatchesBaseline: Bool
+    ) -> UnderlayPathTransitionAction {
+        guard isSatisfied else {
+            availability = .unavailable
+            return .cancelPending
+        }
+        if availability == .unavailable {
+            availability = .restoring
+        }
+        guard hasCompleteSnapshot else { return .none }
+        if availability == .restoring {
+            availability = .available
+            return .scheduleRefresh(allowEquivalentSnapshot: true)
+        }
+        availability = .available
+        return snapshotMatchesBaseline
+            ? .cancelPending
+            : .scheduleRefresh(allowEquivalentSnapshot: false)
+    }
+}
+
+/// macOS reports an NWPath unavailable -> satisfied cycle while the machine
+/// wakes even when the committed Underlay is byte-for-byte unchanged. That is
+/// a power lifecycle boundary, not a network epoch: the existing Provider and
+/// its Line-local recovery remain authoritative. A materially changed snapshot
+/// still proceeds, and a later real connectivity restoration is outside this
+/// bounded coalescing window.
+struct SystemWakeUnderlayPolicy {
+    static let equivalentRestorationWindow: TimeInterval = 30
+
+    static func suppressesEquivalentRestoration(
+        connectivityRestored: Bool,
+        snapshotMatchesBaseline: Bool,
+        secondsSinceSystemWake: TimeInterval?
+    ) -> Bool {
+        guard connectivityRestored,
+              snapshotMatchesBaseline,
+              let secondsSinceSystemWake else {
+            return false
+        }
+        return secondsSinceSystemWake >= 0
+            && secondsSinceSystemWake <= equivalentRestorationWindow
+    }
+}
+
 enum NetworkEpochTransitionAction: Equatable {
     case none
-    case rebuildCurrentConnection
     case switchScenario(requiresUnderlayRefresh: Bool)
     case persistScenario
 }
 
 /// A network epoch can carry two independent facts: the host Underlay changed,
-/// and the SSID selected a Scenario. Rebuilding an unchanged Scenario is an
-/// Underlay recovery, not a Scenario Switch; only a different desired Scenario
-/// may enter the staged Switch transaction.
+/// and the SSID selected a Scenario. An unchanged Scenario still enters the
+/// staged Switch transaction when its Underlay epoch changes, so the committed
+/// generation keeps serving traffic until the replacement is fully ready.
 struct NetworkEpochTransitionPolicy {
     static func decide(
         desiredScenarioID: String,
@@ -225,7 +305,7 @@ struct NetworkEpochTransitionPolicy {
                   runtimeStatus == "connected" else {
                 return .none
             }
-            return .rebuildCurrentConnection
+            return .switchScenario(requiresUnderlayRefresh: true)
         }
 
         if !underlayChanged,

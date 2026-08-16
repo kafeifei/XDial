@@ -35,7 +35,7 @@ final class GoEngine: ObservableObject {
     private var requestSeq: UInt64 = 0
     private var pendingCallbacks: [String: (DaemonResponse) -> Void] = [:]
     private var transparentProxySystemStatus = "disconnected"
-    var underlayChangeHandler: ((String) -> Void)?
+    var underlayChangeHandler: ((String, Bool) -> Void)?
 
     @Published private(set) var status: String = "disconnected"
     @Published var lastError: String?
@@ -105,9 +105,13 @@ final class GoEngine: ObservableObject {
                 self?.scenarioSwitchProjection = projection
             }
         }
-        transparentProxy.underlayChangeHandler = { [weak self] fingerprint in
+        transparentProxy.underlayChangeHandler = {
+            [weak self] fingerprint, connectivityRestored in
             Task { @MainActor in
-                self?.underlayChangeHandler?(fingerprint)
+                self?.underlayChangeHandler?(
+                    fingerprint,
+                    connectivityRestored
+                )
             }
         }
     }
@@ -137,11 +141,13 @@ final class GoEngine: ObservableObject {
     /// atomically commits the target transaction.
     func switchScenario(
         profileJSON: String,
+        refreshLineRuntimes: Bool,
         completion: @escaping (Result<ConnectionReport, Error>) -> Void
     ) {
         lastError = nil
         transparentProxy.switchScenario(
-            profileJSON: profileJSON
+            profileJSON: profileJSON,
+            refreshLineRuntimes: refreshLineRuntimes
         ) { [weak self] result in
             Task { @MainActor [weak self] in
                 switch result {
@@ -167,15 +173,6 @@ final class GoEngine: ObservableObject {
                 completion(result)
             }
         }
-    }
-
-    @discardableResult
-    func rebuildCurrentConnectionForUnderlayChange(
-        expectedFingerprint: String
-    ) -> Bool {
-        transparentProxy.rebuildCurrentConnectionForUnderlayChange(
-            expectedFingerprint: expectedFingerprint
-        )
     }
 
     func runtimeConfigurationFingerprint(
@@ -339,7 +336,13 @@ final class GoEngine: ObservableObject {
         transparentProxy.syncStatus()
     }
 
-    func systemDidWake(completion: (() -> Void)? = nil) {
+    func systemDidWake(
+        isSystemWake: Bool,
+        completion: (() -> Void)? = nil
+    ) {
+        if isSystemWake {
+            transparentProxy.noteSystemWake()
+        }
         syncStatus(completion: completion)
     }
 
