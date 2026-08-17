@@ -5,19 +5,18 @@ private final class SettingsDockUIDelegate:
     NSApplicationDelegate
 {
     private let hostPID: pid_t?
-    private var dockIcon: NSImage?
     private var dismissalObserver: NSObjectProtocol?
-    private var iconStateObserver: NSObjectProtocol?
     private var hostWatchTimer: Timer?
 
-    init(connected: Bool, hostPID: pid_t?) {
+    init(hostPID: pid_t?) {
         self.hostPID = hostPID
         super.init()
-        updateDockIcon(connected: connected)
     }
 
+    /// Dock 图标只用 Bundle 的 SettingsDockIcon.icns，不在运行时另设
+    /// `applicationIconImage`：否则进程退出瞬间 Dock 会从自定义图切回系统渲染的
+    /// icns，退去动画里图标会“变一下”。
     func configure(_ application: NSApplication) {
-        application.applicationIconImage = dockIcon
         _ = application.setActivationPolicy(.regular)
     }
 
@@ -35,18 +34,6 @@ private final class SettingsDockUIDelegate:
             ) { _ in
                 NSApp.terminate(nil)
             }
-        iconStateObserver = DistributedNotificationCenter.default()
-            .addObserver(
-                forName: SettingsDockProxyProtocol.iconStateNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] notification in
-                guard let connected = notification.userInfo?[
-                    "connected"
-                ] as? Bool else { return }
-                self?.updateDockIcon(connected: connected)
-            }
-
         if hostPID != nil {
             hostWatchTimer = Timer.scheduledTimer(
                 withTimeInterval: 1,
@@ -69,12 +56,6 @@ private final class SettingsDockUIDelegate:
         return true
     }
 
-    private func updateDockIcon(connected: Bool) {
-        let icon = AppIcon.dock(size: 512, connected: connected)
-        dockIcon = icon
-        NSApp.applicationIconImage = icon
-    }
-
     private func requestSettingsActivation() {
         DistributedNotificationCenter.default().postNotificationName(
             SettingsDockProxyProtocol.activationNotification,
@@ -95,9 +76,6 @@ private final class SettingsDockUIDelegate:
 
 private let application = NSApplication.shared
 private let delegate = SettingsDockUIDelegate(
-    connected: CommandLine.arguments.contains(
-        SettingsDockProxyProtocol.connectedArgument
-    ),
     hostPID: SettingsDockProxyProtocol.hostPID(
         in: CommandLine.arguments
     )

@@ -48,20 +48,17 @@ final class SettingsDockProxyCoordinator {
                     else { return }
                     self.runningApplication = nil
                     if self.desiredVisible {
-                        self.present(
-                            connected: GoEngine.shared.isConnected
-                        )
+                        self.present()
                     }
                 }
             }
     }
 
-    func present(connected: Bool) {
+    func present() {
         desiredVisible = true
         dismissalFallbackTask?.cancel()
         dismissalFallbackTask = nil
         if runningApplication?.isTerminated == false || launchInFlight {
-            updateConnected(connected)
             return
         }
 
@@ -70,9 +67,7 @@ final class SettingsDockProxyCoordinator {
         configuration.arguments = [
             SettingsDockProxyProtocol.hostPIDArgumentPrefix
                 + String(ProcessInfo.processInfo.processIdentifier),
-        ] + (connected
-            ? [SettingsDockProxyProtocol.connectedArgument]
-            : [])
+        ]
         launchInFlight = true
         NSWorkspace.shared.openApplication(
             at: helperBundleURL,
@@ -104,16 +99,6 @@ final class SettingsDockProxyCoordinator {
                 Self.helperBundleName,
                 isDirectory: true
             )
-    }
-
-    func updateConnected(_ connected: Bool) {
-        guard desiredVisible else { return }
-        DistributedNotificationCenter.default().postNotificationName(
-            SettingsDockProxyProtocol.iconStateNotification,
-            object: nil,
-            userInfo: ["connected": connected],
-            deliverImmediately: true
-        )
     }
 
     func dismiss() {

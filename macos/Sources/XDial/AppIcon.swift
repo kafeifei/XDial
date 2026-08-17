@@ -1,11 +1,22 @@
 import AppKit
 
+/// App、Dock、iOS 与 tvOS 图标：石板蓝灰底上的冷灰表面拨号盘，几何来自
+/// `RotaryDial`，颜色只取 `XDialBrandPalette`。
+///
+/// 本文件会被图标生成器用 `swiftc` 单独编译，只能依赖 AppKit、
+/// `XDialBrandPalette` 与 `RotaryDial`。
 enum AppIcon {
+    /// macOS 图标网格：1024 画布上 824 的圆角方块，圆角约 22.5%。
+    static let macTileInset: CGFloat = 100 / 1024
+    static let macTileCornerRatio: CGFloat = 185.4 / 824
+    /// 拨号盘 16 网格占底块边长的比例：实心盘直径约为底块的 71%。
+    static let dialGridRatio: CGFloat = 0.86
+
     static func base(size: CGFloat) -> NSImage {
         primary(size: size, connected: true)
     }
 
-    /// Finder 里 XDial.app 的主图标只是月球，不表达“设置”。
+    /// Finder 里 XDial.app 的主图标：圆角底块 + 拨号盘，不表达“设置”。
     static func primary(
         size: CGFloat,
         connected: Bool
@@ -13,216 +24,124 @@ enum AppIcon {
         let image = NSImage(size: NSSize(width: size, height: size))
         image.lockFocus()
         NSGraphicsContext.current?.shouldAntialias = true
-        drawMoon(
-            in: NSRect(
-                x: size * 0.09,
-                y: size * 0.09,
-                width: size * 0.82,
-                height: size * 0.82
-            ),
-            connected: connected,
-            castsShadow: true
-        )
+        let tile = macTileRect(size: size)
+        drawTile(in: tile, cornerRadius: tile.width * macTileCornerRatio)
+        drawDial(in: dialRect(in: tile), connected: connected)
         image.unlockFocus()
         image.isTemplate = false
         return image
     }
 
-    /// 设置窗口打开时 XDial 才临时出现在 Dock，这个
-    /// 运行时图标在同一月背指纹右下角叠加齿轮。
+    /// 设置窗口打开时 XDial 才临时出现在 Dock，这个运行时图标在同一拨号盘
+    /// 右下角叠加齿轮。拨号盘略缩小并上移让位；齿轮徽标连同阴影都必须留在
+    /// 圆角底块内——macOS 26 会把内容超出标准圆角方块的图标整张缩进灰色底板，
+    /// 载体退出时的 Dock 动画回退到 icns 就会显示成那副样子。
     static func dock(size: CGFloat, connected: Bool = false) -> NSImage {
         let image = NSImage(size: NSSize(width: size, height: size))
         image.lockFocus()
         NSGraphicsContext.current?.shouldAntialias = true
-
-        let moonRect = NSRect(
-            x: size * 0.09,
-            y: size * 0.14,
-            width: size * 0.78,
-            height: size * 0.78
-        )
-        drawMoon(
-            in: moonRect,
-            connected: connected,
-            castsShadow: true
+        let tile = macTileRect(size: size)
+        drawTile(in: tile, cornerRadius: tile.width * macTileCornerRatio)
+        let side = tile.width * 0.78
+        drawDial(
+            in: NSRect(
+                x: tile.midX - side / 2 - tile.width * 0.03,
+                y: tile.midY - side / 2 + tile.height * 0.04,
+                width: side,
+                height: side
+            ),
+            connected: connected
         )
         drawGearBadge(size: size)
-
         image.unlockFocus()
         image.isTemplate = false
         return image
     }
 
-    /// 菜单栏使用 2x 像素密度单独绘制；最终布局尺寸由
-    /// `MenuBarLabel` 控制，这里不引入额外透明边距。
-    static func menuBar(
-        connected: Bool,
-        hasError: Bool = false,
-        updateAvailable: Bool = false
-    ) -> NSImage {
-        let canvas: CGFloat = 44
-        let image = NSImage(size: NSSize(width: canvas, height: canvas))
-        image.lockFocus()
-        NSGraphicsContext.current?.shouldAntialias = true
-        drawMoon(
-            in: NSRect(x: 1, y: 1, width: 42, height: 42),
-            connected: connected,
-            castsShadow: false
-        )
-        if hasError {
-            drawErrorBadge(in: NSRect(x: 27, y: 1, width: 16, height: 16))
-        } else if updateAvailable {
-            drawUpdateBadge(in: NSRect(x: 34, y: 34, width: 9, height: 9))
-        }
-        image.unlockFocus()
-        image.size = NSSize(width: 20, height: 20)
-        image.isTemplate = false
-        return image
-    }
+    // 菜单栏状态图标见 `MenuBarStatusIcon`。
 
     @MainActor
     static func applyDockState(connected: Bool) {
         NSApp.applicationIconImage = dock(size: 512, connected: connected)
     }
 
-    private static func drawMoon(
-        in rect: NSRect,
-        connected: Bool,
-        castsShadow: Bool
-    ) {
-        let lunarDisc = NSBezierPath(ovalIn: rect)
+    // MARK: - 组成部件（供 macOS 图标与移动端生成器复用）
 
-        if castsShadow {
+    static func macTileRect(size: CGFloat) -> NSRect {
+        let inset = size * macTileInset
+        return NSRect(x: inset, y: inset, width: size - inset * 2, height: size - inset * 2)
+    }
+
+    /// 拨号盘 16 网格在底块内居中占 `dialGridRatio`。
+    static func dialRect(in tile: NSRect) -> NSRect {
+        let side = min(tile.width, tile.height) * dialGridRatio
+        return NSRect(
+            x: tile.midX - side / 2,
+            y: tile.midY - side / 2,
+            width: side,
+            height: side
+        )
+    }
+
+    /// 底块：石板蓝灰纵向微渐变（Accent → Selection），`cornerRadius = 0` 时为
+    /// 满幅方块（iOS / tvOS 背景层由系统裁切）。
+    static func drawTile(in rect: NSRect, cornerRadius: CGFloat) {
+        let tile = NSBezierPath(
+            roundedRect: rect,
+            xRadius: cornerRadius,
+            yRadius: cornerRadius
+        )
+        NSGradient(
+            starting: XDialBrandPalette.color(XDialBrandPalette.accentLightHex),
+            ending: XDialBrandPalette.color(XDialBrandPalette.selectionLightHex)
+        )?.draw(in: tile, angle: -90)
+    }
+
+    /// 拨号盘：已连接是冷灰表面实心盘（镂空指孔与指停器透出底块），未连接是
+    /// 同色空心环加指孔并整组降到 0.45，与菜单栏状态语义一致。
+    static func drawDial(in rect: NSRect, connected: Bool) {
+        let ink = XDialBrandPalette.surface
+
+        if connected {
             NSGraphicsContext.saveGraphicsState()
             let shadow = NSShadow()
             shadow.shadowColor = NSColor.black.withAlphaComponent(0.28)
             shadow.shadowBlurRadius = rect.width * 0.035
-            shadow.shadowOffset = NSSize(
-                width: 0,
-                height: -rect.width * 0.022
-            )
+            shadow.shadowOffset = NSSize(width: 0, height: -rect.width * 0.022)
             shadow.set()
             NSColor.black.withAlphaComponent(0.18).setFill()
-            lunarDisc.fill()
+            RotaryDial.withGrid(in: rect, flipped: false) {
+                RotaryDial.circle(
+                    at: RotaryDial.center,
+                    radius: RotaryDial.discRadius
+                ).fill()
+            }
             NSGraphicsContext.restoreGraphicsState()
         }
 
-        let surfaceLight = connected
-            ? XDialBrandPalette.surface
-            : XDialBrandPalette.divider
-        let surfaceShade = connected
-            ? XDialBrandPalette.accentHighlight
-            : XDialBrandPalette.disabled
-        NSGradient(starting: surfaceShade, ending: surfaceLight)?
-            .draw(in: lunarDisc, angle: 55)
-
-        NSGraphicsContext.saveGraphicsState()
-        lunarDisc.addClip()
-
-        // 南极—艾特肯盆地是月背下方的大范围暗斑，不画成一枚边缘整齐的巨坑。
-        (connected
-            ? XDialBrandPalette.accent.withAlphaComponent(0.86)
-            : XDialBrandPalette.disabled.withAlphaComponent(0.94)
-        ).setFill()
-        NSBezierPath(
-            ovalIn: normalizedRect(
-                x: 0.09,
-                y: 0.03,
-                width: 0.78,
-                height: 0.38,
-                in: rect
-            )
-        ).fill()
-        (connected
-            ? XDialBrandPalette.accentHighlight.withAlphaComponent(0.78)
-            : XDialBrandPalette.disabled.withAlphaComponent(0.82)
-        ).setFill()
-        NSBezierPath(
-            ovalIn: normalizedRect(
-                x: 0.16,
-                y: 0.08,
-                width: 0.65,
-                height: 0.27,
-                in: rect
-            )
-        ).fill()
-
-        drawCrater(
-            center: normalizedPoint(x: 0.20, y: 0.56, in: rect),
-            radius: rect.width * 0.125,
-            connected: connected
-        )
-        drawCrater(
-            center: normalizedPoint(x: 0.72, y: 0.25, in: rect),
-            radius: rect.width * 0.094,
-            connected: connected
-        )
-        drawCrater(
-            center: normalizedPoint(x: 0.74, y: 0.72, in: rect),
-            radius: rect.width * 0.081,
-            connected: connected
-        )
-        drawCrater(
-            center: normalizedPoint(x: 0.34, y: 0.81, in: rect),
-            radius: rect.width * 0.053,
-            connected: connected
-        )
-
-        NSGraphicsContext.restoreGraphicsState()
-
-        // 外沿只是月球轮廓，不承担连接语义；连接状态只由整个月面的
-        // 明暗表达，避免在菜单栏出现一圈突兀的成功绿。
-        XDialBrandPalette.selection.withAlphaComponent(0.82).setStroke()
-        lunarDisc.lineWidth = max(1, rect.width * 0.028)
-        lunarDisc.stroke()
-    }
-
-    /// 错误与更新都只是菜单栏的附加状态。错误优先级更高，并通过
-    /// “实心徽标 + 叹号”表达，避免只靠红色与更新圆点区分。
-    private static func drawErrorBadge(in rect: NSRect) {
-        let badge = NSBezierPath(ovalIn: rect)
-        XDialBrandPalette.surface.setStroke()
-        badge.lineWidth = 2.2
-        badge.stroke()
-        XDialBrandPalette.danger.setFill()
-        badge.fill()
-
-        XDialBrandPalette.surface.setFill()
-        NSBezierPath(
-            roundedRect: NSRect(
-                x: rect.midX - 1.05,
-                y: rect.minY + rect.height * 0.39,
-                width: 2.1,
-                height: rect.height * 0.34
-            ),
-            xRadius: 1.05,
-            yRadius: 1.05
-        ).fill()
-        NSBezierPath(
-            ovalIn: NSRect(
-                x: rect.midX - 1.15,
-                y: rect.minY + rect.height * 0.19,
-                width: 2.3,
-                height: 2.3
-            )
-        ).fill()
-    }
-
-    private static func drawUpdateBadge(in rect: NSRect) {
-        let badge = NSBezierPath(ovalIn: rect)
-        XDialBrandPalette.surface.setStroke()
-        badge.lineWidth = 2
-        badge.stroke()
-        XDialBrandPalette.danger.setFill()
-        badge.fill()
+        RotaryDial.withGrid(in: rect, flipped: false) {
+            if connected {
+                // 镂空用 destinationOut，必须隔离在自己的透明层里，
+                // 否则会连底块一起打穿成透明。
+                RotaryDial.withGroupOpacity(1) {
+                    RotaryDial.fillDiscWithCutouts(ink: ink)
+                }
+            } else {
+                RotaryDial.withGroupOpacity(RotaryDial.idleOpacity) {
+                    RotaryDial.strokeRing(ink: ink)
+                    RotaryDial.fillHoles(ink: ink)
+                }
+            }
+        }
     }
 
     private static func drawGearBadge(size: CGFloat) {
+        // 底块占 [0.098, 0.902]；徽标 [0.60, 0.86] × [0.14, 0.40] 连阴影都在其内。
         let badgeRect = NSRect(
-            x: size * 0.64,
-            y: size * 0.065,
-            width: size * 0.30,
-            height: size * 0.30
+            x: size * 0.60,
+            y: size * 0.14,
+            width: size * 0.26,
+            height: size * 0.26
         )
         let badge = NSBezierPath(ovalIn: badgeRect)
 
@@ -247,7 +166,7 @@ enum AppIcon {
             return
         }
         let pointConfiguration = NSImage.SymbolConfiguration(
-            pointSize: size * 0.17,
+            pointSize: size * 0.15,
             weight: .semibold
         )
         let paletteConfiguration = NSImage.SymbolConfiguration(
@@ -258,7 +177,7 @@ enum AppIcon {
         ) else {
             return
         }
-        let gearSide = size * 0.19
+        let gearSide = size * 0.165
         configured.draw(
             in: NSRect(
                 x: badgeRect.midX - gearSide / 2,
@@ -272,56 +191,5 @@ enum AppIcon {
             respectFlipped: true,
             hints: [.interpolation: NSImageInterpolation.high]
         )
-    }
-
-    private static func normalizedRect(
-        x: CGFloat,
-        y: CGFloat,
-        width: CGFloat,
-        height: CGFloat,
-        in rect: NSRect
-    ) -> NSRect {
-        NSRect(
-            x: rect.minX + rect.width * x,
-            y: rect.minY + rect.height * y,
-            width: rect.width * width,
-            height: rect.height * height
-        )
-    }
-
-    private static func normalizedPoint(
-        x: CGFloat,
-        y: CGFloat,
-        in rect: NSRect
-    ) -> NSPoint {
-        NSPoint(
-            x: rect.minX + rect.width * x,
-            y: rect.minY + rect.height * y
-        )
-    }
-
-    private static func drawCrater(
-        center: NSPoint,
-        radius: CGFloat,
-        connected: Bool
-    ) {
-        let rect = NSRect(
-            x: center.x - radius,
-            y: center.y - radius,
-            width: radius * 2,
-            height: radius * 2
-        )
-        let crater = NSBezierPath(ovalIn: rect)
-        (connected
-            ? XDialBrandPalette.selection.withAlphaComponent(0.94)
-            : XDialBrandPalette.textSecondary.withAlphaComponent(0.94)
-        ).setFill()
-        crater.fill()
-        (connected
-            ? XDialBrandPalette.canvas.withAlphaComponent(0.95)
-            : XDialBrandPalette.divider.withAlphaComponent(0.95)
-        ).setStroke()
-        crater.lineWidth = max(1, radius * 0.35)
-        crater.stroke()
     }
 }

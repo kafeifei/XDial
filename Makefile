@@ -26,8 +26,10 @@ PATCHED_GO_ENV = GOWORK='$(PATCHED_WORKFILE)' GOFLAGS=
 SING_BOX_TEST_BINARY := $(abspath $(BUILD_DIR)/tools/sing-box)
 MACOS_ICON_GENERATOR := scripts/generate-macos-app-icon/main.swift
 MACOS_ICON_GENERATOR_BINARY := $(BUILD_DIR)/generate-app-icon
-MACOS_ICON_SOURCE := macos/Sources/XDial/AppIcon.swift
+MACOS_ICON_SOURCE := macos/Sources/XDial/AppIcon.swift macos/Sources/XDial/RotaryDial.swift
 MACOS_BRAND_PALETTE_SOURCE := macos/Sources/XDial/XDialBrandPalette.swift
+MOBILE_ICON_GENERATOR := scripts/generate-mobile-app-icons/main.swift
+MOBILE_ICON_GENERATOR_BINARY := $(BUILD_DIR)/generate-mobile-app-icons
 MACOS_APP_LAUNCH_POLICY_SOURCE := macos/Sources/XDial/ApplicationLaunchPolicy.swift
 MACOS_APP_LAUNCHER_SOURCE := tools/launch-macos-app.swift
 MACOS_APP_LAUNCHER := $(BUILD_DIR)/launch-macos-app
@@ -37,7 +39,7 @@ MACOS_APP_LAUNCHER := $(BUILD_DIR)/launch-macos-app
 SIGN_IDENTITY ?= Apple Development
 MACOS_TEST_XCODEBUILD_FLAGS ?=
 
-.PHONY: all cli app ci-macos-build release restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios FORCE_PATCHED_GO
+.PHONY: all cli app ci-macos-build release restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios mobile-app-icons FORCE_PATCHED_GO
 
 $(MACOS_ICON_GENERATOR_BINARY): $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
 	@mkdir -p "$(BUILD_DIR)"
@@ -58,6 +60,16 @@ macos/SettingsDockIcon.icns: $(MACOS_ICON_GENERATOR_BINARY)
 		"$(BUILD_DIR)/SettingsDockIcon.iconset" --dock
 	iconutil -c icns "$(BUILD_DIR)/SettingsDockIcon.iconset" \
 		-o macos/SettingsDockIcon.icns
+
+# iOS / tvOS 位图图标由同一份拨号盘几何生成，落到 asset catalog 后需提交；
+# 不进入日常构建，改图标后手动执行。
+$(MOBILE_ICON_GENERATOR_BINARY): $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MOBILE_ICON_GENERATOR)
+	@mkdir -p "$(BUILD_DIR)"
+	xcrun swiftc $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MOBILE_ICON_GENERATOR) \
+		-o "$(MOBILE_ICON_GENERATOR_BINARY)"
+
+mobile-app-icons: $(MOBILE_ICON_GENERATOR_BINARY)
+	"$(MOBILE_ICON_GENERATOR_BINARY)" "$(CURDIR)"
 
 $(MACOS_APP_LAUNCHER): $(MACOS_APP_LAUNCH_POLICY_SOURCE) $(MACOS_APP_LAUNCHER_SOURCE)
 	@mkdir -p "$(BUILD_DIR)"

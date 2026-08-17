@@ -204,34 +204,68 @@ extension Notification.Name {
 /// openWindow 环境值的地方（popover 的内容只在展开时才存在）。
 private struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
+    // label 的 colorScheme 来自 status item 所在的 NSStatusBarWindow，跟随真实
+    // 菜单栏明暗（含壁纸压暗），不受设置页外观覆盖影响；只用于非模板的「有更新」图。
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let connected: Bool
+    let connecting: Bool
     let hasError: Bool
     let updateAvailable: Bool
+    /// 连接中拨号动画的帧号；只在真正连接中且未开启 Reduce Motion 时推进。
+    @State private var animationFrame = 0
+
+    private var connection: MenuBarStatusIcon.ConnectionState {
+        if connected { return .connected }
+        if connecting { return .connecting }
+        return .disconnected
+    }
+
+    private var animates: Bool {
+        connection == .connecting && !reduceMotion
+    }
 
     var body: some View {
-        Image(nsImage: AppIcon.menuBar(
-            connected: connected,
-            hasError: hasError,
-            updateAvailable: updateAvailable
+        Image(nsImage: MenuBarStatusIcon.image(
+            connection: connection,
+            badge: .resolve(
+                hasError: hasError,
+                updateAvailable: updateAvailable
+            ),
+            menuBarTone: colorScheme == .dark ? .dark : .light,
+            animationFrame: animationFrame
         ))
-            .resizable()
-            .interpolation(.high)
-            .frame(width: 20, height: 20)
-            // 系统 status item 还会增加自身左右 inset；缩窄
-            // label 布局宽度，但不裁剪 20pt 的月球。
+            .frame(
+                width: MenuBarStatusIcon.canvasSize,
+                height: MenuBarStatusIcon.canvasSize
+            )
+            // 系统 status item 还会增加自身左右 inset；缩窄 label 布局宽度，
+            // 但不裁剪 20 pt 的拨盘。
             .frame(width: 16, height: 22)
             .accessibilityLabel("XDial")
+            .task(id: animates) {
+                // 状态离开连接中时任务被取消并复位帧号，静态图始终是第 0 帧。
+                guard animates else {
+                    animationFrame = 0
+                    return
+                }
+                while !Task.isCancelled {
+                    do {
+                        try await Task.sleep(
+                            for: MenuBarStatusIcon.animationFrameInterval
+                        )
+                    } catch {
+                        return
+                    }
+                    animationFrame = (animationFrame + 1)
+                        % MenuBarStatusIcon.animationFramesPerCycle
+                }
+            }
             .onAppear {
                 AppIcon.applyDockState(connected: connected)
-                SettingsDockProxyCoordinator.shared.updateConnected(
-                    connected
-                )
             }
             .onChange(of: connected) { _, isConnected in
                 AppIcon.applyDockState(connected: isConnected)
-                SettingsDockProxyCoordinator.shared.updateConnected(
-                    isConnected
-                )
             }
             .onReceive(
                 NotificationCenter.default.publisher(
@@ -267,6 +301,7 @@ struct XDialApp: App {
         } label: {
             MenuBarLabel(
                 connected: state.isConnected,
+                connecting: state.isBusy,
                 hasError: state.hasMenuBarError,
                 updateAvailable: updateChecker.isUpdateAvailable
             )
@@ -348,9 +383,7 @@ final class ApplicationWindowLifecycleController {
 
     func prepareToPresentSettingsWindow() {
         AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
-        SettingsDockProxyCoordinator.shared.present(
-            connected: GoEngine.shared.isConnected
-        )
+        SettingsDockProxyCoordinator.shared.present()
         _ = NSApp.setActivationPolicy(.accessory)
         lastPolicyTransitionSucceeded =
             NSApp.activationPolicy() == .accessory

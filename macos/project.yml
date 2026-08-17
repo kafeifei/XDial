@@ -75,9 +75,7 @@ targets:
     platform: macOS
     sources:
       - SettingsDockUI
-      - Sources/XDial/AppIcon.swift
       - Sources/XDial/SettingsDockProxyProtocol.swift
-      - Sources/XDial/XDialBrandPalette.swift
       - path: SettingsDockIcon.icns
         buildPhase: resources
     info:
@@ -284,6 +282,8 @@ targets:
       - Sources/XDial/Models.swift
       - Sources/XDial/ProfileVaultProjection.swift
       - Sources/XDial/Localization.swift
+      - Sources/XDial/MenuBarStatusIcon.swift
+      - Sources/XDial/RotaryDial.swift
       - Sources/XDial/ScenarioIconCatalog.swift
       - Sources/XDial/ScenarioGridLayout.swift
       - Sources/XDial/XDialBrandPalette.swift
