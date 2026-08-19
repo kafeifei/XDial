@@ -85,6 +85,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var automaticReconnectRetryAt: Date?
     private var automaticReconnectRetryAttempt: Int?
     private var automaticReconnectRetryFailedTransactionID: String?
+    private var automaticReconnectUnderlayWaitEvidence:
+        HostUnderlayCaptureEvidence?
     private var stableConnectionResetWorkItem: DispatchWorkItem?
     private var stableConnectionResetAt: Date?
     private var connectedSessionTransactionID: String?
@@ -114,7 +116,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             maxAttempts: automaticReconnectRetryPolicy.maxAttempts,
             stableResetAt: stableConnectionResetAt,
             retryAt: automaticReconnectRetryAt,
-            retryAttempt: automaticReconnectRetryAttempt
+            retryAttempt: automaticReconnectRetryAttempt,
+            underlayWaitEvidence:
+                automaticReconnectUnderlayWaitEvidence
         )
     }
 
@@ -199,6 +203,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         automaticReconnectTrigger = nil
         pendingInitialRetryTrigger = automaticRetryTrigger
         automaticReconnectTransactionID = nil
+        automaticReconnectUnderlayWaitEvidence = nil
         networkExtensionSessionTransactionID = nil
         connectedSessionTransactionID = nil
         activeReconnectIncidentID = nil
@@ -764,6 +769,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             }
         }
     }
+
     #endif
 
     func stop() {
@@ -792,6 +798,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         automaticReconnectTrigger = nil
         pendingInitialRetryTrigger = nil
         automaticReconnectTransactionID = nil
+        automaticReconnectUnderlayWaitEvidence = nil
         networkExtensionSessionTransactionID = nil
         connectedSessionTransactionID = nil
         if let incidentID = activeReconnectIncidentID {
@@ -2213,6 +2220,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     }
 
     private func publishFailure(_ error: Error) {
+        let underlayCaptureError = error as? HostUnderlayCaptureError
         let wasAutomaticReconnect =
             automaticReconnectInProgress
                 && automaticReconnectTrigger != nil
@@ -2230,9 +2238,15 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 }
                 report.setState(.rollingBack)
                 report.fail(
-                    code: "host-start-failed",
+                    code: underlayCaptureError?.evidence.reason.rawValue
+                        ?? "host-start-failed",
                     message: error.localizedDescription,
-                    taskID: report.currentTask?.id ?? ""
+                    taskID: report.currentTask?.id ?? "",
+                    evidence: underlayCaptureError.map {
+                        ConnectionFailureEvidence(
+                            underlayCapture: $0.evidence
+                        )
+                    }
                 )
                 report.rollbackSessionTasks(
                     systemTakeoverRemoved: true,
@@ -2554,6 +2568,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         automaticReconnectTrigger = nil
         pendingInitialRetryTrigger = nil
         automaticReconnectTransactionID = nil
+        automaticReconnectUnderlayWaitEvidence = nil
         cancelAutomaticReconnectRetry(resetAttempts: false)
         if isNewSession || stableConnectionResetWorkItem == nil {
             scheduleStableConnectionReset(
@@ -2960,6 +2975,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             }
             switch result {
             case let .success(snapshot):
+                self.automaticReconnectUnderlayWaitEvidence = nil
                 guard self.automaticReconnectAttemptBudget.recordStarted(
                     retryNumber
                 ) else {
@@ -3004,9 +3020,13 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                     debugFailureStage: nil
                 )
             case let .failure(error):
+                let captureError = error as? HostUnderlayCaptureError
+                self.automaticReconnectUnderlayWaitEvidence =
+                    captureError?.evidence
                 appLog(
                     "Transparent Proxy automatic reconnect waiting for "
-                        + "usable Underlay: \(error.localizedDescription)"
+                        + "usable Underlay: \(error.localizedDescription) "
+                        + (captureError?.evidence.logSummary ?? "")
                 )
                 self.scheduleAutomaticReconnectRetry(
                     failedTransactionID: failedTransactionID,
@@ -3028,6 +3048,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
         automaticReconnectTransactionID = nil
+        automaticReconnectUnderlayWaitEvidence = nil
         networkExtensionSessionTransactionID = nil
         cancelAutomaticReconnectRetry(resetAttempts: false)
         if let incidentID = activeReconnectIncidentID {
@@ -3231,10 +3252,24 @@ private struct HostUnderlaySnapshot {
     }
 }
 
+private struct HostUnderlaySnapshotEvaluation {
+    let result: Result<HostUnderlaySnapshot, Error>?
+    let evidence: HostUnderlayCaptureEvidence?
+}
+
+private struct HostUnderlayCaptureError: LocalizedError {
+    let evidence: HostUnderlayCaptureEvidence
+
+    var errorDescription: String? {
+        ManagerError.underlayUnavailable.localizedDescription
+    }
+}
+
 private final class HostUnderlayCapture {
     private let monitor = NWPathMonitor()
     private let completion: (Result<HostUnderlaySnapshot, Error>) -> Void
     private var finished = false
+    private var latestEvidence: HostUnderlayCaptureEvidence?
 
     private init(
         completion: @escaping (
@@ -3261,30 +3296,58 @@ private final class HostUnderlayCapture {
         }
         monitor.start(queue: .global(qos: .userInitiated))
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [self] in
-            finish(.failure(ManagerError.underlayUnavailable))
+            let evidence = latestEvidence ?? .missingPathUpdate
+            appLog(
+                "Transparent Proxy host Underlay capture timed out "
+                    + evidence.logSummary
+            )
+            finish(.failure(HostUnderlayCaptureError(
+                evidence: evidence
+            )))
         }
     }
 
     private func consume(_ path: Network.NWPath) {
-        guard let result = Self.snapshotResult(for: path) else { return }
+        let evaluation = Self.evaluateSnapshot(for: path)
+        if let evidence = evaluation.evidence {
+            latestEvidence = evidence
+        }
+        guard let result = evaluation.result else { return }
         finish(result)
     }
 
     fileprivate static func snapshotResult(
         for path: Network.NWPath
     ) -> Result<HostUnderlaySnapshot, Error>? {
-        guard path.status == .satisfied else { return nil }
+        evaluateSnapshot(for: path).result
+    }
+
+    private static func evaluateSnapshot(
+        for path: Network.NWPath
+    ) -> HostUnderlaySnapshotEvaluation {
+        let pathStatus = pathStatusName(path.status)
+        var candidateNamesSeen = Set<String>()
+        let candidateNames = path.availableInterfaces.compactMap {
+            candidateNamesSeen.insert($0.name).inserted
+                ? $0.name
+                : nil
+        }
+        guard path.status == .satisfied else {
+            return HostUnderlaySnapshotEvaluation(
+                result: nil,
+                evidence: HostUnderlayCaptureDiagnosticClassifier.classify(
+                    pathStatus: pathStatus,
+                    routeInterface: "",
+                    routeError: "",
+                    candidateInterfaces: candidateNames,
+                    indexedInterfaces: candidateNames.filter {
+                        if_nametoindex($0) > 0
+                    }
+                )
+            )
+        }
         var routeError: NSError?
         let routeInterfaceName = LibboxDetectUnderlayInterface(&routeError)
-        guard routeError == nil, !routeInterfaceName.isEmpty else {
-            if let routeError {
-                appLog(
-                    "Transparent Proxy default route snapshot unavailable: "
-                        + routeError.localizedDescription
-                )
-            }
-            return nil
-        }
         var seenNames = Set<String>()
         let interfaces = path.availableInterfaces.compactMap {
             networkInterface -> HostPathInterfaceSnapshot? in
@@ -3301,6 +3364,18 @@ private final class HostUnderlayCapture {
                 type: Self.networkTypeName(networkInterface.type)
             )
         }
+        if let evidence = HostUnderlayCaptureDiagnosticClassifier.classify(
+            pathStatus: pathStatus,
+            routeInterface: routeInterfaceName,
+            routeError: routeError?.localizedDescription ?? "",
+            candidateInterfaces: candidateNames,
+            indexedInterfaces: interfaces.map(\.name)
+        ) {
+            return HostUnderlaySnapshotEvaluation(
+                result: nil,
+                evidence: evidence
+            )
+        }
         guard
             let defaultInterface = interfaces.first(where: {
                 $0.name == routeInterfaceName
@@ -3310,17 +3385,49 @@ private final class HostUnderlayCapture {
         else {
             // 系统默认路由和 NWPath 可能正处在同一次切换的两个不同通知阶段。
             // 等下一份 path 或 3 秒总超时，不能退回 availableInterfaces.first。
-            return nil
+            return HostUnderlaySnapshotEvaluation(
+                result: nil,
+                evidence: HostUnderlayCaptureEvidence(
+                    schemaVersion: 1,
+                    reason: .snapshotEncodingFailed,
+                    pathStatus: pathStatus,
+                    routeInterface: routeInterfaceName,
+                    candidateInterfaces: candidateNames,
+                    invalidCandidateInterfaces: [],
+                    routeError: "interface snapshot encoding failed"
+                )
+            )
         }
         guard let systemDNSJSON = Self.captureSystemDNSJSON() else {
-            return .failure(ManagerError.systemDNSUnavailable)
+            return HostUnderlaySnapshotEvaluation(
+                result: .failure(ManagerError.systemDNSUnavailable),
+                evidence: nil
+            )
         }
-        return .success(HostUnderlaySnapshot(
-            defaultInterface: defaultInterface,
-            interfaces: interfaces,
-            interfacesJSON: interfacesJSON,
-            systemDNSJSON: systemDNSJSON
-        ))
+        return HostUnderlaySnapshotEvaluation(
+            result: .success(HostUnderlaySnapshot(
+                defaultInterface: defaultInterface,
+                interfaces: interfaces,
+                interfacesJSON: interfacesJSON,
+                systemDNSJSON: systemDNSJSON
+            )),
+            evidence: nil
+        )
+    }
+
+    private static func pathStatusName(
+        _ status: Network.NWPath.Status
+    ) -> String {
+        switch status {
+        case .satisfied:
+            "satisfied"
+        case .unsatisfied:
+            "unsatisfied"
+        case .requiresConnection:
+            "requires-connection"
+        @unknown default:
+            "unknown"
+        }
     }
 
     private func finish(

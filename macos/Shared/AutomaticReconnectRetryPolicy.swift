@@ -20,6 +20,7 @@ struct AutomaticReconnectRuntimeState: Codable, Equatable {
     let stableResetAt: Date?
     let retryAt: Date?
     let retryAttempt: Int?
+    let underlayWaitEvidence: HostUnderlayCaptureEvidence?
 
     enum CodingKeys: String, CodingKey {
         case inProgress = "in_progress"
@@ -29,6 +30,27 @@ struct AutomaticReconnectRuntimeState: Codable, Equatable {
         case stableResetAt = "stable_reset_at"
         case retryAt = "retry_at"
         case retryAttempt = "retry_attempt"
+        case underlayWaitEvidence = "underlay_wait_evidence"
+    }
+
+    init(
+        inProgress: Bool,
+        trigger: AutomaticReconnectTrigger?,
+        attemptsUsed: Int,
+        maxAttempts: Int,
+        stableResetAt: Date?,
+        retryAt: Date?,
+        retryAttempt: Int?,
+        underlayWaitEvidence: HostUnderlayCaptureEvidence? = nil
+    ) {
+        self.inProgress = inProgress
+        self.trigger = trigger
+        self.attemptsUsed = attemptsUsed
+        self.maxAttempts = maxAttempts
+        self.stableResetAt = stableResetAt
+        self.retryAt = retryAt
+        self.retryAttempt = retryAttempt
+        self.underlayWaitEvidence = underlayWaitEvidence
     }
 
     func retryCountdownSeconds(at date: Date) -> Int? {

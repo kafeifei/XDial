@@ -287,13 +287,19 @@ struct AnyConnectLineRuntimeStatus: Decodable, Equatable {
 
 struct ConnectionFailureEvidence: Codable, Equatable {
     let anyConnect: AnyConnectFailureEvidence?
+    let underlayCapture: HostUnderlayCaptureEvidence?
 
     enum CodingKeys: String, CodingKey {
         case anyConnect = "anyconnect"
+        case underlayCapture = "underlay_capture"
     }
 
-    init(anyConnect: AnyConnectFailureEvidence? = nil) {
+    init(
+        anyConnect: AnyConnectFailureEvidence? = nil,
+        underlayCapture: HostUnderlayCaptureEvidence? = nil
+    ) {
         self.anyConnect = anyConnect
+        self.underlayCapture = underlayCapture
     }
 }
 

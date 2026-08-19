@@ -124,6 +124,30 @@ final class AutomaticReconnectRetryPolicyTests: XCTestCase {
         XCTAssertEqual(state.retryAttempt, 1)
     }
 
+    func testRuntimeStateExposesStructuredUnderlayWaitReason() {
+        let evidence = HostUnderlayCaptureEvidence(
+            schemaVersion: 1,
+            reason: .pathUnsatisfied,
+            pathStatus: "unsatisfied",
+            routeInterface: "",
+            candidateInterfaces: ["en0"],
+            invalidCandidateInterfaces: [],
+            routeError: ""
+        )
+        let state = AutomaticReconnectRuntimeState(
+            inProgress: true,
+            trigger: .unexpectedDisconnect,
+            attemptsUsed: 0,
+            maxAttempts: 5,
+            stableResetAt: nil,
+            retryAt: nil,
+            retryAttempt: nil,
+            underlayWaitEvidence: evidence
+        )
+
+        XCTAssertEqual(state.underlayWaitEvidence, evidence)
+    }
+
     func testDoesNotRetryBeforeRollbackCompletes() {
         let policy = AutomaticReconnectRetryPolicy()
         var report = failedReport(
