@@ -43,6 +43,47 @@ func TestTransparentProxyDNSRejectsMissingOrInvalidSystemSnapshot(t *testing.T) 
 	}
 }
 
+func TestTransparentProxyDirectDomainsUseMacOSNativeResolver(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
+		RuleSets: []RuleSet{{
+			ID: "public-direct", Type: RuleSetTypeManual, Enabled: true,
+			Domains: []string{"service.example"},
+		}},
+		Scenarios: []Scenario{{
+			ID: "scenario",
+			Bindings: []RuleBinding{{
+				RuleSetID: "public-direct", LineID: "direct",
+			}},
+			DefaultLineID: "direct",
+		}},
+		ActiveScenarioID: "scenario",
+	}
+
+	cfg, raw := generateTransparentProxyDNSTestConfig(t, profile)
+	native := transparentProxyDNSServerByTag(
+		t, cfg, TransparentNativeDNSTag,
+	)
+	if native["type"] != "local" ||
+		native["xdial_use_system_resolver"] != true {
+		t.Fatalf("Direct resolver does not use macOS native resolution: %v", native)
+	}
+	for _, forbidden := range []string{"server", "server_port", "detour"} {
+		if _, exists := native[forbidden]; exists {
+			t.Fatalf("native Direct resolver contains %s: %v", forbidden, native)
+		}
+	}
+	if cfg.DNS["final"] != TransparentNativeDNSTag {
+		t.Fatalf("Direct default lost native resolver ownership: %v", cfg.DNS)
+	}
+	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
+		`{"action":"resolve","domain_suffix":["service.example"],"server":"xdial-native-dns"}`,
+		`{"domain_suffix":["service.example"],"outbound":"direct"}`,
+		`{"action":"resolve","server":"xdial-native-dns"}`,
+	})
+	singboxCheckConfig(t, raw, "transparent-direct-native-dns")
+}
+
 func TestTransparentProxyDomainEndpointUsesIsolatedBootstrapResolver(t *testing.T) {
 	profile := &Profile{
 		Lines: []Line{
@@ -232,17 +273,20 @@ func TestTransparentProxyDNSCompilesManualDomainThenCIDRInCausalOrder(t *testing
 		`{"domain_suffix":["corp.example"],"outbound":"vpn"}`,
 		`{"action":"resolve","server":"xdial-system-dns"}`,
 		`{"ip_cidr":["10.0.0.0/8"],"outbound":"vpn"}`,
-		`{"action":"resolve","server":"xdial-system-dns"}`,
+		`{"action":"resolve","server":"xdial-native-dns"}`,
 	})
 
 	servers := cfg.DNS["servers"].([]interface{})
-	if len(servers) != 2 {
+	if len(servers) != 3 {
 		t.Fatalf("unexpected DNS servers: %v", servers)
 	}
-	system := servers[0].(map[string]interface{})
-	enterprise := servers[1].(map[string]interface{})
+	system := transparentProxyDNSServerByTag(t, cfg, transparentSystemDNSTag)
+	native := transparentProxyDNSServerByTag(t, cfg, TransparentNativeDNSTag)
+	enterprise := transparentProxyDNSServerByTag(t, cfg, transparentEnterpriseDNSTag)
 	if system["tag"] != transparentSystemDNSTag ||
 		system["server"] != "100.100.100.100" ||
+		native["type"] != "local" ||
+		native["xdial_use_system_resolver"] != true ||
 		enterprise["type"] != "xdial-anyconnect" ||
 		enterprise["tag"] != transparentEnterpriseDNSTag {
 		t.Fatalf("manual domain resolvers do not match their routes: %v", servers)
@@ -303,27 +347,75 @@ func TestTransparentProxyDNSClassifiesURLRulesAndPreservesBindingOrder(t *testin
 		`{"outbound":"proxy-japan","rule_set":"ruleset-domain"}`,
 		`{"action":"resolve","server":"xdial-system-dns"}`,
 		`{"outbound":"proxy-japan","rule_set":"ruleset-ip"}`,
-		`{"action":"resolve","server":"xdial-system-dns"}`,
+		`{"action":"resolve","server":"xdial-native-dns"}`,
 	})
 
-	if dnsRules, ok := cfg.DNS["rules"].([]interface{}); ok && len(dnsRules) > 0 {
-		t.Fatalf("a mixed rule before the domain rule must close the DNS ownership chain: %v", dnsRules)
+	dnsRules, ok := cfg.DNS["rules"].([]interface{})
+	if !ok || len(dnsRules) != 1 {
+		t.Fatalf("IP and mixed rules must not swallow later domain DNS ownership: %v", cfg.DNS["rules"])
+	}
+	domainDNS := dnsRules[0].(map[string]interface{})
+	if domainDNS["rule_set"] != "ruleset-domain" ||
+		domainDNS["server"] != "proxy-dns-proxy-japan" {
+		t.Fatalf("later domain DNS ownership drifted from Scenario: %v", domainDNS)
 	}
 
 	servers := cfg.DNS["servers"].([]interface{})
-	if len(servers) != 2 {
+	if len(servers) != 3 {
 		t.Fatalf("route-time domain resolution is missing its Line resolver: %v", servers)
 	}
-	lineResolver := servers[1].(map[string]interface{})
+	lineResolver := transparentProxyDNSServerByTag(t, cfg, "proxy-dns-proxy-japan")
 	if lineResolver["tag"] != "proxy-dns-proxy-japan" ||
 		lineResolver["type"] != "https" ||
 		lineResolver["detour"] != "proxy-japan" {
 		t.Fatalf("pure-domain URL rule did not resolve through its target Line: %v", lineResolver)
 	}
-	if cfg.DNS["final"] != transparentSystemDNSTag {
-		t.Fatalf("the conservative DNS path must use the startup system DNS: %v", cfg.DNS)
+	if cfg.DNS["final"] != TransparentNativeDNSTag {
+		t.Fatalf("the Direct default must use macOS native DNS: %v", cfg.DNS)
 	}
 	assertTransparentProxyHasNoMobileDNSFallback(t, raw)
+}
+
+func TestTransparentProxyMixedBindingDoesNotSwallowLaterDirectDomainDNS(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{
+				ID: "proxy", Type: LineTypeTrojan, Enabled: true,
+				TrojanServer: "192.0.2.10", TrojanPort: 443,
+				TrojanPassword: "secret", TrojanSNI: "proxy.example",
+			},
+		},
+		RuleSets: []RuleSet{
+			{
+				ID: "internal", Type: RuleSetTypeManual, Enabled: true,
+				Domains: []string{"corp.example"}, CIDRs: []string{"10.0.0.0/8"},
+			},
+			{
+				ID: "domestic", Type: RuleSetTypeURL, Enabled: true,
+				URL: "file:///tmp/domestic.srs", Format: "binary",
+				RuntimeMatchKind: RuleSetMatchDomain,
+			},
+		},
+		Scenarios: []Scenario{{
+			ID: "scenario",
+			Bindings: []RuleBinding{
+				{RuleSetID: "internal", LineID: "proxy"},
+				{RuleSetID: "domestic", LineID: "direct"},
+			},
+			DefaultLineID: "proxy",
+		}},
+		ActiveScenarioID: "scenario",
+	}
+
+	cfg, _ := generateTransparentProxyDNSTestConfig(t, profile)
+	assertTransparentProxyRules(t, cfg.DNS["rules"].([]interface{}), []string{
+		`{"domain_suffix":["corp.example"],"server":"proxy-dns-proxy-proxy"}`,
+		`{"rule_set":"ruleset-domestic","server":"xdial-native-dns"}`,
+	})
+	if cfg.DNS["final"] != "proxy-dns-proxy-proxy" {
+		t.Fatalf("default proxy DNS changed: %v", cfg.DNS)
+	}
 }
 
 func TestTransparentProxyDefaultLineOwnsFinalResolution(t *testing.T) {
@@ -423,7 +515,7 @@ func TestTransparentProxyMagicDNSToggleCompilesDynamicDNSAndPeerRoutes(t *testin
 	cfg, raw := generateTransparentProxyDNSTestConfig(t, profile)
 	resolverTag := TailscaleMagicDNSDNSServerTag("tailscale-tailnet")
 	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
-		`{"action":"resolve","domain_suffix":["cdn.example.com"],"server":"xdial-system-dns"}`,
+		`{"action":"resolve","domain_suffix":["cdn.example.com"],"server":"xdial-native-dns"}`,
 		`{"domain_suffix":["cdn.example.com"],"outbound":"direct"}`,
 		`{"action":"resolve","server":"xdial-system-dns"}`,
 		`{"ip_cidr":["203.0.113.0/24"],"outbound":"direct"}`,
@@ -433,7 +525,7 @@ func TestTransparentProxyMagicDNSToggleCompilesDynamicDNSAndPeerRoutes(t *testin
 	})
 
 	servers := cfg.DNS["servers"].([]interface{})
-	if len(servers) != 3 {
+	if len(servers) != 4 {
 		t.Fatalf("expected system, Tailscale, and default-Line DNS servers, got %v", servers)
 	}
 	for _, rawServer := range servers {
@@ -442,7 +534,7 @@ func TestTransparentProxyMagicDNSToggleCompilesDynamicDNSAndPeerRoutes(t *testin
 			t.Fatalf("MagicDNS must not instantiate the inline Tailscale DNS service: %v", server)
 		}
 	}
-	tailnetDNS := servers[1].(map[string]interface{})
+	tailnetDNS := transparentProxyDNSServerByTag(t, cfg, resolverTag)
 	if tailnetDNS["type"] != "hosts" ||
 		tailnetDNS["tag"] != resolverTag ||
 		tailnetDNS["memory_only"] != true {
@@ -463,7 +555,7 @@ func TestTransparentProxyMagicDNSToggleCompilesDynamicDNSAndPeerRoutes(t *testin
 	if first["preferred_by"] != resolverTag || first["server"] != resolverTag || first["disable_cache"] != true {
 		t.Fatalf("MagicDNS ownership must be first, dynamic, and uncached: %v", first)
 	}
-	if second["server"] != transparentSystemDNSTag ||
+	if second["server"] != TransparentNativeDNSTag ||
 		!reflect.DeepEqual(second["domain_suffix"], []interface{}{"cdn.example.com"}) {
 		t.Fatalf("ordinary Scenario DNS ownership must follow MagicDNS: %v", dnsRules)
 	}
@@ -537,7 +629,7 @@ func TestTransparentProxyInvertedURLIPRuleKeepsSystemResolutionAndInvertsRoute(t
 	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
 		`{"action":"resolve","server":"xdial-system-dns"}`,
 		`{"invert":true,"outbound":"proxy-japan","rule_set":"ruleset-outside-cn"}`,
-		`{"action":"resolve","server":"xdial-system-dns"}`,
+		`{"action":"resolve","server":"xdial-native-dns"}`,
 	})
 }
 
@@ -577,7 +669,7 @@ func TestTransparentProxyInvertedManualDomainRuleInvertsDNSAndRouteTogether(t *t
 	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
 		`{"action":"resolve","domain_suffix":["corp.example"],"invert":true,"server":"proxy-dns-proxy-japan"}`,
 		`{"domain_suffix":["corp.example"],"invert":true,"outbound":"proxy-japan"}`,
-		`{"action":"resolve","server":"xdial-system-dns"}`,
+		`{"action":"resolve","server":"xdial-native-dns"}`,
 	})
 
 	found := false
@@ -632,7 +724,7 @@ func TestTransparentProxyInvertedManualMixedRuleComplementsWholeUnion(t *testing
 	assertTransparentProxyRules(t, transparentProxyUserRules(t, cfg), []string{
 		`{"action":"resolve","server":"xdial-system-dns"}`,
 		`{"invert":true,"mode":"or","outbound":"proxy-japan","rules":[{"domain_suffix":["corp.example"]},{"ip_cidr":["10.0.0.0/8"]}],"type":"logical"}`,
-		`{"action":"resolve","server":"xdial-system-dns"}`,
+		`{"action":"resolve","server":"xdial-native-dns"}`,
 	})
 	singboxCheckConfig(t, raw, "transparent-inverted-manual-mixed")
 }

@@ -819,7 +819,7 @@ func transparentProxyRuleSetRefreshes(
 		}
 		resolverTag := "proxy-dns-" + outboundTag
 		if outboundTag == "direct" {
-			resolverTag = "xdial-system-dns"
+			resolverTag = config.TransparentNativeDNSTag
 		}
 		refreshes = append(refreshes, transparentProxyRuleSetRefresh{
 			RuleSetID:    item.RuleSetID,

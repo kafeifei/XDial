@@ -627,7 +627,7 @@ func TestGenerateTransparentProxyRuleSetBootstrapDefaultsToDirect(t *testing.T) 
 	}
 	session := bootstrap.PreflightSessions[0]
 	if session.LineID != "direct" || session.OutboundTag != "direct" ||
-		session.Refreshes[0].ResolverTag != "xdial-system-dns" {
+		session.Refreshes[0].ResolverTag != config.TransparentNativeDNSTag {
 		t.Fatalf("unspecified fetch Line must be Direct: %+v", session)
 	}
 }

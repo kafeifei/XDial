@@ -164,8 +164,25 @@ Scenario 决定是否使用。同一条线路上，内网域名与公网域名�
 
 **这条约束的作用域只能是「基于域名的绑定」，这一点是因果链的直接推论，不是妥协。** 路由裁决可以基于 IP（`ip_cidr` / GEOIP / `ip_is_private`），而 DNS 裁决发生在拿到 IP **之前**。要求"任意域名的 DNS 判定与路由判定一致"等于要求 DNS 阶段就已经知道解析结果——逻辑上自相矛盾。所以正确表述是：**基于域名的绑定必须双向一致（有路由分支就有 DNS 分支，反之亦然）；基于 IP 的绑定天然不参与 DNS 分域。** 不变量 INV7 就是按这个收窄版写的。
 
-两个显式边界是：`direct` 线路不声明独立解析器（本就使用 Underlay 视角），因此不产生额外
-DNS 分支；以及 D33 的 macOS Transparent Proxy Tailscale MagicDNS 开关，它只在该 Line 被
+因此 DNS 编译只保留 Scenario 中可在名字阶段求值的分支，并维持这些域名分支彼此的可见
+顺序；纯 IP 分支与无法安全拆分的 mixed 分支只在 route 阶段求值，既不生成 DNS 分支，也
+不得截断它们之后明确的域名绑定。否则一个排在前面的 CIDR 会静默吞掉后续域名的解析权，
+形成“解析走默认 Line、连接走后续域名 Line”的确定性漂移。
+
+两个显式边界是：macOS Transparent Proxy 的 `direct` 线路使用一个盒内的原生解析
+transport。系统或应用已经发出的 DNS flow 被 Transparent Proxy 接管后，原生 transport
+必须保留该 flow 的原始 UDP/TCP 查询字节与原始 resolver endpoint；只有 sing-box 的同源
+DNS 规则裁决为 `direct` 时，才由 sing-box Direct dialer 把这笔原查询发送到该 endpoint，
+并把经过事务 ID、问题和目标校验的原响应交还应用。这样缓存、scoped resolver、搜索域和
+系统已有网络叠加仍由发起查询的一方与 Underlay 决定，同时 Provider 不读取域名或实现第二套
+DNS 裁决。不得把已经被接管、正等待 Provider 应答的同一问题再次交给 `mDNSResponder`：
+实机已证明 `DNSServiceGetAddrInfo` 在这个上下文中不会完成。只有不存在原始 DNS flow 的
+盒内主动解析（例如 Direct RuleSet 获取或 route resolve）才使用 Apple 正式的
+`DNSServiceGetAddrInfo`。两条路径都不硬编码公共 DNS、不从 Profile 或网络名称选择
+resolver，也不改变随后仍由 `direct` outbound 发出的连接；任一路径缺少完整上下文或校验
+失败都必须 fail-closed，不得退回重建查询、首选 Resolver 裸 UDP 或公共 DNS。另一个边界是
+D33 的 macOS Transparent Proxy
+Tailscale MagicDNS 开关，它只在该 Line 被
 active Scenario 引用且
 用户勾选时，将同一个 endpoint 的动态 DNS 归属与 peer 路由成对启用。启动事务在
 endpoint 就绪后只读取一次 `DNS Config`：`Hosts` 提供完整名和地址，`SearchDomains`
@@ -521,6 +538,31 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   了哪个 RuleSet / outbound。当时的运行版本没有逐 flow 的 matched
   RuleSet / outbound 结构化观察；active Scenario 配置只能表达期望，禁止据此倒推出实际
   Line 并冒充运行时证据。
+- **Direct 系统解析语义事故证据**：同机、同网络、相邻时间窗口内，关闭 XDial 时 macOS
+  原生解析器把 Cindy 公网域名解析到上海地址且 TLS 成功；开启 XDial 后，旧
+  `xdial-system-dns` 绕过 mDNSResponder，向捕获的首选 Resolver 裸发 UDP/53，得到台湾
+  地址，而该地址在原生直连和 XDial Direct 上都 TCP 超时。相同地址经其他 Line 可以完成
+  TLS，只证明地址与出口组合不同，不能替 XDial 的 Direct 修复。随后把 Direct 公网解析
+  硬编码为 `223.5.5.5` DoH 的实验也未通过现场验收：第一版包含非法空 Direct detour，
+  第二版虽能提交数据面，但 Cindy 与 Codex 仍失败，且在失联前没有完成该版 DNS 应答与
+  Direct TLS 的结构化核验。它不是已验证修复，不得进入分发版本。后续实现必须证明与
+  macOS 原生解析视角一致，不得增加 Cindy / 酒店 / 地域特例或要求用户手工改 Scenario。
+  首个原生解析候选直接复用了 sing-box 面向普通进程的 mDNSResponder Unix socket 协议；
+  普通进程查询公网域名约 300ms 成功，但同一实现进入 Transparent Proxy Provider 后，
+  系统已交付并被 Provider 接受的 DNS flow 在 8 秒内没有应答，真实 HTTPS 因解析超时失败。
+  该候选已回滚，证明普通进程成功不能替代 Network Extension 上下文验收。Provider 内的
+  第二个候选改用 Apple 正式的 `DNSServiceGetAddrInfo`，但提交后同样接受了原始 DNS flow
+  而没有在 8 秒内应答，真实 HTTPS 因解析超时失败并已回滚。系统日志确认该 flow 正是
+  应用发往当时系统 resolver 的原查询；因此对已接管 flow 再调用系统解析器不是可用实现。
+  后续实现必须在 sing-box 完成 DNS 归属裁决后，仅对 Direct 原样转发该 flow 已携带的查询
+  与 resolver endpoint；盒内主动解析才允许使用 `DNSServiceGetAddrInfo`。raw Unix socket
+  协议不得作为此场景的运行实现。
+  后续现场探针进一步确认，`酒店` Scenario 的第一条 mixed“内部域名”曾在生成期关闭整个
+  DNS 规则链，使排在后面的“国内域名 → Direct”完全没有进入 `dns.rules`；Cindy 查询因而
+  落到 Scenario 默认的 Taiwan 1 resolver，而连接仍由国内域名 route 送往 Direct。向一个
+  不可达的名义 resolver 发同一查询仍立即得到台湾地址，证明当时并未执行 Direct 原包
+  transport。生成器必须跳过 IP / mixed 的 DNS 分支但继续编译后续域名归属；相应回归测试
+  要固定“mixed 在前、Direct 域名在后、默认代理”的形状。
 - **基础三出口验收**：官方 Tailscale 全程保持 `Running`，默认接口仍是其虚拟接口。
   相同 active Scenario 下，默认 `direct` 与内置 Tailscale 分别得到不同的公网出口观测；
   `corp.example` 经 AnyConnect 分域解析得到私网地址并返回有效 HTTP 重定向。对该企业

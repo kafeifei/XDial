@@ -1,0 +1,484 @@
+--- a/option/dns.go
++++ b/option/dns.go
+@@ -188,8 +188,9 @@
+ 
+ type LocalDNSServerOptions struct {
+ 	RawLocalDNSServerOptions
+-	PreferGo       bool                       `json:"prefer_go,omitempty"`
+-	NeighborDomain badoption.Listable[string] `json:"neighbor_domain,omitempty"`
++	PreferGo               bool                       `json:"prefer_go,omitempty"`
++	NeighborDomain         badoption.Listable[string] `json:"neighbor_domain,omitempty"`
++	XDialUseSystemResolver bool                       `json:"xdial_use_system_resolver,omitempty"`
+ }
+ 
+ type RemoteDNSServerOptions struct {
+--- a/dns/transport/local/local.go
++++ b/dns/transport/local/local.go
+@@ -33,18 +33,19 @@
+ 
+ type Transport struct {
+ 	dns.TransportAdapter
+-	ctx             context.Context
+-	logger          logger.ContextLogger
+-	hosts           *hosts.File
+-	dialer          N.Dialer
+-	preferGo        bool
+-	fallback        bool
+-	resolved        ResolvedResolver
+-	mdnsTransport   adapter.DNSTransport
+-	dhcpTransport   dhcpTransport
+-	system          systemResolver
+-	serverSet       atomic.Pointer[localServerSet]
+-	serverSetAccess sync.Mutex
++	ctx                    context.Context
++	logger                 logger.ContextLogger
++	hosts                  *hosts.File
++	dialer                 N.Dialer
++	preferGo               bool
++	fallback               bool
++	xdialUseSystemResolver bool
++	resolved               ResolvedResolver
++	mdnsTransport          adapter.DNSTransport
++	dhcpTransport          dhcpTransport
++	system                 systemResolver
++	serverSet              atomic.Pointer[localServerSet]
++	serverSetAccess        sync.Mutex
+ 
+ 	neighborResolver adapter.NeighborResolver
+ 	neighborSuffixes []string
+@@ -65,12 +66,13 @@
+ 		return nil, err
+ 	}
+ 	return &Transport{
+-		TransportAdapter: dns.NewTransportAdapterWithLocalOptions(C.DNSTypeLocal, tag, options),
+-		ctx:              ctx,
+-		logger:           logger,
+-		dialer:           transportDialer,
+-		preferGo:         options.PreferGo,
+-		neighborSuffixes: suffixes,
++		TransportAdapter:       dns.NewTransportAdapterWithLocalOptions(C.DNSTypeLocal, tag, options),
++		ctx:                    ctx,
++		logger:                 logger,
++		dialer:                 transportDialer,
++		preferGo:               options.PreferGo,
++		xdialUseSystemResolver: options.XDialUseSystemResolver,
++		neighborSuffixes:       suffixes,
+ 	}, nil
+ }
+ 
+@@ -205,6 +207,10 @@
+ 		t.mdnsTransport.ExchangeAsync(ctx, message, callback)
+ 		return
+ 	}
++	if C.IsDarwin && t.xdialUseSystemResolver {
++		t.xdialSystemExchangeAsync(ctx, message, callback)
++		return
++	}
+ 	if t.resolved != nil {
+ 		t.resolved.ExchangeAsync(ctx, message, callback)
+ 		return
+--- a/dns/transport/local/local_darwin_test.go
++++ b/dns/transport/local/local_darwin_test.go
+@@ -6,6 +6,7 @@
+ 	"cmp"
+ 	"context"
+ 	"net"
++	"net/netip"
+ 	"os"
+ 	"sync"
+ 	"testing"
+@@ -27,6 +28,69 @@
+ 	conn.Close()
+ }
+ 
++func TestXDialSystemResolverOptionDoesNotRequireTunFallback(t *testing.T) {
++	transport := &Transport{xdialUseSystemResolver: true}
++	if !transport.xdialUseSystemResolver || transport.fallback {
++		t.Fatal("explicit system resolver must be independent of TUN fallback")
++	}
++}
++
++func TestXDialSystemResolverOptionRoutesPublicQueriesThroughNativeAPI(t *testing.T) {
++	originalLookup := xdialSystemLookup
++	t.Cleanup(func() { xdialSystemLookup = originalLookup })
++	var queriedName string
++	xdialSystemLookup = func(_ context.Context, name string, qtype uint16, _ time.Duration) (xdialLookupResult, error) {
++		queriedName = name
++		if qtype != mDNS.TypeA {
++			t.Fatalf("unexpected query type: %d", qtype)
++		}
++		return xdialLookupResult{
++			addresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")},
++			ttl:       60,
++		}, nil
++	}
++
++	transport := &Transport{xdialUseSystemResolver: true}
++	message := new(mDNS.Msg)
++	message.SetQuestion("service.example.", mDNS.TypeA)
++	response, err := transport.Exchange(context.Background(), message)
++	if err != nil {
++		t.Fatal("native resolver exchange: ", err)
++	}
++	if queriedName != "service.example." || len(response.Answer) != 1 {
++		t.Fatalf("public query did not use native resolver: name=%q response=%v", queriedName, response)
++	}
++}
++
++func TestXDialDNSServiceLookupLoopback(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	result, err := xdialDNSServiceLookup(ctx, "localhost.", mDNS.TypeA, 3*time.Second)
++	if err != nil {
++		t.Fatal("DNSServiceGetAddrInfo localhost: ", err)
++	}
++	if !containsXDialAddress(result.addresses, netip.MustParseAddr("127.0.0.1")) {
++		t.Fatalf("DNSServiceGetAddrInfo localhost returned %v", result.addresses)
++	}
++}
++
++func TestXDialSystemResolverNoDataDoesNotBecomeNXDomain(t *testing.T) {
++	originalLookup := xdialSystemLookup
++	t.Cleanup(func() { xdialSystemLookup = originalLookup })
++	xdialSystemLookup = func(context.Context, string, uint16, time.Duration) (xdialLookupResult, error) {
++		return xdialLookupResult{}, errXDialSystemNoData
++	}
++	message := new(mDNS.Msg)
++	message.SetQuestion("service.example.", mDNS.TypeAAAA)
++	response, err := xdialSystemExchange(context.Background(), message)
++	if err != nil {
++		t.Fatal("native resolver no-data exchange: ", err)
++	}
++	if response.Rcode != mDNS.RcodeSuccess || len(response.Answer) != 0 {
++		t.Fatalf("native resolver no-data response = %v", response)
++	}
++}
++
+ func systemExchangeForTest(ctx context.Context, transport *Transport, message *mDNS.Msg) (*mDNS.Msg, error) {
+ 	done := make(chan struct{})
+ 	var (
+--- /dev/null
++++ b/dns/transport/local/local_xdial_darwin.go
+@@ -0,0 +1,299 @@
++//go:build darwin && cgo
++
++package local
++
++/*
++#include <arpa/inet.h>
++#include <dns_sd.h>
++#include <errno.h>
++#include <poll.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++typedef struct {
++	char *output;
++	size_t output_size;
++	size_t output_length;
++	uint32_t ttl;
++	int32_t error_code;
++	int answer_count;
++	int done;
++} xdial_dns_result;
++
++static int64_t xdial_dns_now_millis(void) {
++	struct timespec now;
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return ((int64_t)now.tv_sec * 1000) + (now.tv_nsec / 1000000);
++}
++
++static void xdial_dns_addrinfo_reply(
++	DNSServiceRef sd_ref,
++	DNSServiceFlags flags,
++	uint32_t interface_index,
++	DNSServiceErrorType error_code,
++	const char *hostname,
++	const struct sockaddr *address,
++	uint32_t ttl,
++	void *context
++) {
++	(void)sd_ref;
++	(void)interface_index;
++	(void)hostname;
++	xdial_dns_result *result = (xdial_dns_result *)context;
++	if (error_code != kDNSServiceErr_NoError) {
++		result->error_code = error_code;
++		result->done = 1;
++		return;
++	}
++	if ((flags & kDNSServiceFlagsAdd) != 0 && address != NULL) {
++		char text[INET6_ADDRSTRLEN];
++		const void *source = NULL;
++		if (address->sa_family == AF_INET) {
++			source = &((const struct sockaddr_in *)address)->sin_addr;
++		} else if (address->sa_family == AF_INET6) {
++			source = &((const struct sockaddr_in6 *)address)->sin6_addr;
++		}
++		if (source != NULL && inet_ntop(address->sa_family, source, text, sizeof(text)) != NULL) {
++			size_t text_length = strlen(text);
++			size_t separator = result->answer_count > 0 ? 1 : 0;
++			if (result->output_length + separator + text_length + 1 <= result->output_size) {
++				if (separator != 0) {
++					result->output[result->output_length++] = '\n';
++				}
++				memcpy(result->output + result->output_length, text, text_length);
++				result->output_length += text_length;
++				result->output[result->output_length] = '\0';
++				result->answer_count++;
++				if (result->ttl == 0 || ttl < result->ttl) {
++					result->ttl = ttl;
++				}
++			}
++		}
++	}
++	if ((flags & kDNSServiceFlagsMoreComing) == 0) {
++		result->done = 1;
++	}
++}
++
++static int32_t xdial_dns_lookup(
++	const char *hostname,
++	uint32_t protocol,
++	int timeout_millis,
++	char *output,
++	size_t output_size,
++	uint32_t *ttl
++) {
++	xdial_dns_result result;
++	memset(&result, 0, sizeof(result));
++	result.output = output;
++	result.output_size = output_size;
++	if (output_size > 0) {
++		output[0] = '\0';
++	}
++
++	DNSServiceRef service = NULL;
++	DNSServiceErrorType start_error = DNSServiceGetAddrInfo(
++		&service,
++		kDNSServiceFlagsTimeout,
++		kDNSServiceInterfaceIndexAny,
++		protocol,
++		hostname,
++		xdial_dns_addrinfo_reply,
++		&result
++	);
++	if (start_error != kDNSServiceErr_NoError) {
++		return start_error;
++	}
++	int socket_fd = DNSServiceRefSockFD(service);
++	if (socket_fd < 0) {
++		DNSServiceRefDeallocate(service);
++		return kDNSServiceErr_BadReference;
++	}
++
++	int64_t deadline = xdial_dns_now_millis() + timeout_millis;
++	while (!result.done) {
++		int64_t remaining = deadline - xdial_dns_now_millis();
++		if (remaining <= 0) {
++			result.error_code = kDNSServiceErr_Timeout;
++			break;
++		}
++		struct pollfd descriptor = {
++			.fd = socket_fd,
++			.events = POLLIN,
++		};
++		int poll_result = poll(&descriptor, 1, (int)remaining);
++		if (poll_result == 0) {
++			result.error_code = kDNSServiceErr_Timeout;
++			break;
++		}
++		if (poll_result < 0) {
++			if (errno == EINTR) {
++				continue;
++			}
++			result.error_code = kDNSServiceErr_Unknown;
++			break;
++		}
++		DNSServiceErrorType process_error = DNSServiceProcessResult(service);
++		if (process_error != kDNSServiceErr_NoError) {
++			result.error_code = process_error;
++			break;
++		}
++	}
++	DNSServiceRefDeallocate(service);
++	if (result.error_code != kDNSServiceErr_NoError) {
++		return result.error_code;
++	}
++	if (result.answer_count == 0) {
++		return kDNSServiceErr_NoSuchRecord;
++	}
++	*ttl = result.ttl;
++	return kDNSServiceErr_NoError;
++}
++*/
++import "C"
++
++import (
++	"context"
++	"errors"
++	"net/netip"
++	"strings"
++	"time"
++	"unsafe"
++
++	boxC "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/dns"
++	E "github.com/sagernet/sing/common/exceptions"
++
++	mDNS "github.com/miekg/dns"
++)
++
++const (
++	xdialSystemResolverTimeout = 5 * time.Second
++	xdialSystemResolverSlots   = 32
++	xdialSystemResolverBuffer  = 4096
++)
++
++type xdialLookupResult struct {
++	addresses []netip.Addr
++	ttl       uint32
++}
++
++var (
++	errXDialSystemNoData = errors.New("native DNS lookup returned no data")
++	xdialSystemLookup    = xdialDNSServiceLookup
++	xdialSystemSemaphore = make(chan struct{}, xdialSystemResolverSlots)
++)
++
++func (t *Transport) xdialSystemExchangeAsync(
++	ctx context.Context,
++	message *mDNS.Msg,
++	callback func(response *mDNS.Msg, err error),
++) {
++	go func() {
++		response, err := xdialSystemExchange(ctx, message)
++		callback(response, err)
++	}()
++}
++
++func xdialSystemExchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++	if message == nil || len(message.Question) != 1 {
++		return nil, E.New("invalid native DNS question")
++	}
++	question := message.Question[0]
++	if question.Qtype != mDNS.TypeA && question.Qtype != mDNS.TypeAAAA {
++		return dns.FixedResponseStatus(message, mDNS.RcodeSuccess), nil
++	}
++	select {
++	case xdialSystemSemaphore <- struct{}{}:
++		defer func() { <-xdialSystemSemaphore }()
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++	timeout := xdialSystemResolverTimeout
++	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
++		remaining := time.Until(deadline)
++		if remaining <= 0 {
++			return nil, ctx.Err()
++		}
++		if remaining < timeout {
++			timeout = remaining
++		}
++	}
++	result, err := xdialSystemLookup(ctx, question.Name, question.Qtype, timeout)
++	if err != nil {
++		if errors.Is(err, errXDialSystemNoData) {
++			return dns.FixedResponseStatus(message, mDNS.RcodeSuccess), nil
++		}
++		return nil, err
++	}
++	ttl := result.ttl
++	if ttl == 0 {
++		ttl = boxC.DefaultDNSTTL
++	}
++	return dns.FixedResponse(message.Id, question, result.addresses, ttl), nil
++}
++
++func xdialDNSServiceLookup(
++	ctx context.Context,
++	name string,
++	qtype uint16,
++	timeout time.Duration,
++) (xdialLookupResult, error) {
++	if err := ctx.Err(); err != nil {
++		return xdialLookupResult{}, err
++	}
++	protocol := C.uint32_t(C.kDNSServiceProtocol_IPv4)
++	if qtype == mDNS.TypeAAAA {
++		protocol = C.uint32_t(C.kDNSServiceProtocol_IPv6)
++	}
++	cName := C.CString(name)
++	defer C.free(unsafe.Pointer(cName))
++	buffer := make([]byte, xdialSystemResolverBuffer)
++	var ttl C.uint32_t
++	code := int32(C.xdial_dns_lookup(
++		cName,
++		protocol,
++		C.int(timeout.Milliseconds()),
++		(*C.char)(unsafe.Pointer(&buffer[0])),
++		C.size_t(len(buffer)),
++		&ttl,
++	))
++	if err := ctx.Err(); err != nil {
++		return xdialLookupResult{}, err
++	}
++	switch code {
++	case int32(C.kDNSServiceErr_NoError):
++	case int32(C.kDNSServiceErr_NoSuchName):
++		return xdialLookupResult{}, dns.RcodeError(mDNS.RcodeNameError)
++	case int32(C.kDNSServiceErr_NoSuchRecord):
++		return xdialLookupResult{}, errXDialSystemNoData
++	case int32(C.kDNSServiceErr_Timeout):
++		return xdialLookupResult{}, context.DeadlineExceeded
++	default:
++		return xdialLookupResult{}, E.New("native DNS lookup failed: code ", code)
++	}
++	addresses := make([]netip.Addr, 0, 4)
++	for _, value := range strings.Fields(C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))) {
++		address, err := netip.ParseAddr(value)
++		if err != nil {
++			return xdialLookupResult{}, E.Cause(err, "parse native DNS answer")
++		}
++		addresses = append(addresses, address.Unmap())
++	}
++	if len(addresses) == 0 {
++		return xdialLookupResult{}, errXDialSystemNoData
++	}
++	return xdialLookupResult{addresses: addresses, ttl: uint32(ttl)}, nil
++}
++
++func containsXDialAddress(addresses []netip.Addr, expected netip.Addr) bool {
++	for _, address := range addresses {
++		if address == expected {
++			return true
++		}
++	}
++	return false
++}
+--- /dev/null
++++ b/dns/transport/local/local_xdial_other.go
+@@ -0,0 +1,19 @@
++//go:build !darwin || !cgo
++
++package local
++
++import (
++	"context"
++
++	E "github.com/sagernet/sing/common/exceptions"
++
++	mDNS "github.com/miekg/dns"
++)
++
++func (t *Transport) xdialSystemExchangeAsync(
++	_ context.Context,
++	_ *mDNS.Msg,
++	callback func(response *mDNS.Msg, err error),
++) {
++	callback(nil, E.New("native DNS lookup is unavailable on this platform"))
++}
+

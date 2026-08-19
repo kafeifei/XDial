@@ -2287,12 +2287,12 @@ func TestGenerateTransparentProxyUsesAuthenticatedLoopbackSOCKSWithSystemUnderla
 		rules[0].(map[string]interface{})["action"] != "sniff" ||
 		rules[1].(map[string]interface{})["action"] != "hijack-dns" ||
 		rules[2].(map[string]interface{})["action"] != "resolve" ||
-		rules[2].(map[string]interface{})["server"] != transparentSystemDNSTag {
+		rules[2].(map[string]interface{})["server"] != TransparentNativeDNSTag {
 		t.Fatalf("Transparent Proxy must not resolve globally before Scenario rules: %v", rules)
 	}
 	if cfg.Route["default_domain_resolver"] != transparentSystemDNSTag ||
-		cfg.DNS["final"] != transparentSystemDNSTag {
-		t.Fatalf("Transparent Proxy must use the startup system DNS snapshot: dns=%v route=%v", cfg.DNS, cfg.Route)
+		cfg.DNS["final"] != TransparentNativeDNSTag {
+		t.Fatalf("Transparent Proxy must keep endpoint bootstrap separate from native Direct DNS: dns=%v route=%v", cfg.DNS, cfg.Route)
 	}
 }
 

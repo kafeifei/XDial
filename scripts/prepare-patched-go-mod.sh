@@ -228,6 +228,20 @@ grep -Fq 'func applyXDialFlowMetadata(' \
 	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata.go"
 grep -Fq 'func TestXDialFlowMetadataPreservesDomainAndUsesIPv4Destination(' \
 	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata_test.go"
+grep -Fq 'XDialUseSystemResolver bool' \
+	"${patched_sing_box_dir}/option/dns.go"
+grep -Fq 'func TestXDialSystemResolverOptionDoesNotRequireTunFallback(' \
+	"${patched_sing_box_dir}/dns/transport/local/local_darwin_test.go"
+grep -Fq 'DNSServiceGetAddrInfo(' \
+	"${patched_sing_box_dir}/dns/transport/local/local_xdial_darwin.go"
+grep -Fq 'func TestXDialSystemResolverOptionRoutesPublicQueriesThroughNativeAPI(' \
+	"${patched_sing_box_dir}/dns/transport/local/local_darwin_test.go"
+grep -Fq 'func ContextWithXDialOriginalQuery(' \
+	"${patched_sing_box_dir}/dns/xdial_original_query.go"
+grep -Fq 'func TestXDialOriginalUDPExchangePreservesWireRequestAndTarget(' \
+	"${patched_sing_box_dir}/dns/transport/local/local_darwin_test.go"
+grep -Fq 'options.DisableCache = true' \
+	"${patched_sing_box_dir}/dns/client.go"
 
 patched_module_dir="${staging_dir}/tailscale"
 cp -R "${source_dir}" "${patched_module_dir}"

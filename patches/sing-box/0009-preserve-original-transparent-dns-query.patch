@@ -1,0 +1,602 @@
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -205,6 +205,12 @@
+ 		return nil, FixedResponseStatus(message, dns.RcodeFormatError), exchangeDone, nil
+ 	}
+ 	question := message.Question[0]
++	if _, loaded := XDialOriginalQueryFromContext(ctx); loaded {
++		// The application or mDNSResponder remains the cache owner. A cached
++		// answer here would discard the exact resolver endpoint and request bytes
++		// carried by this Transparent Proxy flow.
++		options.DisableCache = true
++	}
+ 	if question.Qtype == dns.TypeA && options.Strategy == C.DomainStrategyIPv6Only || question.Qtype == dns.TypeAAAA && options.Strategy == C.DomainStrategyIPv4Only {
+ 		if c.logger != nil {
+ 			c.logger.DebugContext(ctx, "strategy rejected")
+--- /dev/null
++++ b/dns/xdial_original_query.go
+@@ -0,0 +1,73 @@
++package dns
++
++import (
++	"bytes"
++	"context"
++
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++type xdialOriginalQueryContextKey struct{}
++type xdialOriginalQueryTargetContextKey struct{}
++
++// XDialOriginalQuery is the exact DNS request received from the macOS
++// Transparent Proxy together with the application's original resolver
++// endpoint. It is process-local metadata and never leaves the DNS exchange.
++type XDialOriginalQuery struct {
++	Network     string
++	Payload     []byte
++	Destination M.Socksaddr
++}
++
++type xdialOriginalQueryTarget struct {
++	network     string
++	destination M.Socksaddr
++}
++
++func ContextWithXDialOriginalQuery(
++	ctx context.Context,
++	network string,
++	payload []byte,
++	destination M.Socksaddr,
++) context.Context {
++	return context.WithValue(ctx, xdialOriginalQueryContextKey{}, XDialOriginalQuery{
++		Network:     network,
++		Payload:     bytes.Clone(payload),
++		Destination: destination,
++	})
++}
++
++func XDialOriginalQueryFromContext(ctx context.Context) (XDialOriginalQuery, bool) {
++	query, loaded := ctx.Value(xdialOriginalQueryContextKey{}).(XDialOriginalQuery)
++	if !loaded {
++		return XDialOriginalQuery{}, false
++	}
++	query.Payload = bytes.Clone(query.Payload)
++	return query, true
++}
++
++// ContextWithXDialOriginalQueryTarget carries the TCP resolver endpoint until
++// the length-prefixed DNS payload has been read by protocol/dns.
++func ContextWithXDialOriginalQueryTarget(
++	ctx context.Context,
++	network string,
++	destination M.Socksaddr,
++) context.Context {
++	return context.WithValue(ctx, xdialOriginalQueryTargetContextKey{}, xdialOriginalQueryTarget{
++		network:     network,
++		destination: destination,
++	})
++}
++
++func ContextWithXDialOriginalQueryPayload(ctx context.Context, payload []byte) context.Context {
++	target, loaded := ctx.Value(xdialOriginalQueryTargetContextKey{}).(xdialOriginalQueryTarget)
++	if !loaded {
++		return ctx
++	}
++	return ContextWithXDialOriginalQuery(
++		ctx,
++		target.network,
++		payload,
++		target.destination,
++	)
++}
+--- /dev/null
++++ b/dns/xdial_original_query_test.go
+@@ -0,0 +1,48 @@
++package dns
++
++import (
++	"context"
++	"net/netip"
++	"testing"
++
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++func TestXDialOriginalQueryContextOwnsPayload(t *testing.T) {
++	target := M.SocksaddrFrom(netip.MustParseAddr("192.0.2.53"), 53)
++	payload := []byte{1, 2, 3}
++	ctx := ContextWithXDialOriginalQuery(
++		context.Background(),
++		N.NetworkUDP,
++		payload,
++		target,
++	)
++	payload[0] = 9
++
++	query, loaded := XDialOriginalQueryFromContext(ctx)
++	if !loaded || query.Network != N.NetworkUDP ||
++		query.Destination != target || query.Payload[0] != 1 {
++		t.Fatalf("unexpected original query: loaded=%v query=%+v", loaded, query)
++	}
++	query.Payload[0] = 8
++	second, _ := XDialOriginalQueryFromContext(ctx)
++	if second.Payload[0] != 1 {
++		t.Fatal("original query payload escaped context ownership")
++	}
++}
++
++func TestXDialOriginalQueryTCPPayloadJoinsCapturedTarget(t *testing.T) {
++	target := M.SocksaddrFrom(netip.MustParseAddr("192.0.2.53"), 53)
++	ctx := ContextWithXDialOriginalQueryTarget(
++		context.Background(),
++		N.NetworkTCP,
++		target,
++	)
++	ctx = ContextWithXDialOriginalQueryPayload(ctx, []byte{4, 5, 6})
++	query, loaded := XDialOriginalQueryFromContext(ctx)
++	if !loaded || query.Network != N.NetworkTCP ||
++		query.Destination != target || len(query.Payload) != 3 {
++		t.Fatalf("unexpected TCP original query: loaded=%v query=%+v", loaded, query)
++	}
++}
+--- a/dns/transport/local/local_xdial_darwin.go
++++ b/dns/transport/local/local_xdial_darwin.go
+@@ -156,8 +156,11 @@
+ import "C"
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/binary"
+ 	"errors"
++	"io"
+ 	"net/netip"
+ 	"strings"
+ 	"time"
+@@ -166,6 +169,7 @@
+ 	boxC "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/dns"
+ 	E "github.com/sagernet/sing/common/exceptions"
++	N "github.com/sagernet/sing/common/network"
+ 
+ 	mDNS "github.com/miekg/dns"
+ )
+@@ -182,9 +186,10 @@
+ }
+ 
+ var (
+-	errXDialSystemNoData = errors.New("native DNS lookup returned no data")
+-	xdialSystemLookup    = xdialDNSServiceLookup
+-	xdialSystemSemaphore = make(chan struct{}, xdialSystemResolverSlots)
++	errXDialSystemNoData  = errors.New("native DNS lookup returned no data")
++	xdialSystemLookup     = xdialDNSServiceLookup
++	xdialOriginalExchange = xdialExchangeOriginalQuery
++	xdialSystemSemaphore  = make(chan struct{}, xdialSystemResolverSlots)
+ )
+ 
+ func (t *Transport) xdialSystemExchangeAsync(
+@@ -192,12 +197,118 @@
+ 	message *mDNS.Msg,
+ 	callback func(response *mDNS.Msg, err error),
+ ) {
++	if originalQuery, loaded := dns.XDialOriginalQueryFromContext(ctx); loaded {
++		go func() {
++			callback(xdialOriginalExchange(
++				ctx,
++				t.dialer,
++				message,
++				originalQuery,
++			))
++		}()
++		return
++	}
+ 	go func() {
+ 		response, err := xdialSystemExchange(ctx, message)
+ 		callback(response, err)
+ 	}()
+ }
+ 
++func xdialExchangeOriginalQuery(
++	ctx context.Context,
++	dialer N.Dialer,
++	message *mDNS.Msg,
++	originalQuery dns.XDialOriginalQuery,
++) (*mDNS.Msg, error) {
++	if message == nil || len(message.Question) == 0 {
++		return nil, E.New("invalid original DNS question")
++	}
++	if len(originalQuery.Payload) < 12 || len(originalQuery.Payload) > 65535 ||
++		(originalQuery.Network != N.NetworkUDP &&
++			originalQuery.Network != N.NetworkTCP) ||
++		!originalQuery.Destination.IsIP() ||
++		originalQuery.Destination.Port != 53 ||
++		originalQuery.Destination.Addr.IsUnspecified() ||
++		originalQuery.Destination.Addr.IsMulticast() {
++		return nil, E.New("invalid original DNS flow")
++	}
++	var wireRequest mDNS.Msg
++	if err := wireRequest.Unpack(originalQuery.Payload); err != nil ||
++		wireRequest.Response ||
++		wireRequest.Id != message.Id ||
++		len(wireRequest.Question) != len(message.Question) {
++		return nil, E.New("original DNS request does not match exchange")
++	}
++	for index := range wireRequest.Question {
++		if wireRequest.Question[index] != message.Question[index] {
++			return nil, E.New("original DNS request does not match exchange")
++		}
++	}
++
++	conn, err := dialer.DialContext(
++		ctx,
++		originalQuery.Network,
++		originalQuery.Destination,
++	)
++	if err != nil {
++		return nil, E.Cause(err, "dial original DNS resolver")
++	}
++	defer conn.Close()
++	if deadline, loaded := ctx.Deadline(); loaded {
++		if err := conn.SetDeadline(deadline); err != nil {
++			return nil, E.Cause(err, "set original DNS deadline")
++		}
++	}
++
++	var rawResponse []byte
++	switch originalQuery.Network {
++	case N.NetworkUDP:
++		written, writeErr := conn.Write(originalQuery.Payload)
++		if writeErr != nil {
++			return nil, E.Cause(writeErr, "write original DNS request")
++		}
++		if written != len(originalQuery.Payload) {
++			return nil, io.ErrShortWrite
++		}
++		responseBuffer := make([]byte, 65535)
++		read, readErr := conn.Read(responseBuffer)
++		if readErr != nil {
++			return nil, E.Cause(readErr, "read original DNS response")
++		}
++		rawResponse = responseBuffer[:read]
++	case N.NetworkTCP:
++		frame := make([]byte, 2+len(originalQuery.Payload))
++		binary.BigEndian.PutUint16(frame, uint16(len(originalQuery.Payload)))
++		copy(frame[2:], originalQuery.Payload)
++		if _, err := io.Copy(conn, bytes.NewReader(frame)); err != nil {
++			return nil, E.Cause(err, "write original DNS request")
++		}
++		var responseLength uint16
++		if err := binary.Read(conn, binary.BigEndian, &responseLength); err != nil {
++			return nil, E.Cause(err, "read original DNS response length")
++		}
++		if responseLength == 0 {
++			return nil, E.New("empty original DNS response")
++		}
++		rawResponse = make([]byte, int(responseLength))
++		if _, err := io.ReadFull(conn, rawResponse); err != nil {
++			return nil, E.Cause(err, "read original DNS response")
++		}
++	default:
++		return nil, E.New("invalid original DNS network")
++	}
++
++	var response mDNS.Msg
++	if err := response.Unpack(rawResponse); err != nil ||
++		!response.Response ||
++		response.Id != wireRequest.Id ||
++		len(response.Question) == 0 ||
++		response.Question[0] != wireRequest.Question[0] {
++		return nil, E.New("invalid original DNS response")
++	}
++	return &response, nil
++}
++
+ func xdialSystemExchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+ 	if message == nil || len(message.Question) != 1 {
+ 		return nil, E.New("invalid native DNS question")
+--- a/dns/transport/local/local_darwin_test.go
++++ b/dns/transport/local/local_darwin_test.go
+@@ -3,8 +3,11 @@
+ package local
+ 
+ import (
++	"bytes"
+ 	"cmp"
+ 	"context"
++	"errors"
++	"io"
+ 	"net"
+ 	"net/netip"
+ 	"os"
+@@ -12,6 +15,10 @@
+ 	"testing"
+ 	"time"
+ 
++	boxDNS "github.com/sagernet/sing-box/dns"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
+ 	mDNS "github.com/miekg/dns"
+ )
+ 
+@@ -59,7 +66,144 @@
+ 	}
+ 	if queriedName != "service.example." || len(response.Answer) != 1 {
+ 		t.Fatalf("public query did not use native resolver: name=%q response=%v", queriedName, response)
++	}
++}
++
++func TestXDialSystemResolverUsesOriginalFlowBeforeNativeAPI(t *testing.T) {
++	originalExchange := xdialOriginalExchange
++	originalLookup := xdialSystemLookup
++	t.Cleanup(func() {
++		xdialOriginalExchange = originalExchange
++		xdialSystemLookup = originalLookup
++	})
++
++	message := new(mDNS.Msg)
++	message.SetQuestion("service.example.", mDNS.TypeA)
++	payload, err := message.Pack()
++	if err != nil {
++		t.Fatal(err)
++	}
++	target := M.SocksaddrFrom(netip.MustParseAddr("192.0.2.53"), 53)
++	ctx := boxDNS.ContextWithXDialOriginalQuery(
++		context.Background(),
++		N.NetworkUDP,
++		payload,
++		target,
++	)
++	var originalCalled bool
++	var nativeCalled bool
++	xdialOriginalExchange = func(
++		_ context.Context,
++		_ N.Dialer,
++		request *mDNS.Msg,
++		original boxDNS.XDialOriginalQuery,
++	) (*mDNS.Msg, error) {
++		originalCalled = true
++		if original.Destination != target || original.Network != N.NetworkUDP {
++			return nil, errors.New("unexpected original query")
++		}
++		response := new(mDNS.Msg)
++		response.SetReply(request)
++		return response, nil
++	}
++	xdialSystemLookup = func(context.Context, string, uint16, time.Duration) (xdialLookupResult, error) {
++		nativeCalled = true
++		return xdialLookupResult{}, errors.New("native lookup should not run")
++	}
++
++	transport := &Transport{xdialUseSystemResolver: true}
++	response, err := transport.Exchange(ctx, message)
++	if err != nil || response == nil || !originalCalled || nativeCalled {
++		t.Fatalf(
++			"original relay priority failed: response=%v err=%v original=%v native=%v",
++			response,
++			err,
++			originalCalled,
++			nativeCalled,
++		)
++	}
++}
++
++type xdialOriginalQueryTestDialer struct {
++	connection  net.Conn
++	network     string
++	destination M.Socksaddr
++}
++
++func (d *xdialOriginalQueryTestDialer) DialContext(
++	_ context.Context,
++	network string,
++	destination M.Socksaddr,
++) (net.Conn, error) {
++	d.network = network
++	d.destination = destination
++	return d.connection, nil
++}
++
++func (*xdialOriginalQueryTestDialer) ListenPacket(
++	context.Context,
++	M.Socksaddr,
++) (net.PacketConn, error) {
++	return nil, errors.New("unused")
++}
++
++func TestXDialOriginalUDPExchangePreservesWireRequestAndTarget(t *testing.T) {
++	message := new(mDNS.Msg)
++	message.SetQuestion("service.example.", mDNS.TypeA)
++	message.SetEdns0(1232, false)
++	payload, err := message.Pack()
++	if err != nil {
++		t.Fatal(err)
+ 	}
++	response := new(mDNS.Msg)
++	response.SetReply(message)
++	rawResponse, err := response.Pack()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	client, server := net.Pipe()
++	t.Cleanup(func() {
++		client.Close()
++		server.Close()
++	})
++	requestChecked := make(chan error, 1)
++	go func() {
++		received := make([]byte, len(payload))
++		_, readErr := io.ReadFull(server, received)
++		if readErr == nil && !bytes.Equal(received, payload) {
++			readErr = errors.New("wire request changed")
++		}
++		if readErr == nil {
++			_, readErr = server.Write(rawResponse)
++		}
++		requestChecked <- readErr
++	}()
++
++	target := M.SocksaddrFrom(netip.MustParseAddr("192.0.2.53"), 53)
++	dialer := &xdialOriginalQueryTestDialer{connection: client}
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	got, err := xdialExchangeOriginalQuery(
++		ctx,
++		dialer,
++		message,
++		boxDNS.XDialOriginalQuery{
++			Network:     N.NetworkUDP,
++			Payload:     payload,
++			Destination: target,
++		},
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := <-requestChecked; err != nil {
++		t.Fatal(err)
++	}
++	if dialer.network != N.NetworkUDP || dialer.destination != target ||
++		got.Id != message.Id || !got.Response {
++		t.Fatalf("unexpected preserved exchange: dialer=%+v response=%v", dialer, got)
++	}
+ }
+ 
+ func TestXDialDNSServiceLookupLoopback(t *testing.T) {
+--- a/protocol/dns/handle.go
++++ b/protocol/dns/handle.go
+@@ -1,6 +1,7 @@
+ package dns
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/binary"
+ 	"net"
+@@ -40,7 +41,8 @@
+ 		return err
+ 	}
+ 	metadataInQuery := metadata
+-	router.ExchangeAsync(adapter.WithContext(ctx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
++	queryCtx := dns.ContextWithXDialOriginalQueryPayload(ctx, buffer.Bytes())
++	router.ExchangeAsync(adapter.WithContext(queryCtx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
+ 		if err != nil {
+ 			conn.Close()
+ 			return
+@@ -91,6 +93,7 @@
+ 		for {
+ 			var message mDNS.Msg
+ 			var destination M.Socksaddr
++			var rawQuery []byte
+ 			var err error
+ 			if len(cachedPackets) > 0 {
+ 				packet := cachedPackets[0]
+@@ -98,7 +101,8 @@
+ 				for _, counter := range counters {
+ 					counter(int64(packet.Buffer.Len()))
+ 				}
+-				err = message.Unpack(packet.Buffer.Bytes())
++				rawQuery = bytes.Clone(packet.Buffer.Bytes())
++				err = message.Unpack(rawQuery)
+ 				packet.Buffer.Release()
+ 				if err != nil {
+ 					cancel(err)
+@@ -116,7 +120,8 @@
+ 				for _, counter := range counters {
+ 					counter(int64(buffer.Len()))
+ 				}
+-				err = message.Unpack(buffer.Bytes())
++				rawQuery = bytes.Clone(buffer.Bytes())
++				err = message.Unpack(rawQuery)
+ 				buffer.Release()
+ 				if err != nil {
+ 					cancel(err)
+@@ -125,7 +130,13 @@
+ 				timeout.Update()
+ 			}
+ 			metadataInQuery := metadata
+-			router.ExchangeAsync(adapter.WithContext(ctx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
++			queryCtx := dns.ContextWithXDialOriginalQuery(
++				ctx,
++				N.NetworkUDP,
++				rawQuery,
++				destination,
++			)
++			router.ExchangeAsync(adapter.WithContext(queryCtx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
+ 				if err != nil {
+ 					cancel(err)
+ 					return
+@@ -158,6 +169,7 @@
+ 			var (
+ 				message     mDNS.Msg
+ 				destination M.Socksaddr
++				rawQuery    []byte
+ 				err         error
+ 				buffer      *buf.Buffer
+ 			)
+@@ -167,7 +179,8 @@
+ 				for _, counter := range readCounters {
+ 					counter(int64(packet.Buffer.Len()))
+ 				}
+-				err = message.Unpack(packet.Buffer.Bytes())
++				rawQuery = bytes.Clone(packet.Buffer.Bytes())
++				err = message.Unpack(rawQuery)
+ 				packet.Buffer.Release()
+ 				destination = packet.Destination
+ 				N.PutPacketBuffer(packet)
+@@ -184,7 +197,8 @@
+ 				for _, counter := range readCounters {
+ 					counter(int64(buffer.Len()))
+ 				}
+-				err = message.Unpack(buffer.Bytes())
++				rawQuery = bytes.Clone(buffer.Bytes())
++				err = message.Unpack(rawQuery)
+ 				buffer.Release()
+ 				if err != nil {
+ 					cancel(err)
+@@ -193,7 +207,13 @@
+ 				timeout.Update()
+ 			}
+ 			metadataInQuery := metadata
+-			router.ExchangeAsync(adapter.WithContext(ctx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
++			queryCtx := dns.ContextWithXDialOriginalQuery(
++				ctx,
++				N.NetworkUDP,
++				rawQuery,
++				destination,
++			)
++			router.ExchangeAsync(adapter.WithContext(queryCtx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
+ 				if err != nil {
+ 					cancel(err)
+ 					return
+--- a/route/dns.go
++++ b/route/dns.go
+@@ -18,6 +18,11 @@
+ )
+ 
+ func (r *Router) hijackDNSStream(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
++	ctx = dns.ContextWithXDialOriginalQueryTarget(
++		ctx,
++		N.NetworkTCP,
++		metadata.Destination,
++	)
+ 	metadata.Destination = M.Socksaddr{}
+ 	for {
+ 		conn.SetReadDeadline(time.Now().Add(C.DNSTimeout))
+@@ -50,7 +55,13 @@
+ 	}
+ 	destination := metadata.Destination
+ 	metadata.Destination = M.Socksaddr{}
+-	r.dns.ExchangeAsync(adapter.WithContext(ctx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
++	queryCtx := dns.ContextWithXDialOriginalQuery(
++		ctx,
++		N.NetworkUDP,
++		payload,
++		destination,
++	)
++	r.dns.ExchangeAsync(adapter.WithContext(queryCtx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
+ 		if exchangeErr == nil {
+ 			exchangeErr = r.writeDNSPacketResponse(&message, response, writer, destination)
+ 		}

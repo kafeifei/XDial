@@ -37,6 +37,9 @@ const (
 	mobileDispatcherDNSTag        = "xdial-mobile-dns"
 	transparentSystemDNSTag       = "xdial-system-dns"
 	transparentEnterpriseDNSTag   = "xdial-anyconnect-dns"
+	// TransparentNativeDNSTag is exported so isolated Direct RuleSet refresh
+	// sessions use the same macOS-native resolver contract as Direct traffic.
+	TransparentNativeDNSTag       = "xdial-native-dns"
 	tailnetSingleLabelDomainRegex = `^[^.]+$`
 	minAnyTLSDurationSeconds      = 6
 	maxAnyTLSDurationSeconds      = 3600
@@ -1086,12 +1089,19 @@ func buildTransparentProxyDNS(
 	if err != nil {
 		return nil, err
 	}
-	servers := []map[string]interface{}{{
-		"type":        "udp",
-		"tag":         transparentSystemDNSTag,
-		"server":      primarySystemDNS,
-		"server_port": 53,
-	}}
+	servers := []map[string]interface{}{
+		{
+			"type":        "udp",
+			"tag":         transparentSystemDNSTag,
+			"server":      primarySystemDNS,
+			"server_port": 53,
+		},
+		{
+			"type":                      "local",
+			"tag":                       TransparentNativeDNSTag,
+			"xdial_use_system_resolver": true,
+		},
+	}
 	if needsProxyEndpointBootstrap {
 		servers = append(servers, map[string]interface{}{
 			"type":   "https",
@@ -1102,6 +1112,7 @@ func buildTransparentProxyDNS(
 	var rules []map[string]interface{}
 	seenResolver := map[string]bool{
 		transparentSystemDNSTag: true,
+		TransparentNativeDNSTag: true,
 		desktopPublicDNSTag:     needsProxyEndpointBootstrap,
 	}
 	// 运行期快照归属必须先于 Scenario 中的普通 DNS 分域求值。
@@ -1136,11 +1147,9 @@ func buildTransparentProxyDNS(
 		}
 	}
 
-	// DNS 与 route 使用同一个可见顺序。DNS 查询本身还没有目标 IP，因此遇到
-	// 第一条 IP / 混合规则后，后续域名规则不能越过它抢先选择 resolver；从该点
-	// 开始由启动前系统 DNS 处理。仍继续扫描后续域名 binding 只为注册 route
-	// action:resolve 会引用的 resolver，不再把它们加入 DNS 查询规则链。
-	dnsRulesOpen := true
+	// DNS 与 route 使用同一个可见的域名 binding 顺序。纯 IP 与无法安全拆分的
+	// mixed 分支在名字阶段没有可求值条件，因此不参与 DNS 分域，也不能吞掉后续
+	// 明确的域名归属；route 仍在地址可用后按完整 Scenario 顺序求值。
 	for index := range scenario.Bindings {
 		binding := &scenario.Bindings[index]
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
@@ -1176,35 +1185,25 @@ func buildTransparentProxyDNS(
 		case RuleSetTypeManual:
 			if len(ruleSet.Domains) > 0 && (!ruleSet.Invert || len(ruleSet.CIDRs) == 0) {
 				ensureResolver(resolverTag, outTag)
-				if dnsRulesOpen {
-					rule := map[string]interface{}{
-						"domain_suffix": ruleSet.Domains,
-						"server":        resolverTag,
-					}
-					applyRuleSetInvert(rule, ruleSet)
-					rules = append(rules, rule)
-				}
-			}
-			if len(ruleSet.CIDRs) > 0 {
-				dnsRulesOpen = false
-			}
-		case RuleSetTypeURL:
-			if ruleSet.RuntimeMatchKind != RuleSetMatchDomain {
-				// IP 与无法安全拆分的混合规则走系统 DNS；这是用户指定的
-				// 保守路径，不猜测远程规则集里的域名归属，也不允许后续
-				// 域名规则越过它抢先选择 resolver。
-				dnsRulesOpen = false
-				continue
-			}
-			ensureResolver(resolverTag, outTag)
-			if dnsRulesOpen {
 				rule := map[string]interface{}{
-					"rule_set": sbRuleSetTag(ruleSet),
-					"server":   resolverTag,
+					"domain_suffix": ruleSet.Domains,
+					"server":        resolverTag,
 				}
 				applyRuleSetInvert(rule, ruleSet)
 				rules = append(rules, rule)
 			}
+		case RuleSetTypeURL:
+			if ruleSet.RuntimeMatchKind != RuleSetMatchDomain {
+				// IP 与无法安全拆分的混合规则不参与名字阶段的分域。
+				continue
+			}
+			ensureResolver(resolverTag, outTag)
+			rule := map[string]interface{}{
+				"rule_set": sbRuleSetTag(ruleSet),
+				"server":   resolverTag,
+			}
+			applyRuleSetInvert(rule, ruleSet)
+			rules = append(rules, rule)
 		}
 	}
 
@@ -1246,26 +1245,21 @@ func buildTransparentProxyDNS(
 		}
 		for _, rule := range compiled {
 			if !rule.domain {
-				dnsRulesOpen = false
 				continue
 			}
 			if rule.outTag == rejectTag {
-				if dnsRulesOpen {
-					rules = append(rules, map[string]interface{}{
-						rule.matchKey: rule.values,
-						"action":      "reject",
-					})
-				}
+				rules = append(rules, map[string]interface{}{
+					rule.matchKey: rule.values,
+					"action":      "reject",
+				})
 				continue
 			}
 			resolverTag := transparentProxyResolverForOutbound(rule.outTag)
 			ensureResolver(resolverTag, rule.outTag)
-			if dnsRulesOpen {
-				rules = append(rules, map[string]interface{}{
-					rule.matchKey: rule.values,
-					"server":      resolverTag,
-				})
-			}
+			rules = append(rules, map[string]interface{}{
+				rule.matchKey: rule.values,
+				"server":      resolverTag,
+			})
 		}
 	}
 
@@ -1589,7 +1583,7 @@ func transparentProxySystemResolveRule() map[string]interface{} {
 
 func transparentProxyResolverTag(ruleSet *RuleSet, outTag string) string {
 	if outTag == "direct" {
-		return transparentSystemDNSTag
+		return TransparentNativeDNSTag
 	}
 	if outTag == "vpn" && ruleSet.Type == RuleSetTypeManual && !ruleSet.Invert {
 		return transparentEnterpriseDNSTag
@@ -2501,7 +2495,7 @@ func buildTransparentProxySubscriptionRules(
 
 func transparentProxyResolverForOutbound(outTag string) string {
 	if outTag == "direct" {
-		return transparentSystemDNSTag
+		return TransparentNativeDNSTag
 	}
 	return desktopProxyDNSTag(outTag)
 }
