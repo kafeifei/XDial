@@ -77,10 +77,18 @@ while !launchPreparationComplete {
 }
 
 let me = NSRunningApplication.current
+let relocationPredecessorProcessIdentifier =
+    ApplicationLaunchPolicy.relocationPredecessorProcessIdentifier(
+        arguments: CommandLine.arguments
+    )
 let others = NSRunningApplication.runningApplications(
     withBundleIdentifier: me.bundleIdentifier ?? ""
 ).filter {
     $0.processIdentifier != me.processIdentifier
+        && !ApplicationRelocator.isExpectedRelaunchPredecessor(
+            $0,
+            processIdentifier: relocationPredecessorProcessIdentifier
+        )
 }
 
 if !others.isEmpty {

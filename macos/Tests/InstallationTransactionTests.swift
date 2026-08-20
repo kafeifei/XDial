@@ -418,6 +418,95 @@ final class InstallationTransactionTests: XCTestCase {
             )
         )
     }
+
+    func testBundleInfoReadsReplacementAfterFoundationCachedOldBundle()
+        throws {
+        let fixture = try BundleInfoReplacementFixture()
+        defer { fixture.cleanup() }
+
+        XCTAssertEqual(
+            Bundle(url: fixture.destinationURL)?.bundleIdentifier,
+            XDialApplicationIdentifierPolicy.debug
+        )
+
+        try ApplicationBundleReplacer.replace(
+            destinationURL: fixture.destinationURL,
+            newBundleURL: fixture.newBundleURL,
+            backupName: fixture.backupName
+        ) { url in
+            ApplicationBundleInfo.identifier(at: url)
+                == XDialApplicationIdentifierPolicy.release
+        }
+
+        XCTAssertEqual(
+            ApplicationBundleInfo.identifier(at: fixture.destinationURL),
+            XDialApplicationIdentifierPolicy.release
+        )
+    }
+}
+
+private final class BundleInfoReplacementFixture {
+    let rootURL: URL
+    let destinationURL: URL
+    let newBundleURL: URL
+    let backupName = ".XDial.bundle-info-backup.app"
+
+    init() throws {
+        rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "xdial-bundle-info-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        destinationURL = rootURL.appendingPathComponent(
+            "XDial.app",
+            isDirectory: true
+        )
+        newBundleURL = rootURL.appendingPathComponent(
+            "New.app",
+            isDirectory: true
+        )
+        try Self.writeBundle(
+            at: destinationURL,
+            identifier: XDialApplicationIdentifierPolicy.debug
+        )
+        try Self.writeBundle(
+            at: newBundleURL,
+            identifier: XDialApplicationIdentifierPolicy.release
+        )
+    }
+
+    private static func writeBundle(
+        at url: URL,
+        identifier: String
+    ) throws {
+        let contentsURL = url.appendingPathComponent(
+            "Contents",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: contentsURL,
+            withIntermediateDirectories: true
+        )
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "CFBundleIdentifier": identifier,
+                "CFBundleName": "XDial",
+                "CFBundlePackageType": "APPL",
+                "CFBundleVersion": "1",
+            ],
+            format: .xml,
+            options: 0
+        )
+        try data.write(
+            to: contentsURL.appendingPathComponent("Info.plist")
+        )
+    }
+
+    func cleanup() {
+        if FileManager.default.fileExists(atPath: rootURL.path) {
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+    }
 }
 
 private final class ReplacementFixture {

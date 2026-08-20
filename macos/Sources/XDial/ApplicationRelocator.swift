@@ -239,7 +239,11 @@ enum ApplicationRelocator {
 
     private static func relaunchInstalledApplication() throws {
         let configuration = NSWorkspace.OpenConfiguration()
-        ApplicationLaunchPolicy.configure(configuration)
+        ApplicationLaunchPolicy.configure(
+            configuration,
+            relocationPredecessorProcessIdentifier:
+                NSRunningApplication.current.processIdentifier
+        )
         let completion = DispatchSemaphore(value: 0)
         let result = LaunchResult()
         NSWorkspace.shared.openApplication(
@@ -256,6 +260,25 @@ enum ApplicationRelocator {
         guard application != nil, error == nil else {
             throw InstallationError.relaunchFailed
         }
+    }
+
+    static func isExpectedRelaunchPredecessor(
+        _ application: NSRunningApplication,
+        processIdentifier: Int32?
+    ) -> Bool {
+        let bundleIdentifierMatches =
+            application.bundleIdentifier == Bundle.main.bundleIdentifier
+        let candidateBundleIsCanonical = application.bundleURL.map {
+            canonical($0) == canonical(destinationURL)
+        } ?? true
+        return ApplicationRelaunchHandoffPolicy.shouldIgnoreCandidate(
+            currentIsCanonical: isRunningFromApplications,
+            candidateProcessIdentifier: application.processIdentifier,
+            candidateBundleIdentifierMatches:
+                bundleIdentifierMatches,
+            candidateBundleIsCanonical: candidateBundleIsCanonical,
+            expectedPredecessorProcessIdentifier: processIdentifier
+        )
     }
 
     private static func terminateOtherCopies(
@@ -333,9 +356,9 @@ enum ApplicationRelocator {
     ) throws -> SigningIdentity {
         guard
             bundleURL.pathExtension == "app",
-            let bundle = Bundle(url: bundleURL),
-            let bundleIdentifier = bundle.bundleIdentifier,
-            !bundleIdentifier.isEmpty
+            let bundleIdentifier = ApplicationBundleInfo.identifier(
+                at: bundleURL
+            )
         else {
             throw InstallationError.invalidApplicationBundle
         }
@@ -358,9 +381,10 @@ enum ApplicationRelocator {
             throw InstallationError.helperSignatureMismatch
         }
 
-        guard let extensionIdentifier = bundle.object(
-            forInfoDictionaryKey: "XDialTransparentProxyBundleIdentifier"
-        ) as? String, !extensionIdentifier.isEmpty else {
+        guard let extensionIdentifier = ApplicationBundleInfo.string(
+            forKey: "XDialTransparentProxyBundleIdentifier",
+            at: bundleURL
+        ) else {
             throw InstallationError.extensionIdentifierMissing
         }
         let extensionsURL = bundleURL.appendingPathComponent(
@@ -373,7 +397,8 @@ enum ApplicationRelocator {
             options: [.skipsHiddenFiles]
         ).filter { $0.pathExtension == "systemextension" }
         guard let extensionURL = extensionURLs.first(where: {
-            Bundle(url: $0)?.bundleIdentifier == extensionIdentifier
+            ApplicationBundleInfo.identifier(at: $0)
+                == extensionIdentifier
         }) else {
             throw InstallationError.extensionMissing
         }
@@ -402,9 +427,9 @@ enum ApplicationRelocator {
     ) throws -> SigningIdentity {
         guard
             bundleURL.pathExtension == "app",
-            let bundle = Bundle(url: bundleURL),
-            let bundleIdentifier = bundle.bundleIdentifier,
-            !bundleIdentifier.isEmpty
+            let bundleIdentifier = ApplicationBundleInfo.identifier(
+                at: bundleURL
+            )
         else {
             throw InstallationError.invalidApplicationBundle
         }
