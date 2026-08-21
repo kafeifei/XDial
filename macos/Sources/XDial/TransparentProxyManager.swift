@@ -85,6 +85,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var automaticReconnectRetryAt: Date?
     private var automaticReconnectRetryAttempt: Int?
     private var automaticReconnectRetryFailedTransactionID: String?
+    private var powerLifecycleGate = SystemSleepNetworkEpochGate()
     private var automaticReconnectUnderlayWaitEvidence:
         HostUnderlayCaptureEvidence?
     private var stableConnectionResetWorkItem: DispatchWorkItem?
@@ -589,6 +590,15 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         )
     }
 
+    /// Recovery entry point for an outgoing signed host identity. Network
+    /// Extension preferences are owner-scoped, so the incoming Debug/Release
+    /// identity cannot remove the previous identity's record on its behalf.
+    func removeOwnedNetworkConfigurationsOnly(
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        removeOwnedNetworkConfigurations(completion: completion)
+    }
+
     /// Explicit uninstall path. Upgrades never deactivate the current
     /// extension: an activation request replaces the same bundle identifier
     /// in place. Uninstall first removes this app's transparent-proxy
@@ -905,7 +915,16 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     }
 
     func noteSystemWake() {
+        powerLifecycleGate.noteSystemDidWake()
         underlayMonitor?.noteSystemWake()
+        resumeAutomaticReconnectRetryAfterWake()
+    }
+
+    func noteSystemSleep() {
+        powerLifecycleGate.noteSystemWillSleep()
+        underlayMonitor?.noteSystemSleep()
+        automaticReconnectRetryWorkItem?.cancel()
+        automaticReconnectRetryWorkItem = nil
     }
 
     private func activateExtension(
@@ -2885,7 +2904,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         delay: TimeInterval,
         recordSchedule: Bool = true
     ) {
-        guard automaticReconnectRetryWorkItem == nil else {
+        guard automaticReconnectRetryWorkItem == nil,
+              automaticReconnectRetryToken == nil else {
             return
         }
         guard let retryNumber =
@@ -2920,6 +2940,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         let work = DispatchWorkItem { [weak self] in
             self?.performScheduledAutomaticReconnectRetry(token: token)
         }
+        guard !powerLifecycleGate.defersNetworkWork else {
+            return
+        }
         automaticReconnectRetryWorkItem = work
         DispatchQueue.main.asyncAfter(
             deadline: .now() + delay,
@@ -2929,7 +2952,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
 
     @discardableResult
     func retryAutomaticReconnectNow() -> Bool {
-        guard let token = automaticReconnectRetryToken else {
+        guard !powerLifecycleGate.defersNetworkWork,
+              let token = automaticReconnectRetryToken else {
             return false
         }
         performScheduledAutomaticReconnectRetry(token: token)
@@ -2949,6 +2973,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         automaticReconnectRetryWorkItem?.cancel()
         automaticReconnectRetryWorkItem = nil
+        guard !powerLifecycleGate.defersNetworkWork else {
+            return
+        }
         automaticReconnectRetryToken = nil
         automaticReconnectRetryAt = nil
         automaticReconnectRetryAttempt = nil
@@ -3036,6 +3063,27 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 )
             }
         }
+    }
+
+    private func resumeAutomaticReconnectRetryAfterWake() {
+        guard automaticReconnectRetryWorkItem == nil,
+              let token = automaticReconnectRetryToken,
+              automaticReconnectRetryAttempt != nil,
+              automaticReconnectRetryFailedTransactionID != nil else {
+            return
+        }
+        let delay = max(
+            0,
+            automaticReconnectRetryAt?.timeIntervalSinceNow ?? 0
+        )
+        let work = DispatchWorkItem { [weak self] in
+            self?.performScheduledAutomaticReconnectRetry(token: token)
+        }
+        automaticReconnectRetryWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + delay,
+            execute: work
+        )
     }
 
     private func finishAutomaticReconnect(
@@ -3517,6 +3565,7 @@ private final class HostUnderlayMonitor {
     private var pathTransition = UnderlayPathTransitionState()
     private var pendingChange: DispatchWorkItem?
     private var lastSystemWakeAt: Date?
+    private var systemSleepGate = SystemSleepNetworkEpochGate()
     private var cancelled = false
 
     init(
@@ -3546,11 +3595,29 @@ private final class HostUnderlayMonitor {
 
     func noteSystemWake(at date: Date = Date()) {
         guard !cancelled else { return }
+        systemSleepGate.noteSystemDidWake()
         lastSystemWakeAt = date
+        // The process can miss intermediate NWPath callbacks while suspended.
+        // Always re-sample after the full wake; an equivalent snapshot is
+        // suppressed below, while a real move emits exactly one epoch.
+        scheduleChange(allowEquivalentSnapshot: true)
+    }
+
+    func noteSystemSleep() {
+        guard !cancelled else { return }
+        systemSleepGate.noteSystemWillSleep()
+        lastSystemWakeAt = nil
+        pendingChange?.cancel()
+        pendingChange = nil
+        pathTransition = UnderlayPathTransitionState()
     }
 
     private func consume(_ path: Network.NWPath) {
         guard !cancelled else { return }
+        guard systemSleepGate.observeNetworkSignal()
+            == .evaluateCurrentPath else {
+            return
+        }
         let snapshot: HostUnderlaySnapshot?
         if path.status == .satisfied,
             let result = HostUnderlayCapture.snapshotResult(for: path),
@@ -3586,6 +3653,11 @@ private final class HostUnderlayMonitor {
         pendingChange?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.cancelled else { return }
+            guard self.systemSleepGate.observeNetworkSignal()
+                == .evaluateCurrentPath else {
+                self.pendingChange = nil
+                return
+            }
             guard self.monitor.currentPath.status == .satisfied else {
                 _ = self.pathTransition.observe(
                     isSatisfied: false,

@@ -352,13 +352,17 @@ final class EmbeddedSingBoxRuntime {
 
         try checkCancellation(cancellation)
         reporter.setState(.preparing)
+        let directIPv6Available = try probeDirectIPv6Capability(
+            reporter: reporter,
+            cancellation: cancellation
+        )
         var bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
         while bootstrapPort == port {
             bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
         }
         var bootstrapGenerationError: NSError?
         let bootstrapJSON =
-            LibboxGenerateTransparentProxyRuleSetBootstrap(
+            LibboxGenerateTransparentProxyRuleSetBootstrapWithCapabilities(
                 profileJSON,
                 basePath.path,
                 Int(bootstrapPort),
@@ -366,6 +370,7 @@ final class EmbeddedSingBoxRuntime {
                 UUID().uuidString + UUID().uuidString,
                 networkSnapshot.defaultInterface.name,
                 networkSnapshot.systemDNSJSON,
+                directIPv6Available,
                 &bootstrapGenerationError
             )
         if let bootstrapGenerationError {
@@ -399,7 +404,7 @@ final class EmbeddedSingBoxRuntime {
         )
         var generationError: NSError?
         let envelopeJSON =
-            LibboxGenerateTransparentProxySessionWithCallback(
+            LibboxGenerateTransparentProxySessionWithCapabilitiesAndCallback(
             profileJSON,
             basePath.path,
             Int(port),
@@ -407,6 +412,7 @@ final class EmbeddedSingBoxRuntime {
             credentials.password,
             networkSnapshot.defaultInterface.name,
             networkSnapshot.systemDNSJSON,
+            directIPv6Available,
             preparationCallback,
             &generationError
         )
@@ -777,13 +783,17 @@ final class EmbeddedSingBoxRuntime {
 
         reporter.setState(.preparing)
         reporter.markUnderlaySnapshotReady()
+        let directIPv6Available = try probeDirectIPv6Capability(
+            reporter: reporter,
+            cancellation: cancellation
+        )
         var bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
         while bootstrapPort == port || bootstrapPort == sourceSession.port {
             bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
         }
         var bootstrapGenerationError: NSError?
         let bootstrapJSON =
-            LibboxGenerateTransparentProxyRuleSetBootstrap(
+            LibboxGenerateTransparentProxyRuleSetBootstrapWithCapabilities(
                 profileJSON,
                 basePath.path,
                 Int(bootstrapPort),
@@ -791,6 +801,7 @@ final class EmbeddedSingBoxRuntime {
                 UUID().uuidString + UUID().uuidString,
                 networkSnapshot.defaultInterface.name,
                 networkSnapshot.systemDNSJSON,
+                directIPv6Available,
                 &bootstrapGenerationError
             )
         if let bootstrapGenerationError {
@@ -822,7 +833,7 @@ final class EmbeddedSingBoxRuntime {
         let preparationCallback = PreparationCallback(reporter: reporter)
         var generationError: NSError?
         let envelopeJSON =
-            LibboxGenerateTransparentProxySessionWithCallback(
+            LibboxGenerateTransparentProxySessionWithCapabilitiesAndCallback(
                 profileJSON,
                 basePath.path,
                 Int(port),
@@ -830,6 +841,7 @@ final class EmbeddedSingBoxRuntime {
                 credentials.password,
                 networkSnapshot.defaultInterface.name,
                 networkSnapshot.systemDNSJSON,
+                directIPv6Available,
                 preparationCallback,
                 &generationError
             )
@@ -2140,6 +2152,29 @@ final class EmbeddedSingBoxRuntime {
             Thread.sleep(forTimeInterval: 0.1)
         }
         throw RuntimeError.anyConnectRecoveryTimedOut
+    }
+
+    private func probeDirectIPv6Capability(
+        reporter: ConnectionTransactionReporter,
+        cancellation: ConnectionCancellation
+    ) throws -> Bool {
+        try checkCancellation(cancellation)
+        let available = UnderlayIPv6TLSProbe.probe(
+            isCancelled: { cancellation.isCancelled }
+        )
+        try checkCancellation(cancellation)
+        logger.notice(
+            "underlay-direct-ipv6-tls available=\(available, privacy: .public)"
+        )
+        reporter.note(
+            code: "underlay-direct-ipv6-capability",
+            message: available
+                ? "直连 IPv6 TLS 已验证可用"
+                : "直连 IPv6 TLS 不可用，本次事务的直连解析仅返回 IPv4",
+            taskID: "underlay:system",
+            facts: ["direct_ipv6_tls_available": available]
+        )
+        return available
     }
 
     private func checkCancellation(

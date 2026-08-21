@@ -346,6 +346,10 @@ final class GoEngine: ObservableObject {
         syncStatus(completion: completion)
     }
 
+    func systemWillSleep() {
+        transparentProxy.noteSystemSleep()
+    }
+
     func prepareTailscale(
         profileJSON: String,
         lineID: String,

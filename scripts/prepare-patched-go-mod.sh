@@ -222,12 +222,22 @@ grep -Fq 'item = NewPreferredByDNSItem(ctx, options.PreferredBy)' \
 	"${patched_sing_box_dir}/route/rule/rule_default.go"
 grep -Fq 'func TestXDialResolvePreferredByUsesDNSTransport(' \
 	"${patched_sing_box_dir}/route/rule/rule_preferred_by_resolve_xdial_test.go"
-grep -Fq 'XDialFlowMetadata bool' \
+grep -Eq 'XDialFlowMetadata[[:space:]]+bool' \
 	"${patched_sing_box_dir}/option/simple.go"
 grep -Fq 'func applyXDialFlowMetadata(' \
 	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata.go"
 grep -Fq 'func TestXDialFlowMetadataPreservesDomainAndUsesIPv4Destination(' \
 	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata_test.go"
+grep -Eq 'XDialReresolveIPv6FlowDomains[[:space:]]+bool' \
+	"${patched_sing_box_dir}/option/simple.go"
+grep -Fq 'func TestXDialFlowMetadataReresolvesAttributedIPv6Destination(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata_test.go"
+grep -Fq 'XDialBoundInterface string' \
+	"${patched_sing_box_dir}/adapter/inbound.go"
+grep -Fq 'func TestXDialBoundFlowMetadataPreservesInterfaceForDirect(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata_test.go"
+grep -Fq 'func TestXDialBoundDialerOptionsOnlyOverridesInterface(' \
+	"${patched_sing_box_dir}/protocol/direct/xdial_bound_interface_test.go"
 grep -Fq 'XDialUseSystemResolver bool' \
 	"${patched_sing_box_dir}/option/dns.go"
 grep -Fq 'func TestXDialSystemResolverOptionDoesNotRequireTunFallback(' \

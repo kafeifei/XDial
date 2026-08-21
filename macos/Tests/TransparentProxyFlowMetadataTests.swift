@@ -265,4 +265,69 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
             )
         )
     }
+
+    func testEncodesBoundFlowEndpointHostnameAndInterface() throws {
+        let address = try XCTUnwrap(IPv4Address("192.168.69.26"))
+        let encoded = try XCTUnwrap(
+            TransparentProxyFlowMetadata.encodeBoundFlow(
+                hostname: "Kafeifeis-iPhone.local.",
+                endpointHost: .ipv4(address),
+                boundInterface: "en0"
+            )
+        )
+
+        XCTAssertEqual(
+            Array(encoded.prefix(6)),
+            [0x00, 0x58, 0x44, 0x02, 0x07, 0x01]
+        )
+        XCTAssertEqual(encoded.subdata(in: 6 ..< 10), address.rawValue)
+        let hostnameLength = Int(encoded[10])
+        XCTAssertEqual(
+            String(
+                data: encoded.subdata(in: 11 ..< 11 + hostnameLength),
+                encoding: .utf8
+            ),
+            "Kafeifeis-iPhone.local."
+        )
+        let interfaceLengthOffset = 11 + hostnameLength
+        XCTAssertEqual(encoded[interfaceLengthOffset], 3)
+        XCTAssertEqual(
+            String(
+                data: encoded.dropFirst(interfaceLengthOffset + 1),
+                encoding: .utf8
+            ),
+            "en0"
+        )
+    }
+
+    func testEncodesBoundUDPAssociationWithoutFakeDestination() throws {
+        let encoded = try XCTUnwrap(
+            TransparentProxyFlowMetadata.encodeBoundAssociation(
+                boundInterface: "en0"
+            )
+        )
+
+        XCTAssertEqual(
+            Array(encoded),
+            [0x00, 0x58, 0x44, 0x02, 0x04, 0x03, 0x65, 0x6e, 0x30]
+        )
+    }
+
+    func testRejectsInvalidBoundInterfaceMetadata() {
+        XCTAssertNil(
+            TransparentProxyFlowMetadata.encodeBoundAssociation(
+                boundInterface: ""
+            )
+        )
+        XCTAssertNil(
+            TransparentProxyFlowMetadata.encodeBoundAssociation(
+                boundInterface: String(repeating: "a", count: 16)
+            )
+        )
+        XCTAssertNil(
+            TransparentProxyFlowMetadata.encodeBoundAssociation(
+                boundInterface: "无线"
+            )
+        )
+    }
 }

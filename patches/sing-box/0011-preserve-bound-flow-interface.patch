@@ -1,0 +1,461 @@
+diff --git a/adapter/inbound.go b/adapter/inbound.go
+--- a/adapter/inbound.go
++++ b/adapter/inbound.go
+@@ -44,13 +44,14 @@ type InboundRegistry interface {
+ }
+ 
+ type InboundContext struct {
+-	Inbound     string
+-	InboundType string
+-	IPVersion   uint8
+-	Network     string
+-	Source      M.Socksaddr
+-	Destination M.Socksaddr
+-	User        string
+-	Outbound    string
++	Inbound             string
++	InboundType         string
++	IPVersion           uint8
++	Network             string
++	Source              M.Socksaddr
++	Destination         M.Socksaddr
++	User                string
++	Outbound            string
++	XDialBoundInterface string
+ 
+ 	// sniffer
+diff --git a/protocol/socks/inbound.go b/protocol/socks/inbound.go
+--- a/protocol/socks/inbound.go
++++ b/protocol/socks/inbound.go
+@@ -113,5 +113,16 @@ func (h *Inbound) streamUserPacketConnection(ctx context.Context, conn N.PacketC
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
++	if h.xdialFlowMetadata {
++		encoded, err := applyXDialFlowMetadata(
++			&metadata,
++			h.xdialReresolveIPv6FlowDomains,
++		)
++		if encoded && err != nil {
++			N.CloseOnHandshakeFailure(conn, onClose, err)
++			h.logger.ErrorContext(ctx, "reject invalid XDial flow metadata")
++			return
++		}
++	}
+ 	user, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		if !metadata.Destination.IsValid() {
+diff --git a/protocol/socks/xdial_flow_metadata.go b/protocol/socks/xdial_flow_metadata.go
+--- a/protocol/socks/xdial_flow_metadata.go
++++ b/protocol/socks/xdial_flow_metadata.go
+@@ -11,7 +11,12 @@ import (
+ 	M "github.com/sagernet/sing/common/metadata"
+ )
+ 
+-var xdialFlowMetadataMagic = []byte{0x00, 0x58, 0x44, 0x01}
++var (
++	xdialFlowMetadataMagic      = []byte{0x00, 0x58, 0x44, 0x01}
++	xdialBoundFlowMetadataMagic = []byte{0x00, 0x58, 0x44, 0x02}
++)
++
++const xdialBoundInterfaceFlag = byte(1 << 2)
+ 
+ // applyXDialFlowMetadata decodes the authenticated loopback relay's bounded SOCKS
+ // destination envelope. Normally the original domain remains rule metadata while
+@@ -25,10 +30,17 @@ func applyXDialFlowMetadata(
+ 		return false, nil
+ 	}
+ 	raw := []byte(metadata.Destination.Fqdn)
++	if bytes.HasPrefix(raw, xdialBoundFlowMetadataMagic) {
++		return true, applyXDialBoundFlowMetadata(
++			metadata,
++			raw,
++			reresolveIPv6Domains,
++		)
++	}
+ 	if !bytes.HasPrefix(raw, xdialFlowMetadataMagic) {
+ 		return false, nil
+ 	}
+-	if len(raw) <= len(xdialFlowMetadataMagic) {
++	if len(raw) <= len(xdialFlowMetadataMagic)+1 {
+ 		return true, E.New("invalid XDial flow metadata")
+ 	}
+ 
+@@ -78,3 +90,111 @@ func applyXDialFlowMetadata(
+ 	}
+ 	return true, nil
+ }
++
++func applyXDialBoundFlowMetadata(
++	metadata *adapter.InboundContext,
++	raw []byte,
++	reresolveIPv6Domains bool,
++) error {
++	offset := len(xdialBoundFlowMetadataMagic)
++	if len(raw) <= offset {
++		return E.New("invalid XDial bound flow metadata")
++	}
++	flags := raw[offset]
++	offset++
++	const (
++		hasEndpoint = byte(1 << 0)
++		hasHostname = byte(1 << 1)
++		knownFlags  = hasEndpoint | hasHostname | xdialBoundInterfaceFlag
++	)
++	if flags&^knownFlags != 0 || flags&xdialBoundInterfaceFlag == 0 ||
++		flags&hasHostname != 0 && flags&hasEndpoint == 0 {
++		return E.New("invalid XDial bound flow metadata flags")
++	}
++
++	var address netip.Addr
++	if flags&hasEndpoint != 0 {
++		if len(raw) <= offset {
++			return E.New("invalid XDial bound flow metadata")
++		}
++		addressLength := 0
++		switch raw[offset] {
++		case 0x01:
++			addressLength = 4
++		case 0x04:
++			addressLength = 16
++		default:
++			return E.New("invalid XDial bound flow address family")
++		}
++		offset++
++		if len(raw) < offset+addressLength {
++			return E.New("invalid XDial bound flow address")
++		}
++		var valid bool
++		address, valid = netip.AddrFromSlice(raw[offset : offset+addressLength])
++		if !valid || address.IsUnspecified() || address.IsMulticast() {
++			return E.New("invalid XDial bound flow address")
++		}
++		address = address.Unmap()
++		offset += addressLength
++	}
++
++	var hostname string
++	if flags&hasHostname != 0 {
++		if len(raw) <= offset {
++			return E.New("invalid XDial bound flow hostname")
++		}
++		hostnameLength := int(raw[offset])
++		offset++
++		if hostnameLength == 0 || len(raw) < offset+hostnameLength {
++			return E.New("invalid XDial bound flow hostname")
++		}
++		hostnameBytes := raw[offset : offset+hostnameLength]
++		if !utf8.Valid(hostnameBytes) || bytes.IndexByte(hostnameBytes, 0) >= 0 {
++			return E.New("invalid XDial bound flow hostname")
++		}
++		hostname = string(hostnameBytes)
++		if len(hostname) > 253 || strings.TrimSpace(hostname) != hostname ||
++			!M.IsDomainName(hostname) {
++			return E.New("invalid XDial bound flow hostname")
++		}
++		offset += hostnameLength
++	}
++
++	if len(raw) <= offset {
++		return E.New("invalid XDial bound interface")
++	}
++	interfaceLength := int(raw[offset])
++	offset++
++	if interfaceLength == 0 || interfaceLength > 15 ||
++		len(raw) != offset+interfaceLength {
++		return E.New("invalid XDial bound interface")
++	}
++	interfaceBytes := raw[offset:]
++	for _, character := range interfaceBytes {
++		if !(character >= 'a' && character <= 'z') &&
++			!(character >= 'A' && character <= 'Z') &&
++			!(character >= '0' && character <= '9') &&
++			character != '.' && character != '_' && character != '-' {
++			return E.New("invalid XDial bound interface")
++		}
++	}
++
++	metadata.XDialBoundInterface = string(interfaceBytes)
++	if flags&hasEndpoint == 0 {
++		metadata.Destination = M.Socksaddr{}
++		return nil
++	}
++
++	port := metadata.Destination.Port
++	metadata.Domain = hostname
++	if reresolveIPv6Domains && hostname != "" && address.Is6() {
++		metadata.Destination = M.Socksaddr{
++			Fqdn: hostname,
++			Port: port,
++		}
++	} else {
++		metadata.Destination = M.SocksaddrFrom(address, port)
++	}
++	return nil
++}
+diff --git a/protocol/socks/xdial_flow_metadata_test.go b/protocol/socks/xdial_flow_metadata_test.go
+--- a/protocol/socks/xdial_flow_metadata_test.go
++++ b/protocol/socks/xdial_flow_metadata_test.go
+@@ -97,3 +97,85 @@ func TestXDialFlowMetadataReresolvesAttributedIPv6Destination(t *testing.T) {
+ 	require.False(t, metadata.Destination.Addr.IsValid())
+ 	require.Equal(t, uint16(443), metadata.Destination.Port)
+ }
++
++func xdialEncodedBoundDestination(
++	address netip.Addr,
++	hostname string,
++	interfaceName string,
++) string {
++	raw := append([]byte(nil), xdialBoundFlowMetadataMagic...)
++	flags := byte(0x01 | xdialBoundInterfaceFlag)
++	if hostname != "" {
++		flags |= 0x02
++	}
++	raw = append(raw, flags)
++	if address.Is4() {
++		raw = append(raw, 0x01)
++	} else {
++		raw = append(raw, 0x04)
++	}
++	raw = append(raw, address.AsSlice()...)
++	if hostname != "" {
++		raw = append(raw, byte(len(hostname)))
++		raw = append(raw, hostname...)
++	}
++	raw = append(raw, byte(len(interfaceName)))
++	raw = append(raw, interfaceName...)
++	return string(raw)
++}
++
++func TestXDialBoundFlowMetadataPreservesInterfaceForDirect(t *testing.T) {
++	address := netip.MustParseAddr("192.168.69.26")
++	metadata := adapter.InboundContext{
++		Destination: M.Socksaddr{
++			Fqdn: xdialEncodedBoundDestination(
++				address,
++				"Kafeifeis-iPhone.local.",
++				"en0",
++			),
++			Port: 49152,
++		},
++	}
++
++	encoded, err := applyXDialFlowMetadata(&metadata, false)
++	require.NoError(t, err)
++	require.True(t, encoded)
++	require.Equal(t, "en0", metadata.XDialBoundInterface)
++	require.Equal(t, "Kafeifeis-iPhone.local.", metadata.Domain)
++	require.Equal(t, address, metadata.Destination.Addr)
++	require.Equal(t, uint16(49152), metadata.Destination.Port)
++}
++
++func TestXDialBoundUDPAssociationPreservesInterfaceWithoutDestination(t *testing.T) {
++	raw := append([]byte(nil), xdialBoundFlowMetadataMagic...)
++	raw = append(raw, xdialBoundInterfaceFlag, 0x03)
++	raw = append(raw, "en0"...)
++	metadata := adapter.InboundContext{
++		Destination: M.Socksaddr{Fqdn: string(raw)},
++	}
++
++	encoded, err := applyXDialFlowMetadata(&metadata, false)
++	require.NoError(t, err)
++	require.True(t, encoded)
++	require.Equal(t, "en0", metadata.XDialBoundInterface)
++	require.False(t, metadata.Destination.IsValid())
++}
++
++func TestXDialBoundFlowMetadataRejectsInvalidInterface(t *testing.T) {
++	address := netip.MustParseAddr("192.168.69.26")
++	metadata := adapter.InboundContext{
++		Destination: M.Socksaddr{
++			Fqdn: xdialEncodedBoundDestination(
++				address,
++				"device.local.",
++				"bad/name",
++			),
++			Port: 443,
++		},
++	}
++
++	encoded, err := applyXDialFlowMetadata(&metadata, false)
++	require.Error(t, err)
++	require.True(t, encoded)
++	require.Empty(t, metadata.XDialBoundInterface)
++}
+diff --git a/protocol/direct/outbound.go b/protocol/direct/outbound.go
+--- a/protocol/direct/outbound.go
++++ b/protocol/direct/outbound.go
+@@ -5,4 +5,5 @@ import (
+ 	"net"
+ 	"net/netip"
+ 	"reflect"
++	"sync"
+ 	"time"
+@@ -43,6 +44,9 @@ type Outbound struct {
+ 	domainStrategy C.DomainStrategy
+ 	fallbackDelay  time.Duration
+ 	isEmpty        bool
++	dialerOptions  option.DialerOptions
++	boundDialers   map[string]dialer.ParallelInterfaceDialer
++	boundDialerMu  sync.Mutex
+ 	myAddresses    common.TypedValue[[]netip.Prefix]
+ 	icmpPort       *ping.Port
+ }
+@@ -70,6 +74,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		fallbackDelay:  time.Duration(options.FallbackDelay),
+ 		dialer:         outboundDialer.(dialer.ParallelInterfaceDialer),
+ 		isEmpty: reflect.DeepEqual(options.DialerOptions, option.DialerOptions{
+ 			AbstractDialerOptions: option.AbstractDialerOptions{UDPFragmentDefault: true},
+ 		}),
++		dialerOptions: options.DialerOptions,
++		boundDialers:  make(map[string]dialer.ParallelInterfaceDialer),
+ 	}
+@@ -139,8 +145,53 @@ func (h *Outbound) isMyLoopbackAddress(addresses ...netip.Addr) bool {
+ 	return false
+ }
+ 
++func xdialBoundDialerOptions(
++	base option.DialerOptions,
++	interfaceName string,
++) option.DialerOptions {
++	base.BindInterface = interfaceName
++	return base
++}
++
++func (h *Outbound) dialerForContext(
++	ctx context.Context,
++) (dialer.ParallelInterfaceDialer, error) {
++	metadata := adapter.ContextFrom(ctx)
++	if metadata == nil || metadata.XDialBoundInterface == "" {
++		return h.dialer, nil
++	}
++	interfaceName := metadata.XDialBoundInterface
++	h.boundDialerMu.Lock()
++	defer h.boundDialerMu.Unlock()
++	if boundDialer := h.boundDialers[interfaceName]; boundDialer != nil {
++		return boundDialer, nil
++	}
++	newDialer, err := dialer.NewWithOptions(dialer.Options{
++		Context: h.ctx,
++		Options: xdialBoundDialerOptions(
++			h.dialerOptions,
++			interfaceName,
++		),
++		RemoteIsDomain: true,
++		DirectOutbound: true,
++	})
++	if err != nil {
++		return nil, err
++	}
++	boundDialer, loaded := newDialer.(dialer.ParallelInterfaceDialer)
++	if !loaded {
++		return nil, E.New("bound Direct dialer lacks parallel interface support")
++	}
++	h.boundDialers[interfaceName] = boundDialer
++	return boundDialer, nil
++}
++
+ func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+ 	if h.isMyLoopbackAddress(destination.Addr) {
+ 		return nil, E.New("loopback connection to TUN range")
+ 	}
++	outboundDialer, err := h.dialerForContext(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	ctx, metadata := adapter.ExtendContext(ctx)
+@@ -153,11 +204,15 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination M
+ 	case N.NetworkUDP:
+ 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+ 	}
+-	return h.dialer.DialContext(ctx, network, destination)
++	return outboundDialer.DialContext(ctx, network, destination)
+ }
+ 
+ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+ 	if h.isMyLoopbackAddress(destination.Addr) {
+ 		return nil, E.New("loopback connection to TUN range")
+ 	}
++	outboundDialer, err := h.dialerForContext(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	ctx, metadata := adapter.ExtendContext(ctx)
+@@ -167,4 +222,4 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "outbound packet connection")
+-	conn, err := h.dialer.ListenPacket(ctx, destination)
++	conn, err := outboundDialer.ListenPacket(ctx, destination)
+ 	if err != nil {
+@@ -214,4 +269,8 @@ func (h *Outbound) DialParallel(ctx context.Context, network string, destination
+ 	if h.isMyLoopbackAddress(destinationAddresses...) {
+ 		return nil, E.New("loopback connection to TUN range")
+ 	}
++	outboundDialer, err := h.dialerForContext(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	ctx, metadata := adapter.ExtendContext(ctx)
+@@ -222,8 +281,12 @@ func (h *Outbound) DialParallel(ctx context.Context, network string, destination
+-	return dialer.DialParallelNetwork(ctx, h.dialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), nil, nil, nil, h.fallbackDelay)
++	return dialer.DialParallelNetwork(ctx, outboundDialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), nil, nil, nil, h.fallbackDelay)
+ }
+ 
+ func (h *Outbound) DialParallelNetwork(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, networkStrategy *C.NetworkStrategy, networkType []C.InterfaceType, fallbackNetworkType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
+ 	if h.isMyLoopbackAddress(destinationAddresses...) {
+ 		return nil, E.New("loopback connection to TUN range")
+ 	}
++	outboundDialer, err := h.dialerForContext(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	ctx, metadata := adapter.ExtendContext(ctx)
+@@ -239,8 +302,12 @@ func (h *Outbound) DialParallelNetwork(ctx context.Context, network string, desti
+-	return dialer.DialParallelNetwork(ctx, h.dialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
++	return dialer.DialParallelNetwork(ctx, outboundDialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
+ }
+ 
+ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.Socksaddr, destinationAddresses []netip.Addr, networkStrategy *C.NetworkStrategy, networkType []C.InterfaceType, fallbackNetworkType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, netip.Addr, error) {
+ 	if h.isMyLoopbackAddress(destinationAddresses...) {
+ 		return nil, netip.Addr{}, E.New("loopback connection to TUN range")
+ 	}
++	outboundDialer, err := h.dialerForContext(ctx)
++	if err != nil {
++		return nil, netip.Addr{}, err
++	}
+ 	ctx, metadata := adapter.ExtendContext(ctx)
+@@ -253,4 +320,4 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.S
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "outbound packet connection")
+-	conn, newDestination, err := dialer.ListenSerialNetworkPacket(ctx, h.dialer, destination, destinationAddresses, networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
++	conn, newDestination, err := dialer.ListenSerialNetworkPacket(ctx, outboundDialer, destination, destinationAddresses, networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
+ 	if err != nil {
+diff --git a/protocol/direct/xdial_bound_interface_test.go b/protocol/direct/xdial_bound_interface_test.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/direct/xdial_bound_interface_test.go
+@@ -0,0 +1,25 @@
++package direct
++
++import (
++	"testing"
++
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestXDialBoundDialerOptionsOnlyOverridesInterface(t *testing.T) {
++	base := option.DialerOptions{
++		AbstractDialerOptions: option.AbstractDialerOptions{
++			DomainResolver: &option.DomainResolveOptions{
++				Server: "xdial-native-dns",
++			},
++		},
++	}
++
++	bound := xdialBoundDialerOptions(base, "en0")
++
++	require.Empty(t, base.BindInterface)
++	require.Equal(t, "en0", bound.BindInterface)
++	require.Equal(t, "xdial-native-dns", bound.DomainResolver.Server)
++}

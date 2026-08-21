@@ -360,30 +360,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     throw injected
                 }
 #endif
-                let settings = NETransparentProxyNetworkSettings(
-                    tunnelRemoteAddress: "127.0.0.1"
-                )
-                settings.includedNetworkRules = session.dnsCaptureDomains.map {
-                    domain in
-                    NENetworkRule(
-                        destinationHostEndpoint: .hostPort(
-                            host: NWEndpoint.Host(domain),
-                            port: NWEndpoint.Port(rawValue: 53)!
-                        ),
-                        protocol: .any
-                    )
-                } + [
-                    NENetworkRule(
-                        remoteNetworkEndpoint: nil,
-                        remotePrefix: 0,
-                        localNetworkEndpoint: nil,
-                        localPrefix: 0,
-                        protocol: .any,
-                        direction: .outbound
-                    ),
-                ]
+                let settings = self.networkSettings(for: session)
                 self.logger.notice(
-                    "dns-capture-rules count=\(session.dnsCaptureDomains.count, privacy: .public) tailscale-records=\(session.tailscaleDNSRecordCount, privacy: .public)"
+                    "dns-capture-rules count=\(session.dnsCaptureDomains.count, privacy: .public) tailscale-records=\(session.tailscaleDNSRecordCount, privacy: .public) interface-scoped-exclusions=\(TransparentProxyNetworkRulePlan.interfaceScopedRemoteNetworks.count, privacy: .public)"
                 )
                 let commitID = UUID()
                 let replacedRelays = self.relayRegistry.activate(
@@ -1786,6 +1765,21 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 direction: .outbound
             ),
         ]
+        settings.excludedNetworkRules =
+            TransparentProxyNetworkRulePlan.interfaceScopedRemoteNetworks.map {
+                network in
+                NENetworkRule(
+                    remoteNetworkEndpoint: .hostPort(
+                        host: NWEndpoint.Host(network.address),
+                        port: .any
+                    ),
+                    remotePrefix: network.prefixLength,
+                    localNetworkEndpoint: nil,
+                    localPrefix: 0,
+                    protocol: .any,
+                    direction: .outbound
+                )
+            }
         return settings
     }
 

@@ -132,6 +132,7 @@ test-patched-sing-box: $(PATCHED_WORKFILE)
 		github.com/sagernet/sing-box/dns \
 		github.com/sagernet/sing-box/dns/transport/hosts \
 		github.com/sagernet/sing-box/dns/transport/local \
+		github.com/sagernet/sing-box/protocol/direct \
 		github.com/sagernet/sing-box/protocol/socks \
 		-run '^TestXDial.*$$' \
 		-count=1
@@ -146,7 +147,19 @@ test: public-content-gate $(PATCHED_WORKFILE) test-patched-tailscale test-patche
 
 test-macos-transaction:
 	@! rg -n 'probeNetwork|127\.0\.0\.1:9090|test-out' macos/Sources/XDial
-	@! rg -n 'willSleepNotification|screensDidSleepNotification|systemIsSleeping|sawUnavailablePath' macos/Sources/XDial macos/Shared
+	@test "$$(rg -l 'willSleepNotification' macos/Sources/XDial macos/Shared | sort)" = macos/Sources/XDial/AppState.swift
+	@! rg -n 'screensDidSleepNotification|systemIsSleeping|sawUnavailablePath' macos/Sources/XDial macos/Shared
+	@rg -q 'engine\.systemWillSleep\(\)' macos/Sources/XDial/AppState.swift
+	@rg -q 'powerLifecycleGate\.noteSystemWillSleep\(\)' macos/Sources/XDial/TransparentProxyManager.swift
+	@rg -q 'connection\.forceCancel\(\)' macos/Shared/RelayConnectionCancellation.swift
+	@! rg -n '(connection|control|currentRelay|relay)\??\.cancel\(\)' macos/TransparentProxyExtension/TCPFlowSOCKSRelay.swift macos/TransparentProxyExtension/UDPFlowSOCKSRelay.swift
+	@test "$$(rg -c 'NETransparentProxyNetworkSettings\(' macos/TransparentProxyExtension/TransparentProxyProvider.swift)" = 1
+	@rg -q 'settings\.excludedNetworkRules' macos/TransparentProxyExtension/TransparentProxyProvider.swift
+	@rg -q 'TransparentProxyNetworkRulePlan\.interfaceScopedRemoteNetworks' macos/TransparentProxyExtension/TransparentProxyProvider.swift
+	@rg -q 'UnderlayIPv6TLSProbe\.probe' macos/TransparentProxyExtension/EmbeddedSingBoxRuntime.swift
+	@rg -q 'GenerateTransparentProxySessionWithCapabilitiesAndCallback' macos/TransparentProxyExtension/EmbeddedSingBoxRuntime.swift
+	@rg -q 'directIPv6Available' core/config/generator.go core/libbox/configgen.go
+	@rg -q 'xdial_reresolve_ipv6_flow_domains' core/config/generator.go
 	@test "$$(rg -l 'setActivationPolicy\(' macos/Sources/XDial macos/SettingsDockUI --glob '*.swift' | sort)" = "$$(printf '%s\n' macos/SettingsDockUI/main.swift macos/Sources/XDial/XDialApp.swift)"
 	@! rg -n 'NSApp\.setActivationPolicy\(\.regular\)' macos/Sources/XDial/XDialApp.swift
 	@rg -q 'NSApp\.setActivationPolicy\(\.accessory\)' macos/Sources/XDial/XDialApp.swift

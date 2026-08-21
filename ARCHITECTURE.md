@@ -204,6 +204,26 @@ DNS；官方 VPN 存在时可以就是该 VPN 的 DNS，绝不等于绕过所有
 答案直接带到另一个出口。默认线路是 `direct` 时，两次解析自然都是完整 Underlay 视角；
 默认线路是代理、AnyConnect 或内置 Tailscale 时，最终解析经该线路完成。
 
+**解析视角还必须收窄到所属线路已验证可用的地址族。** 2026-08-21 实机事故中，启动前
+Underlay 同时安装了 IPv6 地址与默认路由，但其运行状态明确报告当前外网没有 IPv6；对多个
+固定 IPv6 目标的 TCP 建连成功后，TLS ClientHello 均在无响应字节的情况下被关闭。同一批
+域名的 A 查询和 IPv4 HTTPS 正常。Safari 随后回退 IPv4，Chrome 则把这条 TLS 关闭暴露为
+大量 `ERR_CONNECTION_CLOSED`。旧启动门禁只验证 IPv4 出口，却仍把 Direct resolver 的
+AAAA 回答交给应用，因此“Line ready”与实际解析视角自相矛盾。
+
+Transparent Proxy 的 Provider 必须在每次冷启动和候选 Switch 生成配置之前，从尚未提交
+的新事务外侧对当前 Direct Underlay 做有界、冗余的 IPv6 TCP+认证 TLS 握手探测；只看到
+接口、地址、路由或 TCP connected 都不算成功。IPv6 TLS 不可用但 IPv4 已通过现有出口门禁
+时，这是 Direct 的合法 IPv4-only 能力，不是整笔连接失败：同一份 sing-box 配置必须让
+Direct 拥有的 DNS rule、route resolve 与 outbound 域名解析统一使用 `ipv4_only`，使 AAAA
+查询得到无地址成功应答。应用或连接池可能仍持有上个 epoch 的 AAAA：若 Apple flow 同时
+交付了经过有界校验的原始域名与 IPv6 endpoint，盒内 Ingress 必须丢弃这个已被本事务证明
+不可用的地址，并把域名重新交给当前 Scenario 所属 Line 的同源 resolver；不能要求用户清
+浏览器缓存。其他代理、AnyConnect 与 Tailscale Line 拥有的 resolver 不继承 Direct 的能力，
+仍按各自出口解析。不得按浏览器、网站、网络名称、接口名或 Underlay 产品加特例；网络 epoch
+变化必须重新探测，旧事务结果不得跨 epoch 复用。没有可信域名的字面量 IPv6 目标不存在
+安全的重解析路径，仍按所属 Line 的真实能力 fail-closed。
+
 ### 4.2 fake IP 的定位
 
 fake IP 常被误解成一种分流机制。它不是。
@@ -399,6 +419,22 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   Provider 只接收 macOS 交付的 TCP/UDP flow，并通过同进程、随机凭据保护的回环
   SOCKS 会话送入 sing-box；DNS 包、规则匹配、出口选择和实际拨号仍由同一份 sing-box
   数据面完成。Provider 不读取 Line / RuleSet / Scenario，不实现第二套路由或 DNS 裁决。
+- **接口作用域边界**：IPv4/IPv6 link-local、multicast 与 limited broadcast 的远端地址
+  依赖当前接口或二层广播域，穿过回环 SOCKS 后无法保留 scope ID 与广播语义。2026-08-21
+  实机中 `remotepairingd` 在四分钟内向 `fe80::/10` 产生 15,173 个被 Provider 接管后立即
+  失败的 flow，Provider 持续约 39% CPU；这条重试链与普通网页流量无关。Provider 必须用
+  `excludedNetworkRules` 让这些严格的接口作用域地址留在启动前 Underlay。排除集合只能由
+  地址语义定义，不得按进程名、端口、设备品牌或接口名加特例；RFC1918、IPv6 ULA、
+  Tailnet 与企业网单播地址仍进入 XDial，由 active Scenario 裁决。
+- **已绑定 flow 的接口归属**：可路由单播地址不能因为属于 RFC1918 就整体绕过 XDial，
+  但 `NEAppProxyFlow.isBound` 与 `networkInterface` 是 macOS 在进入 XDial 前已经做出的
+  单条 flow 裁决，回环 relay 不得丢弃。2026-08-21 实机中本地地址
+  `192.168.68.114/20` 到同一 `en0` 直连网段的 `192.168.69.26` 被系统标记为
+  `en0(bound)`；旧 relay 丢失该事实后，`remotepairingd` 的 TCP/UDP 配对连接持续失败并
+  高频重试。Provider 必须把绑定接口作为经过认证、长度受限的 flow metadata 送入
+  sing-box；active Scenario 仍先完成规则与 Line 选择，只有最终命中 Direct 时才恢复这份
+  接口绑定。命中 AnyConnect、Tailscale 或其他代理 Line 时不得继承它。这样既不按设备、
+  进程或私网段加例外，也不会让 Provider 建立第二套路由裁决。
 - **Underlay 转交**：宿主 App 必须在请求 Transparent Proxy 连接之前捕获
   `route -n get default` 已选中的接口和 `NWPath.availableInterfaces` 完整候选，并随本次
   `startVPNTunnel(options:)` 交给 Provider；Provider 必须拒绝缺失或不一致的快照。
@@ -414,7 +450,10 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   用同一份用户 Profile 触发一次完整数据面重连。系统休眠会制造一次假的
   `unsatisfied → satisfied`；若该恢复紧邻 `didWake`、Provider 仍为 connected，且收敛后的
   Underlay 快照与已提交基线完全等价，则它只是电源生命周期边界，不得创建同 Scenario
-  候选事务，现有事务及 Line 局部恢复继续负责。快照真实变化，或唤醒合并窗口之外的真实
+  候选事务，现有事务及 Line 局部恢复继续负责。宿主必须用 `willSleep` 只记录电源边界；
+  从进入休眠到完整 `didWake` 之间的 Dark Wake 路径、路由、DNS 与 SSID 抖动全部延后，
+  完整断线重试计时器也必须暂停；不得停止已提交事务，也不得创建候选或新连接。完整唤醒后重新捕获一次收敛快照：等价则保持原
+  generation，真实变化则只产生一笔 network epoch。快照真实变化，或唤醒合并窗口之外的真实
   断网恢复，仍必须进入 network epoch。它不得热改某条 outbound，也不得按接口
   名、类型或 VPN 产品决定策略。重连只替换运行时 Underlay 快照，不修改 Line / RuleSet /
   Scenario。D39 中用户显式配置的 SSID 触发器可以选择另一 Scenario，但它必须走完整
@@ -733,7 +772,9 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   Scenario, Underlay fingerprint)` 启动一次 Switch；不得先因 Underlay 重建一次，再因
   SSID 变化重建第二次。快速 A→B→C 只允许 C 成为候选。自动触发的瞬态失败可以在同一
   epoch 和预算内重试；用户手动切换失败不自动循环，凭据/证书/配置等终止错误也不重试。
-- **休眠不是网络切换**：紧邻系统 `didWake` 的等价 Underlay 恢复不得仅凭
+- **休眠不是网络切换**：`willSleep` 到完整 `didWake` 之间只允许积累变化事实，不允许
+  Dark Wake 直接提交 Switch；唤醒后必须用一份新捕获的稳定 Underlay 与 SSID 样本合并为
+  至多一笔 epoch。紧邻系统 `didWake` 的等价 Underlay 恢复不得仅凭
   `NWPath` 的不可用/恢复边沿创建同 Scenario Switch。只要 Provider 仍 connected，当前
   generation 保持权威，AnyConnect 等 Line 按 D35 的局部恢复语义自行处理休眠期间失效的
   会话；局部预算耗尽后才升级为完整断线恢复。实际 Underlay 指纹变化不受此规则抑制。

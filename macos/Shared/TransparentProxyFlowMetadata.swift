@@ -198,7 +198,11 @@ enum TransparentProxyApplicationCredentialDecision: Equatable {
 }
 
 enum TransparentProxyFlowMetadata {
-    private static let magic = Data([0x00, 0x58, 0x44, 0x01])
+    private static let addressMetadataMagic = Data([0x00, 0x58, 0x44, 0x01])
+    private static let boundFlowMetadataMagic = Data([0x00, 0x58, 0x44, 0x02])
+    private static let hasEndpointFlag: UInt8 = 1 << 0
+    private static let hasHostnameFlag: UInt8 = 1 << 1
+    private static let hasBoundInterfaceFlag: UInt8 = 1 << 2
 
     static func encode(
         hostname: String,
@@ -228,10 +232,107 @@ enum TransparentProxyFlowMetadata {
             return nil
         }
 
-        var encoded = magic
+        var encoded = addressMetadataMagic
         encoded.append(family)
         encoded.append(address)
         encoded.append(hostnameBytes)
+        guard encoded.count <= 255 else {
+            return nil
+        }
+        return encoded
+    }
+
+    /// Carries the interface choice macOS already attached to a bound flow.
+    /// The authenticated loopback relay is only a transport envelope: the
+    /// active Scenario still selects the outbound, and only Direct restores
+    /// this interface when it is the selected Line.
+    static func encodeBoundFlow(
+        hostname: String?,
+        endpointHost: Network.NWEndpoint.Host,
+        boundInterface: String
+    ) -> Data? {
+        let endpoint: (family: UInt8, address: Data)
+        switch endpointHost {
+        case let .ipv4(value):
+            endpoint = (0x01, value.rawValue)
+        case let .ipv6(value):
+            endpoint = (0x04, value.rawValue)
+        case .name:
+            return nil
+        @unknown default:
+            return nil
+        }
+
+        return encodeBoundMetadata(
+            endpoint: endpoint,
+            hostname: hostname,
+            boundInterface: boundInterface
+        )
+    }
+
+    /// UDP ASSOCIATE has no single remote endpoint, but its socket still owns
+    /// the original bound-interface fact for every datagram in the flow.
+    static func encodeBoundAssociation(
+        boundInterface: String
+    ) -> Data? {
+        encodeBoundMetadata(
+            endpoint: nil,
+            hostname: nil,
+            boundInterface: boundInterface
+        )
+    }
+
+    private static func encodeBoundMetadata(
+        endpoint: (family: UInt8, address: Data)?,
+        hostname: String?,
+        boundInterface: String
+    ) -> Data? {
+        let interfaceBytes = Data(boundInterface.utf8)
+        guard
+            !interfaceBytes.isEmpty,
+            interfaceBytes.count <= 15,
+            !interfaceBytes.contains(0),
+            interfaceBytes.allSatisfy({ $0 < 0x80 })
+        else {
+            return nil
+        }
+
+        let hostnameBytes: Data?
+        if let hostname {
+            let bytes = Data(hostname.utf8)
+            guard
+                !bytes.isEmpty,
+                bytes.count <= 253,
+                !bytes.contains(0)
+            else {
+                return nil
+            }
+            hostnameBytes = bytes
+        } else {
+            hostnameBytes = nil
+        }
+
+        var flags = hasBoundInterfaceFlag
+        if endpoint != nil {
+            flags |= hasEndpointFlag
+        }
+        if hostnameBytes != nil {
+            flags |= hasHostnameFlag
+        }
+
+        var encoded = boundFlowMetadataMagic
+        encoded.append(flags)
+        if let endpoint {
+            encoded.append(endpoint.family)
+            encoded.append(endpoint.address)
+        }
+        if let hostnameBytes {
+            encoded.append(UInt8(hostnameBytes.count))
+            encoded.append(hostnameBytes)
+        }
+        encoded.append(UInt8(interfaceBytes.count))
+        encoded.append(interfaceBytes)
+
         guard encoded.count <= 255 else {
             return nil
         }

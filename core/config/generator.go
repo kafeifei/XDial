@@ -138,9 +138,10 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 }
 
 type transparentProxyIngress struct {
-	port     int
-	username string
-	password string
+	port                int
+	username            string
+	password            string
+	directIPv6Available bool
 }
 
 // GenerateSingBoxTransparentProxy 生成 macOS Transparent Proxy 扩展内的配置。
@@ -153,6 +154,33 @@ func GenerateSingBoxTransparentProxy(
 	basePath string,
 	underlayInterface string,
 	systemDNS []string,
+) ([]byte, error) {
+	return GenerateSingBoxTransparentProxyWithCapabilities(
+		profile,
+		listenPort,
+		username,
+		password,
+		basePath,
+		underlayInterface,
+		systemDNS,
+		true,
+	)
+}
+
+// GenerateSingBoxTransparentProxyWithCapabilities compiles facts measured by
+// the Provider before Commit into the same DNS/route data plane. IPv4-only is
+// a valid Direct capability: names owned by Direct then stop advertising AAAA,
+// while resolvers owned by VPN/proxy/Tailscale Lines keep their own address-
+// family view.
+func GenerateSingBoxTransparentProxyWithCapabilities(
+	profile *Profile,
+	listenPort int,
+	username string,
+	password string,
+	basePath string,
+	underlayInterface string,
+	systemDNS []string,
+	directIPv6Available bool,
 ) ([]byte, error) {
 	if listenPort < 1 || listenPort > 65535 {
 		return nil, fmt.Errorf("transparent proxy listen port is invalid")
@@ -172,9 +200,10 @@ func GenerateSingBoxTransparentProxy(
 		systemDNS,
 		underlayInterface,
 		&transparentProxyIngress{
-			port:     listenPort,
-			username: username,
-			password: password,
+			port:                listenPort,
+			username:            username,
+			password:            password,
+			directIPv6Available: directIPv6Available,
 		},
 	)
 }
@@ -230,7 +259,14 @@ func generateSingBox(
 		return nil, fmt.Errorf("only one active Tailscale line is supported: %d active lines would share one identity", len(activeTailscaleIDs))
 	}
 
-	outbounds := []map[string]interface{}{{"type": "direct", "tag": "direct"}}
+	directOutbound := map[string]interface{}{"type": "direct", "tag": "direct"}
+	if platform.isTransparentProxy() && !transparentIngress.directIPv6Available {
+		directOutbound["domain_resolver"] = map[string]interface{}{
+			"server":   TransparentNativeDNSTag,
+			"strategy": "ipv4_only",
+		}
+	}
+	outbounds := []map[string]interface{}{directOutbound}
 	if len(activeVPNIDs) > 0 {
 		vpnOutbound := map[string]interface{}{
 			"type":        "socks",
@@ -470,6 +506,9 @@ func generateSingBox(
 			"action": "resolve",
 			"server": transparentProxyResolverForOutbound(defaultTag),
 		})
+		if !transparentIngress.directIPv6Available {
+			applyTransparentProxyDirectIPv4OnlyRouteRules(routeRules)
+		}
 	}
 
 	route := map[string]interface{}{
@@ -518,6 +557,7 @@ func generateSingBox(
 			defaultTag,
 			needsProxyEndpointBootstrap,
 			transparentIngress.username,
+			transparentIngress.directIPv6Available,
 		)
 		if dnsErr != nil {
 			return nil, dnsErr
@@ -578,14 +618,18 @@ func buildTransparentProxyInbound(
 			"password": ingress.password,
 		})
 	}
-	return map[string]interface{}{
+	inbound := map[string]interface{}{
 		"type":                "socks",
 		"tag":                 "transparent-proxy-in",
 		"listen":              "127.0.0.1",
 		"listen_port":         ingress.port,
 		"xdial_flow_metadata": true,
 		"users":               users,
-	}, nil
+	}
+	if !ingress.directIPv6Available {
+		inbound["xdial_reresolve_ipv6_flow_domains"] = true
+	}
+	return inbound, nil
 }
 
 // ApplicationSOCKSUsername derives a per-flow SOCKS username from the session
@@ -1084,6 +1128,7 @@ func buildTransparentProxyDNS(
 	defaultOutboundTag string,
 	needsProxyEndpointBootstrap bool,
 	baseUsername string,
+	directIPv6Available bool,
 ) (map[string]interface{}, error) {
 	primarySystemDNS, err := validateTransparentProxySystemDNS(systemDNS)
 	if err != nil {
@@ -1265,6 +1310,19 @@ func buildTransparentProxyDNS(
 
 	defaultResolverTag := transparentProxyResolverForOutbound(defaultOutboundTag)
 	ensureResolver(defaultResolverTag, defaultOutboundTag)
+	if !directIPv6Available {
+		for _, rule := range rules {
+			if rule["server"] == TransparentNativeDNSTag {
+				rule["strategy"] = "ipv4_only"
+			}
+		}
+		if defaultResolverTag == TransparentNativeDNSTag {
+			rules = append(rules, map[string]interface{}{
+				"server":   TransparentNativeDNSTag,
+				"strategy": "ipv4_only",
+			})
+		}
+	}
 	dnsConfig := map[string]interface{}{
 		"servers":           servers,
 		"final":             defaultResolverTag,
@@ -1274,6 +1332,17 @@ func buildTransparentProxyDNS(
 		dnsConfig["rules"] = rules
 	}
 	return dnsConfig, nil
+}
+
+func applyTransparentProxyDirectIPv4OnlyRouteRules(
+	rules []map[string]interface{},
+) {
+	for _, rule := range rules {
+		if rule["action"] == "resolve" &&
+			rule["server"] == TransparentNativeDNSTag {
+			rule["strategy"] = "ipv4_only"
+		}
+	}
 }
 
 func validateTransparentProxySystemDNS(systemDNS []string) (string, error) {

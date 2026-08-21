@@ -142,11 +142,34 @@ enum TCPFlowSOCKSRelay {
         guard !host.isEmpty else {
             throw RelayError.invalidDestination
         }
-        let encodedFlowMetadata = flow.remoteHostname.flatMap {
-            TransparentProxyFlowMetadata.encode(
-                hostname: $0,
-                endpointHost: endpointHost
-            )
+        let boundInterface: String?
+        if flow.isBound {
+            guard let interfaceName = flow.interface?.name,
+                  !interfaceName.isEmpty else {
+                throw RelayError.invalidDestination
+            }
+            boundInterface = interfaceName
+        } else {
+            boundInterface = nil
+        }
+        let encodedFlowMetadata: Data?
+        if let boundInterface {
+            encodedFlowMetadata =
+                TransparentProxyFlowMetadata.encodeBoundFlow(
+                    hostname: flow.remoteHostname,
+                    endpointHost: endpointHost,
+                    boundInterface: boundInterface
+                )
+            guard encodedFlowMetadata != nil else {
+                throw RelayError.invalidDestination
+            }
+        } else {
+            encodedFlowMetadata = flow.remoteHostname.flatMap {
+                TransparentProxyFlowMetadata.encode(
+                    hostname: $0,
+                    endpointHost: endpointHost
+                )
+            }
         }
         return RelayDestination(
             host: host,
@@ -519,7 +542,7 @@ private final class TCPRelayResources: @unchecked Sendable {
         flowWriteClosed = true
         lock.unlock()
 
-        connection.cancel()
+        RelayConnectionCancellation.cancel(connection, error: error)
         let sourceError = AppProxyFlowCloseError.normalize(error)
         if shouldCloseRead {
             flow.closeReadWithError(sourceError)

@@ -1,5 +1,56 @@
 import AppKit
 
+if CommandLine.arguments.contains(
+    "--deactivate-owned-system-extension"
+) {
+    let application = NSApplication.shared
+    TransparentProxyManager.shared.uninstallSystemExtension { result in
+        switch result {
+        case .success:
+            fputs(
+                "XDial System Extension deactivated successfully.\n",
+                stdout
+            )
+            exit(0)
+        case let .failure(error):
+            fputs(
+                "XDial System Extension deactivation failed: "
+                    + error.localizedDescription + "\n",
+                stderr
+            )
+            exit(1)
+        }
+    }
+    application.run()
+    exit(0)
+}
+
+if CommandLine.arguments.contains(
+    "--remove-owned-network-configurations"
+) {
+    let application = NSApplication.shared
+    TransparentProxyManager.shared
+        .removeOwnedNetworkConfigurationsOnly { result in
+            switch result {
+            case .success:
+                fputs(
+                    "XDial network configurations removed successfully.\n",
+                    stdout
+                )
+                exit(0)
+            case let .failure(error):
+                fputs(
+                    "XDial network configuration removal failed: "
+                        + error.localizedDescription + "\n",
+                    stderr
+                )
+                exit(1)
+            }
+        }
+    application.run()
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--uninstall") {
     guard ApplicationRelocator.isRunningFromApplications else {
         fputs(

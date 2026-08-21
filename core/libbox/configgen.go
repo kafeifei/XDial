@@ -186,6 +186,7 @@ func GenerateTransparentProxySession(
 		socksPassword,
 		underlayInterface,
 		systemDNSJSON,
+		true,
 		nil,
 	)
 }
@@ -201,6 +202,33 @@ func GenerateTransparentProxySessionWithCallback(
 	socksPassword string,
 	underlayInterface string,
 	systemDNSJSON string,
+	callback ConnectionPreparationCallback,
+) (string, error) {
+	return GenerateTransparentProxySessionWithCapabilitiesAndCallback(
+		profileJSON,
+		basePath,
+		listenPort,
+		socksUsername,
+		socksPassword,
+		underlayInterface,
+		systemDNSJSON,
+		true,
+		callback,
+	)
+}
+
+// GenerateTransparentProxySessionWithCapabilitiesAndCallback includes
+// Provider-measured Direct address-family capability in the immutable session
+// generated before system network Commit.
+func GenerateTransparentProxySessionWithCapabilitiesAndCallback(
+	profileJSON string,
+	basePath string,
+	listenPort int,
+	socksUsername string,
+	socksPassword string,
+	underlayInterface string,
+	systemDNSJSON string,
+	directIPv6Available bool,
 	callback ConnectionPreparationCallback,
 ) (string, error) {
 	var sink connectionPreparationSink
@@ -220,6 +248,7 @@ func GenerateTransparentProxySessionWithCallback(
 		socksPassword,
 		underlayInterface,
 		systemDNSJSON,
+		directIPv6Available,
 		sink,
 	)
 }
@@ -237,6 +266,31 @@ func GenerateTransparentProxyRuleSetBootstrap(
 	socksPassword string,
 	underlayInterface string,
 	systemDNSJSON string,
+) (string, error) {
+	return GenerateTransparentProxyRuleSetBootstrapWithCapabilities(
+		profileJSON,
+		basePath,
+		listenPort,
+		socksUsername,
+		socksPassword,
+		underlayInterface,
+		systemDNSJSON,
+		true,
+	)
+}
+
+// GenerateTransparentProxyRuleSetBootstrapWithCapabilities gives isolated
+// Direct RuleSet acquisition the same address-family view as the formal
+// traffic session prepared for this transaction.
+func GenerateTransparentProxyRuleSetBootstrapWithCapabilities(
+	profileJSON string,
+	basePath string,
+	listenPort int,
+	socksUsername string,
+	socksPassword string,
+	underlayInterface string,
+	systemDNSJSON string,
+	directIPv6Available bool,
 ) (string, error) {
 	profile, err := config.ParseProfile([]byte(profileJSON))
 	if err != nil {
@@ -340,7 +394,7 @@ func GenerateTransparentProxyRuleSetBootstrap(
 		if err != nil {
 			return "", err
 		}
-		data, err := config.GenerateSingBoxTransparentProxy(
+		data, err := config.GenerateSingBoxTransparentProxyWithCapabilities(
 			&isolated,
 			listenPort,
 			socksUsername,
@@ -348,6 +402,7 @@ func GenerateTransparentProxyRuleSetBootstrap(
 			basePath,
 			underlayInterface,
 			systemDNS,
+			directIPv6Available,
 		)
 		if err != nil {
 			return "", err
@@ -454,6 +509,7 @@ func generateTransparentProxySession(
 	socksPassword string,
 	underlayInterface string,
 	systemDNSJSON string,
+	directIPv6Available bool,
 	progress connectionPreparationSink,
 ) (string, error) {
 	profile, err := config.ParseProfile([]byte(profileJSON))
@@ -481,7 +537,7 @@ func generateTransparentProxySession(
 	if err := json.Unmarshal([]byte(systemDNSJSON), &systemDNS); err != nil {
 		return "", fmt.Errorf("decode system DNS snapshot: %w", err)
 	}
-	data, err := config.GenerateSingBoxTransparentProxy(
+	data, err := config.GenerateSingBoxTransparentProxyWithCapabilities(
 		profile,
 		listenPort,
 		socksUsername,
@@ -489,6 +545,7 @@ func generateTransparentProxySession(
 		basePath,
 		underlayInterface,
 		systemDNS,
+		directIPv6Available,
 	)
 	if err != nil {
 		return "", err

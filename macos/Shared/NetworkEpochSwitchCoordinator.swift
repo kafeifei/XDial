@@ -273,6 +273,34 @@ struct SystemWakeUnderlayPolicy {
     }
 }
 
+enum SystemSleepNetworkEpochAction: Equatable {
+    case evaluateCurrentPath
+    case deferUntilWake
+}
+
+/// Prevents Dark Wake path churn from becoming a sequence of data-plane
+/// generations. The host records the power boundary before Network.framework
+/// callbacks are consumed; the first full wake always performs one fresh
+/// Underlay capture, which either proves the committed snapshot is still
+/// equivalent or emits one material network epoch.
+struct SystemSleepNetworkEpochGate {
+    private var isSleeping = false
+
+    var defersNetworkWork: Bool { isSleeping }
+
+    mutating func noteSystemWillSleep() {
+        isSleeping = true
+    }
+
+    mutating func noteSystemDidWake() {
+        isSleeping = false
+    }
+
+    mutating func observeNetworkSignal() -> SystemSleepNetworkEpochAction {
+        isSleeping ? .deferUntilWake : .evaluateCurrentPath
+    }
+}
+
 enum NetworkEpochTransitionAction: Equatable {
     case none
     case switchScenario(requiresUnderlayRefresh: Bool)

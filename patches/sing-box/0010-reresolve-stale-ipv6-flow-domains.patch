@@ -1,0 +1,173 @@
+diff --git a/option/simple.go b/option/simple.go
+--- a/option/simple.go
++++ b/option/simple.go
+@@ -7,9 +7,10 @@ import (
+ 
+ type SocksInboundOptions struct {
+ 	ListenOptions
+-	Users             []auth.User           `json:"users,omitempty"`
+-	DomainResolver    *DomainResolveOptions `json:"domain_resolver,omitempty"`
+-	XDialFlowMetadata bool                  `json:"xdial_flow_metadata,omitempty"`
++	Users                         []auth.User           `json:"users,omitempty"`
++	DomainResolver                *DomainResolveOptions `json:"domain_resolver,omitempty"`
++	XDialFlowMetadata             bool                  `json:"xdial_flow_metadata,omitempty"`
++	XDialReresolveIPv6FlowDomains bool                  `json:"xdial_reresolve_ipv6_flow_domains,omitempty"`
+ }
+ 
+ type HTTPMixedInboundOptions struct {
+diff --git a/protocol/socks/inbound.go b/protocol/socks/inbound.go
+--- a/protocol/socks/inbound.go
++++ b/protocol/socks/inbound.go
+@@ -28,12 +28,13 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+-	router            adapter.ConnectionRouterEx
+-	logger            logger.ContextLogger
+-	listener          *listener.Listener
+-	authenticator     *auth.Authenticator
+-	udpTimeout        time.Duration
+-	xdialFlowMetadata bool
++	router                        adapter.ConnectionRouterEx
++	logger                        logger.ContextLogger
++	listener                      *listener.Listener
++	authenticator                 *auth.Authenticator
++	udpTimeout                    time.Duration
++	xdialFlowMetadata             bool
++	xdialReresolveIPv6FlowDomains bool
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SocksInboundOptions) (adapter.Inbound, error) {
+@@ -44,12 +45,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLog
+ 		udpTimeout = C.UDPTimeout
+ 	}
+ 	inbound := &Inbound{
+-		Adapter:           inbound.NewAdapter(C.TypeSOCKS, tag),
+-		router:            uot.NewRouter(router, logger),
+-		logger:            logger,
+-		authenticator:     auth.NewAuthenticator(options.Users),
+-		udpTimeout:        udpTimeout,
+-		xdialFlowMetadata: options.XDialFlowMetadata,
++		Adapter:                       inbound.NewAdapter(C.TypeSOCKS, tag),
++		router:                        uot.NewRouter(router, logger),
++		logger:                        logger,
++		authenticator:                 auth.NewAuthenticator(options.Users),
++		udpTimeout:                    udpTimeout,
++		xdialFlowMetadata:             options.XDialFlowMetadata,
++		xdialReresolveIPv6FlowDomains: options.XDialReresolveIPv6FlowDomains,
+ 	}
+ 	inbound.listener = listener.New(listener.Options{
+ 		Context:           ctx,
+@@ -88,7 +90,10 @@ func (h *Inbound) newUserConnection(ctx context.Context, conn net.Conn, metadata
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	if h.xdialFlowMetadata {
+-		encoded, err := applyXDialFlowMetadata(&metadata)
++		encoded, err := applyXDialFlowMetadata(
++			&metadata,
++			h.xdialReresolveIPv6FlowDomains,
++		)
+ 		if encoded && err != nil {
+ 			N.CloseOnHandshakeFailure(conn, onClose, err)
+ 			h.logger.ErrorContext(ctx, "reject invalid XDial flow metadata")
+diff --git a/protocol/socks/xdial_flow_metadata.go b/protocol/socks/xdial_flow_metadata.go
+--- a/protocol/socks/xdial_flow_metadata.go
++++ b/protocol/socks/xdial_flow_metadata.go
+@@ -13,10 +13,16 @@ import (
+ 
+ var xdialFlowMetadataMagic = []byte{0x00, 0x58, 0x44, 0x01}
+ 
+-// applyXDialFlowMetadata decodes the authenticated loopback relay's bounded
+-// SOCKS destination envelope. The original domain remains rule metadata while
+-// the already-resolved NE endpoint becomes the transport destination.
+-func applyXDialFlowMetadata(metadata *adapter.InboundContext) (bool, error) {
++// applyXDialFlowMetadata decodes the authenticated loopback relay's bounded SOCKS
++// destination envelope. Normally the original domain remains rule metadata while
++// the already-resolved NE endpoint stays the transport destination. When the
++// transaction proved Direct IPv6 unusable, an IPv6 endpoint carrying a trusted
++// hostname becomes a domain destination again so the current Scenario-owned
++// resolver can replace an application's stale AAAA result.
++func applyXDialFlowMetadata(
++	metadata *adapter.InboundContext,
++	reresolveIPv6Domains bool,
++) (bool, error) {
+ 	if !metadata.Destination.IsDomain() {
+ 		return false, nil
+ 	}
+@@ -62,6 +68,13 @@ func applyXDialFlowMetadata(metadata *adapter.InboundContext) (bool, error) {
+ 
+ 	port := metadata.Destination.Port
+ 	metadata.Domain = hostname
+-	metadata.Destination = M.SocksaddrFrom(address, port)
++	if reresolveIPv6Domains && address.Is6() {
++		metadata.Destination = M.Socksaddr{
++			Fqdn: hostname,
++			Port: port,
++		}
++	} else {
++		metadata.Destination = M.SocksaddrFrom(address, port)
++	}
+ 	return true, nil
+ }
+diff --git a/protocol/socks/xdial_flow_metadata_test.go b/protocol/socks/xdial_flow_metadata_test.go
+--- a/protocol/socks/xdial_flow_metadata_test.go
++++ b/protocol/socks/xdial_flow_metadata_test.go
+@@ -30,7 +30,7 @@ func TestXDialFlowMetadataPreservesDomainAndUsesIPv4Destination(t *testing.T) {
+ 		},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata)
++	encoded, err := applyXDialFlowMetadata(&metadata, false)
+ 	require.NoError(t, err)
+ 	require.True(t, encoded)
+ 	require.Equal(t, "mbp128k", metadata.Domain)
+@@ -48,7 +48,7 @@ func TestXDialFlowMetadataPreservesDomainAndUsesIPv6Destination(t *testing.T) {
+ 		},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata)
++	encoded, err := applyXDialFlowMetadata(&metadata, false)
+ 	require.NoError(t, err)
+ 	require.True(t, encoded)
+ 	require.Equal(t, "node.example.ts.net", metadata.Domain)
+@@ -60,7 +60,7 @@ func TestXDialFlowMetadataLeavesOrdinarySOCKSDomainUntouched(t *testing.T) {
+ 		Destination: M.Socksaddr{Fqdn: "example.com", Port: 443},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata)
++	encoded, err := applyXDialFlowMetadata(&metadata, true)
+ 	require.NoError(t, err)
+ 	require.False(t, encoded)
+ 	require.Empty(t, metadata.Domain)
+@@ -75,8 +75,30 @@ func TestXDialFlowMetadataRejectsMalformedEnvelope(t *testing.T) {
+ 		},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata)
++	encoded, err := applyXDialFlowMetadata(&metadata, true)
+ 	require.Error(t, err)
+ 	require.True(t, encoded)
+ 	require.Empty(t, metadata.Domain)
+ }
++
++func TestXDialFlowMetadataReresolvesAttributedIPv6Destination(t *testing.T) {
++	address := netip.MustParseAddr("2001:db8::10")
++	metadata := adapter.InboundContext{
++		Destination: M.Socksaddr{
++			Fqdn: xdialEncodedDestination(
++				0x04,
++				address.AsSlice(),
++				"video.example",
++			),
++			Port: 443,
++		},
++	}
++
++	encoded, err := applyXDialFlowMetadata(&metadata, true)
++	require.NoError(t, err)
++	require.True(t, encoded)
++	require.Equal(t, "video.example", metadata.Domain)
++	require.Equal(t, "video.example", metadata.Destination.Fqdn)
++	require.False(t, metadata.Destination.Addr.IsValid())
++	require.Equal(t, uint16(443), metadata.Destination.Port)
++}

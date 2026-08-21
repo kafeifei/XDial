@@ -84,6 +84,111 @@ func TestTransparentProxyDirectDomainsUseMacOSNativeResolver(t *testing.T) {
 	singboxCheckConfig(t, raw, "transparent-direct-native-dns")
 }
 
+func TestTransparentProxyUnavailableDirectIPv6NarrowsOnlyDirectResolution(t *testing.T) {
+	profile := &Profile{
+		Lines: []Line{
+			{ID: "direct", Type: LineTypeDirect, Enabled: true},
+			{
+				ID:             "proxy",
+				Type:           LineTypeAnyTLS,
+				Enabled:        true,
+				AnyTLSServer:   "192.0.2.10",
+				AnyTLSPort:     443,
+				AnyTLSPassword: "secret",
+			},
+		},
+		RuleSets: []RuleSet{{
+			ID: "proxied", Type: RuleSetTypeManual, Enabled: true,
+			Domains: []string{"proxied.example"},
+		}},
+		Scenarios: []Scenario{{
+			ID: "scenario",
+			Bindings: []RuleBinding{{
+				RuleSetID: "proxied", LineID: "proxy",
+			}},
+			DefaultLineID: "direct",
+		}},
+		ActiveScenarioID: "scenario",
+	}
+
+	raw, err := GenerateSingBoxTransparentProxyWithCapabilities(
+		profile,
+		29876,
+		"session-user",
+		"session-password",
+		t.TempDir(),
+		"utun-underlay",
+		[]string{"100.100.100.100"},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg SingBoxConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	directResolver, ok := transparentProxyOutboundByTag(
+		t, cfg, "direct",
+	)["domain_resolver"].(map[string]interface{})
+	if !ok || directResolver["server"] != TransparentNativeDNSTag ||
+		directResolver["strategy"] != "ipv4_only" {
+		t.Fatalf("Direct outbound did not inherit IPv4-only capability: %v", directResolver)
+	}
+	if len(cfg.Inbounds) != 1 ||
+		cfg.Inbounds[0]["xdial_reresolve_ipv6_flow_domains"] != true {
+		t.Fatalf("stale attributed IPv6 flows were not scheduled for re-resolution: %v", cfg.Inbounds)
+	}
+
+	proxyResolverTag := desktopProxyDNSTag("proxy-proxy")
+	var sawDirectDNS, sawProxyDNS bool
+	for _, rawRule := range cfg.DNS["rules"].([]interface{}) {
+		rule := rawRule.(map[string]interface{})
+		switch rule["server"] {
+		case TransparentNativeDNSTag:
+			sawDirectDNS = true
+			if rule["strategy"] != "ipv4_only" {
+				t.Fatalf("Direct DNS rule did not suppress unusable AAAA: %v", rule)
+			}
+		case proxyResolverTag:
+			sawProxyDNS = true
+			if _, exists := rule["strategy"]; exists {
+				t.Fatalf("proxy-owned DNS inherited Direct capability: %v", rule)
+			}
+		}
+	}
+	if !sawDirectDNS || !sawProxyDNS {
+		t.Fatalf("missing resolver ownership rules: %v", cfg.DNS["rules"])
+	}
+
+	routeRules := transparentProxyUserRules(t, cfg)
+	var sawDirectResolve, sawProxyResolve bool
+	for _, rawRule := range routeRules {
+		rule := rawRule.(map[string]interface{})
+		guardedServer, _ := rule["server"].(string)
+		if rule["action"] != "resolve" {
+			continue
+		}
+		switch guardedServer {
+		case TransparentNativeDNSTag:
+			sawDirectResolve = true
+			if rule["strategy"] != "ipv4_only" {
+				t.Fatalf("Direct route resolve did not use IPv4-only: %v", rule)
+			}
+		case proxyResolverTag:
+			sawProxyResolve = true
+			if _, exists := rule["strategy"]; exists {
+				t.Fatalf("proxy route resolve inherited Direct capability: %v", rule)
+			}
+		}
+	}
+	if !sawDirectResolve || !sawProxyResolve {
+		t.Fatalf("missing route resolution ownership: %v", routeRules)
+	}
+	singboxCheckConfig(t, raw, "transparent-direct-ipv4-only")
+}
+
 func TestTransparentProxyDomainEndpointUsesIsolatedBootstrapResolver(t *testing.T) {
 	profile := &Profile{
 		Lines: []Line{

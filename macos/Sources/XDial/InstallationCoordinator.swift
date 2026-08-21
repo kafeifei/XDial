@@ -152,7 +152,13 @@ final class InstallationCoordinator: ObservableObject {
                     + " code=\(failure.code)"
             )
         } catch {
-            let taskID = report.currentTask?.id ?? "bundle"
+            // The System Extension delegate can publish its structured failure
+            // before the activation continuation resumes with the same error.
+            // Preserve that authoritative task instead of falsely turning the
+            // already-ready bundle task red.
+            let taskID = report.error?.taskID
+                ?? report.currentTask?.id
+                ?? "bundle"
             report.fail(
                 code: "installation-failed",
                 message: error.localizedDescription,
@@ -236,11 +242,19 @@ final class InstallationCoordinator: ObservableObject {
     }
 
     private func prepareSystemExtension() async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            GoEngine.shared.prepareSystemExtension { result in
-                continuation.resume(with: result)
+        do {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
+                GoEngine.shared.prepareSystemExtension { result in
+                    continuation.resume(with: result)
+                }
             }
+        } catch {
+            throw InstallationFailure(
+                code: "system-extension-activation-failed",
+                message: error.localizedDescription,
+                taskID: "system-extension"
+            )
         }
     }
 

@@ -42,9 +42,20 @@ enum UDPFlowSOCKSRelay {
                         stage = "control-connect"
                         try await start(control)
                         stage = "udp-associate"
+                        let boundInterface: String?
+                        if flow.isBound {
+                            guard let interfaceName = flow.interface?.name,
+                                  !interfaceName.isEmpty else {
+                                throw RelayError.invalidEndpoint
+                            }
+                            boundInterface = interfaceName
+                        } else {
+                            boundInterface = nil
+                        }
                         let relayEndpoint = try await associateUDP(
                             control,
-                            credentials: credentials
+                            credentials: credentials,
+                            boundInterface: boundInterface
                         )
                         stage = "relay-connect"
                         let udpRelay = NWConnection(
@@ -131,7 +142,8 @@ enum UDPFlowSOCKSRelay {
 
     private static func associateUDP(
         _ connection: NWConnection,
-        credentials: SOCKSCredentials?
+        credentials: SOCKSCredentials?,
+        boundInterface: String?
     ) async throws -> Network.NWEndpoint {
         let method: UInt8 = credentials == nil ? 0x00 : 0x02
         try await send(Data([0x05, 0x01, method]), to: connection)
@@ -144,10 +156,25 @@ enum UDPFlowSOCKSRelay {
         }
 
         // UDP ASSOCIATE with 0.0.0.0:0 asks the server to select its relay.
-        try await send(
-            Data([0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            to: connection
-        )
+        // A bound flow uses the authenticated domain envelope to preserve the
+        // interface macOS already selected; it is not a routing destination.
+        var request = Data([0x05, 0x03, 0x00])
+        if let boundInterface {
+            guard let metadata =
+                    TransparentProxyFlowMetadata.encodeBoundAssociation(
+                        boundInterface: boundInterface
+                    )
+            else {
+                throw RelayError.invalidEndpoint
+            }
+            request.append(0x03)
+            request.append(UInt8(metadata.count))
+            request.append(metadata)
+        } else {
+            request.append(contentsOf: [0x01, 0x00, 0x00, 0x00, 0x00])
+        }
+        request.append(contentsOf: [0x00, 0x00])
+        try await send(request, to: connection)
         let header = try await receiveExactly(4, from: connection)
         guard header[0] == 0x05, header[1] == 0x00 else {
             throw RelayError.socksProtocol("UDP associate rejected")
@@ -573,7 +600,7 @@ private final class UDPRelayResources: @unchecked Sendable {
         lock.lock()
         if closed {
             lock.unlock()
-            relay.cancel()
+            relay.forceCancel()
             return
         }
         self.relay = relay
@@ -591,8 +618,13 @@ private final class UDPRelayResources: @unchecked Sendable {
         relay = nil
         lock.unlock()
 
-        control.cancel()
-        currentRelay?.cancel()
+        RelayConnectionCancellation.cancel(control, error: error)
+        if let currentRelay {
+            RelayConnectionCancellation.cancel(
+                currentRelay,
+                error: error
+            )
+        }
         let sourceError = AppProxyFlowCloseError.normalize(error)
         flow.closeReadWithError(sourceError)
         flow.closeWriteWithError(sourceError)

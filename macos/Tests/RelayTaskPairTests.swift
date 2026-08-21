@@ -1,6 +1,23 @@
 import XCTest
 
 final class RelayTaskPairTests: XCTestCase {
+    func testRelayCancellationUsesImmediateProtocolTeardown() {
+        XCTAssertEqual(
+            RelayConnectionCancellation.mode(for: CancellationError()),
+            .immediate
+        )
+        XCTAssertEqual(
+            RelayConnectionCancellation.mode(
+                for: AppProxyFlowCloseError.aborted
+            ),
+            .immediate
+        )
+        XCTAssertEqual(
+            RelayConnectionCancellation.mode(for: nil),
+            .graceful
+        )
+    }
+
     func testNormalHalfCloseWaitsForSiblingBeforeShutdown() async throws {
         let secondStarted = AsyncTestGate()
         let firstFinished = AsyncTestGate()

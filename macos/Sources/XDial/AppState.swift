@@ -195,6 +195,7 @@ final class AppState: ObservableObject {
     let engine = GoEngine.shared
     let installation = InstallationCoordinator.shared
     private var engineSubs = Set<AnyCancellable>()
+    private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
     private var screenWakeObserver: NSObjectProtocol?
     private var sessionActiveObserver: NSObjectProtocol?
@@ -216,6 +217,7 @@ final class AppState: ObservableObject {
     private var scenarioSwitchRequiresUnderlayRefresh = false
     private var networkEpochSwitchCoordinator =
         NetworkEpochSwitchCoordinator()
+    private var networkEpochPowerGate = SystemSleepNetworkEpochGate()
     private var networkEpochQuietWorkItem: DispatchWorkItem?
     private lazy var wifiSSIDMonitor = WiFiSSIDMonitor(
         onSettling: { [weak self] in
@@ -747,6 +749,9 @@ final class AppState: ObservableObject {
     deinit {
         wakeReconnectTask?.cancel()
         let notificationCenter = NSWorkspace.shared.notificationCenter
+        if let sleepObserver {
+            notificationCenter.removeObserver(sleepObserver)
+        }
         if let wakeObserver {
             notificationCenter.removeObserver(wakeObserver)
         }
@@ -911,7 +916,8 @@ final class AppState: ObservableObject {
     }
 
     private func runLaunchAutoConnectIfNeeded() {
-        guard initialStatusSynchronized else { return }
+        guard initialStatusSynchronized,
+              !networkEpochPowerGate.defersNetworkWork else { return }
         synchronizeConnectionDesiredState(
             runtimeStatus: engine.status,
             report: engine.connectionReport
@@ -956,6 +962,15 @@ final class AppState: ObservableObject {
 
     private func registerWakeObservers() {
         let notificationCenter = NSWorkspace.shared.notificationCenter
+        sleepObserver = notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleSystemWillSleep()
+            }
+        }
         wakeObserver = notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil,
@@ -985,7 +1000,23 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func handleSystemWillSleep() {
+        // Any quiet-window sample that started before clamshell sleep is no
+        // longer adjacent to a stable physical network. Drop it and let the
+        // first full wake capture the one authoritative post-wake Underlay.
+        networkEpochPowerGate.noteSystemWillSleep()
+        cancelNetworkEpochQuietWindow()
+        cancelWakeReconnectTask()
+        appLog(
+            "sleep signal workspace_will_sleep: deferring network epochs"
+        )
+        engine.systemWillSleep()
+    }
+
     private func handleWakeSignal(trigger: String) {
+        if trigger == "workspace_did_wake" {
+            networkEpochPowerGate.noteSystemDidWake()
+        }
         wakeStatusSyncGeneration += 1
         let generation = wakeStatusSyncGeneration
         appLog("wake signal \(trigger): synchronizing runtime status")
@@ -1023,6 +1054,10 @@ final class AppState: ObservableObject {
     }
 
     private func reconcileDesiredConnection(trigger: String) {
+        // Preserve the desired connection while asleep, but never let a Dark
+        // Wake status/SSID/path callback start or stop a full transaction.
+        // The full wake synchronizes system state and resumes this reconcile.
+        guard !networkEpochPowerGate.defersNetworkWork else { return }
         guard connectionDesired.wantsConnection else {
             let action = DesiredConnectionReconcilePolicy.decide(
                 desired: connectionDesired,
@@ -1689,6 +1724,10 @@ final class AppState: ObservableObject {
     }
 
     private func handleWiFiSSIDSettling() {
+        guard networkEpochPowerGate.observeNetworkSignal()
+            == .evaluateCurrentPath else {
+            return
+        }
         let currentDesiredScenarioID = scenarioSwitchTargetID
             ?? connectionDesired.scenarioID
             ?? engine.connectionReport?.scenario.id
@@ -1703,6 +1742,10 @@ final class AppState: ObservableObject {
     }
 
     private func activateScenarioForCurrentSSIDIfNeeded() {
+        guard networkEpochPowerGate.observeNetworkSignal()
+            == .evaluateCurrentPath else {
+            return
+        }
         guard wifiSSIDAccessState == .ready else { return }
         let currentDesiredScenarioID = scenarioSwitchTargetID
             ?? connectionDesired.scenarioID
@@ -1738,6 +1781,10 @@ final class AppState: ObservableObject {
         underlayFingerprint: String,
         forceNewEpoch: Bool
     ) {
+        guard networkEpochPowerGate.observeNetworkSignal()
+            == .evaluateCurrentPath else {
+            return
+        }
         guard automaticScenarioChangeKeepsConnection else {
             return
         }

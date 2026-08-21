@@ -357,6 +357,23 @@ final class NetworkEpochSwitchCoordinatorTests: XCTestCase {
         )
     }
 
+    func testClamshellDefersEveryDarkWakePathUntilFullWake() {
+        var gate = SystemSleepNetworkEpochGate()
+
+        gate.noteSystemWillSleep()
+        XCTAssertTrue(gate.defersNetworkWork)
+        XCTAssertEqual(gate.observeNetworkSignal(), .deferUntilWake)
+        XCTAssertEqual(gate.observeNetworkSignal(), .deferUntilWake)
+        XCTAssertEqual(gate.observeNetworkSignal(), .deferUntilWake)
+
+        gate.noteSystemDidWake()
+        XCTAssertFalse(gate.defersNetworkWork)
+        XCTAssertEqual(
+            gate.observeNetworkSignal(),
+            .evaluateCurrentPath
+        )
+    }
+
     func testRealUnmatchedSSIDSeparatesReturnToSameTuple() {
         var coordinator = NetworkEpochSwitchCoordinator()
         _ = coordinator.observeSSIDResolution(
