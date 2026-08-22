@@ -192,10 +192,21 @@ if [[ "${#sing_box_patch_files[@]}" -eq 0 ]]; then
 	exit 1
 fi
 for patch_file in "${sing_box_patch_files[@]}"; do
-	(
-		cd "${patched_sing_box_dir}"
-		patch -p1 --batch --forward < "${patch_file}"
-	)
+	if [[ "$(basename "${patch_file}")" == \
+		"0011-preserve-bound-flow-interface.patch" ]]; then
+		# This patch touches repeated constructor and dialer blocks. BSD patch
+		# and GNU patch can choose different fuzzy contexts, so require Git's
+		# exact cross-platform patch semantics for this boundary-sensitive edit.
+		GIT_CEILING_DIRECTORIES="${repo_root}" \
+			git -C "${patched_sing_box_dir}" apply --check "${patch_file}"
+		GIT_CEILING_DIRECTORIES="${repo_root}" \
+			git -C "${patched_sing_box_dir}" apply "${patch_file}"
+	else
+		(
+			cd "${patched_sing_box_dir}"
+			patch -p1 --batch --forward < "${patch_file}"
+		)
+	fi
 done
 
 grep -Fq 'if allowedIP.Bits() == 0 {' \
