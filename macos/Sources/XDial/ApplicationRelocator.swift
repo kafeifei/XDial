@@ -45,6 +45,79 @@ enum ApplicationRelocator {
         _ = try validateDistributionBundle(at: Bundle.main.bundleURL)
     }
 
+    static var permitsAutomaticUpdates: Bool {
+        isRunningFromApplications
+            && Bundle.main.bundleIdentifier
+                == XDialApplicationIdentifierPolicy.release
+    }
+
+    static func validateIncomingUpdateBundle(
+        at bundleURL: URL,
+        expectedVersion: String
+    ) throws {
+        guard permitsAutomaticUpdates else {
+            throw InstallationError.automaticUpdateUnsupported
+        }
+        let currentIdentity = try validateDistributionBundle(
+            at: Bundle.main.bundleURL
+        )
+        let incomingIdentity = try validateDistributionBundle(at: bundleURL)
+        let incomingVersion = ApplicationBundleInfo.string(
+            forKey: "CFBundleShortVersionString",
+            at: bundleURL
+        ) ?? ""
+        let incomingBuild = ApplicationBundleInfo.string(
+            forKey: "CFBundleVersion",
+            at: bundleURL
+        ) ?? ""
+        let settingsURL = bundleURL.appendingPathComponent(
+            "Contents/Helpers/XDial Settings UI.app",
+            isDirectory: true
+        )
+        let extensionURL = bundleURL.appendingPathComponent(
+            "Contents/Library/SystemExtensions/"
+                + AutomaticUpdateBundlePolicy
+                    .releaseExtensionIdentifier
+                + ".systemextension",
+            isDirectory: true
+        )
+        guard AutomaticUpdateBundlePolicy.permits(
+            currentIdentifier: currentIdentity.identifier,
+            currentTeamIdentifier: currentIdentity.teamIdentifier,
+            incomingIdentifier: incomingIdentity.identifier,
+            incomingTeamIdentifier: incomingIdentity.teamIdentifier,
+            incomingVersion: incomingVersion,
+            expectedVersion: expectedVersion
+        ),
+        ApplicationBundleInfo.string(
+            forKey: "XDialTransparentProxyBundleIdentifier",
+            at: bundleURL
+        ) == AutomaticUpdateBundlePolicy.releaseExtensionIdentifier,
+        AutomaticUpdateBundlePolicy.permitsVersionSet(
+            expectedVersion: expectedVersion,
+            hostVersion: incomingVersion,
+            hostBuild: incomingBuild,
+            settingsVersion: ApplicationBundleInfo.string(
+                forKey: "CFBundleShortVersionString",
+                at: settingsURL
+            ) ?? "",
+            settingsBuild: ApplicationBundleInfo.string(
+                forKey: "CFBundleVersion",
+                at: settingsURL
+            ) ?? "",
+            extensionVersion: ApplicationBundleInfo.string(
+                forKey: "CFBundleShortVersionString",
+                at: extensionURL
+            ) ?? "",
+            extensionBuild: ApplicationBundleInfo.string(
+                forKey: "CFBundleVersion",
+                at: extensionURL
+            ) ?? ""
+        ) else {
+            throw InstallationError.automaticUpdateIdentityMismatch
+        }
+    }
+
     /// 开发重启先在无 UI、无 AppState 的进程中完成原子替换，再只启动
     /// /Applications 中的最终 bundle。这样不会先启动构建目录副本、建立一次
     /// 网络事务，随后又因自动安装被终止并建立第二次事务。
@@ -98,6 +171,19 @@ enum ApplicationRelocator {
         let sourceURL = Bundle.main.bundleURL
         do {
             let sourceIdentity = try validateDistributionBundle(at: sourceURL)
+            if AppUpdateStager.isOwnedStagedApplication(sourceURL) {
+                let sourceVersion = ApplicationBundleInfo.string(
+                    forKey: "CFBundleShortVersionString",
+                    at: sourceURL
+                ) ?? ""
+                guard AppUpdateRelaunchIntentStore
+                    .permitsStagedSuccessor(
+                        targetVersion: sourceVersion
+                    ) else {
+                    throw InstallationError
+                        .automaticUpdateIdentityMismatch
+                }
+            }
             let destinationExists = FileManager.default.fileExists(
                 atPath: destinationURL.path
             )
@@ -142,14 +228,25 @@ enum ApplicationRelocator {
                     canRetry: false
                 )
             case .install, .replace:
-                try install(
-                    sourceURL: sourceURL,
-                    sourceIdentity: sourceIdentity,
-                    replacedIdentity: destinationIdentity,
-                    replaceExisting: destinationExists
-                )
-                try relaunchInstalledApplication()
-                return .relaunching
+                do {
+                    try install(
+                        sourceURL: sourceURL,
+                        sourceIdentity: sourceIdentity,
+                        replacedIdentity: destinationIdentity,
+                        replaceExisting: destinationExists
+                    )
+                    try relaunchInstalledApplication()
+                    AppUpdateStager.discardOwnedRoot(
+                        containing: sourceURL
+                    )
+                    return .relaunching
+                } catch {
+                    relaunchInstalledApplicationAfterFailedReplacement(
+                        sourceIdentity: sourceIdentity,
+                        replacedIdentity: destinationIdentity
+                    )
+                    throw error
+                }
             }
         } catch {
             return .failed(
@@ -260,6 +357,30 @@ enum ApplicationRelocator {
         guard application != nil, error == nil else {
             throw InstallationError.relaunchFailed
         }
+    }
+
+    private static func relaunchInstalledApplicationAfterFailedReplacement(
+        sourceIdentity: SigningIdentity,
+        replacedIdentity: SigningIdentity?
+    ) {
+        guard FileManager.default.fileExists(atPath: destinationURL.path)
+        else {
+            return
+        }
+        let identifiers = Set(
+            [
+                sourceIdentity.identifier,
+                replacedIdentity?.identifier,
+            ].compactMap { $0 }
+        )
+        guard otherRunningCopies(
+            bundleIdentifiers: identifiers,
+            currentProcessIdentifier:
+                NSRunningApplication.current.processIdentifier
+        ).isEmpty else {
+            return
+        }
+        try? relaunchInstalledApplication()
     }
 
     static func isExpectedRelaunchPredecessor(
@@ -377,8 +498,30 @@ enum ApplicationRelocator {
             throw InstallationError.helperMissing
         }
         let helperIdentity = try signingIdentity(at: helperURL)
-        guard helperIdentity.teamIdentifier == hostIdentity.teamIdentifier else {
+        guard helperIdentity.identifier
+                == AutomaticUpdateBundlePolicy.releaseHelperIdentifier,
+              helperIdentity.teamIdentifier == hostIdentity.teamIdentifier else {
             throw InstallationError.helperSignatureMismatch
+        }
+
+        guard let expectedSettingsIdentifier =
+            XDialApplicationIdentifierPolicy.settingsUIIdentifier(
+                forApplicationIdentifier: hostIdentity.identifier
+            ) else {
+            throw InstallationError.bundleIdentifierMismatch
+        }
+        let settingsURL = bundleURL.appendingPathComponent(
+            "Contents/Helpers/XDial Settings UI.app",
+            isDirectory: true
+        )
+        guard FileManager.default.fileExists(atPath: settingsURL.path) else {
+            throw InstallationError.settingsUIMissing
+        }
+        let settingsIdentity = try signingIdentity(at: settingsURL)
+        guard settingsIdentity.identifier == expectedSettingsIdentifier,
+              settingsIdentity.teamIdentifier == hostIdentity.teamIdentifier
+        else {
+            throw InstallationError.settingsUISignatureMismatch
         }
 
         guard let extensionIdentifier = ApplicationBundleInfo.string(
@@ -503,6 +646,8 @@ enum ApplicationRelocator {
         case bundleIdentifierMismatch
         case helperMissing
         case helperSignatureMismatch
+        case settingsUIMissing
+        case settingsUISignatureMismatch
         case extensionIdentifierMissing
         case extensionMissing
         case extensionFilenameMismatch
@@ -517,6 +662,8 @@ enum ApplicationRelocator {
         case existingApplicationDidNotTerminate
         case existingApplicationNotReplaceable
         case applicationNotInstalled
+        case automaticUpdateUnsupported
+        case automaticUpdateIdentityMismatch
 
         var canRetry: Bool {
             switch self {
@@ -537,6 +684,10 @@ enum ApplicationRelocator {
                 "安装包缺少 xdial-daemon"
             case .helperSignatureMismatch:
                 "xdial-daemon 与 XDial 的签名身份不一致"
+            case .settingsUIMissing:
+                "安装包缺少 XDial 设置窗口组件"
+            case .settingsUISignatureMismatch:
+                "设置窗口组件与 XDial 的签名身份不一致"
             case .extensionIdentifierMissing:
                 "安装包没有声明网络扩展标识"
             case .extensionMissing:
@@ -568,6 +719,10 @@ enum ApplicationRelocator {
                     + "已拒绝覆盖"
             case .applicationNotInstalled:
                 "XDial 不在“应用程序”目录，无法完成卸载"
+            case .automaticUpdateUnsupported:
+                "当前 XDial 构建不允许应用内自动更新"
+            case .automaticUpdateIdentityMismatch:
+                "下载的 XDial 版本或签名身份与当前应用不一致"
             }
         }
     }

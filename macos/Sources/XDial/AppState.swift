@@ -207,6 +207,8 @@ final class AppState: ObservableObject {
         WakeReconnectPhase?
     private var initialStatusSynchronized = false
     private var launchAutoConnectPending = false
+    private var updateRelaunchDecision:
+        AppUpdateRelaunchDecision?
     private var connectionAttempts = ConnectionAttemptGate()
     @Published private(set) var scenarioSwitchTargetID: String?
     @Published private var scenarioSwitchFailureAcknowledgement:
@@ -715,6 +717,13 @@ final class AppState: ObservableObject {
             }
             .store(in: &engineSubs)
         loadSaved()
+        updateRelaunchDecision =
+            AppUpdateRelaunchIntentStore.loadDecision(
+                currentVersion: Bundle.main.object(
+                    forInfoDictionaryKey: "CFBundleShortVersionString"
+                ) as? String ?? "0",
+                activeScenarioID: profile.activeScenarioID
+            )
         // 首次启动就取得当前 SSID，设置页才能直接把正在使用的 Wi-Fi
         // 加到场景；等用户先配置触发条件再申请会形成无法初始化的闭环。
         wifiSSIDMonitor.start(requestAuthorization: true)
@@ -723,7 +732,16 @@ final class AppState: ObservableObject {
         )
         checkHelper()
         installation.start()
-        launchAutoConnectPending = autoConnect
+        switch updateRelaunchDecision {
+        case .reconnect:
+            launchAutoConnectPending = true
+        case .stayDisconnected:
+            launchAutoConnectPending = false
+            AppUpdateRelaunchIntentStore.clear()
+            updateRelaunchDecision = nil
+        case nil:
+            launchAutoConnectPending = autoConnect
+        }
         registerWakeObservers()
         engine.syncStatus { [weak self] in
             Task { @MainActor [weak self] in
@@ -931,12 +949,21 @@ final class AppState: ObservableObject {
             // 自动连接请求也不能在这里被消费。安装事务可能紧接着替换
             // System Extension，使旧 Provider 会话掉线。请求要一直保留到
             // 真正发起新连接，或用户明确断开。
+            if installation.isReady,
+               case let .reconnect(scenarioID) = updateRelaunchDecision,
+               engine.connectionReport?.scenario.id == scenarioID {
+                AppUpdateRelaunchIntentStore.clear()
+                updateRelaunchDecision = nil
+                launchAutoConnectPending = false
+            }
             return
         }
         guard installation.isReady else { return }
         guard engine.status == "disconnected" else { return }
         guard canConnect else {
             launchAutoConnectPending = false
+            AppUpdateRelaunchIntentStore.clear()
+            updateRelaunchDecision = nil
             connectionDesired.settleInitialDisconnection()
             appLog(
                 "launch auto-connect skipped: active Scenario is not ready"
@@ -944,20 +971,30 @@ final class AppState: ObservableObject {
             return
         }
         guard AutomaticConnectionPolicy.shouldConnectOnLaunch(
-            enabled: autoConnect,
+            enabled: autoConnect || updateRelaunchDecision != nil,
             initialStatusSynchronized: initialStatusSynchronized,
             installationReady: installation.isReady,
             runtimeStatus: engine.status,
             canConnect: canConnect
         ) else {
             launchAutoConnectPending = false
+            AppUpdateRelaunchIntentStore.clear()
+            updateRelaunchDecision = nil
             connectionDesired.settleInitialDisconnection()
             return
         }
 
         launchAutoConnectPending = false
+        let expectedScenarioID: String?
+        if case let .reconnect(scenarioID) = updateRelaunchDecision {
+            expectedScenarioID = scenarioID
+        } else {
+            expectedScenarioID = nil
+        }
+        AppUpdateRelaunchIntentStore.clear()
+        updateRelaunchDecision = nil
         appLog("launch auto-connect started")
-        connectAutomatically()
+        connectAutomatically(expectedScenarioID: expectedScenarioID)
     }
 
     private func registerWakeObservers() {

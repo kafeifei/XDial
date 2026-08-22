@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      MACOS_DEVELOPER_ID_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+      MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+      MACOS_RELEASE_HOST_PROFILE_BASE64: ${{ secrets.MACOS_RELEASE_HOST_PROFILE_BASE64 }}
+      MACOS_RELEASE_EXTENSION_PROFILE_BASE64: ${{ secrets.MACOS_RELEASE_EXTENSION_PROFILE_BASE64 }}
+      APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+      NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release build identity
+        run: echo "RELEASE_BUILD_NUMBER=$(date -u +%s)" >> "$GITHUB_ENV"
+
+      - name: Validate public repository, tag, notes, and content gate
+        run: |
+          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility)" = public
+          scripts/release-contract.sh validate-inputs "$RELEASE_TAG" "$RELEASE_BUILD_NUMBER"
+          scripts/release-contract.sh validate-notes "$RELEASE_TAG" RELEASE_NOTES.md
+          scripts/release-contract.sh assert-git-tag "$RELEASE_TAG"
+          make public-content-gate
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen
+          go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
+          go install github.com/sagernet/gomobile/cmd/gobind@v0.1.13
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Validate signing and notarization secrets
+        run: |
+          test -n "$MACOS_DEVELOPER_ID_P12_BASE64"
+          test -n "$MACOS_DEVELOPER_ID_P12_PASSWORD"
+          test -n "$MACOS_RELEASE_HOST_PROFILE_BASE64"
+          test -n "$MACOS_RELEASE_EXTENSION_PROFILE_BASE64"
+          test -n "$APPLE_NOTARY_KEY_BASE64"
+          test -n "$NOTARY_KEY_ID"
+          test -n "$NOTARY_ISSUER"
+
+      - name: Import Developer ID identity and provisioning profiles
+        env:
+          SIGNING_KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          keychain="$RUNNER_TEMP/xdial-signing.keychain-db"
+          certificate="$RUNNER_TEMP/xdial-developer-id.p12"
+          profiles="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          host_profile="$profiles/xdial-release-host.provisionprofile"
+          extension_profile="$profiles/xdial-release-extension.provisionprofile"
+
+          printf '%s' "$MACOS_DEVELOPER_ID_P12_BASE64" | /usr/bin/base64 --decode > "$certificate"
+          /usr/bin/security create-keychain -p "$SIGNING_KEYCHAIN_PASSWORD" "$keychain"
+          /usr/bin/security set-keychain-settings -lut 21600 "$keychain"
+          /usr/bin/security unlock-keychain -p "$SIGNING_KEYCHAIN_PASSWORD" "$keychain"
+          /usr/bin/security import "$certificate" -k "$keychain" \
+            -P "$MACOS_DEVELOPER_ID_P12_PASSWORD" -A -t cert -f pkcs12
+          /usr/bin/security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$SIGNING_KEYCHAIN_PASSWORD" "$keychain"
+          /usr/bin/security list-keychains -d user -s "$keychain"
+
+          mkdir -p "$profiles"
+          printf '%s' "$MACOS_RELEASE_HOST_PROFILE_BASE64" \
+            | /usr/bin/base64 --decode > "$host_profile"
+          printf '%s' "$MACOS_RELEASE_EXTENSION_PROFILE_BASE64" \
+            | /usr/bin/base64 --decode > "$extension_profile"
+          test "$(/usr/bin/security cms -D -i "$host_profile" \
+            | /usr/bin/plutil -extract Name raw -o - -)" \
+            = "XDial Developer ID Host 2026"
+          test "$(/usr/bin/security cms -D -i "$extension_profile" \
+            | /usr/bin/plutil -extract Name raw -o - -)" \
+            = "XDial Developer ID Transparent Proxy"
+          /usr/bin/security find-identity -v -p codesigning "$keychain" \
+            | grep -F 'Developer ID Application:'
+          echo "SIGNING_KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+
+      - name: Prepare App Store Connect notarization key
+        run: |
+          notary_key="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          printf '%s' "$APPLE_NOTARY_KEY_BASE64" \
+            | /usr/bin/base64 --decode > "$notary_key"
+          chmod 600 "$notary_key"
+          echo "NOTARY_KEY=$notary_key" >> "$GITHUB_ENV"
+
+      - name: Build, notarize, staple, and verify release
+        run: |
+          make release \
+            RELEASE_TAG="$RELEASE_TAG" \
+            RELEASE_BUILD_NUMBER="$RELEASE_BUILD_NUMBER" \
+            NOTARY_KEY="$NOTARY_KEY" \
+            NOTARY_KEY_ID="$NOTARY_KEY_ID" \
+            NOTARY_ISSUER="$NOTARY_ISSUER"
+
+      - name: Publish immutable release assets
+        run: |
+          gh release create "$RELEASE_TAG" \
+            "build/release/XDial-${RELEASE_TAG}.zip" \
+            "build/release/XDial-${RELEASE_TAG}.zip.sha256" \
+            --verify-tag \
+            --title "XDial $RELEASE_TAG" \
+            --notes-file RELEASE_NOTES.md
+
+      - name: Remove temporary signing keychain
+        if: always()
+        run: |
+          if [ -n "${SIGNING_KEYCHAIN_PATH:-}" ]; then
+            /usr/bin/security delete-keychain "$SIGNING_KEYCHAIN_PATH" || true
+          fi

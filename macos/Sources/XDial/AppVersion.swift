@@ -1,6 +1,42 @@
 import Foundation
 
 enum VersionUpdatePolicy {
+    static func stableReleaseVersion(fromTag tag: String) -> String? {
+        guard tag.first == "v" else { return nil }
+        let value = tag.dropFirst()
+        let parts = value.split(
+            separator: ".",
+            omittingEmptySubsequences: false
+        )
+        guard parts.count == 3,
+              parts.allSatisfy({ part in
+                  !part.isEmpty
+                      && part.utf8.allSatisfy { (48 ... 57).contains($0) }
+                      && (part == "0" || part.first != "0")
+              }) else {
+            return nil
+        }
+        return String(value)
+    }
+
+    static func stableVersion(fromTag tag: String) -> String? {
+        var value = tag.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        if value.first == "v" || value.first == "V" {
+            value.removeFirst()
+        }
+        let parts = value.split(
+            separator: ".",
+            omittingEmptySubsequences: false
+        )
+        guard !parts.isEmpty,
+              parts.allSatisfy({ !$0.isEmpty && Int($0) != nil }) else {
+            return nil
+        }
+        return value
+    }
+
     static func isNewer(
         latestTag: String,
         than currentVersion: String

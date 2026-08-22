@@ -290,6 +290,20 @@ enum SystemExtensionActivationVerifier {
 enum XDialApplicationIdentifierPolicy {
     static let debug = "com.kafeifei.xdial.ne-probe"
     static let release = "com.kafeifei.xdial"
+    static let debugSettingsUI =
+        "com.kafeifei.xdial.ne-probe.settings-ui"
+    static let releaseSettingsUI =
+        "com.kafeifei.xdial.settings-ui"
+
+    static func settingsUIIdentifier(
+        forApplicationIdentifier identifier: String
+    ) -> String? {
+        switch identifier {
+        case debug: debugSettingsUI
+        case release: releaseSettingsUI
+        default: nil
+        }
+    }
 
     static func permitsReplacement(
         existingIdentifier: String,

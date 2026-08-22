@@ -1,6 +1,12 @@
 BUILD_DIR := build
 APP_BUNDLE := $(BUILD_DIR)/XDial.app
 RELEASE_BUNDLE := $(BUILD_DIR)/release/XDial.app
+RELEASE_TAG ?=
+RELEASE_BUILD_NUMBER ?=
+RELEASE_VERSION = $(patsubst v%,%,$(RELEASE_TAG))
+RELEASE_ARCHIVE = $(BUILD_DIR)/release/XDial-$(RELEASE_TAG).zip
+RELEASE_NOTARIZATION_LOG = $(BUILD_DIR)/release/XDial-$(RELEASE_TAG)-notarization.json
+RELEASE_CONTRACT := scripts/release-contract.sh
 GOBIN := $(shell go env GOPATH)/bin
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PLIST_VERSION := $(patsubst v%,%,$(VERSION))
@@ -39,7 +45,7 @@ MACOS_APP_LAUNCHER := $(BUILD_DIR)/launch-macos-app
 SIGN_IDENTITY ?= Apple Development
 MACOS_TEST_XCODEBUILD_FLAGS ?=
 
-.PHONY: all cli app ci-macos-build release restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios mobile-app-icons FORCE_PATCHED_GO
+.PHONY: all cli app ci-macos-build release-inputs release-app release test-release-contract restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios mobile-app-icons FORCE_PATCHED_GO
 
 $(MACOS_ICON_GENERATOR_BINARY): $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
 	@mkdir -p "$(BUILD_DIR)"
@@ -145,7 +151,10 @@ test-patched-sslcon: $(PATCHED_WORKFILE)
 test: public-content-gate $(PATCHED_WORKFILE) test-patched-tailscale test-patched-sing-box test-patched-sslcon sing-box-test-validator
 	PATH="$(dir $(SING_BOX_TEST_BINARY)):$(PATH)" $(PATCHED_GO_ENV) go test -tags '$(MOBILE_LIBBOX_TAGS)' ./core/... -v -count=1
 
-test-macos-transaction:
+test-release-contract:
+	bash test/release_contract_test.sh
+
+test-macos-transaction: test-release-contract
 	@! rg -n 'probeNetwork|127\.0\.0\.1:9090|test-out' macos/Sources/XDial
 	@test "$$(rg -l 'willSleepNotification' macos/Sources/XDial macos/Shared | sort)" = macos/Sources/XDial/AppState.swift
 	@! rg -n 'screensDidSleepNotification|systemIsSleeping|sawUnavailablePath' macos/Sources/XDial macos/Shared
@@ -235,25 +244,49 @@ ci-macos-build: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDo
 		test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode-ci/Build/Products/'"$$configuration"'/XDial.app/Contents/Info.plist')" = true; \
 	done
 
-# release 构建:swift -c release 使 #if DEBUG 的 DebugServer 整体排除,
-# go -trimpath -s -w 去符号并注入版本。分发一律用这个产物。
-release: libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns
+# Release 的 marketing version 只来自 RELEASE_TAG；build number 是独立、
+# 单调递增的安装身份。release-app 只产生待公证的签名 app，不能分发；
+# 分发一律使用 make release 在所有门禁后产生的 zip。
+release-inputs:
+	@$(RELEASE_CONTRACT) validate-inputs "$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
+	@$(RELEASE_CONTRACT) validate-notes "$(RELEASE_TAG)" RELEASE_NOTES.md
+
+release-app: release-inputs libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns
 	@mkdir -p $(BUILD_DIR)
-	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -trimpath -ldflags "$(GO_LDFLAGS) -s -w" -o $(BUILD_DIR)/xdial ./cmd/xdial/
+	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -trimpath \
+		-ldflags "-X main.version=$(RELEASE_TAG) -s -w" \
+		-o $(BUILD_DIR)/xdial ./cmd/xdial/
 	cd macos && xcodegen generate
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Release \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode-release \
+		MARKETING_VERSION="$(RELEASE_VERSION)" \
+		CURRENT_PROJECT_VERSION="$(RELEASE_BUILD_NUMBER)" \
 		build
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration Release \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode-release \
+		MARKETING_VERSION="$(RELEASE_VERSION)" \
+		CURRENT_PROJECT_VERSION="$(RELEASE_BUILD_NUMBER)" \
 		build
 	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode-release/Build/Products/Release/XDial.app/Contents/Info.plist')" = true
 	rm -rf "$(RELEASE_BUNDLE)"
 	ditto "$(BUILD_DIR)/macos-xcode-release/Build/Products/Release/XDial.app" "$(RELEASE_BUNDLE)"
 	@test "$$(plutil -extract LSUIElement raw '$(RELEASE_BUNDLE)/Contents/Info.plist')" = true
-	@echo "release bundle: $(RELEASE_BUNDLE) (version $(PLIST_VERSION))"
+	@$(RELEASE_CONTRACT) verify-app "$(RELEASE_BUNDLE)" \
+		"$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
+	@echo "signed release app (not yet distributable): $(RELEASE_BUNDLE)"
+
+release: release-app
+	@$(RELEASE_CONTRACT) notarize "$(RELEASE_BUNDLE)" \
+		"$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)" \
+		"$(RELEASE_NOTARIZATION_LOG)"
+	@$(RELEASE_CONTRACT) archive "$(RELEASE_BUNDLE)" \
+		"$(RELEASE_TAG)" "$(BUILD_DIR)/release"
+	@$(RELEASE_CONTRACT) verify-archive "$(RELEASE_ARCHIVE)" \
+		"$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
+	@echo "release archive: $(RELEASE_ARCHIVE)"
+	@echo "release checksum: $(RELEASE_ARCHIVE).sha256"
 
 # 一键重启：先完整构建并签名新版本，成功后才让旧实例完成网络回滚并退出。
 # 构建目录中的进程紧接着执行无 UI 的原子安装，然后只启动

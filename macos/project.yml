@@ -11,6 +11,11 @@ settings:
     DEVELOPMENT_TEAM: UVZM439VGU
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "5.0"
+    # Source and CI builds use a neutral identity. `make release` is the only
+    # distribution producer and overrides both values from its validated tag
+    # and monotonically increasing build number.
+    MARKETING_VERSION: "0.0.0"
+    CURRENT_PROJECT_VERSION: "1"
   configs:
     Debug:
       XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
@@ -44,8 +49,6 @@ targets:
         # match its bundle identifier exactly. PRODUCT_NAME controls the
         # outer .systemextension filename.
         PRODUCT_NAME: "$(PRODUCT_BUNDLE_IDENTIFIER)"
-        MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "97"
         ENABLE_APP_SANDBOX: YES
       configs:
         Debug:
@@ -94,8 +97,6 @@ targets:
       base:
         PRODUCT_NAME: XDial Settings UI
         PRODUCT_BUNDLE_IDENTIFIER: "$(XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER)"
-        MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "97"
         ENABLE_APP_SANDBOX: NO
         SKIP_INSTALL: YES
       configs:
@@ -141,8 +142,6 @@ targets:
     settings:
       base:
         PRODUCT_NAME: XDial
-        MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "97"
         ENABLE_USER_SCRIPT_SANDBOXING: NO
       configs:
         Debug:
@@ -254,10 +253,12 @@ targets:
           if [ "${CONFIGURATION}" = "Release" ]; then
             /usr/bin/codesign --force --options runtime --timestamp \
               --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              --identifier com.kafeifei.xdial.helper \
               --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
               "${helper_dir}/xdial-daemon"
           else
             /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              --identifier com.kafeifei.xdial.helper \
               --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
               "${helper_dir}/xdial-daemon"
           fi
@@ -276,8 +277,13 @@ targets:
       - Tests
       - Shared
       - Sources/XDial/AppIcon.swift
+      - Sources/XDial/AppDefaults.swift
       - Sources/XDial/ApplicationLaunchPolicy.swift
       - Sources/XDial/AppVersion.swift
+      - Sources/XDial/AppUpdateStager.swift
+      - Sources/XDial/AppUpdateDownloader.swift
+      - Sources/XDial/AppUpdateTransaction.swift
+      - Sources/XDial/ApplicationRelocator.swift
       - Sources/XDial/DebugStateRedactor.swift
       - Sources/XDial/Models.swift
       - Sources/XDial/ProfileVaultProjection.swift

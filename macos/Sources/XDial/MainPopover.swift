@@ -15,6 +15,7 @@ private struct FailurePresentation {
 
 struct MainPopover: View {
     @EnvironmentObject private var state: AppState
+    @EnvironmentObject private var updater: AppUpdateChecker
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var networkInfo = NetworkInfo.shared
     @StateObject private var trafficInfo = TrafficInfo()
@@ -65,6 +66,21 @@ struct MainPopover: View {
         )
         .background(XDialPalette.elevated)
         .contextMenu {
+            if let candidate = updater.releaseCandidate {
+                Button(
+                    state.tr(
+                        "新版本 v\(candidate.version)…",
+                        "New Version v\(candidate.version)…"
+                    )
+                ) {
+                    presentUpdateWindow()
+                }
+            } else {
+                Button(state.tr("检查更新…", "Check for Updates…")) {
+                    presentUpdateWindow()
+                    Task { await updater.checkNow() }
+                }
+            }
             Button(state.tr("安装状态…", "Installation Status…")) {
                 state.installation.present()
             }
@@ -121,6 +137,40 @@ struct MainPopover: View {
                         )
                     }
                 }
+            }
+            if let candidate = updater.releaseCandidate {
+                Button {
+                    presentUpdateWindow()
+                } label: {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(XDialPalette.danger)
+                            .frame(width: 5, height: 5)
+                        Text("v\(candidate.version)")
+                            .font(.system(size: 10.5, weight: .semibold))
+                    }
+                    .foregroundStyle(XDialPalette.warning)
+                    .padding(.horizontal, 7)
+                    .frame(height: 22)
+                    .background(
+                        XDialPalette.warning.opacity(0.09),
+                        in: Capsule()
+                    )
+                    .overlay {
+                        Capsule().stroke(
+                            XDialPalette.warning.opacity(0.28),
+                            lineWidth: 0.75
+                        )
+                    }
+                }
+                .buttonStyle(.plain)
+                .help(state.tr("打开 XDial 更新", "Open XDial Update"))
+                .accessibilityLabel(
+                    state.tr(
+                        "新版本 v\(candidate.version) 可用",
+                        "New version v\(candidate.version) available"
+                    )
+                )
             }
             Spacer()
             Button {
@@ -187,6 +237,13 @@ struct MainPopover: View {
             return dangerColor
         }
         return Color.secondary.opacity(0.82)
+    }
+
+    private func presentUpdateWindow() {
+        ApplicationWindowLifecycleController.shared
+            .prepareToPresentUpdateWindow()
+        openWindow(id: "update")
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @ViewBuilder

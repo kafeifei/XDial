@@ -79,7 +79,7 @@ final class DebugServer {
                     "GET  /health",
                     "GET  /state",
                     "GET  /ax[?depth=N]",
-                    "POST /action  {action: connect|disconnect|reconnect|connect-with-failure|application-attribution-snapshot|begin-route-probe|routing-probe-snapshot|select-scenario|ax-press|ax-set-value, ...}",
+                    "POST /action  {action: connect|disconnect|reconnect|connect-with-failure|application-attribution-snapshot|begin-route-probe|routing-probe-snapshot|select-scenario|open-update|fake-update|clear-update|ax-press|ax-set-value, ...}",
                 ],
             ]))
         }
@@ -224,6 +224,16 @@ final class DebugServer {
         ] as [String: Any]
         dict["applicationLifecycle"] =
             ApplicationWindowLifecycleController.shared.diagnostics
+        if let updater = AppUpdateChecker.current {
+            dict["appUpdate"] = [
+                "phase": updater.phase.rawValue,
+                "available": updater.isUpdateAvailable,
+                "version": updater.releaseCandidate?.version ?? "",
+                "downloadProgress": updater.downloadProgress,
+                "failureCode": updater.failure?.code.rawValue ?? "",
+                "failureDetail": updater.failure?.detail ?? "",
+            ] as [String: Any]
+        }
 
         dict["windows"] = NSApp.windows.map { w -> [String: Any] in
             [
@@ -363,6 +373,13 @@ final class DebugServer {
     @MainActor
     private static func settingsWindow() -> NSWindow? {
         NSApp.windows.first { $0.title.contains("设置") || $0.title.contains("Settings") }
+    }
+
+    @MainActor
+    private static func updateWindow() -> NSWindow? {
+        NSApp.windows.first {
+            $0.title.contains("更新") || $0.title.contains("Update")
+        }
     }
 
     @MainActor
@@ -647,6 +664,66 @@ final class DebugServer {
                 }
             }
             return ok(["ok": false, "error": "settings window did not open"])
+        case "fake-update":
+            guard let updater = AppUpdateChecker.current else {
+                return ("500 Internal Server Error", json([
+                    "error": "AppUpdateChecker unavailable",
+                ]))
+            }
+            let version = obj["version"] as? String ?? "99.0.0"
+            guard VersionUpdatePolicy.stableVersion(
+                fromTag: "v\(version)"
+            ) == version else {
+                return ("400 Bad Request", json([
+                    "error": "invalid numeric version",
+                ]))
+            }
+            updater.injectFakeRelease(version: version)
+            return ok([
+                "ok": true,
+                "phase": updater.phase.rawValue,
+                "version": version,
+            ])
+        case "clear-update":
+            guard let updater = AppUpdateChecker.current else {
+                return ("500 Internal Server Error", json([
+                    "error": "AppUpdateChecker unavailable",
+                ]))
+            }
+            updater.clearFakeRelease()
+            return ok(["ok": true, "phase": updater.phase.rawValue])
+        case "open-update":
+            guard AppUpdateChecker.current != nil else {
+                return ("500 Internal Server Error", json([
+                    "error": "AppUpdateChecker unavailable",
+                ]))
+            }
+            ApplicationWindowLifecycleController.shared
+                .prepareToPresentUpdateWindow()
+            NSApp.activate(ignoringOtherApps: true)
+            if let window = updateWindow() {
+                window.makeKeyAndOrderFront(nil)
+                return ok(["ok": true])
+            }
+            NotificationCenter.default.post(
+                name: .xdialDebugOpenUpdate,
+                object: nil
+            )
+            let updateDeadline = Date().addingTimeInterval(3)
+            while Date() < updateDeadline {
+                RunLoop.current.run(
+                    mode: .default,
+                    before: Date().addingTimeInterval(0.05)
+                )
+                if let window = updateWindow() {
+                    window.makeKeyAndOrderFront(nil)
+                    return ok(["ok": true])
+                }
+            }
+            return ok([
+                "ok": false,
+                "error": "update window did not open",
+            ])
         case "ax-press":
             return axPress(obj)
         case "ax-set-value":
@@ -700,7 +777,7 @@ final class DebugServer {
             ])
         default:
             return ("400 Bad Request", json(["error": "unknown action: \(action)",
-                "available": ["connect", "disconnect", "reconnect", "select-scenario", "open-settings",
+                "available": ["connect", "disconnect", "reconnect", "select-scenario", "open-settings", "open-update", "fake-update", "clear-update",
                               "connect-with-failure",
                               "begin-route-probe", "routing-probe-snapshot",
                               "ax-press", "ax-set-value", "setup-helper", "check-helper",

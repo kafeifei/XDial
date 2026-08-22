@@ -195,6 +195,9 @@ extension Notification.Name {
     /// 图标才会出现 —— 那个图标是系统 status item，AXPress 和 System Events 都点不动。
     /// 所以调试时改由常驻渲染的菜单栏 label 代为 openWindow。
     static let xdialDebugOpenSettings = Notification.Name("xdial.debug.openSettings")
+    static let xdialDebugOpenUpdate = Notification.Name(
+        "xdial.debug.openUpdate"
+    )
     static let xdialSettingsSelectTab = Notification.Name(
         "xdial.settings.selectTab"
     )
@@ -284,6 +287,16 @@ private struct MenuBarLabel: View {
                 openWindow(id: "settings")
                 NSApp.activate(ignoringOtherApps: true)
             }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: .xdialDebugOpenUpdate
+                )
+            ) { _ in
+                ApplicationWindowLifecycleController.shared
+                    .prepareToPresentUpdateWindow()
+                openWindow(id: "update")
+                NSApp.activate(ignoringOtherApps: true)
+            }
         #endif
     }
 }
@@ -297,6 +310,7 @@ struct XDialApp: App {
         MenuBarExtra {
             MainPopover()
                 .environmentObject(state)
+                .environmentObject(updateChecker)
                 .tint(XDialPalette.accent)
         } label: {
             MenuBarLabel(
@@ -306,7 +320,7 @@ struct XDialApp: App {
                 updateAvailable: updateChecker.isUpdateAvailable
             )
             .task {
-                await updateChecker.checkIfNeeded()
+                await updateChecker.pollForUpdates()
             }
         }
         .menuBarExtraStyle(.window)
@@ -331,6 +345,15 @@ struct XDialApp: App {
         }
         .defaultSize(width: 480, height: 420)
         .windowResizability(.contentSize)
+
+        Window("XDial 更新", id: "update") {
+            AppUpdateView(updater: updateChecker)
+                .environmentObject(state)
+                .tint(XDialPalette.accent)
+                .background(InstallationWindowChrome())
+        }
+        .defaultSize(width: 460, height: 420)
+        .windowResizability(.contentSize)
     }
 }
 
@@ -341,6 +364,7 @@ final class ApplicationWindowLifecycleController {
     private enum ManagedWindowKind: String {
         case settings
         case installation
+        case update
     }
 
     private var observers: [NSObjectProtocol] = []
@@ -396,6 +420,13 @@ final class ApplicationWindowLifecycleController {
             NSApp.activationPolicy() == .accessory
     }
 
+    func prepareToPresentUpdateWindow() {
+        guard !hasOpenWindow(.settings) else { return }
+        _ = NSApp.setActivationPolicy(.accessory)
+        lastPolicyTransitionSucceeded =
+            NSApp.activationPolicy() == .accessory
+    }
+
     private func windowDidBecomeKey(_ notification: Notification) {
         guard let window = notification.object as? NSWindow,
               let kind = kind(of: window) else { return }
@@ -407,6 +438,10 @@ final class ApplicationWindowLifecycleController {
             window.level = .floating
             window.styleMask.remove(.miniaturizable)
             prepareToPresentInstallationWindow()
+        case .update:
+            window.level = .floating
+            window.styleMask.remove(.miniaturizable)
+            prepareToPresentUpdateWindow()
         }
     }
 
@@ -430,7 +465,7 @@ final class ApplicationWindowLifecycleController {
         _ = NSApp.setActivationPolicy(.accessory)
         lastPolicyTransitionSucceeded =
             NSApp.activationPolicy() == .accessory
-        if !hasOpenWindow(.installation) {
+        if !hasOpenWindow(.installation), !hasOpenWindow(.update) {
             NSApp.deactivate()
         }
     }
