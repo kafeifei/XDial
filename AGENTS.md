@@ -3,20 +3,51 @@
 XDial 是 macOS 菜单栏网络工具：SwiftUI 提供控制面，sing-box 提供数据面，AnyConnect
 协议由 vendored sslcon 适配。
 
-本文件是 Agent 的**最短执行入口**，不是仓库索引。目录、类型、函数、构建实现等能从
-源码、测试或 `Makefile` 直接得到的事实，不在这里重复维护；先用 `rg` 定位，以当前代码
-为准。
+本文件是 Agent 的唯一常驻入口和阅读路由，不是仓库索引、架构全文或操作手册。先按任务
+选择必要资料，再读涉及的实现与测试；不要默认把所有规范装入上下文。目录、类型、命令和
+构建事实先用 `rg`、源码、测试和 `Makefile` 获取，以当前 checkout 与运行态为准。
 
-## 开始工作前
+## 先定任务和现场
 
-1. 动代码前完整阅读 [ARCHITECTURE.md](ARCHITECTURE.md)，尤其是三条定律、相关 ADR、
-   第 7 节禁止事项和第 9 节自检清单。
-2. UI、交互或视觉改动还必须完整阅读 [DESIGN.md](DESIGN.md)，不得只照当前截图复制局部样式。
-3. 再读改动涉及的实现和测试。不要仅凭文档猜测当前代码行为。
-4. 如果实现与架构规范冲突，先判断是实现越界还是规范需要改变。未经用户明确同意，不得
-   改写架构约束来迁就实现。
+- 答疑、审查、诊断只检查和报告；变更、构建、修复才编辑。扩大范围前先和用户对齐。
+- 开始前检查 branch、HEAD、工作树和相关运行态。发现本地分支落后、存在无关改动或运行的
+  App 与当前构建不一致时先报告，不自动 pull、reset、stash、覆盖或清理。
+- 先比对正常路径，追事实源、所有权、状态流和不变量；历史文档与日志只作线索。
+- 如果实现与规范冲突，先判断是实现越界还是规范需要改变。未经用户明确同意，不得改写
+  架构或设计约束来迁就实现。
 
-架构的最短摘要：
+## 保护正在运行的系统
+
+- 默认保留用户当前的 XDial 连接、网络配置、Line / Scenario、System Extension、账号状态
+  和前台输入。
+- 未经当前任务明确授权，不执行 `make restart`，不退出或替换运行中的 XDial，不调用
+  connect / disconnect / reconnect / select-scenario / prepare-system-extension / 故障注入，
+  不改变 DNS、路由、Network Extension、Tailscale 登录或远端节点状态。
+- Debug Server 的 `/health`、`/state` 和 `/ax` 可用于只读检查。任何 POST 或 AX 操作都先
+  判断实际副作用；授权只覆盖用户本次指定的目标，不自动扩展到断连、重装或故障注入。
+- 获准做运行态验证前，先读取当前状态并说明预期影响与恢复边界；完成后用结构化事务、真实
+  流量和当前进程证明结果。不得用重启后暂时恢复代替根因修复。
+- 禁止重启、关机或注销电脑。需要具体 Debug 动作时才读
+  [Debug Server 操作手册](docs/agent/debug-server.md)。
+
+## 按任务阅读
+
+所有任务先读本文件，再读改动涉及的源码、测试和 `Makefile`。其余资料按下表选择：
+
+| 任务 | 必读资料 |
+|---|---|
+| 文案、局部测试、无行为变化的构建或文档维护 | 相关实现与测试；只有触及产品契约时再读规范 |
+| Line / RuleSet / Scenario、配置生成、DNS、路由、连接事务或平台数据面 | `ARCHITECTURE.md` 的第 1、2、5、7–9 节，以及相关主题章节和 ADR |
+| macOS Underlay、Transparent Proxy、Packet Tunnel | `ARCHITECTURE.md` 的 D31–D40 中相关决策，不默认加载全部事故记录 |
+| Tailscale Line 或其验收 | D33–D35，以及 [Tailscale 验收边界](docs/verification/tailscale.md) |
+| 安装、System Extension、更新或发布 | D37、相关事务实现、`Makefile` 与发布脚本 |
+| UI、交互或视觉 | `DESIGN.md` 的第 1–2 节、受影响表面及第 3–11 节中的相关规则 |
+| Debug Server、真实 UI 或网络现场诊断 | [Debug Server 操作手册](docs/agent/debug-server.md)；网络诊断再读相关 ADR |
+
+只有修改架构/设计规范本身、改动跨越多个所有权边界，或无法判定相关决策时，才完整阅读
+`ARCHITECTURE.md` 或 `DESIGN.md`。规范是权威约束，但不是每个任务的默认上下文。
+
+## 不变量摘要
 
 - **控制面与数据面分离**：XDial 表达、编译和托管；sing-box 接管、解析、裁决和转发。
 - **外部密封律**：XDial 对系统只增加一个网络叠加层，DNS、路由和分流不散落到盒外。
@@ -26,152 +57,37 @@ XDial 是 macOS 菜单栏网络工具：SwiftUI 提供控制面，sing-box 提�
   XDial 不识别产品、不重排接口，只把系统已有裁决交给 sing-box。
 
 `core/config/invariants_test.go` 是架构约束的可执行门禁。测试变红时应修正实现；不得放宽、
-跳过、删除或给断言加特例。若确实要改变架构，先与用户对齐并更新
-`ARCHITECTURE.md`，再调整测试。
+跳过、删除或给断言加特例。确实要改变架构时，先与用户对齐并更新规范，再调整测试。
 
 ## 验证边界
 
-具体 target 及构建细节以 `Makefile` 为准。常用闭环：
+- 从改动直接涉及的最小测试开始，再按风险扩展。具体 target 和构建细节以 `Makefile` 为准。
+- UI 改动先完成编译、聚焦测试和静态检查。只有获得运行态授权后，才重启 App 并检查真实
+  窗口、AX 树、键盘、VoiceOver 或输入设备行为。
+- 网络改动必须核对当前 System Extension、Transparent Proxy、Provider、Underlay、DNS
+  归因和真实流量出口。编译成功、配置可生成、NE 显示 connected 或 `sing-box check`
+  通过，都不等于真实链路已工作；旧 helper、接口和路由只代表原生 TUN 历史路径。
+- macOS Underlay 快照必须来自宿主 App 请求连接之前的 `NWPath`；Provider 内的 `NWPath`
+  会隐藏既有全流量 VPN，只能用于诊断，不能作为 sing-box 的 Underlay。
+- 分发产物只能使用 `make release` 生成的 `build/release/XDial.app`。Debug 构建包含本地调试
+  接口，不得分发；不得为让 Release 通过而删除 entitlement 或把 Debug 标识带入 Release。
+- 本机 Debug 暂用 `com.kafeifei.xdial.ne-probe{,.extension}` 标识，Release 保持正式标识；
+  正式 Release 必须保留 host 与 extension 所需的 System Extension provisioning profile。
+- 未完成真实运行验证时明确报告剩余边界，不把源码、测试或旧日志包装成现场结论。
 
-```bash
-make test
-make test-smoke
-make restart
-python3 test/e2e_test.py
-```
-
-- UI 改动必须执行 `make restart`，再通过 Debug Server 操作和读取真实 UI 状态。
-- 网络改动必须分别核对已激活的 System Extension、Transparent Proxy 配置、Provider
-  状态、Underlay、DNS 归因和真实流量出口；旧 helper、接口和路由只代表原生 TUN
-  历史路径。编译成功、配置可生成、Network Extension 显示 connected 或
-  `sing-box check` 通过，都不等于真实链路已工作。
-- macOS Underlay 快照必须来自宿主 App 请求连接之前的 `NWPath`；Provider 进程内的
-  `NWPath` 会隐藏既有全流量 VPN，只能用于诊断，不能作为 sing-box 的 Underlay。
-- 分发产物只能使用 `make release` 生成的 `build/release/XDial.app`；Debug 构建包含
-  本地调试接口，不得分发。
-- 本机 Debug 暂用已获签名授权的 `com.kafeifei.xdial.ne-probe{,.extension}` 标识；
-  Release 保持正式标识。正式 Release 需要同时包含 System Extension 权限的 host 与
-  extension provisioning profile；缺少签名账号时不得为“让构建通过”删除 entitlement
-  或把 Debug 标识带进 Release。
-
-## Debug Server
-
-Debug 构建只在 `127.0.0.1:19876` 提供 HTTP 接口，release 构建完全排除。统一使用
-`127.0.0.1`，不要依赖 `localhost` 的 IPv6 解析。
-
-```bash
-# 存活与进程
-curl -sS 127.0.0.1:19876/health
-
-# engine/profile/network/windows；敏感字段已脱敏
-curl -sS 127.0.0.1:19876/state
-
-# 当前 UI 元素树
-curl -sS "127.0.0.1:19876/ax?depth=8"
-
-# 连接、断开、重连
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"connect"}'
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"disconnect"}'
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"reconnect"}'
-
-# Debug-only 故障注入；会真实启动并回滚网络会话，必须先取得用户对本次断连的授权
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"connect-with-failure","stage":"commit"}'
-
-# 只安装或替换 System Extension，不创建网络配置、不接管流量
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"prepare-system-extension"}'
-
-# 打开设置、选择场景
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"open-settings"}'
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"select-scenario","id":"scenario-id"}'
-
-# 在当前已提交事务中建立一次固定 443 端口的路由归因探针，再读取结构化快照。
-# host 只接受 ASCII DNS 名；Provider 会再次校验当前 transaction。
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"begin-route-probe","host":"example.com","timeout_ms":10000}'
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"routing-probe-snapshot","probe_id":"<上一步返回的 probeID>"}'
-
-# 按 /ax 返回的 title 操作 UI
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"ax-press","title":"连接"}'
-curl -sS -X POST 127.0.0.1:19876/action \
-  -d '{"action":"ax-set-value","title":"字段当前值","value":"新值"}'
-```
-
-`/state.installationReport` 是当前平台安装事务的事实来源；
-`/state.connectionReport` 是本次连接事务的事实来源：它包含动态计划、逐任务状态、错误、
-事件顺序及回滚结果。诊断安装或连接失败时先读对应报告，不得从文本日志反推控制流。
-安装报告就绪只证明 app、helper 和 System Extension 前置条件，不证明网络配置、Line、
-RuleSet、DNS 或真实出口已经工作。
-`/state` 中当前与期望场景分别读取 `activeScenarioID`、`desiredConnectionScenarioID`。
-Debug 动作只使用 `select-scenario`；不保留旧领域名别名。
-`/state.configDirty` 只表示已保存配置的有效运行依赖与当前事务不同；未引用对象、显示名、
-SSID 和顶层视觉排序变化不得令它置位。底层指纹可能受凭据影响，因此不得通过 Debug、日志
-或 UI 暴露。
-`/state.network.perLine` 只是由当前 Provider 事务产生、按 `transactionID` 绑定的易失
-出口地址观察；它不表示 Line 运行状态，断开、Scenario 或 transaction 改变时会清空。
-逐域名归因使用 `begin-route-probe` 后读取 `routing-probe-snapshot`；不得用页面显示、
-公网 IP 或旧的 Clash API selector 反推命中线路。实际 Line 归因只读响应中的
-`lineIDCounts`；`outboundTagCounts` 是 Provider 内部证据，无法唯一映射时不得猜测。
-
-Popover 只有在菜单栏图标被点开后才会出现在 AX 树中；设置窗口优先用
-`open-settings` 打开。helper 的安装状态、版本和进程信息也通过 `/state` 或
-`POST /action` 的 `check-helper`、`daemon-info` 检查，避免凭进程名猜测。
-
-### Tailscale 验收边界
-
-- 桌面 Tailscale 的登录与节点发现只能由设置页 Line 卡片显式启动。Debug Server
-  可以用 AX 打开和检查这张卡片，但不得增加接收、回显或持久化 Auth Key 的接口。
-- 浏览器登录会改变用户的 Tailscale 账号状态；Agent 未经用户明确授权，只验收到登录
-  入口和结构化状态，不代替用户完成登录。Auth Key 同理不得从本机配置或日志中搜集。
-- setup session 前后都要确认 XDial 数据面处于断开状态，系统没有新增 XDial TUN、
-  默认路由与 DNS 未被 setup 改写。正式连接还必须确认 LocalAPI 登录态、所选 exit
-  node 在线，以及连接后的真实出口；仅看到下拉框或配置生成成功不算完成。
-- 官方 Tailscale exit node 等全流量 Network Extension 作为 Underlay 时，原生 TUN
-  存在 D34 平台边界。不得只凭 `route.default_interface`、一条 `route get` 或出口
-  自测宣告叠加成功；系统 DNS 必须进入 XDial，且普通 TCP/UDP 要分别证明命中真实
-  Scenario 出口。DNS 接管路由被下层 link route 抢走时应让连接失败，不得追加产品特例或
-  再尝试第二个 Packet Tunnel。
-- 旧原生 TUN 遇到 `RTF_GLOBAL` Underlay，必须在任何 Line 会话、规则预取和 sing-box
-  启动之前拒绝。Transparent Proxy 不靠这条路由判据，但同样必须先完成 sing-box 与
-  active Tailscale 出口就绪，再提交系统网络设置；`Connecting` 不是允许半接管用户
-  流量的状态。
-- 若结构化状态同时满足 exit node 在线且已选中、存在于 netmap / magicsock / engine、
-  `tx > 0`、`rx = 0`、无握手，应报告 peer handshake 失败，不能改写成登录、外部网络限制、
-  Underlay 或普通出口探测结论。需要定位 DERP 状态漂移时必须做同时间双端取证，分别
-  比较控制图与 magicsock 实时 Relay；旧日志和上一次成功不能替代本轮状态。远端
-  `tailscaled` 重启只会清除既有内存状态，未经用户明确授权不得执行，也不得把重启后
-  成功当作产品修复或验收。
-- 本地 NetInfo 发布调用返回、lite map HTTP 接受、远端 peer map 消费、fresh handshake
-  和真实出口是逐层独立的证据；只完成前一层不得宣称后一层。DERP client / ready 汇总
-  只是点时快照，不能排除两次采样之间发生 reconnect；缺少结构化 lifecycle 证据时必须
-  报告尚未确定。
-- 不得在连接启动事务中自动触发 Home DERP 重选。出现上述 peer handshake failure 时
-  必须在提交系统网络设置前失败并回滚；任何用户显式启动的重选也仍需 fresh handshake
-  与真实出口验收，不能把本地提升或 control HTTP 接受当成恢复成功。
-
-## 仓库特有纪律
+## 仓库纪律
 
 - 概念命名固定为线路 Line / 规则 RuleSet / 场景 Scenario。
-- 不修改 `third_party/`。需要上游变更时使用本地补丁并留痕。
-- Go 代码提交前执行 `gofmt`。
-- 回复用户用中文，代码标识符保持英文。
-- 使用精确工程术语：分域解析、域名归因、解析视角与出口视角一致、非权威或被篡改的
-  应答、受限解析环境。不要使用含义不明确的社区俗语。
+- 不修改 `third_party/`；需要上游变更时使用本地补丁并留痕。Go 代码提交前执行 `gofmt`。
+- 未经授权不 commit、push、merge、发布或清理 worktree / build 产物。
+- 回复用户用中文，代码标识符保持英文。使用精确工程术语，不用含义不明的社区俗语。
 
-## 文档放什么
+## 文档职责
 
-- `ARCHITECTURE.md` 记录无法安全地从代码反推的内容：边界、理念、因果关系、失败语义、
-  真实事故证据、架构决策及被否决方案。
-- `AGENTS.md` 记录 Agent 必须提前知道的操作入口：阅读顺序、硬约束、验收边界和
-  Debug 接口。
-- 局部实现中容易误改的原因写在代码旁，注释解释“为什么”，不复述“做了什么”。
-- 不在文档维护目录树、类型/字段/函数清单、完整命令清单或临时任务进度；这些内容会
-  漂移，应从源码、测试、`Makefile` 和实时状态获取。
+- `AGENTS.md` 只放常驻规则、阅读路由、保护项和最小验收边界。
+- `ARCHITECTURE.md` 记录不能安全地从代码反推的架构契约与 ADR；专项事故证据不应成为
+  所有任务的默认阅读内容。
+- `DESIGN.md` 记录设计合同；按受影响的产品表面和横切规则读取。
+- `docs/agent/` 放按需操作手册，`docs/verification/` 放专项验收边界。
+- `docs/incidents/` 保存日期化证据、失败实验和历史取证；只在复盘同类事故或修改相关契约时读取。
+- 局部原因写在代码旁。不在根指令维护目录树、完整命令清单或临时任务进度。

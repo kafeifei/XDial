@@ -2,8 +2,9 @@
 
 ## 0. 这份文档是什么
 
-这是 XDial 的**架构约束规范**，不是代码导览。任何 AI 编码工具（Claude Code /
-Codex / Cursor）和人类贡献者在改动本仓库前必须先读完本文，改完后必须能对照第 7 节
+这是 XDial 的**架构约束规范全集**，不是代码导览，也不是每个任务的默认上下文。贡献者按
+[AGENTS.md](AGENTS.md) 的阅读路由先读核心边界和直接相关的 ADR；只有修改架构规范本身、
+改动跨越多个所有权边界，或无法判断相关决策时才需要阅读全文。改完后必须能对照第 7 节
 （禁止事项）和第 8 节（不变量测试）自证没有越界。
 
 **为什么要有这份文档。** XDial 桌面版长期不稳定的根因不是某个函数写错，而是**模块越界**：某个维度的组件擅自替另一个维度做了决策，且这个决策对用户不可见。典型症状是"改一个看似无关的开关，全局路由/DNS 行为整个变了，且没人能在配置里指出是哪一行造成的"。这类 bug 无法靠 code review 逮住——每一处单看都"合理"，问题只在跨模块组合时出现。
@@ -15,8 +16,9 @@ Codex / Cursor）和人类贡献者在改动本仓库前必须先读完本文，
 
 文档负责让你**理解**边界，测试负责在你**没理解**时把提交拦下来。如果你发现测试挡住了一个你认为正确的改动，**先停下来和用户讨论修改架构约束，不要绕过测试、不要放宽断言、不要给断言加特例分支**。
 
-本文只记录**不能安全地从当前代码反推**的事实：职责边界、因果关系、失败语义、真实事故
-证据、架构决策及被否决方案。目录树、类型/字段/函数清单和临时实现状态以源码与测试为
+本文正文只记录**不能安全地从当前代码反推**的当前契约：职责边界、因果关系、失败语义、
+架构决策及被否决方案。日期化测量、完整事故链和失败实验移入 `docs/incidents/`，正文只保留
+形成决策所需的最短依据和回链。目录树、类型/字段/函数清单和临时实现状态以源码与测试为
 准，不在这里复制。必要的代码定位只使用文件路径和符号名，不使用容易漂移的行号。
 
 ---
@@ -415,206 +417,90 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
 
 ### D35 — macOS Transparent Proxy 是主入口，已通过当前 Scenario 的基础三出口验收
 
-- **入口决策**：桌面 App 使用 `NETransparentProxyProvider` 作为唯一系统接入层。
-  Provider 只接收 macOS 交付的 TCP/UDP flow，并通过同进程、随机凭据保护的回环
-  SOCKS 会话送入 sing-box；DNS 包、规则匹配、出口选择和实际拨号仍由同一份 sing-box
-  数据面完成。Provider 不读取 Line / RuleSet / Scenario，不实现第二套路由或 DNS 裁决。
-- **接口作用域边界**：IPv4/IPv6 link-local、multicast 与 limited broadcast 的远端地址
-  依赖当前接口或二层广播域，穿过回环 SOCKS 后无法保留 scope ID 与广播语义。2026-08-21
-  实机中 `remotepairingd` 在四分钟内向 `fe80::/10` 产生 15,173 个被 Provider 接管后立即
-  失败的 flow，Provider 持续约 39% CPU；这条重试链与普通网页流量无关。Provider 必须用
-  `excludedNetworkRules` 让这些严格的接口作用域地址留在启动前 Underlay。排除集合只能由
-  地址语义定义，不得按进程名、端口、设备品牌或接口名加特例；RFC1918、IPv6 ULA、
-  Tailnet 与企业网单播地址仍进入 XDial，由 active Scenario 裁决。
-- **已绑定 flow 的接口归属**：可路由单播地址不能因为属于 RFC1918 就整体绕过 XDial，
-  但 `NEAppProxyFlow.isBound` 与 `networkInterface` 是 macOS 在进入 XDial 前已经做出的
-  单条 flow 裁决，回环 relay 不得丢弃。2026-08-21 实机中本地地址
-  `192.168.68.114/20` 到同一 `en0` 直连网段的 `192.168.69.26` 被系统标记为
-  `en0(bound)`；旧 relay 丢失该事实后，`remotepairingd` 的 TCP/UDP 配对连接持续失败并
-  高频重试。Provider 必须把绑定接口作为经过认证、长度受限的 flow metadata 送入
-  sing-box；active Scenario 仍先完成规则与 Line 选择，只有最终命中 Direct 时才恢复这份
-  接口绑定。命中 AnyConnect、Tailscale 或其他代理 Line 时不得继承它。这样既不按设备、
-  进程或私网段加例外，也不会让 Provider 建立第二套路由裁决。
-- **Underlay 转交**：宿主 App 必须在请求 Transparent Proxy 连接之前捕获
-  `route -n get default` 已选中的接口和 `NWPath.availableInterfaces` 完整候选，并随本次
-  `startVPNTunnel(options:)` 交给 Provider；Provider 必须拒绝缺失或不一致的快照。
-  不能在 Provider 进程内重新捕获来替代它：实机已证明该视角会把现有全流量 VPN
-  `utun14` 折叠成物理接口 `en0`；`NWPath.availableInterfaces.first` 也不是默认路由
-  契约，实机切换期间曾错误返回 `en0`。全程不得按接口名或类型过滤。Go 侧只按系统接口名称
-  补齐 MTU、状态标志和地址；这属于把操作系统事实补全给 sing-box，不是选择或重排
-  Underlay。生成配置的 `route.default_interface` 必须等于这份内核结果，从而让
-  Provider 内的 direct、DNS、代理和内置 Tailscale 底层 socket 延续启动前 Underlay；
-  不得为单条 outbound 生成 `bind_interface`。只有当前 XDial 会话自己登记的接口可以排除。
-- **Underlay 生命周期**：宿主 App 在会话成功后继续观察系统路径。路径曾不可用，或默认
-  接口、候选接口集合、系统 DNS 快照发生变化时，等待路由 / `NWPath` / DNS 通知收敛后，
-  用同一份用户 Profile 触发一次完整数据面重连。系统休眠会制造一次假的
-  `unsatisfied → satisfied`；若该恢复紧邻 `didWake`、Provider 仍为 connected，且收敛后的
-  Underlay 快照与已提交基线完全等价，则它只是电源生命周期边界，不得创建同 Scenario
-  候选事务，现有事务及 Line 局部恢复继续负责。宿主必须用 `willSleep` 只记录电源边界；
-  从进入休眠到完整 `didWake` 之间的 Dark Wake 路径、路由、DNS 与 SSID 抖动全部延后，
-  完整断线重试计时器也必须暂停；不得停止已提交事务，也不得创建候选或新连接。完整唤醒后重新捕获一次收敛快照：等价则保持原
-  generation，真实变化则只产生一笔 network epoch。快照真实变化，或唤醒合并窗口之外的真实
-  断网恢复，仍必须进入 network epoch。它不得热改某条 outbound，也不得按接口
-  名、类型或 VPN 产品决定策略。重连只替换运行时 Underlay 快照，不修改 Line / RuleSet /
-  Scenario。D39 中用户显式配置的 SSID 触发器可以选择另一 Scenario，但它必须走完整
-  场景切换事务，且不能选择、过滤或改写 Underlay。系统路径收敛不等于下层数据面已经恢复真实出口；仅当本次失败被结构化归因为
-  `underlay-egress-unavailable`，且 Rollback 已完成、系统接管已移除时，宿主才可按
-  2 / 5 / 10 / 20 / 30 秒做至多五次有界重试。Line 登录、节点、握手或规则失败不得被
-  **Underlay 切换**这条重试掩盖。
-- **已提交会话的 Line 局部恢复**：一次已经进入 `committed` 并真实发布为 `connected`
-  的会话，如果某条 Line 在用户没有执行断开的情况下掉线，且该 Line 的协议适配器支持
-  在同一 sing-box 代际内替换会话，则只允许把这条 Line 置为 `reconnecting` 并有界
-  重建它自己的会话。其他 Line、endpoint、sing-box、Transparent Proxy Ingress 和
-  transaction ID 必须保持不变；不可用窗口严格执行铁律 3 的 REJECT / SERVFAIL，
-  不得回落到其他出口。每次尝试和最终恢复必须写入当前 `ConnectionReport`。局部预算
-  耗尽后才把该 Line 失败提升为本次数据面失败，进入完整 Rollback 和宿主恢复。
-- **已提交会话的完整恢复**：如果 Provider 自身掉线、数据面共享组件失败，或 Line
-  局部恢复预算耗尽，宿主保留同一份用户连接意图，在系统接管已移除后启动有界自动
-  重连。这个恢复序列使用五次总预算；恢复事务中的 Line / 握手失败必须原样写入报告和
-  断线历史，但可以继续消耗剩余预算，不能静默无限拉起。短暂“连上又掉”不重置预算；
-  只有同一事务连续稳定运行满五分钟才清零。用户主动断开立即取消恢复，且不触发新的
-  重连。
-- **断线事实源**：每次意外断线都要在用户私有目录留下有界结构化记录，至少包含断线
-  时间、原事务与 Scenario、结构化原因、系统最后断线错误、每次重连的时间/事务 ID，以及
-  最终恢复、失败或耗尽预算的结果。Debug Server 只读暴露这份记录；日志不能反过来
-  推动重连状态机。
-- **启动与失败语义**：完整 sing-box 实例及 active Tailscale Line 的真实出口探测必须
-  先成功，之后才能提交 Transparent Proxy 网络设置。启动失败不得安装半成品网络配置；
-  已接管 flow 的转发失败必须关闭该 flow，不得回落系统直连。冷启动或唤醒产生的自动
-  连接意图如果启动失败，只能在完整 Rollback 且已证明系统接管移除后进入与完整恢复相同
-  的 2 / 5 / 10 / 20 / 30 秒有界重试；等待必须在 UI 显示结构化倒计时并允许用户立即
-  消费当前已排定的尝试。用户显式点击连接失败不得自动循环拉起；用户显式断开后，系统
-  回到原 Underlay，并立即取消倒计时与恢复意图。
-- **MagicDNS 系统接入事故证据**：已提交事务中，Tailscale endpoint 与
-  当时的内部 tag `dns:mode`（现领域名为 Scenario）曾被标记为 ready，但系统解析器仍把
-  启动前 Wi-Fi resolver 作为查询目的地，
-  成员短名得到 NXDOMAIN；仅凭 ready 状态不能证明系统 DNS 已进入 XDial。Apple 为
-  Transparent Proxy 提供的受支持 DNS 捕获入口是 destination-domain network rule，
-  `NEDNSSettings` 则会被该 Provider 类型忽略。因此启用 MagicDNS 时，Provider 必须在
-  Commit 前从同一 endpoint 的实时 `DNS Config` 取得当前域名后缀、完整主机名和可展开的
-  单标签别名，为它们生成 port 53 的 destination-host rules，再追加普通全流量规则。
-  捕获列表为空、畸形或超过有界上限时连接必须失败，不能把“控制面存在 MagicDNS 后缀”
-  冒充系统查询已经能进入 XDial。该列表只是 Ingress 捕获事实，不参与 Scenario 裁决；
-  记录与地址仅在 Provider 内存中注入 sing-box hosts server，macOS Transparent Proxy 的
-  Tailscale DNS transport 和默认
-  resolver 都不得成为 XDial 查询链的一部分。实机曾从当前 endpoint 导入一组有界捕获名；
-  直发 DNS 得到成员地址，且不受旧 NXDOMAIN 负缓存影响的新成员短名可由 `dscacheutil`
-  解析。macOS 可能继续缓存修复前的 NXDOMAIN；验收应使用新名称或在用户授权下刷新
-  mDNSResponder，不能把旧负缓存误判为当前数据面失败。
-- **入口演进证据**：首次试验正确签名、嵌入并激活 System Extension，但 Provider 内捕获
-  的 `NWPath` 把已有全流量 VPN 折叠成物理接口；后续试验能收到宿主的虚拟默认接口快照，
-  但生成配置还没有把它写入 `route.default_interface`。这些结果都只证明安装、激活和
-  失败关闭，不能证明数据通路。最终只有 Provider 接收的接口快照与 sing-box `direct`
-  精确 outbound 的真实 HTTPS 探测同时成功，才证明盒内出站延续了启动前 Underlay。
-- **Tailscale peer 事故证据**：初始取证记录到所选 exit node 已进入 netmap、magicsock
-  和 engine，发送计数持续增加，但接收计数为零且没有握手。同时间双端取证进一步确认：
-  XDial 本机控制连接存在，当前
-  control client 已接收 NetInfo 发布调用，Home DERP 协议在采样时刻就绪且节点已选中；
-  远端 `tailscaled` 收到每次 WireGuard initiation 并生成 response，却仍把 response
-  发往已经过期的 peer DERP，DERP 明确返回“不认识该 peer”。这不是 XDial Underlay、
-  登录态或出口探测超时。
-- **确定的状态一致性链**：远端 magicsock 的完整 peer 快照指向 relay A，随后增量 mutation
-  只把实时 endpoint 改为 relay B，没有同步完整快照；下一张 full map 又报告 relay A 时，
-  输入恰好等于旧快照，`updateNodes` 的无变化 fast path 提前返回，实时 endpoint 因而
-  错误地永久留在 relay B。重启远端 `tailscaled` 会从当前 full map 同时重建快照和
-  endpoint，所以曾让链路立即恢复；它只是清除错误的进程内状态，不是修复，也不能作为
-  XDial 的验收步骤。
-- **本地防护与失败语义**：vendored Tailscale 通过仓库补丁记录“实时 endpoint 已收到
-  增量 mutation”。下一次 full map 即使与快照相等也必须执行完整 endpoint upsert，
-  同时重算 relay candidate，完成后才能清除 dirty 状态。回归测试固定复刻
-  `snapshot=A / endpoint=A → delta(B) → full(A)`，并要求最终 endpoint 回到 A、随后
-  才恢复 fast path。远端既有脏状态仍未清除时，必须准确报告
-  `tailscale-peer-handshake-failed`，在 Transparent Proxy Commit 前完整回滚。
-  XDial 不得自动重启远端、固定 DERP、遍历 DERP 或回落 direct 来掩盖该故障；远端一次性
-  恢复属于显式运维动作，必须另行授权。
-- **控制发布的确认边界**：本地 NetInfo 发布调用返回，只证明
-  调用开始时捕获的当前 control client 已接收该调用，且同步调用已经返回；携带对应
-  NetInfo 修订的 lite map 请求获得成功 HTTP 应答，只证明该请求被 control 的 HTTP
-  接口接受。二者都不能证明远端 peer 已消费更新后的 map。远端 peer map 消费、fresh
-  WireGuard handshake 与真实出口分别是独立事实，必须由同时间的远端结构化状态、握手
-  事实和真实出口探测分别证明；前一级不得替代后一级。
-- **启动恢复边界**：同轮证据证明，本地 Home DERP 提升、本地 NetInfo 发布调用返回和
-  lite map HTTP 接受，可以与持续发送、没有接收且没有握手同时成立。因此 Home DERP
-  重选不再是连接启动事务中的自动恢复动作；满足 peer handshake failure 条件时必须失败，
-  并在 Commit 前回滚。若未来保留重选能力，它只能是用户显式启动的诊断或维护动作，
-  不得成为 Prepare 的成功条件，也不得据此宣告链路已经恢复。
-- **身份级 A/B 边界**：在相同代码、相同官方
-  Tailscale Underlay、相同 Exit Node 和相同 Scenario 下，旧持久身份持续发送但接收为零，
-  独立临时身份则在数秒内完成握手并通过真实出口探测。这证明该轮失败绑定于旧身份对应的
-  peer / DERP 会话状态，而不是首次控制面访问、RuleSet、DNS 或其他 Underlay VPN。
-  换身份能够清除
-  该轮状态，但不是协议修复：不得据此宣称旧身份已经自愈，也不得在连接事务中静默轮换
-  身份。旧身份必须保留以供取证；建立新身份仍是用户显式登录或运维恢复动作。
-- **DERP readiness 快照语义**：DERP client 数与 protocol-ready 数只是采样时刻的汇总；
-  前后两个相同汇总不能证明中间没有发生 transport reconnect 或 client / session
-  generation 变化。需要排除瞬时重连时，必须读取结构化的 lifecycle sequence 或
-  generation；尚无这类证据时只能报告无法由当前快照判定，不得从汇总值或日志缺失推出
-  “没有重连”。
-- **Transparent Proxy 运行态事实源**：宿主、设置页、菜单栏和 Debug Server 对本次
-  Transparent Proxy 是否正在运行的判断，只能来自当前 `ConnectionReport` 的事务 ID、
-  状态和系统接管结果。设置页出现、消失、展开 Line 卡片或刷新视图都不是数据面生命周期，
-  不得因此启动出口探测、刷新线路或产生网络请求；UI 只能读取并展示既有事务事实。
-- **旧桌面诊断旁路不属于 Transparent Proxy**：`127.0.0.1:9090` / `test-out` 是旧
-  desktop helper / Clash API 路径留下的逐线路测试旁路；Transparent Proxy Provider
-  不开放该 listener，也不得把它作为运行态 capability。若残留旧进程仍监听该端口，
-  请求命中的是另一个生命周期和配置代际，会产生看似可用、实则不属于当前事务的错误事实；
-  因而必须先验证 capability 属于当前事务，不能以端口可连接推断 TP Line 可用。
-- **Provider diagnostics capability**：Provider 诊断必须以当前 transaction ID 为
-  作用域，由 capability 明确列出本次 active `Line ID`，且只允许诊断其中的 Line。
-  读取诊断必须完全只读，不得切换 selector、启动或结束事务、重启 Provider、改写
-  sing-box 配置或改变任何系统网络状态。公网 IP 只是某次、某时刻从一个 outbound
-  观察到的易失出口结果；它既不是 RuleSet 命中，也不能替代 matched outbound / Line
-  的结构化证据。
-- **DEBUG route watch 的最小边界**：逐流裁决观察只存在于 DEBUG，必须由显式目标和短时
-  窗口启动，只观察经过本次会话认证且 inbound 为 `transparent-proxy-in` 的 flow。
-  快照只返回固定闭集的 RuleSet / outbound / active Line 关系和有界 sequence，不回传
-  目标域名或 IP、原始规则内容、URL、凭据及普通浏览历史；超时或事务结束后自动失效。
-  它是观察器，不得参与裁决。
-- **可观测性事故证据**：同一已提交事务中，两个保留域名的公网目标与
-  `corp.example` 企业目标的 TCP flow 均被系统交给 Provider 且 accepted；企业域名通过
-  三个 resolver 入口得到相同私网答案，随后真实 HTTP 返回成功。这些事实分别证明
-  Transparent Proxy 接管、盒内 DNS 归因和企业线路可达，却仍不能证明三个 flow 各自命中
-  了哪个 RuleSet / outbound。当时的运行版本没有逐 flow 的 matched
-  RuleSet / outbound 结构化观察；active Scenario 配置只能表达期望，禁止据此倒推出实际
-  Line 并冒充运行时证据。
-- **Direct 系统解析语义事故证据**：同机、同网络、相邻时间窗口内，关闭 XDial 时 macOS
-  原生解析器把 Cindy 公网域名解析到上海地址且 TLS 成功；开启 XDial 后，旧
-  `xdial-system-dns` 绕过 mDNSResponder，向捕获的首选 Resolver 裸发 UDP/53，得到台湾
-  地址，而该地址在原生直连和 XDial Direct 上都 TCP 超时。相同地址经其他 Line 可以完成
-  TLS，只证明地址与出口组合不同，不能替 XDial 的 Direct 修复。随后把 Direct 公网解析
-  硬编码为 `223.5.5.5` DoH 的实验也未通过现场验收：第一版包含非法空 Direct detour，
-  第二版虽能提交数据面，但 Cindy 与 Codex 仍失败，且在失联前没有完成该版 DNS 应答与
-  Direct TLS 的结构化核验。它不是已验证修复，不得进入分发版本。后续实现必须证明与
-  macOS 原生解析视角一致，不得增加 Cindy / 酒店 / 地域特例或要求用户手工改 Scenario。
-  首个原生解析候选直接复用了 sing-box 面向普通进程的 mDNSResponder Unix socket 协议；
-  普通进程查询公网域名约 300ms 成功，但同一实现进入 Transparent Proxy Provider 后，
-  系统已交付并被 Provider 接受的 DNS flow 在 8 秒内没有应答，真实 HTTPS 因解析超时失败。
-  该候选已回滚，证明普通进程成功不能替代 Network Extension 上下文验收。Provider 内的
-  第二个候选改用 Apple 正式的 `DNSServiceGetAddrInfo`，但提交后同样接受了原始 DNS flow
-  而没有在 8 秒内应答，真实 HTTPS 因解析超时失败并已回滚。系统日志确认该 flow 正是
-  应用发往当时系统 resolver 的原查询；因此对已接管 flow 再调用系统解析器不是可用实现。
-  后续实现必须在 sing-box 完成 DNS 归属裁决后，仅对 Direct 原样转发该 flow 已携带的查询
-  与 resolver endpoint；盒内主动解析才允许使用 `DNSServiceGetAddrInfo`。raw Unix socket
-  协议不得作为此场景的运行实现。
-  后续现场探针进一步确认，`酒店` Scenario 的第一条 mixed“内部域名”曾在生成期关闭整个
-  DNS 规则链，使排在后面的“国内域名 → Direct”完全没有进入 `dns.rules`；Cindy 查询因而
-  落到 Scenario 默认的 Taiwan 1 resolver，而连接仍由国内域名 route 送往 Direct。向一个
-  不可达的名义 resolver 发同一查询仍立即得到台湾地址，证明当时并未执行 Direct 原包
-  transport。生成器必须跳过 IP / mixed 的 DNS 分支但继续编译后续域名归属；相应回归测试
-  要固定“mixed 在前、Direct 域名在后、默认代理”的形状。
-- **基础三出口验收**：官方 Tailscale 全程保持 `Running`，默认接口仍是其虚拟接口。
-  相同 active Scenario 下，默认 `direct` 与内置 Tailscale 分别得到不同的公网出口观测；
-  `corp.example` 经 AnyConnect 分域解析得到私网地址并返回有效 HTTP 重定向。对该企业
-  域名分别向公共 DNS、不可达的测试地址和 MagicDNS 名义地址发查询，三者返回相同私网
-  应答，证明 DNS 包被盒内 `hijack-dns` 接管，而不是碰巧由 Underlay resolver 回答。
-  TCP、DNS UDP、保持 flow 存活的普通 UDP nonce 及一条立即关闭发送端的短命 UDP
-  nonce 均实际穿过 Provider。后续修正将 `flow.open` 提前到 UDP relay 准备之前，
-  消除了短 flow 在接管确认前被系统 reset 的错误风暴；后续 SOCKS relay 失败仍关闭
-  flow，不得回落直连。
-- **仍未完成的门禁**：Underlay 自动重连的代码存在不等于实机验收完成；仍需分别验证
-  下层默认接口切换、断网后恢复、Provider 异常退出。UI 和自动化不得把 Network
-  Extension 的 `connected` 单独当成策略生效证据；至少还要分别核对 DNS 归因、规则
-  归属和真实出口。
+本节只保留当前规范契约。形成这些决策的日期化现场测量、失败实验和基础验收链见
+[D35 Transparent Proxy 证据档案](docs/incidents/d35-transparent-proxy-evidence.md)；历史证据
+不能替代当前运行态验证。
+
+- **入口与所有权**：桌面 App 使用 `NETransparentProxyProvider` 作为唯一系统接入层。
+  Provider 只接收 macOS 交付的 TCP/UDP flow，并通过同进程、随机凭据保护的回环 SOCKS
+  会话交给 sing-box。DNS、规则匹配、出口选择和拨号仍由同一份 sing-box 数据面完成；
+  Provider 不读取 Line / RuleSet / Scenario，也不实现第二套路由或 DNS 裁决。
+- **接口作用域地址**：IPv4/IPv6 link-local、multicast 与 limited broadcast 必须通过
+  `excludedNetworkRules` 留在启动前 Underlay。排除集合只能由地址语义定义，不得按进程、
+  端口、设备品牌或接口名加特例；RFC1918、IPv6 ULA、Tailnet 与企业单播地址仍进入 XDial，
+  由 active Scenario 裁决。
+- **已绑定 flow**：`NEAppProxyFlow.isBound` 与 `networkInterface` 是 macOS 在进入 XDial
+  前已经做出的单 flow 裁决。Provider 必须把接口绑定作为经过认证、长度受限的 metadata
+  交给 sing-box；Scenario 仍先完成规则和 Line 选择，只有最终命中 Direct 才恢复绑定。
+  AnyConnect、Tailscale 和其他代理 Line 不得继承它。
+- **Underlay 转交**：宿主必须在请求连接之前捕获内核默认路由接口、完整
+  `NWPath.availableInterfaces` 候选和系统 DNS 快照，并随本次 `startVPNTunnel(options:)`
+  交给 Provider；缺失或不一致时必须拒绝。Provider 进程内重新捕获的 `NWPath` 只用于诊断，
+  不能替代宿主快照，也不得使用 `availableInterfaces.first` 猜默认接口。Go 侧只按系统接口
+  名补齐 MTU、状态标志和地址；生成配置的 `route.default_interface` 必须等于内核结果，
+  不得为单条 outbound 生成 `bind_interface`。只有当前 XDial 会话登记的接口可以排除。
+- **Underlay 生命周期**：会话成功后宿主继续观察路径、内核默认接口、候选集合和 DNS。
+  真实变化只产生一个 network epoch，并以同一用户 Profile 重建完整数据面；不得热改某条
+  outbound，也不得修改 Line / RuleSet / Scenario。SSID 只能按 D39 选择 Scenario，不能
+  选择或改写 Underlay。系统路径收敛不等于真实出口已经恢复；Line 登录、节点、握手或规则
+  失败不得伪装成 Underlay 切换，也不得被它的重试预算掩盖。
+- **休眠合并**：`willSleep` 只记录电源边界；从休眠到完整 `didWake` 之间的 Dark Wake
+  路径、路由、DNS 和 SSID 抖动全部延后，不能停止已提交事务、创建候选或启动新连接。完整
+  唤醒后只捕获一次收敛快照：与已提交基线等价则保留原 generation，真实变化才产生一个
+  network epoch。仅在结构化原因为 `underlay-egress-unavailable`、Rollback 完成且系统
+  接管已移除后，才允许按 2 / 5 / 10 / 20 / 30 秒进行至多五次有界重试。
+- **Line 局部恢复**：已 committed 的会话中，支持同代际重建的 Line 可以单独进入
+  `reconnecting`。其他 Line、endpoint、sing-box、Transparent Proxy Ingress 和
+  transaction ID 必须不变；不可用窗口执行 REJECT / SERVFAIL，不得回落其他出口。每次
+  尝试和结果写入当前 `ConnectionReport`；局部预算耗尽后才提升为完整数据面失败。
+- **完整恢复**：Provider 掉线、共享组件失败或 Line 局部预算耗尽后，宿主可保留原用户连接
+  意图，在系统接管移除后启动有界恢复。整个序列共享五次预算；Line 与握手失败原样写入报告
+  和断线历史。短暂“连上又掉”不重置预算，只有同一事务稳定五分钟才清零；用户主动断开立即
+  取消恢复。
+- **断线事实源**：每次意外断线在用户私有目录写入有界结构化记录，至少包含时间、原事务和
+  Scenario、结构化原因、系统错误、每次重连的时间与事务 ID，以及最终结果。Debug Server
+  只读暴露记录；日志不能反过来驱动状态机。
+- **启动与失败语义**：完整 sing-box 和 active Tailscale Line 的真实出口探测必须先成功，
+  才能提交 Transparent Proxy 网络设置。启动失败不得安装半成品网络配置；已接管 flow 的
+  转发失败必须关闭 flow，不得回落系统直连。冷启动或唤醒的自动连接意图只有在完整 Rollback
+  后才可使用上述有界重试，并在 UI 暴露倒计时、允许用户立即执行已排定的尝试；用户显式
+  点击连接失败不得自动循环拉起，用户显式断开立即取消倒计时和恢复意图。
+- **MagicDNS 系统接入**：启用 MagicDNS 时，Provider 必须在 Commit 前从同一 Tailscale
+  endpoint 的实时 `DNS Config` 取得域名后缀、完整主机名和可展开的单标签别名，为它们生成
+  port 53 的 destination-host rules，再追加普通全流量规则。列表为空、畸形或超出有界
+  上限时必须失败。
+  列表只表达 Ingress 捕获，不参与 Scenario 裁决；记录与地址仅在 Provider 内存中注入
+  sing-box hosts server，Tailscale DNS transport 和默认 resolver 都不得成为查询链。
+- **Direct 系统解析语义**：sing-box 必须先完成 DNS 归属裁决。最终属于 Direct 的查询只
+  原样转发已接管 flow 携带的查询和 resolver endpoint；Provider 不得对同一 flow 再调用
+  mDNSResponder、raw Unix socket 协议或 `DNSServiceGetAddrInfo`。只有盒内主动解析才可
+  使用 `DNSServiceGetAddrInfo`。生成器遇到 IP / mixed 规则时只跳过其 DNS 分支，必须
+  继续编译后续域名归属；不得硬编码公共 resolver 或增加应用、酒店、地域特例。
+- **Tailscale endpoint 一致性**：vendored Tailscale 必须记录实时 endpoint 已被增量
+  mutation 修改。下一张 full map 即使与旧快照相等，也要完成 endpoint upsert 和 relay
+  candidate 重算后才能恢复 fast path。回归必须覆盖
+  `snapshot=A / endpoint=A → delta(B) → full(A)`。无法 fresh handshake 时报告
+  `tailscale-peer-handshake-failed` 并在 Commit 前回滚；不得自动重启远端、固定或遍历
+  DERP、回落 Direct，或静默轮换身份。
+- **证据层级**：本地 NetInfo 调用返回、lite map HTTP 接受、远端 peer 消费 map、fresh
+  WireGuard handshake 和真实出口是逐层独立的事实，前一级不能替代后一级。DERP client /
+  ready 汇总只是点时快照；缺少 lifecycle sequence 或 generation 时必须报告无法判定，
+  不得从前后相同汇总或日志缺失推出“没有重连”。Home DERP 重选只能是用户显式维护动作，
+  不能成为 Prepare 的成功条件。
+- **运行态事实源**：宿主、设置页、菜单栏和 Debug Server 只能用当前
+  `ConnectionReport` 的 transaction ID、状态和系统接管结果判断 Transparent Proxy。
+  打开设置、展开 Line 或刷新 UI 不得启动探测、刷新线路或产生网络请求。旧
+  `127.0.0.1:9090` / `test-out` 属于 desktop helper / Clash API 的另一生命周期，
+  端口可连接不能证明当前 Transparent Proxy 的 Line 可用。
+- **诊断 capability**：Provider 诊断以当前 transaction ID 为作用域，只列出本次 active
+  Line ID，并保持完全只读。公网 IP 只是易失出口观察，不是 RuleSet 或 Line 归属证据。
+  DEBUG route watch 必须由显式目标和短时窗口启动，只观察本次认证会话的
+  `transparent-proxy-in` flow；只返回固定闭集的归属关系和有界 sequence，不回传目标、
+  原始规则、URL、凭据或普通浏览历史，超时或事务结束后自动失效，且不得参与裁决。
+- **验收状态**：基础 Direct、Tailscale、AnyConnect 三出口和 TCP / DNS UDP / 普通 UDP
+  已有现场证据，详见证据档案。仍需分别实机验证下层默认接口切换、断网恢复和 Provider
+  异常退出。Network Extension 显示 `connected` 不能单独证明策略生效；仍要核对 DNS
+  归因、规则归属和真实出口。
 
 ### D36 — 每次连接是一笔由 active Scenario 编译出的动态事务
 
