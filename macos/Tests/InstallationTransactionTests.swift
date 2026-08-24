@@ -256,7 +256,16 @@ final class InstallationTransactionTests: XCTestCase {
         )
     }
 
-    func testRelocationAllowsKnownDebugReleaseReplacementForSameTeam() {
+    func testRelocationAllowsKnownApplicationReplacementForSameTeam() {
+        XCTAssertTrue(
+            XDialApplicationIdentifierPolicy.permitsReplacement(
+                existingIdentifier:
+                    XDialApplicationIdentifierPolicy.legacyRelease,
+                incomingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                teamIdentifiersMatch: true
+            )
+        )
         XCTAssertTrue(
             XDialApplicationIdentifierPolicy.permitsReplacement(
                 existingIdentifier:
@@ -282,6 +291,193 @@ final class InstallationTransactionTests: XCTestCase {
                     XDialApplicationIdentifierPolicy.debug,
                 teamIdentifiersMatch: true
             )
+        )
+    }
+
+    func testReleaseUnregistersObsoleteApplicationIdentities() {
+        XCTAssertEqual(
+            XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
+                forInstalledIdentifier:
+                    XDialApplicationIdentifierPolicy.release
+            ),
+            [
+                XDialApplicationIdentifierPolicy.debug,
+                XDialApplicationIdentifierPolicy.legacyRelease,
+            ]
+        )
+        XCTAssertEqual(
+            XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
+                forInstalledIdentifier:
+                    XDialApplicationIdentifierPolicy.debug
+            ),
+            []
+        )
+        XCTAssertEqual(
+            XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
+                forInstalledIdentifier: "com.example.not-xdial"
+            ),
+            []
+        )
+    }
+
+    func testReleaseUnregistersNonInstalledApplicationCopies() {
+        XCTAssertTrue(
+            XDialApplicationIdentifierPolicy
+                .shouldUnregisterApplicationRegistration(
+                    installedIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    registeredIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    isInstalledDestination: false
+                )
+        )
+        XCTAssertTrue(
+            XDialApplicationIdentifierPolicy
+                .shouldUnregisterApplicationRegistration(
+                    installedIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    registeredIdentifier:
+                        XDialApplicationIdentifierPolicy.legacyRelease,
+                    isInstalledDestination: false
+                )
+        )
+        XCTAssertFalse(
+            XDialApplicationIdentifierPolicy
+                .shouldUnregisterApplicationRegistration(
+                    installedIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    registeredIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    isInstalledDestination: true
+                )
+        )
+        XCTAssertTrue(
+            XDialApplicationIdentifierPolicy
+                .shouldUnregisterApplicationRegistration(
+                    installedIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    registeredIdentifier:
+                        XDialApplicationIdentifierPolicy.debug,
+                    isInstalledDestination: false
+                )
+        )
+        XCTAssertFalse(
+            XDialApplicationIdentifierPolicy
+                .shouldUnregisterApplicationRegistration(
+                    installedIdentifier:
+                        XDialApplicationIdentifierPolicy.debug,
+                    registeredIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    isInstalledDestination: false
+                )
+        )
+    }
+
+    func testOutgoingCleanupPlansForIdentityOrComponentMigration() throws {
+        let existingURL = URL(
+            fileURLWithPath: "/Applications/XDial.app",
+            isDirectory: true
+        )
+        let plan = try XCTUnwrap(
+            OutgoingApplicationCleanup.plan(
+                existingBundleURL: existingURL,
+                existingIdentifier:
+                    XDialApplicationIdentifierPolicy.debug,
+                incomingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                teamIdentifiersMatch: true
+            )
+        )
+        XCTAssertEqual(
+            plan.executableURL.path,
+            "/Applications/XDial.app/Contents/MacOS/XDial"
+        )
+        XCTAssertEqual(
+            plan.arguments,
+            [OutgoingApplicationCleanup.replacementArgument]
+        )
+        XCTAssertEqual(plan.timeout, 5 * 60)
+        XCTAssertNil(
+            OutgoingApplicationCleanup.plan(
+                existingBundleURL: existingURL,
+                existingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                incomingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                teamIdentifiersMatch: true
+            )
+        )
+        XCTAssertNotNil(
+            OutgoingApplicationCleanup.plan(
+                existingBundleURL: existingURL,
+                existingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                incomingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                teamIdentifiersMatch: true,
+                requiresComponentCleanup: true
+            )
+        )
+        XCTAssertNil(
+            OutgoingApplicationCleanup.plan(
+                existingBundleURL: existingURL,
+                existingIdentifier:
+                    XDialApplicationIdentifierPolicy.debug,
+                incomingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                teamIdentifiersMatch: false
+            )
+        )
+    }
+
+    func testOutgoingCleanupRunsExactBoundedOldHostCommand() throws {
+        let plan = try XCTUnwrap(
+            OutgoingApplicationCleanup.plan(
+                existingBundleURL: URL(
+                    fileURLWithPath: "/Applications/XDial.app",
+                    isDirectory: true
+                ),
+                existingIdentifier:
+                    XDialApplicationIdentifierPolicy.debug,
+                incomingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                teamIdentifiersMatch: true
+            )
+        )
+        var invocation: OutgoingApplicationCleanup.Plan?
+
+        try OutgoingApplicationCleanup.run(plan) {
+            executableURL, arguments, timeout in
+            invocation = OutgoingApplicationCleanup.Plan(
+                executableURL: executableURL,
+                arguments: arguments,
+                timeout: timeout
+            )
+            return true
+        }
+
+        XCTAssertEqual(invocation, plan)
+    }
+
+    func testOutgoingCleanupFailureStopsReplacement() throws {
+        let plan = try XCTUnwrap(
+            OutgoingApplicationCleanup.plan(
+                existingBundleURL: URL(
+                    fileURLWithPath: "/Applications/XDial.app",
+                    isDirectory: true
+                ),
+                existingIdentifier:
+                    XDialApplicationIdentifierPolicy.debug,
+                incomingIdentifier:
+                    XDialApplicationIdentifierPolicy.release,
+                teamIdentifiersMatch: true
+            )
+        )
+
+        XCTAssertThrowsError(
+            try OutgoingApplicationCleanup.run(plan) {
+                _, _, _ in false
+            }
         )
     }
 

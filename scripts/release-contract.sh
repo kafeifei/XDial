@@ -3,10 +3,10 @@
 set -euo pipefail
 
 readonly PRODUCT_NAME="XDial"
-readonly RELEASE_APPLICATION_IDENTIFIER="com.kafeifei.xdial"
-readonly RELEASE_SETTINGS_IDENTIFIER="com.kafeifei.xdial.settings-ui"
-readonly RELEASE_EXTENSION_IDENTIFIER="com.kafeifei.xdial.transparent-proxy"
-readonly RELEASE_HELPER_IDENTIFIER="com.kafeifei.xdial.helper"
+readonly RELEASE_APPLICATION_IDENTIFIER="com.kafeifei.xdial.app"
+readonly RELEASE_SETTINGS_IDENTIFIER="com.kafeifei.xdial.app.settings-ui"
+readonly RELEASE_EXTENSION_IDENTIFIER="com.kafeifei.xdial.app.transparent-proxy"
+readonly RELEASE_HELPER_IDENTIFIER="com.kafeifei.xdial.app.helper"
 readonly RELEASE_TEAM_IDENTIFIER="UVZM439VGU"
 
 cleanup_root=""

@@ -36,6 +36,11 @@ enum ApplicationRelocator {
         fileURLWithPath: "/Applications/XDial.app",
         isDirectory: true
     )
+    private static let launchServicesRegistrarURL = URL(
+        fileURLWithPath:
+            "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+                + "LaunchServices.framework/Support/lsregister"
+    )
 
     static var isRunningFromApplications: Bool {
         canonical(Bundle.main.bundleURL) == canonical(destinationURL)
@@ -160,6 +165,7 @@ enum ApplicationRelocator {
         guard isRunningFromApplications else {
             throw InstallationError.applicationNotInstalled
         }
+        try unregisterApplication(at: destinationURL)
         var resultingURL: NSURL?
         try FileManager.default.trashItem(
             at: destinationURL,
@@ -219,6 +225,9 @@ enum ApplicationRelocator {
                     destinationIsRecognizedProduct
             ) {
             case .continueLaunch:
+                try unregisterConflictingApplications(
+                    forInstalledIdentifier: sourceIdentity.identifier
+                )
                 return .continueLaunch
             case .rejectExisting:
                 return .failed(
@@ -291,6 +300,24 @@ enum ApplicationRelocator {
                     ].compactMap { $0 }
                 )
             )
+            if let replacedIdentity,
+               let cleanup = OutgoingApplicationCleanup.plan(
+                   existingBundleURL: destinationURL,
+                   existingIdentifier: replacedIdentity.identifier,
+                   incomingIdentifier: sourceIdentity.identifier,
+                   teamIdentifiersMatch:
+                        replacedIdentity.teamIdentifier
+                           == sourceIdentity.teamIdentifier,
+                   requiresComponentCleanup:
+                        platformComponentIdentifiers(at: destinationURL)
+                            != platformComponentIdentifiers(at: sourceURL)
+               ) {
+                try OutgoingApplicationCleanup.run(
+                    cleanup,
+                    execute: runOutgoingCleanupProcess
+                )
+                try unregisterApplication(at: destinationURL)
+            }
             let backupName =
                 ".XDial.backup-\(UUID().uuidString).app"
             let backupURL = destinationURL
@@ -331,6 +358,100 @@ enum ApplicationRelocator {
                 }
                 throw error
             }
+        }
+    }
+
+    private static func runOutgoingCleanupProcess(
+        executableURL: URL,
+        arguments: [String],
+        timeout: TimeInterval
+    ) throws -> Bool {
+        guard FileManager.default.isExecutableFile(
+            atPath: executableURL.path
+        ) else {
+            return false
+        }
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let completion = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            completion.signal()
+        }
+        try process.run()
+        guard completion.wait(
+            timeout: .now() + max(0, timeout)
+        ) == .success else {
+            process.terminate()
+            _ = completion.wait(timeout: .now() + 1)
+            return false
+        }
+        return process.terminationReason == .exit
+            && process.terminationStatus == 0
+    }
+
+    private static func unregisterConflictingApplications(
+        forInstalledIdentifier identifier: String
+    ) throws {
+        let candidateIdentifiers =
+            XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
+                forInstalledIdentifier: identifier
+            )
+                .union([identifier])
+        for candidateIdentifier in candidateIdentifiers {
+            let registeredURLs = NSWorkspace.shared
+                .urlsForApplications(
+                    withBundleIdentifier: candidateIdentifier
+                )
+            var canonicalPaths = Set<String>()
+            for registeredURL in registeredURLs {
+                guard
+                    ApplicationBundleInfo.identifier(at: registeredURL)
+                        == candidateIdentifier
+                else {
+                    continue
+                }
+                let canonicalURL = canonical(registeredURL)
+                guard canonicalPaths.insert(canonicalURL.path).inserted
+                else {
+                    continue
+                }
+                guard
+                    XDialApplicationIdentifierPolicy
+                        .shouldUnregisterApplicationRegistration(
+                            installedIdentifier: identifier,
+                            registeredIdentifier: candidateIdentifier,
+                            isInstalledDestination:
+                                canonicalURL == canonical(destinationURL)
+                        )
+                else {
+                    continue
+                }
+                try unregisterApplication(at: registeredURL)
+            }
+        }
+    }
+
+    private static func unregisterApplication(at bundleURL: URL) throws {
+        guard FileManager.default.isExecutableFile(
+            atPath: launchServicesRegistrarURL.path
+        ) else {
+            throw InstallationError.launchServicesRegistrarMissing
+        }
+        let process = Process()
+        process.executableURL = launchServicesRegistrarURL
+        process.arguments = ["-u", bundleURL.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard
+            process.terminationReason == .exit,
+            process.terminationStatus == 0
+        else {
+            throw InstallationError.applicationUnregistrationFailed
         }
     }
 
@@ -561,6 +682,25 @@ enum ApplicationRelocator {
         return hostIdentity
     }
 
+    private static func platformComponentIdentifiers(
+        at bundleURL: URL
+    ) -> Set<String> {
+        var identifiers: Set<String> = []
+        if let extensionIdentifier = ApplicationBundleInfo.string(
+            forKey: "XDialTransparentProxyBundleIdentifier",
+            at: bundleURL
+        ) {
+            identifiers.insert(extensionIdentifier)
+        }
+        let helperURL = bundleURL.appendingPathComponent(
+            "Contents/MacOS/xdial-daemon"
+        )
+        if let helperIdentity = try? signingIdentity(at: helperURL) {
+            identifiers.insert(helperIdentity.identifier)
+        }
+        return identifiers
+    }
+
     /// An upgrade must be able to repair an older app whose embedded helper or
     /// system extension is incomplete. The incoming app is fully validated,
     /// while the existing destination is trusted only enough to prove that it
@@ -662,6 +802,8 @@ enum ApplicationRelocator {
         case existingApplicationDidNotTerminate
         case existingApplicationNotReplaceable
         case applicationNotInstalled
+        case launchServicesRegistrarMissing
+        case applicationUnregistrationFailed
         case automaticUpdateUnsupported
         case automaticUpdateIdentityMismatch
 
@@ -719,6 +861,10 @@ enum ApplicationRelocator {
                     + "已拒绝覆盖"
             case .applicationNotInstalled:
                 "XDial 不在“应用程序”目录，无法完成卸载"
+            case .launchServicesRegistrarMissing:
+                "系统缺少 LaunchServices 注册工具，无法清理旧版 XDial"
+            case .applicationUnregistrationFailed:
+                "旧版 XDial 的系统应用注册未能清理"
             case .automaticUpdateUnsupported:
                 "当前 XDial 构建不允许应用内自动更新"
             case .automaticUpdateIdentityMismatch:

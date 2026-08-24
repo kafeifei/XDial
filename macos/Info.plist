@@ -49,7 +49,7 @@
 			<key>UTTypeDescription</key>
 			<string>XDial Settings Reorder Item</string>
 			<key>UTTypeIdentifier</key>
-			<string>com.kafeifei.xdial.settings-entry</string>
+			<string>com.kafeifei.xdial.app.settings-entry</string>
 		</dict>
 	</array>
 	<key>XDialTransparentProxyBundleIdentifier</key>

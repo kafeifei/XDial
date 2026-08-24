@@ -574,6 +574,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if terminationTask != nil {
             return .terminateCancel
         }
+        if InstallationCoordinator.shared.isInstalling {
+            appLog(
+                "application termination: installation transaction active"
+            )
+            return .terminateCancel
+        }
         let engine = GoEngine.shared
         guard Self.requiresTerminationDrain(engine) else {
             appLog("application termination: no active network transaction")

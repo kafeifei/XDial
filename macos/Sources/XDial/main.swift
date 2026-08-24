@@ -1,6 +1,41 @@
 import AppKit
 
 if CommandLine.arguments.contains(
+    OutgoingApplicationCleanup.replacementArgument
+) {
+    let application = NSApplication.shared
+    TransparentProxyManager.shared.uninstallSystemExtension { result in
+        switch result {
+        case .success:
+            do {
+                try PrivilegeManager.unregisterForIdentityReplacement()
+                fputs(
+                    "XDial platform components cleaned successfully.\n",
+                    stdout
+                )
+                exit(0)
+            } catch {
+                fputs(
+                    "XDial helper cleanup failed: "
+                        + error.localizedDescription + "\n",
+                    stderr
+                )
+                exit(1)
+            }
+        case let .failure(error):
+            fputs(
+                "XDial System Extension cleanup failed: "
+                    + error.localizedDescription + "\n",
+                stderr
+            )
+            exit(1)
+        }
+    }
+    application.run()
+    exit(0)
+}
+
+if CommandLine.arguments.contains(
     "--deactivate-owned-system-extension"
 ) {
     let application = NSApplication.shared

@@ -89,14 +89,14 @@ define assemble_app
 	@cp $(BUILD_DIR)/xdial "$(2)/Contents/MacOS/xdial-daemon"
 	@cp macos/Info.plist "$(2)/Contents/Info.plist"
 	@cp macos/AppIcon.icns "$(2)/Contents/Resources/AppIcon.icns"
-	@cp macos/com.kafeifei.xdial.helper.plist "$(2)/Contents/Library/LaunchDaemons/"
+	@cp macos/com.kafeifei.xdial.app.daemon.plist "$(2)/Contents/Library/LaunchDaemons/"
 	@plutil -replace CFBundleExecutable -string XDial "$(2)/Contents/Info.plist"
-	@plutil -replace CFBundleIdentifier -string com.kafeifei.xdial "$(2)/Contents/Info.plist"
+	@plutil -replace CFBundleIdentifier -string com.kafeifei.xdial.app "$(2)/Contents/Info.plist"
 	@plutil -replace CFBundleName -string XDial "$(2)/Contents/Info.plist"
 	@plutil -replace CFBundleVersion -string "$(PLIST_VERSION)" "$(2)/Contents/Info.plist"
 	@plutil -replace CFBundleShortVersionString -string "$(PLIST_VERSION)" "$(2)/Contents/Info.plist"
 	@plutil -replace LSMinimumSystemVersion -string "15.0" "$(2)/Contents/Info.plist"
-	@codesign -f -s "$(SIGN_IDENTITY)" -i com.kafeifei.xdial.helper --entitlements macos/XDialDaemon.entitlements "$(2)/Contents/MacOS/xdial-daemon"
+	@codesign -f -s "$(SIGN_IDENTITY)" -i com.kafeifei.xdial.app.helper --entitlements macos/XDialDaemon.entitlements "$(2)/Contents/MacOS/xdial-daemon"
 	@codesign -f -s "$(SIGN_IDENTITY)" "$(2)"
 endef
 

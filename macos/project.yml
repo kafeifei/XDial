@@ -4,6 +4,7 @@ options:
     macOS: "15.0"
 configs:
   Debug: debug
+  FormalDevelopment: release
   Release: release
 
 settings:
@@ -20,9 +21,12 @@ settings:
     Debug:
       XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
       XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.settings-ui
+    FormalDevelopment:
+      XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.transparent-proxy
+      XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.settings-ui
     Release:
-      XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.transparent-proxy
-      XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.settings-ui
+      XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.transparent-proxy
+      XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.settings-ui
 
 targets:
   XDialTransparentProxy:
@@ -57,11 +61,17 @@ targets:
           CODE_SIGN_IDENTITY: Apple Development
           PROVISIONING_PROFILE_SPECIFIER: XDial Debug Extension Both Macs 2026
           CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxy.entitlements
+        FormalDevelopment:
+          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.transparent-proxy
+          CODE_SIGN_STYLE: Automatic
+          CODE_SIGN_IDENTITY: Apple Development
+          CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxy.entitlements
+          ENABLE_HARDENED_RUNTIME: YES
         Release:
-          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.transparent-proxy
+          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.transparent-proxy
           CODE_SIGN_STYLE: Manual
           CODE_SIGN_IDENTITY: Developer ID Application
-          PROVISIONING_PROFILE_SPECIFIER: XDial Developer ID Transparent Proxy
+          PROVISIONING_PROFILE_SPECIFIER: XDial Developer ID App Transparent Proxy
           CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxyRelease.entitlements
           CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
           OTHER_CODE_SIGN_FLAGS: "--timestamp"
@@ -103,6 +113,10 @@ targets:
         Debug:
           CODE_SIGN_STYLE: Manual
           CODE_SIGN_IDENTITY: Apple Development
+        FormalDevelopment:
+          CODE_SIGN_STYLE: Automatic
+          CODE_SIGN_IDENTITY: Apple Development
+          ENABLE_HARDENED_RUNTIME: YES
         Release:
           CODE_SIGN_STYLE: Manual
           CODE_SIGN_IDENTITY: Developer ID Application
@@ -134,7 +148,7 @@ targets:
         NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。
         NSLocationWhenInUseUsageDescription: XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。
         UTExportedTypeDeclarations:
-          - UTTypeIdentifier: com.kafeifei.xdial.settings-entry
+          - UTTypeIdentifier: com.kafeifei.xdial.app.settings-entry
             UTTypeConformsTo:
               - public.data
             UTTypeDescription: XDial Settings Reorder Item
@@ -150,11 +164,17 @@ targets:
           CODE_SIGN_IDENTITY: Apple Development
           PROVISIONING_PROFILE_SPECIFIER: XDial Debug Host Both Macs 2026
           CODE_SIGN_ENTITLEMENTS: XDial.entitlements
+        FormalDevelopment:
+          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app
+          CODE_SIGN_STYLE: Automatic
+          CODE_SIGN_IDENTITY: Apple Development
+          CODE_SIGN_ENTITLEMENTS: XDial.entitlements
+          ENABLE_HARDENED_RUNTIME: YES
         Release:
-          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial
+          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app
           CODE_SIGN_STYLE: Manual
           CODE_SIGN_IDENTITY: Developer ID Application
-          PROVISIONING_PROFILE_SPECIFIER: XDial Developer ID Host 2026
+          PROVISIONING_PROFILE_SPECIFIER: XDial Developer ID App Host 2026
           CODE_SIGN_ENTITLEMENTS: XDialRelease.entitlements
           CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
           OTHER_CODE_SIGN_FLAGS: "--timestamp"
@@ -222,7 +242,8 @@ targets:
           rm -rf \
             "${extension_dir}/XDialTransparentProxy.systemextension" \
             "${extension_dir}/com.kafeifei.xdial.ne-probe.extension.systemextension" \
-            "${extension_dir}/com.kafeifei.xdial.transparent-proxy.systemextension"
+            "${extension_dir}/com.kafeifei.xdial.transparent-proxy.systemextension" \
+            "${extension_dir}/com.kafeifei.xdial.app.transparent-proxy.systemextension"
           /usr/bin/ditto \
             "${extension_source}" \
             "${extension_dir}/${extension_name}"
@@ -246,29 +267,29 @@ targets:
           test -x "${helper_source}"
           mkdir -p "${helper_dir}" "${launchd_dir}"
           cp "${helper_source}" "${helper_dir}/xdial-daemon"
-          cp "${SRCROOT}/com.kafeifei.xdial.helper.plist" "${launchd_dir}/"
+          cp "${SRCROOT}/com.kafeifei.xdial.app.daemon.plist" "${launchd_dir}/"
           if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ]; then
             exit 0
           fi
           if [ "${CONFIGURATION}" = "Release" ]; then
             /usr/bin/codesign --force --options runtime --timestamp \
               --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
-              --identifier com.kafeifei.xdial.helper \
+              --identifier com.kafeifei.xdial.app.helper \
               --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
               "${helper_dir}/xdial-daemon"
           else
             /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
-              --identifier com.kafeifei.xdial.helper \
+              --identifier com.kafeifei.xdial.app.helper \
               --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
               "${helper_dir}/xdial-daemon"
           fi
         inputFiles:
           - "$(SRCROOT)/../build/xdial"
-          - "$(SRCROOT)/com.kafeifei.xdial.helper.plist"
+          - "$(SRCROOT)/com.kafeifei.xdial.app.daemon.plist"
           - "$(SRCROOT)/XDialDaemon.entitlements"
         outputFiles:
           - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/xdial-daemon"
-          - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchDaemons/com.kafeifei.xdial.helper.plist"
+          - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchDaemons/com.kafeifei.xdial.app.daemon.plist"
 
   XDialTests:
     type: bundle.unit-test

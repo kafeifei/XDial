@@ -289,17 +289,21 @@ enum SystemExtensionActivationVerifier {
 
 enum XDialApplicationIdentifierPolicy {
     static let debug = "com.kafeifei.xdial.ne-probe"
-    static let release = "com.kafeifei.xdial"
+    static let legacyRelease = "com.kafeifei.xdial"
+    static let release = "com.kafeifei.xdial.app"
     static let debugSettingsUI =
         "com.kafeifei.xdial.ne-probe.settings-ui"
-    static let releaseSettingsUI =
+    static let legacyReleaseSettingsUI =
         "com.kafeifei.xdial.settings-ui"
+    static let releaseSettingsUI =
+        "com.kafeifei.xdial.app.settings-ui"
 
     static func settingsUIIdentifier(
         forApplicationIdentifier identifier: String
     ) -> String? {
         switch identifier {
         case debug: debugSettingsUI
+        case legacyRelease: legacyReleaseSettingsUI
         case release: releaseSettingsUI
         default: nil
         }
@@ -311,9 +315,95 @@ enum XDialApplicationIdentifierPolicy {
         teamIdentifiersMatch: Bool
     ) -> Bool {
         guard teamIdentifiersMatch else { return false }
-        let knownIdentifiers = Set([debug, release])
+        let knownIdentifiers = Set([
+            debug,
+            legacyRelease,
+            release,
+        ])
         return knownIdentifiers.contains(existingIdentifier)
             && knownIdentifiers.contains(incomingIdentifier)
+    }
+
+    static func obsoleteIdentifiers(
+        forInstalledIdentifier identifier: String
+    ) -> Set<String> {
+        guard identifier == release else { return [] }
+        return [debug, legacyRelease]
+    }
+
+    static func shouldUnregisterApplicationRegistration(
+        installedIdentifier: String,
+        registeredIdentifier: String,
+        isInstalledDestination: Bool
+    ) -> Bool {
+        guard installedIdentifier == release else { return false }
+        if registeredIdentifier == debug
+            || registeredIdentifier == legacyRelease {
+            return true
+        }
+        return registeredIdentifier == release
+            && !isInstalledDestination
+    }
+}
+
+enum OutgoingApplicationCleanup {
+    static let timeout: TimeInterval = 5 * 60
+    static let replacementArgument =
+        "--prepare-owned-components-for-replacement"
+
+    struct Plan: Equatable {
+        let executableURL: URL
+        let arguments: [String]
+        let timeout: TimeInterval
+    }
+
+    static func plan(
+        existingBundleURL: URL,
+        existingIdentifier: String,
+        incomingIdentifier: String,
+        teamIdentifiersMatch: Bool,
+        requiresComponentCleanup: Bool = false
+    ) -> Plan? {
+        guard
+            existingIdentifier != incomingIdentifier
+                || requiresComponentCleanup,
+            XDialApplicationIdentifierPolicy.permitsReplacement(
+                existingIdentifier: existingIdentifier,
+                incomingIdentifier: incomingIdentifier,
+                teamIdentifiersMatch: teamIdentifiersMatch
+            )
+        else {
+            return nil
+        }
+        return Plan(
+            executableURL: existingBundleURL.appendingPathComponent(
+                "Contents/MacOS/XDial"
+            ),
+            arguments: [replacementArgument],
+            timeout: timeout
+        )
+    }
+
+    static func run(
+        _ plan: Plan,
+        execute: (URL, [String], TimeInterval) throws -> Bool
+    ) throws {
+        guard try execute(
+            plan.executableURL,
+            plan.arguments,
+            plan.timeout
+        ) else {
+            throw CleanupError.failed
+        }
+    }
+
+    private enum CleanupError: LocalizedError {
+        case failed
+
+        var errorDescription: String? {
+            "旧版 XDial 的后台服务或网络扩展未能完整清理，"
+                + "正式版尚未替换，请重试"
+        }
     }
 }
 

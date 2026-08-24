@@ -28,7 +28,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
            !configured.isEmpty {
             return configured
         }
-        return "com.kafeifei.xdial.transparent-proxy"
+        return "com.kafeifei.xdial.app.transparent-proxy"
     }()
     private let configurationName = "XDial Transparent Proxy"
 

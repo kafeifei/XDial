@@ -356,9 +356,10 @@ enum AppUpdateRelaunchIntentStore {
 }
 
 enum AutomaticUpdateBundlePolicy {
-    static let releaseHelperIdentifier = "com.kafeifei.xdial.helper"
+    static let releaseHelperIdentifier =
+        "com.kafeifei.xdial.app.helper"
     static let releaseExtensionIdentifier =
-        "com.kafeifei.xdial.transparent-proxy"
+        "com.kafeifei.xdial.app.transparent-proxy"
 
     static func permits(
         currentIdentifier: String,

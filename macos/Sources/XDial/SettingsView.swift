@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 private extension UTType {
     static let xdialSettingsEntry = UTType(
-        exportedAs: "com.kafeifei.xdial.settings-entry",
+        exportedAs: "com.kafeifei.xdial.app.settings-entry",
         conformingTo: .data
     )
 }

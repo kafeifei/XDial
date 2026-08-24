@@ -9,8 +9,10 @@ import ServiceManagement
 // - 重编后运行中的旧 daemon 通过 respawn 命令原地 re-exec 成新二进制，全程无感
 // - 旧机制（密码安装到 /Library/PrivilegedHelperTools）只保留一次性清理入口
 enum PrivilegeManager {
-    static let label = "com.kafeifei.xdial.helper"
-    static let plistName = "com.kafeifei.xdial.helper.plist"
+    static let label = "com.kafeifei.xdial.app.daemon"
+    static let plistName =
+        "com.kafeifei.xdial.app.daemon.plist"
+    private static let legacyLabel = "com.kafeifei.xdial.helper"
     static let socketPath = "/tmp/xdial.sock"
 
     static var service: SMAppService { SMAppService.daemon(plistName: plistName) }
@@ -33,6 +35,28 @@ enum PrivilegeManager {
 
     static func unregister() throws {
         try service.unregister()
+    }
+
+    static func unregisterForIdentityReplacement() throws {
+        if #available(macOS 13.0, *) {
+            let mainAppService = SMAppService.mainApp
+            if mainAppService.status == .enabled
+                || mainAppService.status == .requiresApproval {
+                try mainAppService.unregister()
+            }
+        }
+        if status == .enabled || status == .requiresApproval {
+            try unregister()
+        }
+        for _ in 0..<50 {
+            if status != .enabled,
+               status != .requiresApproval,
+               !canConnectSocket() {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        throw HelperError.unregisterTimedOut
     }
 
     static func openApprovalSettings() {
@@ -58,8 +82,10 @@ enum PrivilegeManager {
 
     // MARK: - 旧机制残留（/Library 安装）
 
-    static let legacyHelperPath = "/Library/PrivilegedHelperTools/\(label)"
-    static let legacyPlistPath = "/Library/LaunchDaemons/\(label).plist"
+    static let legacyHelperPath =
+        "/Library/PrivilegedHelperTools/\(legacyLabel)"
+    static let legacyPlistPath =
+        "/Library/LaunchDaemons/\(legacyLabel).plist"
 
     static var legacyInstalled: Bool {
         FileManager.default.fileExists(atPath: legacyPlistPath)
@@ -70,7 +96,7 @@ enum PrivilegeManager {
     /// 且只发生在从旧机制迁移的机器上。
     static func cleanupLegacy() throws {
         let shell = """
-        launchctl bootout system/\(label) 2>/dev/null || true
+        launchctl bootout system/\(legacyLabel) 2>/dev/null || true
         rm -f '\(legacyPlistPath)' '\(legacyHelperPath)'
         rm -f '/etc/sudoers.d/xdial'
         """
@@ -239,11 +265,14 @@ enum PrivilegeManager {
 
     private enum HelperError: LocalizedError {
         case socketUnavailable
+        case unregisterTimedOut
 
         var errorDescription: String? {
             switch self {
             case .socketUnavailable:
                 "后台服务已注册，但 6 秒内没有建立本地控制通道"
+            case .unregisterTimedOut:
+                "旧版后台服务未能在 5 秒内退出"
             }
         }
     }
