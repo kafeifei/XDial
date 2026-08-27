@@ -71,8 +71,11 @@ XDial 是 macOS 菜单栏网络工具：SwiftUI 提供控制面，sing-box 提�
   会隐藏既有全流量 VPN，只能用于诊断，不能作为 sing-box 的 Underlay。
 - 分发产物只能使用 `make release` 生成的 `build/release/XDial.app`。Debug 构建包含本地调试
   接口，不得分发；不得为让 Release 通过而删除 entitlement 或把 Debug 标识带入 Release。
-- 本机 Debug 暂用 `com.kafeifei.xdial.ne-probe{,.extension}` 标识，Release 保持正式标识；
-  正式 Release 必须保留 host 与 extension 所需的 System Extension provisioning profile。
+- Debug、FormalDevelopment 与 Release 始终使用同一套正式身份：Host
+  `com.kafeifei.xdial.app`、Settings UI `com.kafeifei.xdial.app.settings-ui`、System Extension
+  `com.kafeifei.xdial.app.transparent-proxy`、helper `com.kafeifei.xdial.app.helper`。配置之间只允许
+  编译条件与签名方式不同，不得再用不同 bundle identity 隔离 Debug；正式 Release 必须保留
+  host 与 extension 所需的 System Extension provisioning profile。
 - 未完成真实运行验证时明确报告剩余边界，不把源码、测试或旧日志包装成现场结论。
 
 ## 仓库纪律

@@ -40,6 +40,10 @@ struct MainPopover: View {
             header
             Divider()
             scenarioCarousel
+            if needsSSIDAccess {
+                Divider()
+                ssidAccessWarningBand
+            }
             if let failure = scenarioSwitchFailureProjection {
                 Divider()
                 scenarioSwitchFailureBand(failure)
@@ -518,6 +522,52 @@ struct MainPopover: View {
         }
     }
 
+    private var ssidAccessWarningBand: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "location.slash.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(warningColor)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(state.tr(
+                    "Wi-Fi 自动切换不可用",
+                    "Automatic Wi-Fi Switching Unavailable"
+                ))
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.primary.opacity(0.82))
+                .fixedSize(horizontal: false, vertical: true)
+                Text(state.tr(
+                    "无法读取当前 Wi-Fi，场景不会自动切换。",
+                    "XDial cannot read the current Wi-Fi, so scenarios will not switch automatically."
+                ))
+                .font(.system(size: 9.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 6)
+            Button(ssidAccessActionTitle) {
+                state.requestSSIDAccess()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .fixedSize()
+        }
+        .padding(.leading, 20)
+        .padding(.trailing, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            LinearGradient(
+                colors: [
+                    warningColor.opacity(0.075),
+                    warningColor.opacity(0.025),
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        }
+    }
+
     private func dirtyStatusRow(showsAction: Bool) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.circle.fill")
@@ -683,6 +733,29 @@ struct MainPopover: View {
 
     private var showsStatusBand: Bool {
         state.isBusy || (state.configDirty && state.isConnected)
+    }
+
+    private var needsSSIDAccess: Bool {
+        state.requiresSSIDAccess && state.wifiSSIDAccessState != .ready
+    }
+
+    private var ssidAccessActionTitle: String {
+        switch state.wifiSSIDAccessState {
+        case .permissionRequired:
+            return state.tr(
+                "开启位置权限",
+                "Enable Location Access"
+            )
+        case .denied:
+            return state.tr(
+                "打开定位服务设置",
+                "Open Location Settings"
+            )
+        case .unavailable:
+            return state.tr("重试", "Retry")
+        case .ready:
+            return state.tr("完成", "Done")
+        }
     }
 
     private var scenarioSwitchFailureProjection:

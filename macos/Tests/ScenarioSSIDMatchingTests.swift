@@ -1,6 +1,27 @@
 import XCTest
 
 final class ScenarioSSIDMatchingTests: XCTestCase {
+    func testSSIDPermissionIsOnlyRequiredByConfiguredMatchingRules() {
+        var profile = Profile()
+        profile.scenarios = [
+            Scenario(
+                id: "blank",
+                name: "空白",
+                matchSSIDs: ["  "]
+            )
+        ]
+        XCTAssertFalse(profile.usesSSIDScenarioMatching)
+
+        profile.scenarios.append(
+            Scenario(
+                id: "hotel",
+                name: "酒店",
+                matchSSIDs: ["Hotel Wi-Fi"]
+            )
+        )
+        XCTAssertTrue(profile.usesSSIDScenarioMatching)
+    }
+
     func testBlankScenarioRoundTripsWithoutImplicitConfiguration() throws {
         var profile = Profile()
         profile.scenarios = [Scenario(id: "blank", name: "空白")]

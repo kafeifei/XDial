@@ -288,10 +288,13 @@ enum SystemExtensionActivationVerifier {
 }
 
 enum XDialApplicationIdentifierPolicy {
-    static let debug = "com.kafeifei.xdial.ne-probe"
+    // Migration-only identity from old local builds. It is accepted only as
+    // the installed predecessor of the canonical app and can never be an
+    // incoming replacement identity.
+    static let legacyProbe = "com.kafeifei.xdial.ne-probe"
     static let legacyRelease = "com.kafeifei.xdial"
     static let release = "com.kafeifei.xdial.app"
-    static let debugSettingsUI =
+    static let legacyProbeSettingsUI =
         "com.kafeifei.xdial.ne-probe.settings-ui"
     static let legacyReleaseSettingsUI =
         "com.kafeifei.xdial.settings-ui"
@@ -302,11 +305,15 @@ enum XDialApplicationIdentifierPolicy {
         forApplicationIdentifier identifier: String
     ) -> String? {
         switch identifier {
-        case debug: debugSettingsUI
+        case legacyProbe: legacyProbeSettingsUI
         case legacyRelease: legacyReleaseSettingsUI
         case release: releaseSettingsUI
         default: nil
         }
+    }
+
+    static func permitsIncomingInstallation(identifier: String) -> Bool {
+        identifier == release
     }
 
     static func permitsReplacement(
@@ -315,33 +322,41 @@ enum XDialApplicationIdentifierPolicy {
         teamIdentifiersMatch: Bool
     ) -> Bool {
         guard teamIdentifiersMatch else { return false }
-        let knownIdentifiers = Set([
-            debug,
+        guard incomingIdentifier == release else { return false }
+        let replaceableExistingIdentifiers = Set([
+            legacyProbe,
             legacyRelease,
             release,
         ])
-        return knownIdentifiers.contains(existingIdentifier)
-            && knownIdentifiers.contains(incomingIdentifier)
+        return replaceableExistingIdentifiers.contains(existingIdentifier)
     }
 
     static func obsoleteIdentifiers(
         forInstalledIdentifier identifier: String
     ) -> Set<String> {
         guard identifier == release else { return [] }
-        return [debug, legacyRelease]
+        return [legacyProbe, legacyRelease]
     }
 
     static func shouldUnregisterApplicationRegistration(
         installedIdentifier: String,
         registeredIdentifier: String,
+        onDiskIdentifier: String,
         isInstalledDestination: Bool
     ) -> Bool {
         guard installedIdentifier == release else { return false }
-        if registeredIdentifier == debug
-            || registeredIdentifier == legacyRelease {
-            return true
+        let obsoleteIdentifiers = Set([legacyProbe, legacyRelease])
+        if obsoleteIdentifiers.contains(registeredIdentifier) {
+            if onDiskIdentifier == registeredIdentifier {
+                return true
+            }
+            // Xcode can rewrite a build product in place while LaunchServices
+            // keeps its former identifier. Unregister that stale non-installed
+            // path without unregistering the canonical /Applications copy.
+            return onDiskIdentifier == release && !isInstalledDestination
         }
         return registeredIdentifier == release
+            && onDiskIdentifier == release
             && !isInstalledDestination
     }
 }

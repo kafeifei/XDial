@@ -143,6 +143,10 @@ final class AppState: ObservableObject {
     @Published private(set) var wifiSSIDAccessState:
         WiFiSSIDAccessState = .permissionRequired
 
+    var requiresSSIDAccess: Bool {
+        profile.usesSSIDScenarioMatching
+    }
+
     @Published var helperInstalled: Bool = false
     /// SMAppService 已注册但等用户在系统设置「登录项」里批准
     @Published var helperNeedsApproval: Bool = false
@@ -221,6 +225,9 @@ final class AppState: ObservableObject {
         NetworkEpochSwitchCoordinator()
     private var networkEpochPowerGate = SystemSleepNetworkEpochGate()
     private var networkEpochQuietWorkItem: DispatchWorkItem?
+    private var didEvaluateInitialSSIDAccess = false
+    private var ssidAccessActivationObserver: NSObjectProtocol?
+    private var ssidAccessActivationGeneration = 0
     private lazy var wifiSSIDMonitor = WiFiSSIDMonitor(
         onSettling: { [weak self] in
             Task { @MainActor [weak self] in
@@ -724,9 +731,9 @@ final class AppState: ObservableObject {
                 ) as? String ?? "0",
                 activeScenarioID: profile.activeScenarioID
             )
-        // 首次启动就取得当前 SSID，设置页才能直接把正在使用的 Wi-Fi
-        // 加到场景；等用户先配置触发条件再申请会形成无法初始化的闭环。
-        wifiSSIDMonitor.start(requestAuthorization: true)
+        // 启动时只读取授权状态。位置授权弹窗必须由安装窗口或设置页中
+        // 可见、前台的用户动作触发，不能在菜单栏进程初始化时裸请求。
+        wifiSSIDMonitor.start()
         configurationChanges.load(
             runtimeConfigurationSignature()
         )
@@ -1701,12 +1708,70 @@ final class AppState: ObservableObject {
     // MARK: - Wi-Fi scenario activation
 
     func requestSSIDAccess() {
-        wifiSSIDMonitor.requestAuthorizationAndRefresh()
-        guard wifiSSIDAccessState == .denied,
+        ssidAccessActivationGeneration &+= 1
+        let generation = ssidAccessActivationGeneration
+        clearSSIDAccessActivationObserver()
+
+        if NSApp.isActive {
+            performSSIDAccessRequest()
+            return
+        }
+
+        ssidAccessActivationObserver = NotificationCenter.default
+            .addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: NSApp,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.completeSSIDAccessActivation(
+                        generation: generation
+                    )
+                }
+            }
+        NSApp.activate(ignoringOtherApps: true)
+        if NSApp.isActive {
+            completeSSIDAccessActivation(generation: generation)
+        }
+
+        // Activation normally settles immediately, but do not leave a stale
+        // observer that could surprise the user with a prompt much later.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self,
+                  generation == self.ssidAccessActivationGeneration,
+                  self.ssidAccessActivationObserver != nil else {
+                return
+            }
+            self.clearSSIDAccessActivationObserver()
+            appLog(
+                "Wi-Fi SSID access request skipped: app did not become active"
+            )
+        }
+    }
+
+    private func completeSSIDAccessActivation(generation: Int) {
+        guard generation == ssidAccessActivationGeneration,
+              ssidAccessActivationObserver != nil,
+              NSApp.isActive else {
+            return
+        }
+        clearSSIDAccessActivationObserver()
+        performSSIDAccessRequest()
+    }
+
+    private func clearSSIDAccessActivationObserver() {
+        guard let observer = ssidAccessActivationObserver else { return }
+        NotificationCenter.default.removeObserver(observer)
+        ssidAccessActivationObserver = nil
+    }
+
+    private func performSSIDAccessRequest() {
+        guard NSApp.isActive else { return }
+        let disposition = wifiSSIDMonitor.requestAuthorizationAndRefresh()
+        guard disposition == .openSystemSettings,
               let url = URL(
                   string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"
-              )
-        else {
+              ) else {
             return
         }
         NSWorkspace.shared.open(url)
@@ -1736,7 +1801,11 @@ final class AppState: ObservableObject {
         }
         profile.scenarios[index].matchSSIDs.append(ssid)
         save()
-        wifiSSIDMonitor.start(requestAuthorization: true)
+        if wifiSSIDAccessState == .ready {
+            wifiSSIDMonitor.start()
+        } else {
+            requestSSIDAccess()
+        }
         activateScenarioForCurrentSSIDIfNeeded()
         return nil
     }
@@ -1757,6 +1826,16 @@ final class AppState: ObservableObject {
     ) {
         currentSSID = ssid
         wifiSSIDAccessState = accessState
+        if !didEvaluateInitialSSIDAccess {
+            didEvaluateInitialSSIDAccess = true
+            if requiresSSIDAccess, accessState != .ready {
+                appLog(
+                    "Wi-Fi Scenario setup requires SSID access state="
+                        + accessState.logValue
+                )
+                installation.present()
+            }
+        }
         activateScenarioForCurrentSSIDIfNeeded()
     }
 

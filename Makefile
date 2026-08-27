@@ -45,7 +45,7 @@ MACOS_APP_LAUNCHER := $(BUILD_DIR)/launch-macos-app
 SIGN_IDENTITY ?= Apple Development
 MACOS_TEST_XCODEBUILD_FLAGS ?=
 
-.PHONY: all cli app ci-macos-build release-inputs release-app release test-release-contract restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios mobile-app-icons FORCE_PATCHED_GO
+.PHONY: all cli app ci-macos-build macos-identity-contract release-inputs release-app release test-release-contract restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios mobile-app-icons FORCE_PATCHED_GO
 
 $(MACOS_ICON_GENERATOR_BINARY): $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
 	@mkdir -p "$(BUILD_DIR)"
@@ -154,7 +154,11 @@ test: public-content-gate $(PATCHED_WORKFILE) test-patched-tailscale test-patche
 test-release-contract:
 	bash test/release_contract_test.sh
 
-test-macos-transaction: test-release-contract
+macos-identity-contract:
+	cd macos && xcodegen generate
+	bash scripts/verify-macos-identity-contract.sh
+
+test-macos-transaction: test-release-contract macos-identity-contract
 	@! rg -n 'probeNetwork|127\.0\.0\.1:9090|test-out' macos/Sources/XDial
 	@test "$$(rg -l 'willSleepNotification' macos/Sources/XDial macos/Shared | sort)" = macos/Sources/XDial/AppState.swift
 	@! rg -n 'screensDidSleepNotification|systemIsSleeping|sawUnavailablePath' macos/Sources/XDial macos/Shared
@@ -210,8 +214,7 @@ cli: $(PATCHED_WORKFILE)
 	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS)" -o $(BUILD_DIR)/xdial ./cmd/xdial/
 
 # debug 构建(含 DebugServer,仅本地开发用,不得分发)
-app: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER)
-	cd macos && xcodegen generate
+app: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Debug \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
@@ -222,6 +225,9 @@ app: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
 		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		build
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Info.plist')" = com.kafeifei.xdial.app
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = com.kafeifei.xdial.app.settings-ui
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Library/SystemExtensions/com.kafeifei.xdial.app.transparent-proxy.systemextension/Contents/Info.plist')" = com.kafeifei.xdial.app.transparent-proxy
 	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Info.plist')" = true
 	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = false
 	@test "$$(plutil -extract CFBundleDisplayName raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = XDial
@@ -232,8 +238,7 @@ app: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns
 
 # GitHub 托管 runner 不持有 System Extension 的签名证书和 provisioning profile。
 # 这里分别编译 Debug / Release 的扩展与宿主，只验证源码和链接；产物没有签名、不可分发。
-ci-macos-build: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns
-	cd macos && xcodegen generate
+ci-macos-build: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
 	@set -e; for configuration in Debug Release; do \
 		xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy \
 			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
@@ -251,12 +256,11 @@ release-inputs:
 	@$(RELEASE_CONTRACT) validate-inputs "$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
 	@$(RELEASE_CONTRACT) validate-notes "$(RELEASE_TAG)" RELEASE_NOTES.md
 
-release-app: release-inputs libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns
+release-app: release-inputs libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
 	@mkdir -p $(BUILD_DIR)
 	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -trimpath \
 		-ldflags "-X main.version=$(RELEASE_TAG) -s -w" \
 		-o $(BUILD_DIR)/xdial ./cmd/xdial/
-	cd macos && xcodegen generate
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Release \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode-release \

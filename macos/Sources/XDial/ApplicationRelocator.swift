@@ -404,15 +404,12 @@ enum ApplicationRelocator {
             let registeredURLs = NSWorkspace.shared
                 .urlsForApplications(
                     withBundleIdentifier: candidateIdentifier
-                )
+            )
             var canonicalPaths = Set<String>()
             for registeredURL in registeredURLs {
-                guard
+                guard let onDiskIdentifier =
                     ApplicationBundleInfo.identifier(at: registeredURL)
-                        == candidateIdentifier
-                else {
-                    continue
-                }
+                else { continue }
                 let canonicalURL = canonical(registeredURL)
                 guard canonicalPaths.insert(canonicalURL.path).inserted
                 else {
@@ -423,6 +420,7 @@ enum ApplicationRelocator {
                         .shouldUnregisterApplicationRegistration(
                             installedIdentifier: identifier,
                             registeredIdentifier: candidateIdentifier,
+                            onDiskIdentifier: onDiskIdentifier,
                             isInstalledDestination:
                                 canonicalURL == canonical(destinationURL)
                         )
@@ -607,6 +605,12 @@ enum ApplicationRelocator {
 
         let hostIdentity = try signingIdentity(at: bundleURL)
         guard hostIdentity.identifier == bundleIdentifier else {
+            throw InstallationError.bundleIdentifierMismatch
+        }
+        guard XDialApplicationIdentifierPolicy
+            .permitsIncomingInstallation(
+                identifier: hostIdentity.identifier
+            ) else {
             throw InstallationError.bundleIdentifierMismatch
         }
 

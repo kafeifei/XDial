@@ -799,6 +799,16 @@ struct Profile: Codable, Hashable {
 }
 
 extension Profile {
+    var usesSSIDScenarioMatching: Bool {
+        scenarios.contains { scenario in
+            scenario.matchSSIDs.contains {
+                !$0.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).isEmpty
+            }
+        }
+    }
+
     func scenario(matchingSSID ssid: String) -> Scenario? {
         scenarios.first { $0.matchSSIDs.contains(ssid) }
     }

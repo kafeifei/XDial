@@ -145,6 +145,9 @@ final class DebugServer {
         dict["language"] = s.language.rawValue
         dict["launchAtLogin"] = s.launchAtLogin
         dict["autoConnect"] = s.autoConnect
+        dict["currentSSID"] = s.currentSSID ?? ""
+        dict["wifiSSIDAccessState"] = s.wifiSSIDAccessState.logValue
+        dict["requiresSSIDAccess"] = s.requiresSSIDAccess
         dict["wakeReconnectPhase"] =
             s.wakeReconnectPhase?.rawValue ?? ""
         dict["desiredConnectionState"] =

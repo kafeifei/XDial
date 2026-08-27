@@ -266,12 +266,12 @@ final class InstallationTransactionTests: XCTestCase {
                 teamIdentifiersMatch: true
             )
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             XDialApplicationIdentifierPolicy.permitsReplacement(
                 existingIdentifier:
                     XDialApplicationIdentifierPolicy.release,
                 incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.debug,
+                    XDialApplicationIdentifierPolicy.legacyProbe,
                 teamIdentifiersMatch: true
             )
         )
@@ -280,7 +280,7 @@ final class InstallationTransactionTests: XCTestCase {
                 existingIdentifier:
                     XDialApplicationIdentifierPolicy.release,
                 incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.debug,
+                    XDialApplicationIdentifierPolicy.legacyProbe,
                 teamIdentifiersMatch: false
             )
         )
@@ -288,9 +288,32 @@ final class InstallationTransactionTests: XCTestCase {
             XDialApplicationIdentifierPolicy.permitsReplacement(
                 existingIdentifier: "com.example.not-xdial",
                 incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.debug,
+                    XDialApplicationIdentifierPolicy.release,
                 teamIdentifiersMatch: true
             )
+        )
+    }
+
+    func testOnlyCanonicalApplicationCanBeAnInstallationSource() {
+        XCTAssertTrue(
+            XDialApplicationIdentifierPolicy
+                .permitsIncomingInstallation(
+                    identifier: XDialApplicationIdentifierPolicy.release
+                )
+        )
+        XCTAssertFalse(
+            XDialApplicationIdentifierPolicy
+                .permitsIncomingInstallation(
+                    identifier:
+                        XDialApplicationIdentifierPolicy.legacyProbe
+                )
+        )
+        XCTAssertFalse(
+            XDialApplicationIdentifierPolicy
+                .permitsIncomingInstallation(
+                    identifier:
+                        XDialApplicationIdentifierPolicy.legacyRelease
+                )
         )
     }
 
@@ -301,14 +324,14 @@ final class InstallationTransactionTests: XCTestCase {
                     XDialApplicationIdentifierPolicy.release
             ),
             [
-                XDialApplicationIdentifierPolicy.debug,
+                XDialApplicationIdentifierPolicy.legacyProbe,
                 XDialApplicationIdentifierPolicy.legacyRelease,
             ]
         )
         XCTAssertEqual(
             XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
                 forInstalledIdentifier:
-                    XDialApplicationIdentifierPolicy.debug
+                    XDialApplicationIdentifierPolicy.legacyProbe
             ),
             []
         )
@@ -328,6 +351,8 @@ final class InstallationTransactionTests: XCTestCase {
                         XDialApplicationIdentifierPolicy.release,
                     registeredIdentifier:
                         XDialApplicationIdentifierPolicy.release,
+                    onDiskIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
                     isInstalledDestination: false
                 )
         )
@@ -337,6 +362,8 @@ final class InstallationTransactionTests: XCTestCase {
                     installedIdentifier:
                         XDialApplicationIdentifierPolicy.release,
                     registeredIdentifier:
+                        XDialApplicationIdentifierPolicy.legacyRelease,
+                    onDiskIdentifier:
                         XDialApplicationIdentifierPolicy.legacyRelease,
                     isInstalledDestination: false
                 )
@@ -348,6 +375,8 @@ final class InstallationTransactionTests: XCTestCase {
                         XDialApplicationIdentifierPolicy.release,
                     registeredIdentifier:
                         XDialApplicationIdentifierPolicy.release,
+                    onDiskIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
                     isInstalledDestination: true
                 )
         )
@@ -357,7 +386,9 @@ final class InstallationTransactionTests: XCTestCase {
                     installedIdentifier:
                         XDialApplicationIdentifierPolicy.release,
                     registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.debug,
+                        XDialApplicationIdentifierPolicy.legacyProbe,
+                    onDiskIdentifier:
+                        XDialApplicationIdentifierPolicy.legacyProbe,
                     isInstalledDestination: false
                 )
         )
@@ -365,10 +396,36 @@ final class InstallationTransactionTests: XCTestCase {
             XDialApplicationIdentifierPolicy
                 .shouldUnregisterApplicationRegistration(
                     installedIdentifier:
-                        XDialApplicationIdentifierPolicy.debug,
+                        XDialApplicationIdentifierPolicy.legacyProbe,
                     registeredIdentifier:
                         XDialApplicationIdentifierPolicy.release,
+                    onDiskIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
                     isInstalledDestination: false
+                )
+        )
+        XCTAssertTrue(
+            XDialApplicationIdentifierPolicy
+                .shouldUnregisterApplicationRegistration(
+                    installedIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    registeredIdentifier:
+                        XDialApplicationIdentifierPolicy.legacyProbe,
+                    onDiskIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    isInstalledDestination: false
+                )
+        )
+        XCTAssertFalse(
+            XDialApplicationIdentifierPolicy
+                .shouldUnregisterApplicationRegistration(
+                    installedIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    registeredIdentifier:
+                        XDialApplicationIdentifierPolicy.legacyProbe,
+                    onDiskIdentifier:
+                        XDialApplicationIdentifierPolicy.release,
+                    isInstalledDestination: true
                 )
         )
     }
@@ -382,7 +439,7 @@ final class InstallationTransactionTests: XCTestCase {
             OutgoingApplicationCleanup.plan(
                 existingBundleURL: existingURL,
                 existingIdentifier:
-                    XDialApplicationIdentifierPolicy.debug,
+                    XDialApplicationIdentifierPolicy.legacyProbe,
                 incomingIdentifier:
                     XDialApplicationIdentifierPolicy.release,
                 teamIdentifiersMatch: true
@@ -422,7 +479,7 @@ final class InstallationTransactionTests: XCTestCase {
             OutgoingApplicationCleanup.plan(
                 existingBundleURL: existingURL,
                 existingIdentifier:
-                    XDialApplicationIdentifierPolicy.debug,
+                    XDialApplicationIdentifierPolicy.legacyProbe,
                 incomingIdentifier:
                     XDialApplicationIdentifierPolicy.release,
                 teamIdentifiersMatch: false
@@ -438,7 +495,7 @@ final class InstallationTransactionTests: XCTestCase {
                     isDirectory: true
                 ),
                 existingIdentifier:
-                    XDialApplicationIdentifierPolicy.debug,
+                    XDialApplicationIdentifierPolicy.legacyProbe,
                 incomingIdentifier:
                     XDialApplicationIdentifierPolicy.release,
                 teamIdentifiersMatch: true
@@ -467,7 +524,7 @@ final class InstallationTransactionTests: XCTestCase {
                     isDirectory: true
                 ),
                 existingIdentifier:
-                    XDialApplicationIdentifierPolicy.debug,
+                    XDialApplicationIdentifierPolicy.legacyProbe,
                 incomingIdentifier:
                     XDialApplicationIdentifierPolicy.release,
                 teamIdentifiersMatch: true
@@ -622,7 +679,7 @@ final class InstallationTransactionTests: XCTestCase {
 
         XCTAssertEqual(
             Bundle(url: fixture.destinationURL)?.bundleIdentifier,
-            XDialApplicationIdentifierPolicy.debug
+            XDialApplicationIdentifierPolicy.legacyProbe
         )
 
         try ApplicationBundleReplacer.replace(
@@ -663,7 +720,7 @@ private final class BundleInfoReplacementFixture {
         )
         try Self.writeBundle(
             at: destinationURL,
-            identifier: XDialApplicationIdentifierPolicy.debug
+            identifier: XDialApplicationIdentifierPolicy.legacyProbe
         )
         try Self.writeBundle(
             at: newBundleURL,

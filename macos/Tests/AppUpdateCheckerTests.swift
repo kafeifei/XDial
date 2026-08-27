@@ -232,7 +232,8 @@ final class AppUpdateCheckerTests: XCTestCase {
         )
         XCTAssertFalse(
             AutomaticUpdateBundlePolicy.permits(
-                currentIdentifier: XDialApplicationIdentifierPolicy.debug,
+                currentIdentifier:
+                    XDialApplicationIdentifierPolicy.legacyProbe,
                 currentTeamIdentifier: "TEAM",
                 incomingIdentifier: XDialApplicationIdentifierPolicy.release,
                 incomingTeamIdentifier: "TEAM",

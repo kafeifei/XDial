@@ -142,10 +142,48 @@ struct InstallationView: View {
                     Divider()
                 }
             }
+            if state.requiresSSIDAccess {
+                if !coordinator.report.tasks.isEmpty {
+                    Divider()
+                }
+                ssidAccessTask
+            }
         }
         .padding(.horizontal, 14)
         .background(.quaternary.opacity(0.5))
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var ssidAccessTask: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: ssidAccessSymbol)
+                .foregroundStyle(ssidAccessColor)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(state.tr(
+                    "开启 Wi-Fi 自动切换",
+                    "Enable Automatic Wi-Fi Switching"
+                ))
+                .font(.system(size: 13, weight: .medium))
+                Text(ssidAccessDetail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if state.wifiSSIDAccessState == .ready {
+                Text(state.tr("就绪", "Ready"))
+                    .font(.caption)
+                    .foregroundStyle(XDialPalette.success)
+            } else {
+                Button(ssidAccessActionTitle) {
+                    state.requestSSIDAccess()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 10)
     }
 
     private var uninstallOptions: some View {
@@ -314,6 +352,12 @@ struct InstallationView: View {
                 "Waiting for macOS Approval"
             )
         case .ready:
+            if needsSSIDAccess {
+                return state.tr(
+                    "平台安装已完成",
+                    "Platform Setup Complete"
+                )
+            }
             return state.tr("XDial 已就绪", "XDial Is Ready")
         case .failed:
             return state.tr(
@@ -351,6 +395,12 @@ struct InstallationView: View {
                 "System Settings is open; setup continues after macOS approval."
             )
         case .ready:
+            if needsSSIDAccess {
+                return state.tr(
+                    "后台服务和网络扩展已就绪；Wi-Fi 自动切换尚未开启。",
+                    "The background service and network extension are ready; automatic Wi-Fi switching is not enabled."
+                )
+            }
             return state.tr(
                 "后台服务和网络扩展均来自当前安装包。",
                 "The background service and network extension match this app."
@@ -373,7 +423,9 @@ struct InstallationView: View {
         }
         switch coordinator.report.state {
         case .ready:
-            return "checkmark.shield.fill"
+            return needsSSIDAccess
+                ? ssidAccessSymbol
+                : "checkmark.shield.fill"
         case .failed:
             return "xmark.shield.fill"
         default:
@@ -390,7 +442,9 @@ struct InstallationView: View {
         }
         switch coordinator.report.state {
         case .ready:
-            return XDialPalette.success
+            return needsSSIDAccess
+                ? XDialPalette.warning
+                : XDialPalette.success
         case .failed:
             return XDialPalette.danger
         case .waitingForApproval:
@@ -495,5 +549,67 @@ struct InstallationView: View {
 
     private var isExtensionFailure: Bool {
         coordinator.report.error?.taskID == "system-extension"
+    }
+
+    private var needsSSIDAccess: Bool {
+        state.requiresSSIDAccess && state.wifiSSIDAccessState != .ready
+    }
+
+    private var ssidAccessSymbol: String {
+        switch state.wifiSSIDAccessState {
+        case .permissionRequired:
+            return "location.fill"
+        case .denied, .unavailable:
+            return "location.slash.fill"
+        case .ready:
+            return "checkmark.circle.fill"
+        }
+    }
+
+    private var ssidAccessColor: Color {
+        state.wifiSSIDAccessState == .ready
+            ? XDialPalette.success
+            : XDialPalette.warning
+    }
+
+    private var ssidAccessDetail: String {
+        switch state.wifiSSIDAccessState {
+        case .permissionRequired:
+            return state.tr(
+                "macOS 需要位置权限才会提供当前 Wi-Fi 名称；XDial 只用它匹配场景。",
+                "macOS requires location access to provide the current Wi-Fi name; XDial only uses it to match scenarios."
+            )
+        case .denied:
+            return state.tr(
+                "请在系统设置中允许 XDial 访问位置，否则场景不会随 Wi-Fi 自动切换。",
+                "Allow XDial location access in System Settings, or scenarios cannot switch automatically with Wi-Fi."
+            )
+        case .unavailable:
+            return state.tr(
+                "XDial 暂时无法读取当前 Wi-Fi；场景不会自动切换。",
+                "XDial cannot currently read the active Wi-Fi; scenarios will not switch automatically."
+            )
+        case .ready:
+            return state.tr(
+                "Wi-Fi 自动切换已就绪。",
+                "Automatic Wi-Fi switching is ready."
+            )
+        }
+    }
+
+    private var ssidAccessActionTitle: String {
+        switch state.wifiSSIDAccessState {
+        case .permissionRequired:
+            return state.tr("继续", "Continue")
+        case .denied:
+            return state.tr(
+                "打开定位服务设置",
+                "Open Location Settings"
+            )
+        case .unavailable:
+            return state.tr("重试", "Retry")
+        case .ready:
+            return state.tr("完成", "Done")
+        }
     }
 }

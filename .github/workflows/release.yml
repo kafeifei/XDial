@@ -91,10 +91,18 @@ jobs:
             | /usr/bin/base64 --decode > "$extension_profile"
           test "$(/usr/bin/security cms -D -i "$host_profile" \
             | /usr/bin/plutil -extract Name raw -o - -)" \
-            = "XDial Developer ID Host 2026"
+            = "XDial Developer ID App Host 2026"
+          test "$(/usr/bin/security cms -D -i "$host_profile" \
+            | /usr/bin/plutil -extract \
+              'Entitlements.com\.apple\.application-identifier' raw -o - -)" \
+            = "UVZM439VGU.com.kafeifei.xdial.app"
           test "$(/usr/bin/security cms -D -i "$extension_profile" \
             | /usr/bin/plutil -extract Name raw -o - -)" \
-            = "XDial Developer ID Transparent Proxy"
+            = "XDial Developer ID App Transparent Proxy"
+          test "$(/usr/bin/security cms -D -i "$extension_profile" \
+            | /usr/bin/plutil -extract \
+              'Entitlements.com\.apple\.application-identifier' raw -o - -)" \
+            = "UVZM439VGU.com.kafeifei.xdial.app.transparent-proxy"
           /usr/bin/security find-identity -v -p codesigning "$keychain" \
             | grep -F 'Developer ID Application:'
           echo "SIGNING_KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"

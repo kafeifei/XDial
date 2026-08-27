@@ -2,13 +2,6 @@ import CoreLocation
 import CoreWLAN
 import Foundation
 
-enum WiFiSSIDAccessState: Equatable {
-    case ready
-    case permissionRequired
-    case denied
-    case unavailable
-}
-
 /// SSID 只是宿主控制面的场景触发事实。它不进入 ConnectionPlan，
 /// 不参与 DNS、路由或 Underlay 接口选择。
 final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
@@ -36,30 +29,24 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
         locationManager.delegate = self
     }
 
-    func start(requestAuthorization: Bool) {
-        if !monitoring {
-            client.delegate = self
-            do {
-                try client.startMonitoringEvent(with: .ssidDidChange)
-                try client.startMonitoringEvent(with: .powerDidChange)
-                monitoring = true
-            } catch {
+    /// Start observing and publish the current authorization state. This API
+    /// deliberately cannot request authorization: prompting belongs only to a
+    /// visible, foreground user action.
+    func start() {
+        switch WiFiSSIDAccessPolicy.accessState(
+            for: locationManager.authorizationStatus
+        ) {
+        case .ready:
+            guard startMonitoringIfNeeded() else {
                 emit(ssid: nil, accessState: .unavailable)
                 return
             }
-        }
-
-        switch locationManager.authorizationStatus {
-        case .authorizedAlways:
             scheduleRefresh(delay: 0)
-        case .notDetermined:
+        case .permissionRequired:
             emit(ssid: nil, accessState: .permissionRequired)
-            if requestAuthorization {
-                locationManager.requestWhenInUseAuthorization()
-            }
-        case .denied, .restricted:
+        case .denied:
             emit(ssid: nil, accessState: .denied)
-        @unknown default:
+        case .unavailable:
             emit(ssid: nil, accessState: .unavailable)
         }
     }
@@ -74,8 +61,29 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
         monitoring = false
     }
 
-    func requestAuthorizationAndRefresh() {
-        start(requestAuthorization: true)
+    @discardableResult
+    func requestAuthorizationAndRefresh()
+        -> WiFiSSIDAccessRequestDisposition
+    {
+        let disposition = WiFiSSIDAccessPolicy.requestDisposition(
+            for: locationManager.authorizationStatus
+        )
+        switch disposition {
+        case .refreshed:
+            guard startMonitoringIfNeeded() else {
+                emit(ssid: nil, accessState: .unavailable)
+                return .unavailable
+            }
+            scheduleRefresh(delay: 0)
+        case .authorizationRequested:
+            emit(ssid: nil, accessState: .permissionRequired)
+            locationManager.requestWhenInUseAuthorization()
+        case .openSystemSettings:
+            emit(ssid: nil, accessState: .denied)
+        case .unavailable:
+            emit(ssid: nil, accessState: .unavailable)
+        }
+        return disposition
     }
 
     /// Synchronously sample the SSID at a network-epoch settle point. Updating
@@ -85,7 +93,9 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
         ssid: String?,
         accessState: WiFiSSIDAccessState
     )? {
-        guard locationManager.authorizationStatus == .authorizedAlways else {
+        guard WiFiSSIDAccessPolicy.accessState(
+            for: locationManager.authorizationStatus
+        ) == .ready else {
             return nil
         }
         let normalizedSSID = readCurrentSSID().flatMap {
@@ -99,7 +109,7 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     func locationManagerDidChangeAuthorization(
         _ manager: CLLocationManager
     ) {
-        start(requestAuthorization: false)
+        start()
     }
 
     func ssidDidChangeForWiFiInterface(withName interfaceName: String) {
@@ -137,8 +147,9 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     }
 
     private func refresh() {
-        guard locationManager.authorizationStatus == .authorizedAlways
-        else {
+        guard WiFiSSIDAccessPolicy.accessState(
+            for: locationManager.authorizationStatus
+        ) == .ready else {
             return
         }
         emit(
@@ -162,13 +173,37 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
         accessState: WiFiSSIDAccessState
     ) {
         let normalizedSSID = ssid.flatMap { $0.isEmpty ? nil : $0 }
+        let accessStateChanged = accessState != lastAccessState
         guard normalizedSSID != lastSSID || accessState != lastAccessState else {
             return
         }
         lastSSID = normalizedSSID
         lastAccessState = accessState
+        if accessStateChanged {
+            appLog("Wi-Fi SSID access state=\(accessState.logValue)")
+        }
         DispatchQueue.main.async { [onUpdate] in
             onUpdate(normalizedSSID, accessState)
         }
+    }
+
+    private func startMonitoringIfNeeded() -> Bool {
+        guard !monitoring else { return true }
+        client.delegate = self
+        do {
+            try client.startMonitoringEvent(with: .ssidDidChange)
+        } catch {
+            client.delegate = nil
+            return false
+        }
+        do {
+            try client.startMonitoringEvent(with: .powerDidChange)
+        } catch {
+            try? client.stopMonitoringEvent(with: .ssidDidChange)
+            client.delegate = nil
+            return false
+        }
+        monitoring = true
+        return true
     }
 }

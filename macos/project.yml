@@ -17,16 +17,12 @@ settings:
     # and monotonically increasing build number.
     MARKETING_VERSION: "0.0.0"
     CURRENT_PROJECT_VERSION: "1"
-  configs:
-    Debug:
-      XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
-      XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.settings-ui
-    FormalDevelopment:
-      XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.transparent-proxy
-      XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.settings-ui
-    Release:
-      XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.transparent-proxy
-      XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.settings-ui
+    # Bundle identity is a product invariant, not a build-configuration knob.
+    # Debug differs only in code and signing so permissions and macOS-owned
+    # state remain attached to the one XDial identity.
+    XDIAL_APPLICATION_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app
+    XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.transparent-proxy
+    XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.settings-ui
 
 targets:
   XDialTransparentProxy:
@@ -53,22 +49,19 @@ targets:
         # match its bundle identifier exactly. PRODUCT_NAME controls the
         # outer .systemextension filename.
         PRODUCT_NAME: "$(PRODUCT_BUNDLE_IDENTIFIER)"
+        PRODUCT_BUNDLE_IDENTIFIER: "$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)"
         ENABLE_APP_SANDBOX: YES
       configs:
         Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe.extension
-          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
-          PROVISIONING_PROFILE_SPECIFIER: XDial Debug Extension Both Macs 2026
           CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxy.entitlements
         FormalDevelopment:
-          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.transparent-proxy
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
           CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxy.entitlements
           ENABLE_HARDENED_RUNTIME: YES
         Release:
-          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.transparent-proxy
           CODE_SIGN_STYLE: Manual
           CODE_SIGN_IDENTITY: Developer ID Application
           PROVISIONING_PROFILE_SPECIFIER: XDial Developer ID App Transparent Proxy
@@ -111,7 +104,7 @@ targets:
         SKIP_INSTALL: YES
       configs:
         Debug:
-          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
         FormalDevelopment:
           CODE_SIGN_STYLE: Automatic
@@ -156,22 +149,19 @@ targets:
     settings:
       base:
         PRODUCT_NAME: XDial
+        PRODUCT_BUNDLE_IDENTIFIER: "$(XDIAL_APPLICATION_BUNDLE_IDENTIFIER)"
         ENABLE_USER_SCRIPT_SANDBOXING: NO
       configs:
         Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.ne-probe
-          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
-          PROVISIONING_PROFILE_SPECIFIER: XDial Debug Host Both Macs 2026
           CODE_SIGN_ENTITLEMENTS: XDial.entitlements
         FormalDevelopment:
-          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
           CODE_SIGN_ENTITLEMENTS: XDial.entitlements
           ENABLE_HARDENED_RUNTIME: YES
         Release:
-          PRODUCT_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app
           CODE_SIGN_STYLE: Manual
           CODE_SIGN_IDENTITY: Developer ID Application
           PROVISIONING_PROFILE_SPECIFIER: XDial Developer ID App Host 2026
@@ -238,12 +228,8 @@ targets:
           extension_source="${BUILT_PRODUCTS_DIR}/${extension_name}"
           extension_dir="${TARGET_BUILD_DIR}/${SYSTEM_EXTENSIONS_FOLDER_PATH}"
           test -d "${extension_source}"
+          rm -rf "${extension_dir}"
           mkdir -p "${extension_dir}"
-          rm -rf \
-            "${extension_dir}/XDialTransparentProxy.systemextension" \
-            "${extension_dir}/com.kafeifei.xdial.ne-probe.extension.systemextension" \
-            "${extension_dir}/com.kafeifei.xdial.transparent-proxy.systemextension" \
-            "${extension_dir}/com.kafeifei.xdial.app.transparent-proxy.systemextension"
           /usr/bin/ditto \
             "${extension_source}" \
             "${extension_dir}/${extension_name}"
@@ -313,6 +299,7 @@ targets:
       - Sources/XDial/RotaryDial.swift
       - Sources/XDial/ScenarioIconCatalog.swift
       - Sources/XDial/ScenarioGridLayout.swift
+      - Sources/XDial/WiFiSSIDAccessPolicy.swift
       - Sources/XDial/XDialBrandPalette.swift
       - TransparentProxyExtension/ConnectionTransactionReporter.swift
     settings:
