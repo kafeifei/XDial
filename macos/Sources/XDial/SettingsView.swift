@@ -442,6 +442,7 @@ struct SettingsView: View {
 
 struct GeneralTab: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         ScrollView {
@@ -575,6 +576,34 @@ struct GeneralTab: View {
                         .controlSize(.small)
                     }
                 }
+
+                SettingsPanel {
+                    HStack(spacing: 8) {
+                        Image(systemName: "info.circle.fill")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Color.secondary.opacity(0.82))
+                            .frame(width: 18, height: 18)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(state.tr("版本", "Version"))
+                                .font(.system(size: 12, weight: .semibold))
+                            Text(appVersionText)
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        Button {
+                            presentUpdateWindow()
+                        } label: {
+                            Label(
+                                state.tr("检查更新", "Check for Updates"),
+                                systemImage: "arrow.triangle.2.circlepath"
+                            )
+                            .font(.system(size: 11.5))
+                        }
+                        .controlSize(.small)
+                    }
+                }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
@@ -621,6 +650,25 @@ struct GeneralTab: View {
             return XDialPalette.danger
         }
         return XDialPalette.progress
+    }
+
+    /// 只读展示当前安装的版本，不参与更新状态机；候选版本与更新进度
+    /// 仍然只由更新窗口和菜单栏消费同一份 update candidate。
+    private var appVersionText: String {
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "?"
+        let build = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String ?? "?"
+        return "v\(version) (build \(build))"
+    }
+
+    private func presentUpdateWindow() {
+        ApplicationWindowLifecycleController.shared
+            .prepareToPresentUpdateWindow()
+        openWindow(id: "update")
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
