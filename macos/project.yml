@@ -139,6 +139,7 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSSystemExtensionUsageDescription: XDial 使用网络扩展将线路、规则和场景交给 sing-box 统一执行。
+        NSLocationUsageDescription: XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。
         NSLocationWhenInUseUsageDescription: XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。
         UTExportedTypeDeclarations:
           - UTTypeIdentifier: com.kafeifei.xdial.app.settings-entry

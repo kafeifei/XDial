@@ -39,6 +39,41 @@ assert_setting() {
         || fail "$configuration/$target uses '$actual', expected '$expected'"
 }
 
+assert_build_setting() {
+    local configuration="$1"
+    local target="$2"
+    local key="$3"
+    local expected="$4"
+    local actual
+
+    actual="$(build_setting "$configuration" "$target" "$key")"
+    [[ "$actual" == "$expected" ]] \
+        || fail "$configuration/$target $key is '$actual', expected '$expected'"
+}
+
+assert_plist_boolean() {
+    local plist="$1"
+    local key="$2"
+    local actual
+
+    [[ -f "$plist" ]] || fail "missing plist: $plist"
+    actual="$(/usr/bin/plutil -extract "$key" raw -o - "$plist" 2>/dev/null \
+        || true)"
+    [[ "$actual" == true ]] \
+        || fail "$plist is missing required boolean entitlement $key"
+}
+
+assert_plist_nonempty() {
+    local plist="$1"
+    local key="$2"
+    local actual
+
+    [[ -f "$plist" ]] || fail "missing plist: $plist"
+    actual="$(/usr/bin/plutil -extract "$key" raw -o - "$plist" 2>/dev/null \
+        || true)"
+    [[ -n "$actual" ]] || fail "$plist is missing required key $key"
+}
+
 [[ -f "$project_path/project.pbxproj" ]] \
     || fail "generated Xcode project is missing: $project_path"
 
@@ -49,4 +84,17 @@ for configuration in Debug FormalDevelopment Release; do
         "$configuration" XDialTransparentProxy "$extension_identifier"
 done
 
-echo "macOS identity contract verified for Debug, FormalDevelopment, and Release"
+for configuration in Debug FormalDevelopment; do
+    assert_build_setting \
+        "$configuration" XDial CODE_SIGN_ENTITLEMENTS XDial.entitlements
+done
+assert_build_setting \
+    Release XDial CODE_SIGN_ENTITLEMENTS XDialRelease.entitlements
+
+assert_plist_boolean macos/XDial.entitlements \
+    'com\.apple\.security\.personal-information\.location'
+assert_plist_boolean macos/XDialRelease.entitlements \
+    'com\.apple\.security\.personal-information\.location'
+assert_plist_nonempty macos/Info.plist NSLocationUsageDescription
+
+echo "macOS identity and location-access contract verified for Debug, FormalDevelopment, and Release"

@@ -105,6 +105,15 @@ assert_plist_value() {
         || fail "$plist $key is '$actual', expected '$expected'"
 }
 
+assert_plist_nonempty() {
+    local plist="$1"
+    local key="$2"
+    local actual
+    [[ -f "$plist" ]] || fail "missing Info.plist: $plist"
+    actual="$(plist_value "$plist" "$key")"
+    [[ -n "$actual" ]] || fail "$plist $key must not be empty"
+}
+
 assert_developer_id_signature() {
     local path="$1"
     local expected_identifier="$2"
@@ -130,6 +139,19 @@ assert_get_task_allow_absent() {
         | grep -qx true; then
         fail "$path contains the forbidden get-task-allow entitlement"
     fi
+}
+
+assert_location_entitlement() {
+    local path="$1"
+    local entitlements actual
+    entitlements="$(/usr/bin/codesign -d --entitlements :- "$path" 2>/dev/null \
+        || true)"
+    actual="$(printf '%s' "$entitlements" \
+        | /usr/bin/plutil -extract \
+            'com\.apple\.security\.personal-information\.location' \
+            raw -o - - 2>/dev/null || true)"
+    [[ "$actual" == true ]] \
+        || fail "$path is missing the required location entitlement"
 }
 
 verify_app() {
@@ -158,6 +180,8 @@ verify_app() {
 
     assert_plist_value "$app_path/Contents/Info.plist" CFBundleIdentifier \
         "$RELEASE_APPLICATION_IDENTIFIER"
+    assert_plist_nonempty "$app_path/Contents/Info.plist" \
+        NSLocationUsageDescription
     assert_plist_value "$settings_path/Contents/Info.plist" CFBundleIdentifier \
         "$RELEASE_SETTINGS_IDENTIFIER"
     assert_plist_value "$extension_path/Contents/Info.plist" CFBundleIdentifier \
@@ -178,6 +202,7 @@ verify_app() {
     assert_developer_id_signature "$settings_path" "$RELEASE_SETTINGS_IDENTIFIER"
     assert_developer_id_signature "$extension_path" "$RELEASE_EXTENSION_IDENTIFIER"
     assert_developer_id_signature "$app_path" "$RELEASE_APPLICATION_IDENTIFIER"
+    assert_location_entitlement "$app_path"
     assert_get_task_allow_absent "$app_path"
     assert_get_task_allow_absent "$extension_path"
     /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
