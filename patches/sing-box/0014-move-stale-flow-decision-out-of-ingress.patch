@@ -1,0 +1,269 @@
+--- a/option/simple.go
++++ b/option/simple.go
+@@ -7,10 +7,9 @@
+ 
+ type SocksInboundOptions struct {
+ 	ListenOptions
+-	Users                         []auth.User           `json:"users,omitempty"`
+-	DomainResolver                *DomainResolveOptions `json:"domain_resolver,omitempty"`
+-	XDialFlowMetadata             bool                  `json:"xdial_flow_metadata,omitempty"`
+-	XDialReresolveIPv6FlowDomains bool                  `json:"xdial_reresolve_ipv6_flow_domains,omitempty"`
++	Users             []auth.User           `json:"users,omitempty"`
++	DomainResolver    *DomainResolveOptions `json:"domain_resolver,omitempty"`
++	XDialFlowMetadata bool                  `json:"xdial_flow_metadata,omitempty"`
+ }
+ 
+ type HTTPMixedInboundOptions struct {
+--- a/protocol/socks/inbound.go
++++ b/protocol/socks/inbound.go
+@@ -28,13 +28,12 @@
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+-	router                        adapter.ConnectionRouterEx
+-	logger                        logger.ContextLogger
+-	listener                      *listener.Listener
+-	authenticator                 *auth.Authenticator
+-	udpTimeout                    time.Duration
+-	xdialFlowMetadata             bool
+-	xdialReresolveIPv6FlowDomains bool
++	router            adapter.ConnectionRouterEx
++	logger            logger.ContextLogger
++	listener          *listener.Listener
++	authenticator     *auth.Authenticator
++	udpTimeout        time.Duration
++	xdialFlowMetadata bool
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SocksInboundOptions) (adapter.Inbound, error) {
+@@ -45,13 +44,12 @@
+ 		udpTimeout = C.UDPTimeout
+ 	}
+ 	inbound := &Inbound{
+-		Adapter:                       inbound.NewAdapter(C.TypeSOCKS, tag),
+-		router:                        uot.NewRouter(router, logger),
+-		logger:                        logger,
+-		authenticator:                 auth.NewAuthenticator(options.Users),
+-		udpTimeout:                    udpTimeout,
+-		xdialFlowMetadata:             options.XDialFlowMetadata,
+-		xdialReresolveIPv6FlowDomains: options.XDialReresolveIPv6FlowDomains,
++		Adapter:           inbound.NewAdapter(C.TypeSOCKS, tag),
++		router:            uot.NewRouter(router, logger),
++		logger:            logger,
++		authenticator:     auth.NewAuthenticator(options.Users),
++		udpTimeout:        udpTimeout,
++		xdialFlowMetadata: options.XDialFlowMetadata,
+ 	}
+ 	inbound.listener = listener.New(listener.Options{
+ 		Context:           ctx,
+@@ -90,10 +88,7 @@
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	if h.xdialFlowMetadata {
+-		encoded, err := applyXDialFlowMetadata(
+-			&metadata,
+-			h.xdialReresolveIPv6FlowDomains,
+-		)
++		encoded, err := applyXDialFlowMetadata(&metadata)
+ 		if encoded && err != nil {
+ 			N.CloseOnHandshakeFailure(conn, onClose, err)
+ 			h.logger.ErrorContext(ctx, "reject invalid XDial flow metadata")
+@@ -115,10 +110,7 @@
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	if h.xdialFlowMetadata {
+-		encoded, err := applyXDialFlowMetadata(
+-			&metadata,
+-			h.xdialReresolveIPv6FlowDomains,
+-		)
++		encoded, err := applyXDialFlowMetadata(&metadata)
+ 		if encoded && err != nil {
+ 			N.CloseOnHandshakeFailure(conn, onClose, err)
+ 			h.logger.ErrorContext(ctx, "reject invalid XDial flow metadata")
+--- a/protocol/socks/xdial_flow_metadata.go
++++ b/protocol/socks/xdial_flow_metadata.go
+@@ -19,26 +19,16 @@
+ 
+ const xdialBoundInterfaceFlag = byte(1 << 2)
+ 
+-// applyXDialFlowMetadata decodes the authenticated loopback relay's bounded SOCKS
+-// destination envelope. Normally the original domain remains rule metadata while
+-// the already-resolved NE endpoint stays the transport destination. When the
+-// transaction proved Direct IPv6 unusable, an IPv6 endpoint carrying a trusted
+-// hostname becomes a domain destination again so the current Scenario-owned
+-// resolver can replace an application's stale AAAA result.
+-func applyXDialFlowMetadata(
+-	metadata *adapter.InboundContext,
+-	reresolveIPv6Domains bool,
+-) (bool, error) {
++// applyXDialFlowMetadata validates the authenticated loopback relay's bounded
++// SOCKS destination envelope and preserves both the original IP endpoint and
++// trusted hostname. The matched route resolve action owns any family fallback.
++func applyXDialFlowMetadata(metadata *adapter.InboundContext) (bool, error) {
+ 	if !metadata.Destination.IsDomain() {
+ 		return false, nil
+ 	}
+ 	raw := []byte(metadata.Destination.Fqdn)
+ 	if bytes.HasPrefix(raw, xdialBoundFlowMetadataMagic) {
+-		return true, applyXDialBoundFlowMetadata(
+-			metadata,
+-			raw,
+-			reresolveIPv6Domains,
+-		)
++		return true, applyXDialBoundFlowMetadata(metadata, raw)
+ 	}
+ 	if !bytes.HasPrefix(raw, xdialFlowMetadataMagic) {
+ 		return false, nil
+@@ -81,21 +72,13 @@
+ 	port := metadata.Destination.Port
+ 	metadata.Domain = hostname
+ 	metadata.XDialOriginalDestinationDomain = hostname
+-	if reresolveIPv6Domains && address.Is6() {
+-		metadata.Destination = M.Socksaddr{
+-			Fqdn: hostname,
+-			Port: port,
+-		}
+-	} else {
+-		metadata.Destination = M.SocksaddrFrom(address, port)
+-	}
++	metadata.Destination = M.SocksaddrFrom(address, port)
+ 	return true, nil
+ }
+ 
+ func applyXDialBoundFlowMetadata(
+ 	metadata *adapter.InboundContext,
+ 	raw []byte,
+-	reresolveIPv6Domains bool,
+ ) error {
+ 	offset := len(xdialBoundFlowMetadataMagic)
+ 	if len(raw) <= offset {
+@@ -190,13 +173,6 @@
+ 	port := metadata.Destination.Port
+ 	metadata.Domain = hostname
+ 	metadata.XDialOriginalDestinationDomain = hostname
+-	if reresolveIPv6Domains && hostname != "" && address.Is6() {
+-		metadata.Destination = M.Socksaddr{
+-			Fqdn: hostname,
+-			Port: port,
+-		}
+-	} else {
+-		metadata.Destination = M.SocksaddrFrom(address, port)
+-	}
++	metadata.Destination = M.SocksaddrFrom(address, port)
+ 	return nil
+ }
+--- a/protocol/socks/xdial_flow_metadata_test.go
++++ b/protocol/socks/xdial_flow_metadata_test.go
+@@ -30,10 +30,11 @@
+ 		},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata, false)
++	encoded, err := applyXDialFlowMetadata(&metadata)
+ 	require.NoError(t, err)
+ 	require.True(t, encoded)
+ 	require.Equal(t, "mbp128k", metadata.Domain)
++	require.Equal(t, "mbp128k", metadata.XDialOriginalDestinationDomain)
+ 	require.Equal(t, netip.MustParseAddr("100.117.141.16"), metadata.Destination.Addr)
+ 	require.Equal(t, uint16(22), metadata.Destination.Port)
+ 	require.Empty(t, metadata.Destination.Fqdn)
+@@ -48,10 +49,11 @@
+ 		},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata, false)
++	encoded, err := applyXDialFlowMetadata(&metadata)
+ 	require.NoError(t, err)
+ 	require.True(t, encoded)
+ 	require.Equal(t, "node.example.ts.net", metadata.Domain)
++	require.Equal(t, "node.example.ts.net", metadata.XDialOriginalDestinationDomain)
+ 	require.Equal(t, address, metadata.Destination.Addr)
+ }
+ 
+@@ -60,7 +62,7 @@
+ 		Destination: M.Socksaddr{Fqdn: "example.com", Port: 443},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata, true)
++	encoded, err := applyXDialFlowMetadata(&metadata)
+ 	require.NoError(t, err)
+ 	require.False(t, encoded)
+ 	require.Empty(t, metadata.Domain)
+@@ -75,13 +77,13 @@
+ 		},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata, true)
++	encoded, err := applyXDialFlowMetadata(&metadata)
+ 	require.Error(t, err)
+ 	require.True(t, encoded)
+ 	require.Empty(t, metadata.Domain)
+ }
+ 
+-func TestXDialFlowMetadataReresolvesAttributedIPv6Destination(t *testing.T) {
++func TestXDialFlowMetadataDefersAddressFamilyDecisionToRoute(t *testing.T) {
+ 	address := netip.MustParseAddr("2001:db8::10")
+ 	metadata := adapter.InboundContext{
+ 		Destination: M.Socksaddr{
+@@ -94,12 +96,13 @@
+ 		},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata, true)
++	encoded, err := applyXDialFlowMetadata(&metadata)
+ 	require.NoError(t, err)
+ 	require.True(t, encoded)
+ 	require.Equal(t, "video.example", metadata.Domain)
+-	require.Equal(t, "video.example", metadata.Destination.Fqdn)
+-	require.False(t, metadata.Destination.Addr.IsValid())
++	require.Equal(t, "video.example", metadata.XDialOriginalDestinationDomain)
++	require.Equal(t, address, metadata.Destination.Addr)
++	require.Empty(t, metadata.Destination.Fqdn)
+ 	require.Equal(t, uint16(443), metadata.Destination.Port)
+ }
+ 
+@@ -142,7 +145,7 @@
+ 		},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata, false)
++	encoded, err := applyXDialFlowMetadata(&metadata)
+ 	require.NoError(t, err)
+ 	require.True(t, encoded)
+ 	require.Equal(t, "en0", metadata.XDialBoundInterface)
+@@ -159,7 +162,7 @@
+ 		Destination: M.Socksaddr{Fqdn: string(raw)},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata, false)
++	encoded, err := applyXDialFlowMetadata(&metadata)
+ 	require.NoError(t, err)
+ 	require.True(t, encoded)
+ 	require.Equal(t, "en0", metadata.XDialBoundInterface)
+@@ -179,7 +182,7 @@
+ 		},
+ 	}
+ 
+-	encoded, err := applyXDialFlowMetadata(&metadata, false)
++	encoded, err := applyXDialFlowMetadata(&metadata)
+ 	require.Error(t, err)
+ 	require.True(t, encoded)
+ 	require.Empty(t, metadata.XDialBoundInterface)
+--- a/route/route.go
++++ b/route/route.go
+@@ -899,6 +899,15 @@
+ 		if err != nil {
+ 			return err
+ 		}
++		if metadata.Destination.IsIP() {
++			metadata.RouteOriginalDestination = metadata.Destination
++			metadata.Destination = M.Socksaddr{
++				Fqdn: queryDomain,
++				Port: metadata.Destination.Port,
++			}
++			metadata.Domain = queryDomain
++			metadata.IPVersion = 0
++		}
+ 		metadata.DestinationAddresses = addresses
+ 		r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.DestinationAddresses), " "), "]")
+ 	}

@@ -37,6 +37,8 @@ const (
 	mobileDispatcherDNSTag        = "xdial-mobile-dns"
 	transparentSystemDNSTag       = "xdial-system-dns"
 	transparentEnterpriseDNSTag   = "xdial-anyconnect-dns"
+	transparentProxyDoHIPv4Server = "1.1.1.1"
+	transparentProxyDoHIPv6Server = "2606:4700:4700::1111"
 	// TransparentNativeDNSTag is exported so isolated Direct RuleSet refresh
 	// sessions use the same macOS-native resolver contract as Direct traffic.
 	TransparentNativeDNSTag       = "xdial-native-dns"
@@ -138,10 +140,31 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 }
 
 type transparentProxyIngress struct {
-	port                int
-	username            string
-	password            string
-	directIPv6Available bool
+	port          int
+	username      string
+	password      string
+	addressFamily transparentProxyAddressFamilyPolicy
+}
+
+// LineAddressFamilyCapability is one Provider-measured, transaction-scoped
+// Line capability. It is intentionally absent from Profile: a network epoch
+// change invalidates the measurement without changing the user's Line.
+type LineAddressFamilyCapability struct {
+	IPv4Available bool `json:"ipv4_available"`
+	IPv6Available bool `json:"ipv6_available"`
+}
+
+// TransparentProxyLineCapabilities carries the address-family measurements
+// for the active ConnectionPlan, keyed by the stable Line ID rather than a
+// generated outbound tag.
+type TransparentProxyLineCapabilities map[string]LineAddressFamilyCapability
+
+type transparentProxyAddressFamilyPolicy struct {
+	strategiesByLineID map[string]string
+}
+
+func (policy transparentProxyAddressFamilyPolicy) strategy(lineID string) string {
+	return policy.strategiesByLineID[lineID]
 }
 
 // GenerateSingBoxTransparentProxy 生成 macOS Transparent Proxy 扩展内的配置。
@@ -168,10 +191,9 @@ func GenerateSingBoxTransparentProxy(
 }
 
 // GenerateSingBoxTransparentProxyWithCapabilities compiles facts measured by
-// the Provider before Commit into the same DNS/route data plane. IPv4-only is
-// a valid Direct capability: names owned by Direct then stop advertising AAAA,
-// while resolvers owned by VPN/proxy/Tailscale Lines keep their own address-
-// family view.
+// older Providers that only measured Direct. Active non-Direct Lines retain
+// their historical dual-stack behavior until the caller adopts the Line-keyed
+// API below.
 func GenerateSingBoxTransparentProxyWithCapabilities(
 	profile *Profile,
 	listenPort int,
@@ -182,6 +204,32 @@ func GenerateSingBoxTransparentProxyWithCapabilities(
 	systemDNS []string,
 	directIPv6Available bool,
 ) ([]byte, error) {
+	capabilities := legacyTransparentProxyLineCapabilities(profile, directIPv6Available)
+	return GenerateSingBoxTransparentProxyWithLineCapabilities(
+		profile,
+		listenPort,
+		username,
+		password,
+		basePath,
+		underlayInterface,
+		systemDNS,
+		capabilities,
+	)
+}
+
+// GenerateSingBoxTransparentProxyWithLineCapabilities compiles immutable
+// address-family facts measured for this exact connection transaction into
+// the DNS and route data plane. Every active Line must have one measurement.
+func GenerateSingBoxTransparentProxyWithLineCapabilities(
+	profile *Profile,
+	listenPort int,
+	username string,
+	password string,
+	basePath string,
+	underlayInterface string,
+	systemDNS []string,
+	capabilities TransparentProxyLineCapabilities,
+) ([]byte, error) {
 	if listenPort < 1 || listenPort > 65535 {
 		return nil, fmt.Errorf("transparent proxy listen port is invalid")
 	}
@@ -189,6 +237,10 @@ func GenerateSingBoxTransparentProxyWithCapabilities(
 	password = strings.TrimSpace(password)
 	if username == "" || password == "" || len(username) > 255 || len(password) > 255 {
 		return nil, fmt.Errorf("transparent proxy session credentials are invalid")
+	}
+	addressFamily, err := compileTransparentProxyAddressFamilyPolicy(profile, capabilities)
+	if err != nil {
+		return nil, err
 	}
 	return generateSingBox(
 		profile,
@@ -200,12 +252,118 @@ func GenerateSingBoxTransparentProxyWithCapabilities(
 		systemDNS,
 		underlayInterface,
 		&transparentProxyIngress{
-			port:                listenPort,
-			username:            username,
-			password:            password,
-			directIPv6Available: directIPv6Available,
+			port:          listenPort,
+			username:      username,
+			password:      password,
+			addressFamily: addressFamily,
 		},
 	)
+}
+
+func legacyTransparentProxyLineCapabilities(
+	profile *Profile,
+	directIPv6Available bool,
+) TransparentProxyLineCapabilities {
+	capabilities := TransparentProxyLineCapabilities{
+		builtinDirectLineID: {
+			IPv4Available: true,
+			IPv6Available: directIPv6Available,
+		},
+	}
+	if profile == nil {
+		return capabilities
+	}
+	scenario := profile.ActiveScenario()
+	if scenario == nil {
+		return capabilities
+	}
+	activeLineIDs, _ := effectiveActiveTargetIDs(profile, scenario)
+	for lineID := range activeLineIDs {
+		if lineID == "" || lineID == builtinDirectLineID {
+			continue
+		}
+		capabilities[lineID] = LineAddressFamilyCapability{
+			IPv4Available: true,
+			IPv6Available: true,
+		}
+	}
+	return capabilities
+}
+
+func compileTransparentProxyAddressFamilyPolicy(
+	profile *Profile,
+	capabilities TransparentProxyLineCapabilities,
+) (transparentProxyAddressFamilyPolicy, error) {
+	policy := transparentProxyAddressFamilyPolicy{
+		strategiesByLineID: make(map[string]string),
+	}
+	if err := ValidateTransparentProxyLineCapabilities(capabilities); err != nil {
+		return policy, err
+	}
+	strategies := make(map[string]string, len(capabilities))
+	for lineID, capability := range capabilities {
+		strategy, _ := transparentProxyAddressFamilyStrategy(capability)
+		strategies[lineID] = strategy
+	}
+	plan, err := BuildConnectionPlan(profile)
+	if err != nil {
+		return policy, err
+	}
+	for _, task := range plan.Tasks {
+		if task.Kind != ConnectionTaskLine {
+			continue
+		}
+		lineID := strings.TrimSpace(task.ResourceID)
+		strategy, ok := strategies[lineID]
+		if !ok {
+			return policy, fmt.Errorf(
+				"transparent proxy active Line %q is missing an address-family capability",
+				lineID,
+			)
+		}
+		policy.strategiesByLineID[lineID] = strategy
+	}
+	return policy, nil
+}
+
+// ValidateTransparentProxyLineCapabilities validates the transport-neutral
+// JSON contract before a concrete traffic or RuleSet-bootstrap profile is
+// selected. Whether every active Line is present is checked while compiling
+// that concrete profile.
+func ValidateTransparentProxyLineCapabilities(
+	capabilities TransparentProxyLineCapabilities,
+) error {
+	if capabilities == nil {
+		return fmt.Errorf("transparent proxy Line address-family capabilities are unavailable")
+	}
+	for lineID, capability := range capabilities {
+		if strings.TrimSpace(lineID) == "" {
+			return fmt.Errorf("transparent proxy Line address-family capability has an empty Line ID")
+		}
+		if lineID == builtinDirectLineID && !capability.IPv4Available {
+			return fmt.Errorf("transparent proxy pure IPv6 Direct capability is unsupported")
+		}
+		_, err := transparentProxyAddressFamilyStrategy(capability)
+		if err != nil {
+			return fmt.Errorf("transparent proxy Line %q address-family capability: %w", lineID, err)
+		}
+	}
+	return nil
+}
+
+func transparentProxyAddressFamilyStrategy(
+	capability LineAddressFamilyCapability,
+) (string, error) {
+	switch {
+	case capability.IPv4Available && capability.IPv6Available:
+		return "", nil
+	case capability.IPv4Available:
+		return "ipv4_only", nil
+	case capability.IPv6Available:
+		return "ipv6_only", nil
+	default:
+		return "", fmt.Errorf("neither IPv4 nor IPv6 is available")
+	}
 }
 
 func generateSingBox(
@@ -260,10 +418,13 @@ func generateSingBox(
 	}
 
 	directOutbound := map[string]interface{}{"type": "direct", "tag": "direct"}
-	if platform.isTransparentProxy() && !transparentIngress.directIPv6Available {
-		directOutbound["domain_resolver"] = map[string]interface{}{
-			"server":   TransparentNativeDNSTag,
-			"strategy": "ipv4_only",
+	if platform.isTransparentProxy() {
+		strategy := transparentIngress.addressFamily.strategy(builtinDirectLineID)
+		if strategy != "" {
+			directOutbound["domain_resolver"] = map[string]interface{}{
+				"server":   TransparentNativeDNSTag,
+				"strategy": strategy,
+			}
 		}
 	}
 	outbounds := []map[string]interface{}{directOutbound}
@@ -420,6 +581,7 @@ func generateSingBox(
 			subTagMap,
 			validTags,
 			transparentIngress.username,
+			transparentIngress.addressFamily,
 		)
 	}
 
@@ -484,15 +646,18 @@ func generateSingBox(
 	// inspectScenarioReferences 里报错拒绝；这里能走到 direct 的只剩用户显式禁用
 	// 对象的 INV6b 语义，并且已经产生对应 ProfileWarning。
 	defaultTag := "direct"
+	defaultLineID := builtinDirectLineID
 	if scenario.DefaultSubscriptionID != "" {
 		if tag, ok := subTagMap[scenario.DefaultSubscriptionID]; ok && validTags[tag] {
 			defaultTag = tag
+			defaultLineID = ""
 		}
 	} else if scenario.DefaultLineID != "" {
 		if l := profile.FindLine(scenario.DefaultLineID); l != nil && l.Enabled {
 			candidate := resolveOutboundTag(l)
 			if validTags[candidate] {
 				defaultTag = candidate
+				defaultLineID = l.ID
 			}
 		}
 	}
@@ -502,13 +667,14 @@ func generateSingBox(
 	// 这里再从默认线路的解析视角求值，避免把 Underlay DNS 的地址带到另一个
 	// 出口。direct 的默认 resolver 本来就是 Underlay 系统 DNS。
 	if platform.isTransparentProxy() {
-		routeRules = append(routeRules, map[string]interface{}{
+		defaultResolve := map[string]interface{}{
 			"action": "resolve",
 			"server": transparentProxyResolverForOutbound(defaultTag),
-		})
-		if !transparentIngress.directIPv6Available {
-			applyTransparentProxyDirectIPv4OnlyRouteRules(routeRules)
 		}
+		if strategy := transparentIngress.addressFamily.strategy(defaultLineID); strategy != "" {
+			defaultResolve["strategy"] = strategy
+		}
+		routeRules = append(routeRules, defaultResolve)
 	}
 
 	route := map[string]interface{}{
@@ -557,7 +723,8 @@ func generateSingBox(
 			defaultTag,
 			needsProxyEndpointBootstrap,
 			transparentIngress.username,
-			transparentIngress.directIPv6Available,
+			defaultLineID,
+			transparentIngress.addressFamily,
 		)
 		if dnsErr != nil {
 			return nil, dnsErr
@@ -625,9 +792,6 @@ func buildTransparentProxyInbound(
 		"listen_port":         ingress.port,
 		"xdial_flow_metadata": true,
 		"users":               users,
-	}
-	if !ingress.directIPv6Available {
-		inbound["xdial_reresolve_ipv6_flow_domains"] = true
 	}
 	return inbound, nil
 }
@@ -1128,7 +1292,8 @@ func buildTransparentProxyDNS(
 	defaultOutboundTag string,
 	needsProxyEndpointBootstrap bool,
 	baseUsername string,
-	directIPv6Available bool,
+	defaultLineID string,
+	addressFamily transparentProxyAddressFamilyPolicy,
 ) (map[string]interface{}, error) {
 	primarySystemDNS, err := validateTransparentProxySystemDNS(systemDNS)
 	if err != nil {
@@ -1171,7 +1336,7 @@ func buildTransparentProxyDNS(
 		rules = append(rules, buildTailnetHostsDNSRules(serverTag)...)
 	}
 
-	ensureResolver := func(resolverTag, outTag string) {
+	ensureResolver := func(resolverTag, outTag, addressFamilyStrategy string) {
 		if seenResolver[resolverTag] {
 			return
 		}
@@ -1183,12 +1348,22 @@ func buildTransparentProxyDNS(
 				"tag":  resolverTag,
 			})
 		default:
-			servers = append(servers, map[string]interface{}{
+			server := transparentProxyDoHIPv4Server
+			resolver := map[string]interface{}{
 				"type":   "https",
 				"tag":    resolverTag,
-				"server": "1.1.1.1",
+				"server": server,
 				"detour": outTag,
-			})
+				"tls": map[string]interface{}{
+					"enabled":     true,
+					"server_name": "one.one.one.one",
+				},
+			}
+			if addressFamilyStrategy == "ipv6_only" {
+				server = transparentProxyDoHIPv6Server
+				resolver["server"] = server
+			}
+			servers = append(servers, resolver)
 		}
 	}
 
@@ -1205,6 +1380,10 @@ func buildTransparentProxyDNS(
 		if outTag == "" {
 			continue
 		}
+		strategy := ""
+		if binding.SubscriptionID == "" {
+			strategy = addressFamily.strategy(binding.LineID)
+		}
 		resolverTag := transparentProxyResolverTag(ruleSet, outTag)
 		switch ruleSet.Type {
 		case RuleSetTypeApplication:
@@ -1212,7 +1391,7 @@ func buildTransparentProxyDNS(
 			if len(selectors) == 0 {
 				continue
 			}
-			ensureResolver(resolverTag, outTag)
+			ensureResolver(resolverTag, outTag, strategy)
 			users := make([]string, 0, len(selectors))
 			for _, selector := range selectors {
 				users = append(users, ApplicationSOCKSUsername(baseUsername, selector))
@@ -1225,14 +1404,20 @@ func buildTransparentProxyDNS(
 				"auth_user": users,
 				"server":    resolverTag,
 			}
+			if strategy != "" {
+				rule["strategy"] = strategy
+			}
 			applyRuleSetInvert(rule, ruleSet)
 			rules = append(rules, rule)
 		case RuleSetTypeManual:
 			if len(ruleSet.Domains) > 0 && (!ruleSet.Invert || len(ruleSet.CIDRs) == 0) {
-				ensureResolver(resolverTag, outTag)
+				ensureResolver(resolverTag, outTag, strategy)
 				rule := map[string]interface{}{
 					"domain_suffix": ruleSet.Domains,
 					"server":        resolverTag,
+				}
+				if strategy != "" {
+					rule["strategy"] = strategy
 				}
 				applyRuleSetInvert(rule, ruleSet)
 				rules = append(rules, rule)
@@ -1242,10 +1427,13 @@ func buildTransparentProxyDNS(
 				// IP 与无法安全拆分的混合规则不参与名字阶段的分域。
 				continue
 			}
-			ensureResolver(resolverTag, outTag)
+			ensureResolver(resolverTag, outTag, strategy)
 			rule := map[string]interface{}{
 				"rule_set": sbRuleSetTag(ruleSet),
 				"server":   resolverTag,
+			}
+			if strategy != "" {
+				rule["strategy"] = strategy
 			}
 			applyRuleSetInvert(rule, ruleSet)
 			rules = append(rules, rule)
@@ -1255,7 +1443,8 @@ func buildTransparentProxyDNS(
 	// RuleSet 的获取线路只描述规则资源的供应路径，不参与上面的用户流量
 	// DNS/route 裁决。如果该线路本来就在当前 Scenario 的正式数据面中，仍要把它的
 	// 专用 resolver 注册进来，供提交后的缓存刷新复用同一个运行实例。未进入
-	// validTags 的获取线路不会因此被带进正式数据面；它由独立的无策略会话刷新。
+	// validTags 的获取线路不会因此被带进正式数据面；它由独立的获取会话刷新，
+	// 不继承正式 traffic plan 的地址族能力。
 	seenRuleSetSource := make(map[string]bool)
 	for index := range scenario.Bindings {
 		ruleSet := profile.FindRuleSet(scenario.Bindings[index].RuleSetID)
@@ -1276,7 +1465,11 @@ func buildTransparentProxyDNS(
 		if outTag == "" || !validTags[outTag] {
 			continue
 		}
-		ensureResolver(transparentProxyResolverForOutbound(outTag), outTag)
+		ensureResolver(
+			transparentProxyResolverForOutbound(outTag),
+			outTag,
+			addressFamily.strategy(fetchLineID),
+		)
 	}
 
 	for _, sub := range profile.Subscriptions {
@@ -1300,7 +1493,7 @@ func buildTransparentProxyDNS(
 				continue
 			}
 			resolverTag := transparentProxyResolverForOutbound(rule.outTag)
-			ensureResolver(resolverTag, rule.outTag)
+			ensureResolver(resolverTag, rule.outTag, "")
 			rules = append(rules, map[string]interface{}{
 				rule.matchKey: rule.values,
 				"server":      resolverTag,
@@ -1309,19 +1502,16 @@ func buildTransparentProxyDNS(
 	}
 
 	defaultResolverTag := transparentProxyResolverForOutbound(defaultOutboundTag)
-	ensureResolver(defaultResolverTag, defaultOutboundTag)
-	if !directIPv6Available {
-		for _, rule := range rules {
-			if rule["server"] == TransparentNativeDNSTag {
-				rule["strategy"] = "ipv4_only"
-			}
-		}
-		if defaultResolverTag == TransparentNativeDNSTag {
-			rules = append(rules, map[string]interface{}{
-				"server":   TransparentNativeDNSTag,
-				"strategy": "ipv4_only",
-			})
-		}
+	ensureResolver(
+		defaultResolverTag,
+		defaultOutboundTag,
+		addressFamily.strategy(defaultLineID),
+	)
+	if strategy := addressFamily.strategy(defaultLineID); strategy != "" {
+		rules = append(rules, map[string]interface{}{
+			"server":   defaultResolverTag,
+			"strategy": strategy,
+		})
 	}
 	dnsConfig := map[string]interface{}{
 		"servers":           servers,
@@ -1332,17 +1522,6 @@ func buildTransparentProxyDNS(
 		dnsConfig["rules"] = rules
 	}
 	return dnsConfig, nil
-}
-
-func applyTransparentProxyDirectIPv4OnlyRouteRules(
-	rules []map[string]interface{},
-) {
-	for _, rule := range rules {
-		if rule["action"] == "resolve" &&
-			rule["server"] == TransparentNativeDNSTag {
-			rule["strategy"] = "ipv4_only"
-		}
-	}
 }
 
 func validateTransparentProxySystemDNS(systemDNS []string) (string, error) {
@@ -1485,6 +1664,7 @@ func buildTransparentProxyScenarioRouteRules(
 	subTagMap map[string]string,
 	validTags map[string]bool,
 	baseUsername string,
+	addressFamily transparentProxyAddressFamilyPolicy,
 ) (rules []map[string]interface{}) {
 	for _, binding := range scenario.Bindings {
 		ruleSet := profile.FindRuleSet(binding.RuleSetID)
@@ -1495,7 +1675,16 @@ func buildTransparentProxyScenarioRouteRules(
 		if outTag == "" {
 			continue
 		}
-		rules = append(rules, compileTransparentProxyRuleSet(ruleSet, outTag, baseUsername)...)
+		strategy := ""
+		if binding.SubscriptionID == "" {
+			strategy = addressFamily.strategy(binding.LineID)
+		}
+		rules = append(rules, compileTransparentProxyRuleSet(
+			ruleSet,
+			outTag,
+			baseUsername,
+			strategy,
+		)...)
 	}
 	return
 }
@@ -1529,7 +1718,12 @@ func bindingOutboundTag(
 	return outTag
 }
 
-func compileTransparentProxyRuleSet(ruleSet *RuleSet, outTag, baseUsername string) []map[string]interface{} {
+func compileTransparentProxyRuleSet(
+	ruleSet *RuleSet,
+	outTag string,
+	baseUsername string,
+	addressFamilyStrategy string,
+) []map[string]interface{} {
 	switch ruleSet.Type {
 	case RuleSetTypeApplication:
 		selectors := applicationRuleSetSelectors(ruleSet)
@@ -1540,25 +1734,43 @@ func compileTransparentProxyRuleSet(ruleSet *RuleSet, outTag, baseUsername strin
 		for _, selector := range selectors {
 			users = append(users, ApplicationSOCKSUsername(baseUsername, selector))
 		}
-		rule := map[string]interface{}{
+		route := map[string]interface{}{
 			"auth_user": users,
 			"outbound":  outTag,
 		}
-		applyRuleSetInvert(rule, ruleSet)
-		return []map[string]interface{}{rule}
+		applyRuleSetInvert(route, ruleSet)
+		if addressFamilyStrategy == "" {
+			return []map[string]interface{}{route}
+		}
+		resolve := map[string]interface{}{
+			"auth_user": users,
+			"action":    "resolve",
+			"server":    transparentProxyResolverTag(ruleSet, outTag),
+			"strategy":  addressFamilyStrategy,
+		}
+		applyRuleSetInvert(resolve, ruleSet)
+		return []map[string]interface{}{resolve, route}
 	case RuleSetTypeManual:
 		if ruleSet.Invert {
-			return compileInvertedTransparentProxyManualRuleSet(ruleSet, outTag)
+			return compileInvertedTransparentProxyManualRuleSet(
+				ruleSet,
+				outTag,
+				addressFamilyStrategy,
+			)
 		}
 		var rules []map[string]interface{}
 		if len(ruleSet.Domains) > 0 {
 			resolver := transparentProxyResolverTag(ruleSet, outTag)
+			resolve := map[string]interface{}{
+				"domain_suffix": ruleSet.Domains,
+				"action":        "resolve",
+				"server":        resolver,
+			}
+			if addressFamilyStrategy != "" {
+				resolve["strategy"] = addressFamilyStrategy
+			}
 			rules = append(rules,
-				map[string]interface{}{
-					"domain_suffix": ruleSet.Domains,
-					"action":        "resolve",
-					"server":        resolver,
-				},
+				resolve,
 				map[string]interface{}{
 					"domain_suffix": ruleSet.Domains,
 					"outbound":      outTag,
@@ -1590,6 +1802,9 @@ func compileTransparentProxyRuleSet(ruleSet *RuleSet, outTag, baseUsername strin
 		case RuleSetMatchDomain:
 			match["action"] = "resolve"
 			match["server"] = transparentProxyResolverTag(ruleSet, outTag)
+			if addressFamilyStrategy != "" {
+				match["strategy"] = addressFamilyStrategy
+			}
 			return []map[string]interface{}{match, route}
 		case RuleSetMatchIP, RuleSetMatchMixed, RuleSetMatchUnknown:
 			return []map[string]interface{}{transparentProxySystemResolveRule(), route}
@@ -1598,7 +1813,11 @@ func compileTransparentProxyRuleSet(ruleSet *RuleSet, outTag, baseUsername strin
 	return nil
 }
 
-func compileInvertedTransparentProxyManualRuleSet(ruleSet *RuleSet, outTag string) []map[string]interface{} {
+func compileInvertedTransparentProxyManualRuleSet(
+	ruleSet *RuleSet,
+	outTag string,
+	addressFamilyStrategy string,
+) []map[string]interface{} {
 	hasDomains := len(ruleSet.Domains) > 0
 	hasCIDRs := len(ruleSet.CIDRs) > 0
 	switch {
@@ -1623,6 +1842,9 @@ func compileInvertedTransparentProxyManualRuleSet(ruleSet *RuleSet, outTag strin
 			"domain_suffix": ruleSet.Domains,
 			"action":        "resolve",
 			"server":        transparentProxyResolverTag(ruleSet, outTag),
+		}
+		if addressFamilyStrategy != "" {
+			resolve["strategy"] = addressFamilyStrategy
 		}
 		route := map[string]interface{}{
 			"domain_suffix": ruleSet.Domains,

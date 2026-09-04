@@ -136,9 +136,12 @@ func TestTransparentProxyUnavailableDirectIPv6NarrowsOnlyDirectResolution(t *tes
 		directResolver["strategy"] != "ipv4_only" {
 		t.Fatalf("Direct outbound did not inherit IPv4-only capability: %v", directResolver)
 	}
-	if len(cfg.Inbounds) != 1 ||
-		cfg.Inbounds[0]["xdial_reresolve_ipv6_flow_domains"] != true {
-		t.Fatalf("stale attributed IPv6 flows were not scheduled for re-resolution: %v", cfg.Inbounds)
+	if len(cfg.Inbounds) != 1 {
+		t.Fatalf("unexpected transparent proxy inbound count: %v", cfg.Inbounds)
+	}
+	if cfg.Inbounds[0]["xdial_reresolve_ipv4_flow_domains"] != nil ||
+		cfg.Inbounds[0]["xdial_reresolve_ipv6_flow_domains"] != nil {
+		t.Fatalf("Direct capability leaked into the shared ingress: %v", cfg.Inbounds)
 	}
 
 	proxyResolverTag := desktopProxyDNSTag("proxy-proxy")

@@ -239,12 +239,18 @@ grep -Fq 'func applyXDialFlowMetadata(' \
 	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata.go"
 grep -Fq 'func TestXDialFlowMetadataPreservesDomainAndUsesIPv4Destination(' \
 	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata_test.go"
-grep -Eq 'XDialReresolveIPv6FlowDomains[[:space:]]+bool' \
+! grep -Eq 'XDialReresolveIPv(4|6)FlowDomains[[:space:]]+bool' \
 	"${patched_sing_box_dir}/option/simple.go"
-grep -Fq 'func TestXDialFlowMetadataReresolvesAttributedIPv6Destination(' \
+grep -Fq 'func TestXDialFlowMetadataDefersAddressFamilyDecisionToRoute(' \
 	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata_test.go"
-grep -Fq 'XDialBoundInterface string' \
+grep -Eq 'XDialBoundInterface[[:space:]]+string' \
 	"${patched_sing_box_dir}/adapter/inbound.go"
+grep -Eq 'XDialOriginalDestinationDomain[[:space:]]+string' \
+	"${patched_sing_box_dir}/adapter/inbound.go"
+grep -Fq 'func TestXDialFlowDomainForResolveUsesMatchedSingleStackStrategy(' \
+	"${patched_sing_box_dir}/route/xdial_flow_resolve_test.go"
+grep -Fq 'func TestXDialApplyResolvedFlowDomainPreservesFirstOriginalDestination(' \
+	"${patched_sing_box_dir}/route/xdial_flow_resolve_test.go"
 grep -Fq 'func TestXDialBoundFlowMetadataPreservesInterfaceForDirect(' \
 	"${patched_sing_box_dir}/protocol/socks/xdial_flow_metadata_test.go"
 grep -Fq 'func TestXDialBoundDialerOptionsOnlyOverridesInterface(' \

@@ -1,0 +1,144 @@
+--- a/adapter/inbound.go
++++ b/adapter/inbound.go
+@@ -45,15 +45,16 @@
+ }
+ 
+ type InboundContext struct {
+-	Inbound             string
+-	InboundType         string
+-	IPVersion           uint8
+-	Network             string
+-	Source              M.Socksaddr
+-	Destination         M.Socksaddr
+-	User                string
+-	Outbound            string
+-	XDialBoundInterface string
++	Inbound                        string
++	InboundType                    string
++	IPVersion                      uint8
++	Network                        string
++	Source                         M.Socksaddr
++	Destination                    M.Socksaddr
++	User                           string
++	Outbound                       string
++	XDialBoundInterface            string
++	XDialOriginalDestinationDomain string
+ 
+ 	// sniffer
+ 
+--- a/protocol/socks/xdial_flow_metadata.go
++++ b/protocol/socks/xdial_flow_metadata.go
+@@ -82,5 +82,6 @@
+ 
+ 	port := metadata.Destination.Port
+ 	metadata.Domain = hostname
++	metadata.XDialOriginalDestinationDomain = hostname
+ 	if reresolveIPv6Domains && address.Is6() {
+ 		metadata.Destination = M.Socksaddr{
+@@ -192,5 +193,6 @@
+ 
+ 	port := metadata.Destination.Port
+ 	metadata.Domain = hostname
++	metadata.XDialOriginalDestinationDomain = hostname
+ 	if reresolveIPv6Domains && hostname != "" && address.Is6() {
+ 		metadata.Destination = M.Socksaddr{
+--- a/route/route.go
++++ b/route/route.go
+@@ -877,7 +877,8 @@
+ }
+ 
+ func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionResolve) error {
+-	if metadata.Destination.IsDomain() {
++	queryDomain := xdialFlowDomainForResolve(metadata, action.Strategy)
++	if queryDomain != "" {
+ 		var transport adapter.DNSTransport
+ 		if action.Server != "" {
+ 			var loaded bool
+@@ -886,7 +887,7 @@
+ 				return E.New("DNS server not found: ", action.Server)
+ 			}
+ 		}
+-		addresses, err := r.dns.Lookup(adapter.WithContext(ctx, metadata), metadata.Destination.Fqdn, adapter.DNSQueryOptions{
++		addresses, err := r.dns.Lookup(adapter.WithContext(ctx, metadata), queryDomain, adapter.DNSQueryOptions{
+ 			Transport:              transport,
+ 			Strategy:               action.Strategy,
+ 			DisableCache:           action.DisableCache,
+@@ -903,3 +904,23 @@
+ 	}
+ 	return nil
+ }
++
++func xdialFlowDomainForResolve(
++	metadata *adapter.InboundContext,
++	strategy C.DomainStrategy,
++) string {
++	if metadata.Destination.IsDomain() {
++		return metadata.Destination.Fqdn
++	}
++	trustedDomain := metadata.XDialOriginalDestinationDomain
++	if !M.IsDomainName(trustedDomain) {
++		return ""
++	}
++	if strategy == C.DomainStrategyIPv4Only &&
++		metadata.Destination.Addr.Is6() ||
++		strategy == C.DomainStrategyIPv6Only &&
++			metadata.Destination.Addr.Is4() {
++		return trustedDomain
++	}
++	return ""
++}
+--- /dev/null
++++ b/route/xdial_flow_resolve_test.go
+@@ -0,0 +1,52 @@
++package route
++
++import (
++	"net/netip"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestXDialFlowDomainForResolveUsesMatchedSingleStackStrategy(t *testing.T) {
++	tests := []struct {
++		name        string
++		destination string
++		trusted     bool
++		domain      string
++		strategy    C.DomainStrategy
++		want        string
++	}{
++		{"ordinary-domain", "example.com", false, "", C.DomainStrategyAsIS, "example.com"},
++		{"ipv6-to-ipv4", "2001:db8::10", true, "example.com", C.DomainStrategyIPv4Only, "example.com"},
++		{"ipv4-to-ipv6", "192.0.2.10", true, "example.com", C.DomainStrategyIPv6Only, "example.com"},
++		{"dual-stack-keeps-ip", "2001:db8::10", true, "example.com", C.DomainStrategyAsIS, ""},
++		{"same-family-keeps-ip", "192.0.2.10", true, "example.com", C.DomainStrategyIPv4Only, ""},
++		{"untrusted-keeps-ip", "2001:db8::10", false, "example.com", C.DomainStrategyIPv4Only, ""},
++		{"literal-keeps-ip", "2001:db8::10", true, "", C.DomainStrategyIPv4Only, ""},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			var destination M.Socksaddr
++			if address, err := netip.ParseAddr(test.destination); err == nil {
++				destination = M.SocksaddrFrom(address, 443)
++			} else {
++				destination = M.Socksaddr{Fqdn: test.destination, Port: 443}
++			}
++			metadata := &adapter.InboundContext{
++				Destination: destination,
++				Domain:      test.domain,
++				XDialOriginalDestinationDomain: func() string {
++					if test.trusted {
++						return test.domain
++					}
++					return ""
++				}(),
++			}
++			require.Equal(t, test.want, xdialFlowDomainForResolve(metadata, test.strategy))
++		})
++	}
++}

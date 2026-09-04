@@ -204,6 +204,29 @@ enum TransparentProxyFlowMetadata {
     private static let hasHostnameFlag: UInt8 = 1 << 1
     private static let hasBoundInterfaceFlag: UInt8 = 1 << 2
 
+    /// A connect-by-name UDP flow must stay a name at the SOCKS boundary.
+    /// That lets the resolver selected by the matched App/Line rule choose the
+    /// usable address family instead of inheriting NetworkExtension's stale IP.
+    static func datagramSOCKSHost(
+        hostname: String?,
+        endpointHost: Network.NWEndpoint.Host
+    ) -> Network.NWEndpoint.Host {
+        guard let hostname else { return endpointHost }
+        let hostnameBytes = Data(hostname.utf8)
+        guard
+            !hostnameBytes.isEmpty,
+            hostnameBytes.count <= 253,
+            !hostnameBytes.contains(0),
+            hostname.trimmingCharacters(in: .whitespacesAndNewlines)
+                == hostname,
+            IPv4Address(hostname) == nil,
+            IPv6Address(hostname) == nil
+        else {
+            return endpointHost
+        }
+        return .name(hostname, nil)
+    }
+
     static func encode(
         hostname: String,
         endpointHost: Network.NWEndpoint.Host

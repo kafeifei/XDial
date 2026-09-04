@@ -213,18 +213,32 @@ Underlay 同时安装了 IPv6 地址与默认路由，但其运行状态明确�
 大量 `ERR_CONNECTION_CLOSED`。旧启动门禁只验证 IPv4 出口，却仍把 Direct resolver 的
 AAAA 回答交给应用，因此“Line ready”与实际解析视角自相矛盾。
 
-Transparent Proxy 的 Provider 必须在每次冷启动和候选 Switch 生成配置之前，从尚未提交
-的新事务外侧对当前 Direct Underlay 做有界、冗余的 IPv6 TCP+认证 TLS 握手探测；只看到
-接口、地址、路由或 TCP connected 都不算成功。IPv6 TLS 不可用但 IPv4 已通过现有出口门禁
-时，这是 Direct 的合法 IPv4-only 能力，不是整笔连接失败：同一份 sing-box 配置必须让
-Direct 拥有的 DNS rule、route resolve 与 outbound 域名解析统一使用 `ipv4_only`，使 AAAA
-查询得到无地址成功应答。应用或连接池可能仍持有上个 epoch 的 AAAA：若 Apple flow 同时
-交付了经过有界校验的原始域名与 IPv6 endpoint，盒内 Ingress 必须丢弃这个已被本事务证明
-不可用的地址，并把域名重新交给当前 Scenario 所属 Line 的同源 resolver；不能要求用户清
-浏览器缓存。其他代理、AnyConnect 与 Tailscale Line 拥有的 resolver 不继承 Direct 的能力，
-仍按各自出口解析。不得按浏览器、网站、网络名称、接口名或 Underlay 产品加特例；网络 epoch
-变化必须重新探测，旧事务结果不得跨 epoch 复用。没有可信域名的字面量 IPv6 目标不存在
-安全的重解析路径，仍按所属 Line 的真实能力 fail-closed。
+Transparent Proxy 的 Provider 必须在每次冷启动和候选 Switch 中，为本次 traffic plan 的
+每条 active Line 形成一份只属于该事务的 IPv4 / IPv6 能力。Direct 沿用生成首个配置前的
+IPv4 基线，并从尚未提交的新事务外侧做有界、冗余的 IPv6 TCP+认证 TLS 握手；每条非 Direct
+的代理、AnyConnect 与 Tailscale Line 则在完整但尚未提交的 sing-box 候选启动后，经各自精确
+outbound 对其逐线路 DoH 实际使用的一组 IPv4 / IPv6 字面量分别完成认证 TLS 探测。SNI 只用于
+证书认证，不能把探测重新变成域名解析；只看到接口、地址、路由或 TCP connected 都不算该
+地址族可用。这个契约不宣称支持没有 IPv4 Underlay 的纯 IPv6 Direct 启动。
+
+探测到双栈时必须保留 IPv6，不能为了规避一次失败而全局收敛到 IPv4。只有一个地址族通过时，
+这是该 Line 的合法单栈能力，不是整笔连接失败：Provider 必须以 Line ID 为键重生成完整候选，
+让该 Line 所属的域名 binding、Application binding 和默认分支的 DNS rule 与 route resolve
+统一使用 `ipv4_only` 或 `ipv6_only`；不支持的查询类型得到无地址成功应答。纯 IP 与 mixed
+RuleSet 仍按各自可见的地址条件分类，不把一个没有可靠域名归属的字面量改写成名字。受限
+Application Rule 必须按同一条 `auth_user` 归属进入同源 resolve，不能因应用流量只剩 IP
+endpoint 而漏过能力策略。受限候选还必须再次通过同一组精确探测且结果与首轮完全一致，才可
+进入 `readyToCommit`；重建期间能力改变，或两个地址族都失败，整笔候选均 fail-closed，不得
+提交旧事实。
+
+应用或连接池可能仍持有上个 epoch 的地址。TCP flow 若同时交付了经过有界校验的原始域名与
+本 Line 已证明不可用地址族的 endpoint，盒内 route resolve 在匹配到该 Line 后才丢弃旧地址，
+并把域名交给同源 resolver。connect-by-name 的 UDP flow 则在 SOCKS 边界继续表达为域名，
+使首个 datagram（包括通常的 QUIC 建连）在选定 Line 内完成解析；这里不宣称支持 unconnected
+多目标 UDP 或 QUIC 迁移。没有可信域名的字面量目标不存在安全重解析路径，仍按所属 Line 的
+真实能力 fail-closed。能力不得传播给其他 Line，也不得按浏览器、网站、网络名称、接口名或
+Underlay 产品加特例；每次冷启动、network epoch 或候选 Switch 都重新探测，旧结果不得跨事务
+复用。
 
 ### 4.2 fake IP 的定位
 
@@ -460,7 +474,8 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
 - **断线事实源**：每次意外断线在用户私有目录写入有界结构化记录，至少包含时间、原事务和
   Scenario、结构化原因、系统错误、每次重连的时间与事务 ID，以及最终结果。Debug Server
   只读暴露记录；日志不能反过来驱动状态机。
-- **启动与失败语义**：完整 sing-box 和 active Tailscale Line 的真实出口探测必须先成功，
+- **启动与失败语义**：完整 sing-box、Direct 的启动前 IPv6 门禁，以及每条非 Direct active
+  Line 的逐地址族真实出口探测必须先完成，
   才能提交 Transparent Proxy 网络设置。启动失败不得安装半成品网络配置；已接管 flow 的
   转发失败必须关闭 flow，不得回落系统直连。冷启动或唤醒的自动连接意图只有在完整 Rollback
   后才可使用上述有界重试，并在 UI 暴露倒计时、允许用户立即执行已排定的尝试；用户显式

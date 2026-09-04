@@ -164,6 +164,10 @@ type Libbox struct {
 		outboundAddressProbeEndpoint,
 		int,
 	) (string, error)
+	probeOutboundTLSCapabilitiesFunc func(
+		context.Context,
+		adapter.Outbound,
+	) outboundTLSCapabilities
 	createTailscaleRuntimeCapabilityFunc func(
 		context.Context,
 		*tailscaleRuntimeSpec,

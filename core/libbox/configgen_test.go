@@ -1707,3 +1707,128 @@ func TestGenerateTransparentProxySessionStillRequiresExitNodeWithMagicDNS(t *tes
 		t.Fatalf("Tailscale without an Exit Node was accepted: %v", err)
 	}
 }
+
+func transparentProxyLineCapabilityAPIProfile(t *testing.T, defaultProxy bool) string {
+	t.Helper()
+	profile := config.Profile{
+		Lines: []config.Line{{
+			ID: "direct", Type: config.LineTypeDirect, Enabled: true,
+		}},
+		Scenarios:        []config.Scenario{{ID: "scenario", DefaultLineID: "direct"}},
+		ActiveScenarioID: "scenario",
+	}
+	if defaultProxy {
+		profile.Lines = append(profile.Lines, config.Line{
+			ID: "proxy", Type: config.LineTypeAnyTLS, Enabled: true,
+			AnyTLSServer: "192.0.2.10", AnyTLSPort: 443, AnyTLSPassword: "secret",
+		})
+		profile.Scenarios[0].DefaultLineID = "proxy"
+	}
+	encoded, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
+}
+
+func TestGenerateTransparentProxySessionWithLineCapabilitiesValidatesJSONContract(t *testing.T) {
+	profileJSON := transparentProxyLineCapabilityAPIProfile(t, true)
+	generate := func(capabilitiesJSON string) error {
+		_, err := GenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
+			profileJSON,
+			t.TempDir(),
+			29876,
+			"session-user",
+			"session-password",
+			"utun-underlay",
+			`["100.100.100.100"]`,
+			true,
+			capabilitiesJSON,
+			nil,
+		)
+		return err
+	}
+	for _, test := range []struct {
+		name string
+		json string
+		want string
+	}{
+		{name: "malformed", json: `{`, want: "decode"},
+		{name: "null", json: `null`, want: "expected an object"},
+		{name: "array", json: `[]`, want: "decode"},
+		{name: "unknown-field", json: `{"proxy":{"ipv4_available":true,"unknown":true}}`, want: "unknown field"},
+		{name: "trailing-value", json: `{} {}`, want: "trailing JSON value"},
+		{name: "empty-line-id", json: `{"":{"ipv4_available":true}}`, want: "empty Line ID"},
+		{name: "neither-family", json: `{"proxy":{}}`, want: "neither IPv4 nor IPv6"},
+		{name: "missing-active-line", json: `{}`, want: "active Line \"proxy\" is missing"},
+		{name: "direct-conflict", json: `{"direct":{"ipv4_available":true,"ipv6_available":false},"proxy":{"ipv4_available":true}}`, want: "conflicts with directIPv6Available"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := generate(test.json)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestGenerateTransparentProxySessionWithLineCapabilitiesAcceptsAllSupportedModes(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		json     string
+		strategy string
+	}{
+		{name: "dual", json: `{"proxy":{"ipv4_available":true,"ipv6_available":true}}`},
+		{name: "ipv4-only", json: `{"proxy":{"ipv4_available":true}}`, strategy: "ipv4_only"},
+		{name: "ipv6-only", json: `{"proxy":{"ipv6_available":true}}`, strategy: "ipv6_only"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sessionJSON, err := GenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
+				transparentProxyLineCapabilityAPIProfile(t, true),
+				t.TempDir(),
+				29876,
+				"session-user",
+				"session-password",
+				"utun-underlay",
+				`["100.100.100.100"]`,
+				true,
+				test.json,
+				nil,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var session transparentProxySession
+			if err := json.Unmarshal([]byte(sessionJSON), &session); err != nil {
+				t.Fatal(err)
+			}
+			var generated config.SingBoxConfig
+			if err := json.Unmarshal([]byte(session.ConfigJSON), &generated); err != nil {
+				t.Fatal(err)
+			}
+			rules := generated.Route["rules"].([]interface{})
+			last := rules[len(rules)-1].(map[string]interface{})
+			if last["server"] != "proxy-dns-proxy-proxy" {
+				t.Fatalf("unexpected default resolve: %v", last)
+			}
+			if got, _ := last["strategy"].(string); got != test.strategy {
+				t.Fatalf("strategy = %q, want %q: %v", got, test.strategy, last)
+			}
+		})
+	}
+
+	if _, err := GenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
+		transparentProxyLineCapabilityAPIProfile(t, false),
+		t.TempDir(),
+		29876,
+		"session-user",
+		"session-password",
+		"utun-underlay",
+		`["100.100.100.100"]`,
+		true,
+		`{}`,
+		nil,
+	); err != nil {
+		t.Fatalf("Direct-only session rejected an empty non-Direct capability map: %v", err)
+	}
+}

@@ -140,6 +140,7 @@ test-patched-sing-box: $(PATCHED_WORKFILE)
 		github.com/sagernet/sing-box/dns/transport/local \
 		github.com/sagernet/sing-box/protocol/direct \
 		github.com/sagernet/sing-box/protocol/socks \
+		github.com/sagernet/sing-box/route \
 		-run '^TestXDial.*$$' \
 		-count=1
 
@@ -171,8 +172,11 @@ test-macos-transaction: test-release-contract macos-identity-contract
 	@rg -q 'TransparentProxyNetworkRulePlan\.interfaceScopedRemoteNetworks' macos/TransparentProxyExtension/TransparentProxyProvider.swift
 	@rg -q 'UnderlayIPv6TLSProbe\.probe' macos/TransparentProxyExtension/EmbeddedSingBoxRuntime.swift
 	@rg -q 'GenerateTransparentProxySessionWithCapabilitiesAndCallback' macos/TransparentProxyExtension/EmbeddedSingBoxRuntime.swift
+	@rg -q 'GenerateTransparentProxySessionWithLineCapabilitiesAndCallback' macos/TransparentProxyExtension/EmbeddedSingBoxRuntime.swift
+	@rg -q 'probeOutboundTLSCapabilities' macos/TransparentProxyExtension/EmbeddedSingBoxRuntime.swift
+	@rg -q 'probePreparedSwitchOutboundTLSCapabilities' macos/TransparentProxyExtension/EmbeddedSingBoxRuntime.swift
 	@rg -q 'directIPv6Available' core/config/generator.go core/libbox/configgen.go
-	@rg -q 'xdial_reresolve_ipv6_flow_domains' core/config/generator.go
+	@! rg -n 'xdial_reresolve_ipv(4|6)_flow_domains' core/config/generator.go
 	@test "$$(rg -l 'setActivationPolicy\(' macos/Sources/XDial macos/SettingsDockUI --glob '*.swift' | sort)" = "$$(printf '%s\n' macos/SettingsDockUI/main.swift macos/Sources/XDial/XDialApp.swift)"
 	@! rg -n 'NSApp\.setActivationPolicy\(\.regular\)' macos/Sources/XDial/XDialApp.swift
 	@rg -q 'NSApp\.setActivationPolicy\(\.accessory\)' macos/Sources/XDial/XDialApp.swift

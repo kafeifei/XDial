@@ -72,6 +72,7 @@ enum UDPFlowSOCKSRelay {
                             flow: flow,
                             connection: udpRelay,
                             control: control,
+                            remoteHostname: flow.remoteHostname,
                             trialID: trialID,
                             logger: logger,
                             shutdown: shutdown,
@@ -248,6 +249,7 @@ enum UDPFlowSOCKSRelay {
         flow: NEAppProxyUDPFlow,
         connection: NWConnection,
         control: NWConnection,
+        remoteHostname: String?,
         trialID: String,
         logger: Logger,
         shutdown: RelayTaskShutdown,
@@ -265,7 +267,8 @@ enum UDPFlowSOCKSRelay {
                         for (payload, endpoint) in datagrams {
                             let packet = try encode(
                                 payload: payload,
-                                destination: endpoint
+                                destination: endpoint,
+                                remoteHostname: remoteHostname
                             )
                             logger.debug(
                                 "udp-send trial=\(trialID, privacy: .public) bytes=\(payload.count)"
@@ -367,13 +370,18 @@ enum UDPFlowSOCKSRelay {
 
     private static func encode(
         payload: Data,
-        destination: Network.NWEndpoint
+        destination: Network.NWEndpoint,
+        remoteHostname: String?
     ) throws -> Data {
         guard case let .hostPort(host, port) = destination else {
             throw RelayError.invalidEndpoint
         }
+        let socksHost = TransparentProxyFlowMetadata.datagramSOCKSHost(
+            hostname: remoteHostname,
+            endpointHost: host
+        )
         var packet = Data([0x00, 0x00, 0x00])
-        switch host {
+        switch socksHost {
         case let .ipv4(address):
             packet.append(0x01)
             packet.append(address.rawValue)

@@ -330,4 +330,43 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
             )
         )
     }
+
+    func testDatagramSOCKSHostUsesTrustedConnectByNameHostname() throws {
+        let address = try XCTUnwrap(IPv6Address("2001:db8::10"))
+        let selected = TransparentProxyFlowMetadata.datagramSOCKSHost(
+            hostname: "connect-by-name.example",
+            endpointHost: .ipv6(address)
+        )
+
+        guard case let .name(hostname, _) = selected else {
+            return XCTFail("expected SOCKS domain destination")
+        }
+        XCTAssertEqual(hostname, "connect-by-name.example")
+    }
+
+    func testDatagramSOCKSHostKeepsLiteralWithoutHostname() throws {
+        let address = try XCTUnwrap(IPv6Address("2001:db8::10"))
+        let selected = TransparentProxyFlowMetadata.datagramSOCKSHost(
+            hostname: nil,
+            endpointHost: .ipv6(address)
+        )
+
+        guard case let .ipv6(selectedAddress) = selected else {
+            return XCTFail("expected literal IPv6 destination")
+        }
+        XCTAssertEqual(selectedAddress, address)
+    }
+
+    func testDatagramSOCKSHostRejectsInvalidHostname() throws {
+        let address = try XCTUnwrap(IPv4Address("192.0.2.10"))
+        let selected = TransparentProxyFlowMetadata.datagramSOCKSHost(
+            hostname: " bad.example",
+            endpointHost: .ipv4(address)
+        )
+
+        guard case let .ipv4(selectedAddress) = selected else {
+            return XCTFail("expected literal IPv4 destination")
+        }
+        XCTAssertEqual(selectedAddress, address)
+    }
 }

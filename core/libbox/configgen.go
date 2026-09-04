@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/netip"
 	"net/url"
 	"os"
@@ -47,6 +48,79 @@ type connectionPreparationEvent struct {
 }
 
 type connectionPreparationSink func(connectionPreparationEvent)
+
+type transparentProxyCapabilityInput struct {
+	legacyDirectIPv6Available bool
+	lineCapabilities          config.TransparentProxyLineCapabilities
+}
+
+func (input transparentProxyCapabilityInput) generateConfig(
+	profile *config.Profile,
+	listenPort int,
+	socksUsername string,
+	socksPassword string,
+	basePath string,
+	underlayInterface string,
+	systemDNS []string,
+) ([]byte, error) {
+	if input.lineCapabilities != nil {
+		return config.GenerateSingBoxTransparentProxyWithLineCapabilities(
+			profile,
+			listenPort,
+			socksUsername,
+			socksPassword,
+			basePath,
+			underlayInterface,
+			systemDNS,
+			input.lineCapabilities,
+		)
+	}
+	return config.GenerateSingBoxTransparentProxyWithCapabilities(
+		profile,
+		listenPort,
+		socksUsername,
+		socksPassword,
+		basePath,
+		underlayInterface,
+		systemDNS,
+		input.legacyDirectIPv6Available,
+	)
+}
+
+func decodeTransparentProxyLineCapabilities(
+	capabilitiesJSON string,
+	directIPv6Available bool,
+) (config.TransparentProxyLineCapabilities, error) {
+	decoder := json.NewDecoder(bytes.NewReader([]byte(capabilitiesJSON)))
+	decoder.DisallowUnknownFields()
+	var capabilities config.TransparentProxyLineCapabilities
+	if err := decoder.Decode(&capabilities); err != nil {
+		return nil, fmt.Errorf("decode Transparent Proxy Line address-family capabilities: %w", err)
+	}
+	if capabilities == nil {
+		return nil, fmt.Errorf("decode Transparent Proxy Line address-family capabilities: expected an object")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("decode Transparent Proxy Line address-family capabilities: trailing JSON value")
+		}
+		return nil, fmt.Errorf("decode Transparent Proxy Line address-family capabilities: %w", err)
+	}
+	direct := config.LineAddressFamilyCapability{
+		IPv4Available: true,
+		IPv6Available: directIPv6Available,
+	}
+	if declared, exists := capabilities["direct"]; exists && declared != direct {
+		return nil, fmt.Errorf(
+			"decode Transparent Proxy Line address-family capabilities: Direct capability conflicts with directIPv6Available",
+		)
+	}
+	capabilities["direct"] = direct
+	if err := config.ValidateTransparentProxyLineCapabilities(capabilities); err != nil {
+		return nil, err
+	}
+	return capabilities, nil
+}
 
 type transparentProxySession struct {
 	ConfigJSON string                 `json:"config_json"`
@@ -186,7 +260,7 @@ func GenerateTransparentProxySession(
 		socksPassword,
 		underlayInterface,
 		systemDNSJSON,
-		true,
+		transparentProxyCapabilityInput{legacyDirectIPv6Available: true},
 		nil,
 	)
 }
@@ -231,6 +305,68 @@ func GenerateTransparentProxySessionWithCapabilitiesAndCallback(
 	directIPv6Available bool,
 	callback ConnectionPreparationCallback,
 ) (string, error) {
+	return generateTransparentProxySessionWithCallback(
+		profileJSON,
+		basePath,
+		listenPort,
+		socksUsername,
+		socksPassword,
+		underlayInterface,
+		systemDNSJSON,
+		transparentProxyCapabilityInput{
+			legacyDirectIPv6Available: directIPv6Available,
+		},
+		callback,
+	)
+}
+
+// GenerateTransparentProxySessionWithLineCapabilitiesAndCallback accepts the
+// transaction's non-Direct Line capabilities as a gomobile-safe JSON object.
+// Direct remains an explicit argument for source compatibility with the
+// Provider's existing underlay probe and is merged into the same Line map.
+func GenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
+	profileJSON string,
+	basePath string,
+	listenPort int,
+	socksUsername string,
+	socksPassword string,
+	underlayInterface string,
+	systemDNSJSON string,
+	directIPv6Available bool,
+	lineCapabilitiesJSON string,
+	callback ConnectionPreparationCallback,
+) (string, error) {
+	lineCapabilities, err := decodeTransparentProxyLineCapabilities(
+		lineCapabilitiesJSON,
+		directIPv6Available,
+	)
+	if err != nil {
+		return "", err
+	}
+	return generateTransparentProxySessionWithCallback(
+		profileJSON,
+		basePath,
+		listenPort,
+		socksUsername,
+		socksPassword,
+		underlayInterface,
+		systemDNSJSON,
+		transparentProxyCapabilityInput{lineCapabilities: lineCapabilities},
+		callback,
+	)
+}
+
+func generateTransparentProxySessionWithCallback(
+	profileJSON string,
+	basePath string,
+	listenPort int,
+	socksUsername string,
+	socksPassword string,
+	underlayInterface string,
+	systemDNSJSON string,
+	capabilities transparentProxyCapabilityInput,
+	callback ConnectionPreparationCallback,
+) (string, error) {
 	var sink connectionPreparationSink
 	if callback != nil {
 		sink = func(event connectionPreparationEvent) {
@@ -248,7 +384,7 @@ func GenerateTransparentProxySessionWithCapabilitiesAndCallback(
 		socksPassword,
 		underlayInterface,
 		systemDNSJSON,
-		directIPv6Available,
+		capabilities,
 		sink,
 	)
 }
@@ -509,7 +645,7 @@ func generateTransparentProxySession(
 	socksPassword string,
 	underlayInterface string,
 	systemDNSJSON string,
-	directIPv6Available bool,
+	capabilities transparentProxyCapabilityInput,
 	progress connectionPreparationSink,
 ) (string, error) {
 	profile, err := config.ParseProfile([]byte(profileJSON))
@@ -537,7 +673,7 @@ func generateTransparentProxySession(
 	if err := json.Unmarshal([]byte(systemDNSJSON), &systemDNS); err != nil {
 		return "", fmt.Errorf("decode system DNS snapshot: %w", err)
 	}
-	data, err := config.GenerateSingBoxTransparentProxyWithCapabilities(
+	data, err := capabilities.generateConfig(
 		profile,
 		listenPort,
 		socksUsername,
@@ -545,7 +681,6 @@ func generateTransparentProxySession(
 		basePath,
 		underlayInterface,
 		systemDNS,
-		directIPv6Available,
 	)
 	if err != nil {
 		return "", err

@@ -1453,10 +1453,21 @@ struct MainPopover: View {
         _ task: ConnectionTaskReport,
         report: ConnectionReport
     ) -> String {
-        networkInfo.observation(
+        let publicNetworkSummary = networkInfo.observation(
             for: task.resourceID,
             transactionID: report.transactionID
-        )?.summary.nonEmpty ?? "—"
+        )?.summary.nonEmpty
+        let degradation =
+            LineConnectionSummaryProjection.addressFamilyDegradation(
+                taskID: task.id,
+                report: report
+            )
+        return LineConnectionSummaryProjection.summary(
+            publicNetworkSummary: publicNetworkSummary,
+            degradation: degradation,
+            ipv4OnlyLabel: state.tr("仅 IPv4", "IPv4 only"),
+            ipv6OnlyLabel: state.tr("仅 IPv6", "IPv6 only")
+        )
     }
 
     private func ingressFact(

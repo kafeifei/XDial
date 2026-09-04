@@ -1,0 +1,172 @@
+--- a/route/route.go
++++ b/route/route.go
+@@ -900,18 +900,34 @@
+ 			return err
+ 		}
+ 		if metadata.Destination.IsIP() {
+-			metadata.RouteOriginalDestination = metadata.Destination
+-			metadata.Destination = M.Socksaddr{
+-				Fqdn: queryDomain,
+-				Port: metadata.Destination.Port,
++			if len(addresses) == 0 {
++				return E.New("DNS response does not contain any addresses")
+ 			}
+-			metadata.Domain = queryDomain
+-			metadata.IPVersion = 0
++			xdialApplyResolvedFlowDomain(metadata, queryDomain)
+ 		}
+ 		metadata.DestinationAddresses = addresses
+ 		r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.DestinationAddresses), " "), "]")
+ 	}
+ 	return nil
++}
++
++func xdialApplyResolvedFlowDomain(
++	metadata *adapter.InboundContext,
++	queryDomain string,
++) {
++	if !metadata.Destination.IsIP() || !M.IsDomainName(queryDomain) {
++		return
++	}
++	if !metadata.RouteOriginalDestination.IsValid() {
++		metadata.RouteOriginalDestination = metadata.Destination
++	}
++	port := metadata.Destination.Port
++	metadata.Destination = M.Socksaddr{
++		Fqdn: queryDomain,
++		Port: port,
++	}
++	metadata.Domain = queryDomain
++	metadata.IPVersion = 0
+ }
+ 
+ func xdialFlowDomainForResolve(
+--- a/route/xdial_flow_resolve_test.go
++++ b/route/xdial_flow_resolve_test.go
+@@ -1,11 +1,14 @@
+ package route
+ 
+ import (
++	"context"
+ 	"net/netip"
+ 	"testing"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	R "github.com/sagernet/sing-box/route/rule"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -50,3 +53,111 @@
+ 		})
+ 	}
+ }
++
++func TestXDialApplyResolvedFlowDomainPreservesFirstOriginalDestination(t *testing.T) {
++	staleDestination := M.SocksaddrFrom(
++		netip.MustParseAddr("2001:db8::10"),
++		443,
++	)
++	firstOriginalDestination := M.SocksaddrFrom(
++		netip.MustParseAddr("192.0.2.20"),
++		8443,
++	)
++	metadata := &adapter.InboundContext{
++		Destination:              staleDestination,
++		RouteOriginalDestination: firstOriginalDestination,
++		IPVersion:                6,
++	}
++
++	xdialApplyResolvedFlowDomain(metadata, "example.com")
++
++	require.Equal(t, firstOriginalDestination, metadata.RouteOriginalDestination)
++	require.Equal(t, "example.com", metadata.Destination.Fqdn)
++	require.False(t, metadata.Destination.Addr.IsValid())
++	require.Equal(t, uint16(443), metadata.Destination.Port)
++	require.Equal(t, "example.com", metadata.Domain)
++	require.Zero(t, metadata.IPVersion)
++
++	metadata = &adapter.InboundContext{Destination: staleDestination}
++	xdialApplyResolvedFlowDomain(metadata, "example.com")
++	require.Equal(t, staleDestination, metadata.RouteOriginalDestination)
++}
++
++type xdialResolveDNSRouter struct {
++	adapter.DNSRouter
++	addresses []netip.Addr
++	domain    string
++	options   adapter.DNSQueryOptions
++}
++
++func (r *xdialResolveDNSRouter) Lookup(
++	_ context.Context,
++	domain string,
++	options adapter.DNSQueryOptions,
++) ([]netip.Addr, error) {
++	r.domain = domain
++	r.options = options
++	return r.addresses, nil
++}
++
++func TestXDialActionResolveFailsClosedOnEmptyAddressResult(t *testing.T) {
++	resolver := &xdialResolveDNSRouter{}
++	router := &Router{
++		dns:    resolver,
++		logger: log.NewNOPFactory().NewLogger("router"),
++	}
++	staleDestination := M.SocksaddrFrom(
++		netip.MustParseAddr("2001:db8::10"),
++		443,
++	)
++	metadata := &adapter.InboundContext{
++		Destination:                    staleDestination,
++		Domain:                         "sniffed.example",
++		XDialOriginalDestinationDomain: "example.com",
++		IPVersion:                      6,
++	}
++	before := *metadata
++
++	err := router.actionResolve(context.Background(), metadata, &R.RuleActionResolve{
++		Strategy: C.DomainStrategyIPv4Only,
++	})
++
++	require.ErrorContains(t, err, "DNS response does not contain any addresses")
++	require.Equal(t, before, *metadata)
++	require.Equal(t, "example.com", resolver.domain)
++	require.Equal(t, C.DomainStrategyIPv4Only, resolver.options.Strategy)
++}
++
++func TestXDialActionResolveReplacesStaleIPAfterAddressResult(t *testing.T) {
++	addresses := []netip.Addr{netip.MustParseAddr("192.0.2.30")}
++	resolver := &xdialResolveDNSRouter{addresses: addresses}
++	router := &Router{
++		dns:    resolver,
++		logger: log.NewNOPFactory().NewLogger("router"),
++	}
++	staleDestination := M.SocksaddrFrom(
++		netip.MustParseAddr("2001:db8::10"),
++		443,
++	)
++	metadata := &adapter.InboundContext{
++		Destination:                    staleDestination,
++		Domain:                         "sniffed.example",
++		XDialOriginalDestinationDomain: "example.com",
++		IPVersion:                      6,
++	}
++
++	err := router.actionResolve(context.Background(), metadata, &R.RuleActionResolve{
++		Strategy: C.DomainStrategyIPv4Only,
++	})
++
++	require.NoError(t, err)
++	require.Equal(t, "example.com", resolver.domain)
++	require.Equal(t, C.DomainStrategyIPv4Only, resolver.options.Strategy)
++	require.Equal(t, staleDestination, metadata.RouteOriginalDestination)
++	require.Equal(t, "example.com", metadata.Destination.Fqdn)
++	require.False(t, metadata.Destination.Addr.IsValid())
++	require.Equal(t, uint16(443), metadata.Destination.Port)
++	require.Equal(t, "example.com", metadata.Domain)
++	require.Zero(t, metadata.IPVersion)
++	require.Equal(t, addresses, metadata.DestinationAddresses)
++}
