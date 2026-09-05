@@ -792,71 +792,105 @@ final class AppState: ObservableObject {
     private static let debugServer = DebugServer()
     #endif
 
-    /// 出口观察只能跟随 Provider 已提交的 ConnectionReport。
-    /// 当前正在编辑的 Profile、设置页生命周期和旧 helper 都不是运行事实来源。
+    private let lineObservationQueue = LineObservationQueue()
+    private var lineObservationTransactionID: String?
+    private var lineObservationWorkerID: UUID?
+
+    /// 出口观察跟随已提交的事务，串行使用 Provider 的单个探测租约。
+    /// 重试由连接生命周期驱动，Popover 的展开和地址族选择不产生网络请求。
     private func synchronizeLineObservations(
         status: String,
         report: ConnectionReport?
     ) {
         guard let runtime = ConnectionReportRuntimeFacts.committedLines(
-            status: status,
-            report: report
-        ) else {
-            NetworkInfo.shared.clear()
+            status: status, report: report
+        ), let report else {
+            clearLineObservations()
             return
         }
-        let pending = NetworkInfo.shared.begin(
-            transactionID: runtime.transactionID,
-            lineIDs: runtime.lineIDs
-        )
-        probeLineObservationsSequentially(
-            pending[...],
-            transactionID: runtime.transactionID
-        )
+        guard lineObservationTransactionID != runtime.transactionID else { return }
+        lineObservationTransactionID = runtime.transactionID
+        startLineObservationWorker(report: report)
     }
 
-    /// Provider 只允许一个出口探测租约。宿主按 ConnectionPlan 顺序串行发送，
-    /// 既保持报告顺序稳定，也避免把并发拒绝误显示为 Line 故障。
-    private func probeLineObservationsSequentially(
-        _ pending: ArraySlice<String>,
-        transactionID: String
+    func retryLineAddress(
+        lineID: String,
+        transactionID: String,
+        family: LineAddressFamily
     ) {
-        guard let lineID = pending.first else { return }
-        guard isCurrentObservationTransaction(transactionID) else {
-            return
+        guard isCurrentObservationTransaction(transactionID),
+              NetworkInfo.shared.retry(lineID: lineID, transactionID: transactionID, family: family),
+              let report = engine.connectionReport else { return }
+        if lineObservationWorkerID == nil {
+            startLineObservationWorker(report: report)
         }
-        engine.probeLineOutboundAddress(
-            transactionID: transactionID,
-            lineID: lineID
-        ) { [weak self] result in
-            guard let self else { return }
-            guard self.isCurrentObservationTransaction(
-                transactionID
-            ) else {
-                return
+    }
+
+    private func startLineObservationWorker(report: ConnectionReport) {
+        guard let runtime = ConnectionReportRuntimeFacts.committedLines(
+            status: engine.status, report: report
+        ) else { return }
+        let workerID = UUID()
+        lineObservationWorkerID = workerID
+        let capabilities = Dictionary(uniqueKeysWithValues: report.tasks.compactMap { task in
+            guard task.kind == "line", let capability =
+                LineConnectionSummaryProjection.addressFamilyCapability(taskID: task.id, report: report)
+            else { return nil as (String, LineAddressFamilyCapability)? }
+            return (task.resourceID, capability)
+        })
+        lineObservationQueue.replace { [weak self] in
+            defer {
+                if self?.lineObservationWorkerID == workerID {
+                    self?.lineObservationWorkerID = nil
+                }
             }
-            switch result {
-            case let .success(address):
-                NetworkInfo.shared.recordAddress(
-                    address,
-                    lineID: lineID,
-                    transactionID: transactionID
+            while !Task.isCancelled {
+                guard let self, self.isCurrentObservationTransaction(runtime.transactionID) else { return }
+                let pending = NetworkInfo.shared.begin(
+                    transactionID: runtime.transactionID,
+                    lineIDs: runtime.lineIDs,
+                    capabilities: capabilities
                 )
-            case let .failure(error):
-                let errorCode =
-                    (error as? ProviderDiagnosticsHostError)?.code
-                        ?? "provider-line-probe-failed"
-                NetworkInfo.shared.recordFailure(
-                    code: errorCode,
-                    lineID: lineID,
-                    transactionID: transactionID
-                )
+                for request in pending {
+                    guard !Task.isCancelled,
+                          self.isCurrentObservationTransaction(runtime.transactionID) else { return }
+                    let result: Result<String, Error> = await withCheckedContinuation { continuation in
+                        self.engine.probeLineOutboundAddress(
+                            transactionID: runtime.transactionID,
+                            lineID: request.lineID,
+                            addressFamily: request.family
+                        ) { continuation.resume(returning: $0) }
+                    }
+                    guard !Task.isCancelled,
+                          self.isCurrentObservationTransaction(runtime.transactionID) else { return }
+                    switch result {
+                    case let .success(address):
+                        NetworkInfo.shared.recordAddress(
+                            address, lineID: request.lineID,
+                            transactionID: runtime.transactionID, family: request.family
+                        )
+                    case let .failure(error):
+                        NetworkInfo.shared.recordFailure(
+                            code: (error as? ProviderDiagnosticsHostError)?.code ?? "provider-line-probe-failed",
+                            lineID: request.lineID, transactionID: runtime.transactionID,
+                            family: request.family
+                        )
+                    }
+                }
+                guard let retryDate = NetworkInfo.shared.nextRetryDate else { return }
+                // 短等待只检查本地队列；手动点击可及时入队，不取消占用租约的请求。
+                let delay = min(0.25, max(0, retryDate.timeIntervalSinceNow))
+                do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+                catch { return }
             }
-            self.probeLineObservationsSequentially(
-                pending.dropFirst(),
-                transactionID: transactionID
-            )
         }
+    }
+
+    private func clearLineObservations() {
+        lineObservationQueue.cancel()
+        lineObservationTransactionID = nil
+        lineObservationWorkerID = nil
+        NetworkInfo.shared.clear()
     }
 
     private func isCurrentObservationTransaction(
@@ -1376,7 +1410,7 @@ final class AppState: ObservableObject {
         }
         guard canConnect else { return }
         let generation = connectionAttempts.begin()
-        NetworkInfo.shared.clear()
+        clearLineObservations()
         // 这次 save 本身就是在下发前落盘，不该把自己标成"未下发"
         save(markDirty: false)
         let profileJSON = buildProfileJSON()
@@ -1438,7 +1472,7 @@ final class AppState: ObservableObject {
         connectionAttempts.cancel()
         cancelWakeReconnectTask()
         cancelScenarioSwitch()
-        NetworkInfo.shared.clear()
+        clearLineObservations()
         // 引擎不再攥着旧快照，残留提示没有意义
         configDirtyFlag = false
         configurationChanges.clear()
@@ -1630,7 +1664,7 @@ final class AppState: ObservableObject {
                     .valid(report.configurationFingerprint)
                 )
                 configDirtyFlag = false
-                NetworkInfo.shared.clear()
+                // save() 已按新 report 对齐观察；此处不能清空刚排入的探测。
                 if cancellationNeedsSourceRestore {
                     // Cancellation can race the Provider's commit point. Once
                     // the target is already committed it is too late to abort,

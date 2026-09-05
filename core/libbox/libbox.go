@@ -17,6 +17,7 @@ package libbox
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
@@ -464,6 +465,26 @@ type outboundAddressProbeEndpoint struct {
 	destination M.Socksaddr
 }
 
+type outboundAddressProbeError struct {
+	code string
+	err  error
+}
+
+func (e *outboundAddressProbeError) Error() string { return e.err.Error() }
+func (e *outboundAddressProbeError) Unwrap() error { return e.err }
+
+func newOutboundAddressProbeError(code string, err error) error {
+	return &outboundAddressProbeError{code: code, err: err}
+}
+
+func outboundAddressProbeSafeCode(err error) string {
+	var probeError *outboundAddressProbeError
+	if errors.As(err, &probeError) {
+		return probeError.code
+	}
+	return "request-failed"
+}
+
 var outboundAddressProbeEndpoints = []outboundAddressProbeEndpoint{
 	{
 		url:         "https://checkip.amazonaws.com/",
@@ -475,12 +496,60 @@ var outboundAddressProbeEndpoints = []outboundAddressProbeEndpoint{
 	},
 }
 
+var outboundAddressProbeEndpointsByFamily = map[string][]outboundAddressProbeEndpoint{
+	"ipv4": {
+		{
+			url:         "https://1.1.1.1/cdn-cgi/trace",
+			destination: M.ParseSocksaddrHostPortStr("1.1.1.1", "443"),
+		},
+		{
+			url:         "https://1.0.0.1/cdn-cgi/trace",
+			destination: M.ParseSocksaddrHostPortStr("1.0.0.1", "443"),
+		},
+	},
+	"ipv6": {
+		{
+			url:         "https://[2606:4700:4700::1111]/cdn-cgi/trace",
+			destination: M.ParseSocksaddrHostPortStr("2606:4700:4700::1111", "443"),
+		},
+		{
+			url:         "https://[2606:4700:4700::1001]/cdn-cgi/trace",
+			destination: M.ParseSocksaddrHostPortStr("2606:4700:4700::1001", "443"),
+		},
+	},
+}
+
 // ProbeOutboundIP fetches a public address through one exact running outbound.
 // Both endpoints are fixed so provider messages cannot turn this into an
 // arbitrary network fetch primitive. The named HTTPS endpoint is the primary
 // reachability/address assertion; the numeric HTTPS endpoint keeps the probe
 // usable when an enterprise tunnel DNS server cannot resolve public names.
 func (l *Libbox) ProbeOutboundIP(outboundTag string, timeoutMS int) (string, error) {
+	return l.probeOutboundIP(outboundTag, "", outboundAddressProbeEndpoints, timeoutMS)
+}
+
+// ProbeOutboundIPForFamily fetches one public address of the requested family
+// through one exact running outbound. The fixed numeric endpoints make the
+// address family an input to routing while keeping the diagnostics surface from
+// becoming an arbitrary network fetch primitive.
+func (l *Libbox) ProbeOutboundIPForFamily(
+	outboundTag string,
+	addressFamily string,
+	timeoutMS int,
+) (string, error) {
+	endpoints, loaded := outboundAddressProbeEndpointsByFamily[addressFamily]
+	if !loaded {
+		return "", fmt.Errorf("address family must be ipv4 or ipv6")
+	}
+	return l.probeOutboundIP(outboundTag, addressFamily, endpoints, timeoutMS)
+}
+
+func (l *Libbox) probeOutboundIP(
+	outboundTag string,
+	addressFamily string,
+	endpoints []outboundAddressProbeEndpoint,
+	timeoutMS int,
+) (string, error) {
 	l.mu.Lock()
 	if !l.running || l.box == nil || l.runtimeCtx == nil ||
 		l.switchCommitInProgress {
@@ -515,25 +584,56 @@ func (l *Libbox) ProbeOutboundIP(outboundTag string, timeoutMS int) (string, err
 	defer cancel()
 
 	var probeErrors []string
-	for index, endpoint := range outboundAddressProbeEndpoints {
+	for index, endpoint := range endpoints {
 		address, err := probe(
 			ctx,
 			outbound,
 			endpoint,
-			len(outboundAddressProbeEndpoints)-index,
+			len(endpoints)-index,
 		)
 		if err == nil {
+			if addressFamily != "" && !addressMatchesFamily(address, addressFamily) {
+				probeErrors = append(probeErrors, familyProbeFailureCode(
+					addressFamily, index, "wrong-family",
+				))
+				continue
+			}
 			if !l.probeGenerationIsCurrent(generation) {
 				return "", fmt.Errorf("connection changed during outbound address probe")
 			}
 			return address, nil
 		}
-		probeErrors = append(probeErrors, err.Error())
+		if addressFamily == "" {
+			probeErrors = append(probeErrors, err.Error())
+		} else {
+			probeErrors = append(probeErrors, familyProbeFailureCode(
+				addressFamily, index, outboundAddressProbeSafeCode(err),
+			))
+		}
 	}
 	if !l.probeGenerationIsCurrent(generation) {
 		return "", fmt.Errorf("connection changed during outbound address probe")
 	}
 	return "", fmt.Errorf("outbound address probe failed: %s", strings.Join(probeErrors, "; "))
+}
+
+func familyProbeFailureCode(addressFamily string, endpointIndex int, code string) string {
+	return fmt.Sprintf("%s-endpoint-%d-%s", addressFamily, endpointIndex+1, code)
+}
+
+func addressMatchesFamily(address string, addressFamily string) bool {
+	parsed, err := netip.ParseAddr(address)
+	if err != nil {
+		return false
+	}
+	switch addressFamily {
+	case "ipv4":
+		return parsed.Is4()
+	case "ipv6":
+		return parsed.Is6() && !parsed.Is4In6()
+	default:
+		return false
+	}
 }
 
 // RefreshRuleSet downloads and atomically replaces one validated cache entry
@@ -668,13 +768,19 @@ func probeOutboundAddress(
 
 	conn, err := outbound.DialContext(ctx, "tcp", endpoint.destination)
 	if err != nil {
-		return "", fmt.Errorf("outbound address probe dial failed: %w", err)
+		return "", newOutboundAddressProbeError(
+			"dial-failed",
+			fmt.Errorf("outbound address probe dial failed: %w", err),
+		)
 	}
 	defer conn.Close()
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.url, nil)
 	if err != nil {
-		return "", fmt.Errorf("create address probe request: %w", err)
+		return "", newOutboundAddressProbeError(
+			"request-failed",
+			fmt.Errorf("create address probe request: %w", err),
+		)
 	}
 	client := http.Client{
 		Transport: &http.Transport{
@@ -693,20 +799,47 @@ func probeOutboundAddress(
 	defer client.CloseIdleConnections()
 	response, err := client.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("outbound address probe request failed: %w", err)
+		code := "request-failed"
+		if isTypedTLSProbeError(err) {
+			code = "tls-failed"
+		}
+		return "", newOutboundAddressProbeError(
+			code,
+			fmt.Errorf("outbound address probe request failed: %w", err),
+		)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf(
-			"address probe returned HTTP %d",
-			response.StatusCode,
+		return "", newOutboundAddressProbeError(
+			fmt.Sprintf("http-status-%d", response.StatusCode),
+			fmt.Errorf("address probe returned HTTP %d", response.StatusCode),
 		)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 	if err != nil {
-		return "", fmt.Errorf("read address probe response: %w", err)
+		return "", newOutboundAddressProbeError(
+			"body-read-failed",
+			fmt.Errorf("read address probe response: %w", err),
+		)
 	}
-	return parsePublicProbeAddress(string(body))
+	address, err := parsePublicProbeAddress(string(body))
+	if err != nil {
+		return "", newOutboundAddressProbeError("invalid-address", err)
+	}
+	return address, nil
+}
+
+func isTypedTLSProbeError(err error) bool {
+	var verificationError *tls.CertificateVerificationError
+	var recordHeaderError tls.RecordHeaderError
+	var hostnameError x509.HostnameError
+	var unknownAuthorityError x509.UnknownAuthorityError
+	var certificateInvalidError x509.CertificateInvalidError
+	return errors.As(err, &verificationError) ||
+		errors.As(err, &recordHeaderError) ||
+		errors.As(err, &hostnameError) ||
+		errors.As(err, &unknownAuthorityError) ||
+		errors.As(err, &certificateInvalidError)
 }
 
 func deadlineFromContext(ctx context.Context) time.Time {

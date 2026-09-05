@@ -10,6 +10,34 @@ enum LineAddressFamilyDegradation: Equatable {
 /// The diagnostic message is deliberately ignored: UI state comes only from
 /// the stable event code and its matching capability facts.
 enum LineConnectionSummaryProjection {
+    static func addressFamilyCapability(
+        taskID: String,
+        report: ConnectionReport
+    ) -> LineAddressFamilyCapability? {
+        guard report.tasks.contains(where: {
+            $0.id == taskID && $0.kind == "line"
+        }) else { return nil }
+
+        var latest: (sequence: Int, capability: LineAddressFamilyCapability)?
+        for event in report.events {
+            guard event.type == "diagnostic", event.taskID == taskID,
+                  let facts = event.facts,
+                  let ipv4 = facts["ipv4_available"],
+                  let ipv6 = facts["ipv6_available"] else {
+                continue
+            }
+            let capability = LineAddressFamilyCapability(
+                ipv4Available: ipv4, ipv6Available: ipv6
+            )
+            guard event.code == capability.reportCode,
+                  facts["degraded"] == capability.isDegraded else { continue }
+            if latest == nil || event.sequence >= latest!.sequence {
+                latest = (event.sequence, capability)
+            }
+        }
+        return latest?.capability
+    }
+
     static func addressFamilyDegradation(
         taskID: String,
         report: ConnectionReport

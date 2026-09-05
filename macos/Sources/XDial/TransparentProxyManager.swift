@@ -7,6 +7,24 @@ import Network
 import SystemConfiguration
 @preconcurrency import SystemExtensions
 
+private func isNumericIPAddress(
+    _ address: String,
+    family: LineAddressFamily
+) -> Bool {
+    switch family {
+    case .ipv4:
+        var value = in_addr()
+        return address.withCString {
+            inet_pton(AF_INET, $0, &value)
+        } == 1
+    case .ipv6:
+        var value = in6_addr()
+        return address.withCString {
+            inet_pton(AF_INET6, $0, &value)
+        } == 1
+    }
+}
+
 /// macOS 数据面的唯一宿主管理器。
 ///
 /// Profile 只通过本次 `startVPNTunnel(options:)` 进入扩展内存；持久的
@@ -629,12 +647,14 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     func probeLineOutboundAddress(
         transactionID: String,
         lineID: String,
+        addressFamily: LineAddressFamily = .ipv4,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
         let request = ProviderDiagnosticsRequest(
             cmd: .probeLineOutboundAddress,
             transactionID: transactionID,
-            lineID: lineID
+            lineID: lineID,
+            addressFamily: addressFamily
         )
         sendProviderDiagnostics(
             request,
@@ -647,7 +667,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 guard
                     let observation = data.lineOutboundAddress,
                     observation.lineID == lineID,
-                    !observation.address.isEmpty
+                    isNumericIPAddress(
+                        observation.address,
+                        family: addressFamily
+                    )
                 else {
                     completion(.failure(
                         ProviderDiagnosticsHostError.payloadMismatch

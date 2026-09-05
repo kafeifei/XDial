@@ -12,6 +12,26 @@ final class ProviderDiagnosticsIPCTests: XCTestCase {
             try ProviderDiagnosticsCodec.decodeRequest(encoded),
             request
         )
+        XCTAssertEqual(request.effectiveAddressFamily, .ipv4)
+
+        for family in LineAddressFamily.allCases {
+            let familyRequest = ProviderDiagnosticsRequest(
+                cmd: .probeLineOutboundAddress,
+                transactionID: "transaction-1",
+                lineID: "company",
+                addressFamily: family
+            )
+            XCTAssertEqual(
+                try ProviderDiagnosticsCodec.decodeRequest(
+                    ProviderDiagnosticsCodec.encodeRequest(familyRequest)
+                ),
+                familyRequest
+            )
+            XCTAssertEqual(
+                familyRequest.effectiveAddressFamily,
+                family
+            )
+        }
 
         for forbidden in [
             """
@@ -22,6 +42,9 @@ final class ProviderDiagnosticsIPCTests: XCTestCase {
             """,
             """
             {"v":1,"cmd":"probe-line-outbound-address","transaction_id":"transaction-1"}
+            """,
+            """
+            {"v":1,"cmd":"probe-line-outbound-address","transaction_id":"transaction-1","line_id":"company","address_family":"ipvx"}
             """,
         ] {
             XCTAssertThrowsError(
