@@ -1,5 +1,59 @@
 import Foundation
 
+/// Keeps a manual Scenario selection authoritative on the same Wi-Fi. An
+/// Underlay refresh can re-sample that Wi-Fi without becoming a new SSID
+/// activation. Missing SSID reads are not proof that the network changed.
+struct SSIDScenarioSelectionState {
+    private enum Network {
+        case unknown
+        case connected(String)
+        case disconnected
+    }
+
+    private var network: Network = .unknown
+    private var hasManualSelection = false
+
+    mutating func noteManualSelection() {
+        hasManualSelection = true
+    }
+
+    /// Call only for a confirmed Wi-Fi disconnect/power-off, never for a nil
+    /// SSID, lost permission, or an unavailable Internet path. Rejoining the
+    /// same SSID after this boundary is a new activation.
+    mutating func noteWiFiDisconnected() {
+        network = .disconnected
+        hasManualSelection = false
+    }
+
+    /// Returns the allowed automatic match, or nil to retain the caller's
+    /// desired Scenario. `forceMatching` is reserved for an explicit edit of
+    /// the currently observed SSID's matching rule.
+    mutating func resolve(
+        ssid: String?,
+        matchedScenarioID: String?,
+        forceMatching: Bool = false
+    ) -> String? {
+        guard let ssid, !ssid.isEmpty else { return nil }
+        switch network {
+        case let .connected(previousSSID):
+            if previousSSID != ssid {
+                hasManualSelection = false
+            }
+        case .disconnected:
+            hasManualSelection = false
+        case .unknown:
+            // A first sample arriving after a manual click establishes that
+            // click's network baseline; it must not undo the click.
+            break
+        }
+        network = .connected(ssid)
+        if forceMatching {
+            hasManualSelection = false
+        }
+        return hasManualSelection ? nil : matchedScenarioID
+    }
+}
+
 /// Coalesces the host-side signals emitted by one physical network change.
 ///
 /// NWPath/default-route/DNS and SSID notifications arrive independently and
@@ -39,6 +93,10 @@ struct NetworkEpochSwitchCoordinator {
     private var lastSettledTuple: SettledTuple?
 
     var hasPendingIntent: Bool { pending != nil }
+
+    func hasUnderlayFingerprint(_ fingerprint: String) -> Bool {
+        pending?.underlayFingerprint == fingerprint
+    }
 
     mutating func observeUnderlayChange(
         currentDesiredScenarioID: String,

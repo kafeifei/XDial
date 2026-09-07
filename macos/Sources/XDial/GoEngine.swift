@@ -36,6 +36,8 @@ final class GoEngine: ObservableObject {
     private var pendingCallbacks: [String: (DaemonResponse) -> Void] = [:]
     private var transparentProxySystemStatus = "disconnected"
     var underlayChangeHandler: ((String, Bool) -> Void)?
+    var automaticReconnectPreparationHandler:
+        ((String, @escaping (AutomaticReconnectPreparation?) -> Void) -> Void)?
 
     @Published private(set) var status: String = "disconnected"
     @Published var lastError: String?
@@ -103,6 +105,19 @@ final class GoEngine: ObservableObject {
             [weak self] projection in
             Task { @MainActor in
                 self?.scenarioSwitchProjection = projection
+            }
+        }
+        transparentProxy.automaticReconnectPreparationHandler = {
+            [weak self] fingerprint, completion in
+            // The manager invokes preparation from its main-queue capture.
+            // Register synchronously: an extra Task hop could install a
+            // cancelled recovery waiter after a new manual connection intent.
+            MainActor.assumeIsolated {
+                guard let handler = self?.automaticReconnectPreparationHandler else {
+                    completion(nil)
+                    return
+                }
+                handler(fingerprint, completion)
             }
         }
         transparentProxy.underlayChangeHandler = {

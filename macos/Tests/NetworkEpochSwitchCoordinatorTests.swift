@@ -1,5 +1,146 @@
 import XCTest
 
+final class SSIDScenarioSelectionStateTests: XCTestCase {
+    func testInitialReadableSSIDCanSelectScenario() {
+        var selection = SSIDScenarioSelectionState()
+        XCTAssertNil(selection.resolve(ssid: nil, matchedScenarioID: nil))
+        XCTAssertEqual(
+            selection.resolve(ssid: "Home", matchedScenarioID: "home"),
+            "home"
+        )
+    }
+
+    func testDNSOnlyEpochRefreshesManualScenarioOnUnchangedSSID() {
+        var selection = SSIDScenarioSelectionState()
+        var coordinator = NetworkEpochSwitchCoordinator()
+        let initialScenarioID = selection.resolve(
+            ssid: "Home", matchedScenarioID: "home"
+        )!
+        _ = coordinator.observeSSIDResolution(
+            desiredScenarioID: initialScenarioID
+        )
+        let initial = coordinator.refreshUnderlayFingerprint("dns-1")!
+        XCTAssertNotNil(coordinator.settle(initial))
+
+        selection.noteManualSelection()
+        coordinator.cancel()
+        _ = coordinator.observeUnderlayChange(
+            currentDesiredScenarioID: "manual",
+            underlayFingerprint: "dns-2"
+        )
+        let automaticMatch = selection.resolve(
+            ssid: "Home", matchedScenarioID: "home"
+        )
+        let refreshed = coordinator.observeSSIDResolution(
+            desiredScenarioID: automaticMatch ?? "manual"
+        )!
+        let intent = coordinator.settle(refreshed)!
+
+        XCTAssertEqual(intent.desiredScenarioID, "manual")
+        XCTAssertEqual(
+            NetworkEpochTransitionPolicy.decide(
+                desiredScenarioID: intent.desiredScenarioID,
+                currentDesiredScenarioID: "manual",
+                committedScenarioID: "manual",
+                underlayChanged: intent.underlayChanged,
+                keepsConnection: true,
+                runtimeStatus: "connected",
+                hasPendingScenarioSwitch: false
+            ),
+            .switchScenario(requiresUnderlayRefresh: true)
+        )
+    }
+
+    func testMissingSSIDDoesNotReleaseManualSelection() {
+        var selection = SSIDScenarioSelectionState()
+        _ = selection.resolve(ssid: "Home", matchedScenarioID: "home")
+        selection.noteManualSelection()
+
+        XCTAssertNil(selection.resolve(ssid: nil, matchedScenarioID: nil))
+        XCTAssertNil(selection.resolve(ssid: "", matchedScenarioID: nil))
+        XCTAssertNil(
+            selection.resolve(ssid: "Home", matchedScenarioID: "home")
+        )
+    }
+
+    func testDifferentSSIDReleasesManualSelection() {
+        var selection = SSIDScenarioSelectionState()
+        _ = selection.resolve(ssid: "Home", matchedScenarioID: "home")
+        selection.noteManualSelection()
+
+        XCTAssertEqual(
+            selection.resolve(ssid: "Office", matchedScenarioID: "office"),
+            "office"
+        )
+    }
+
+    func testUnmatchedSSIDSeparatesReturnToPreviousNetwork() {
+        var selection = SSIDScenarioSelectionState()
+        _ = selection.resolve(ssid: "Home", matchedScenarioID: "home")
+        selection.noteManualSelection()
+
+        XCTAssertNil(
+            selection.resolve(ssid: "Unconfigured", matchedScenarioID: nil)
+        )
+        XCTAssertEqual(
+            selection.resolve(ssid: "Home", matchedScenarioID: "home"),
+            "home"
+        )
+    }
+
+    func testConfirmedWiFiDisconnectAllowsSameSSIDToActivateAgain() {
+        var selection = SSIDScenarioSelectionState()
+        _ = selection.resolve(ssid: "Home", matchedScenarioID: "home")
+        selection.noteManualSelection()
+        selection.noteWiFiDisconnected()
+
+        XCTAssertNil(selection.resolve(ssid: nil, matchedScenarioID: nil))
+        XCTAssertEqual(
+            selection.resolve(ssid: "Home", matchedScenarioID: "home"),
+            "home"
+        )
+    }
+
+    func testManualClickBeforeFirstReadableSampleEstablishesBaseline() {
+        var selection = SSIDScenarioSelectionState()
+        selection.noteManualSelection()
+
+        XCTAssertNil(
+            selection.resolve(ssid: "Home", matchedScenarioID: "home")
+        )
+        XCTAssertEqual(
+            selection.resolve(ssid: "Office", matchedScenarioID: "office"),
+            "office"
+        )
+    }
+
+    func testExplicitCurrentSSIDRuleEditCanReplaceManualSelection() {
+        var selection = SSIDScenarioSelectionState()
+        _ = selection.resolve(ssid: "Home", matchedScenarioID: nil)
+        selection.noteManualSelection()
+
+        XCTAssertNil(
+            selection.resolve(
+                ssid: nil, matchedScenarioID: nil, forceMatching: true
+            )
+        )
+        XCTAssertNil(
+            selection.resolve(ssid: "Home", matchedScenarioID: "new-home")
+        )
+        XCTAssertEqual(
+            selection.resolve(
+                ssid: "Home", matchedScenarioID: "new-home",
+                forceMatching: true
+            ),
+            "new-home"
+        )
+        XCTAssertEqual(
+            selection.resolve(ssid: "Home", matchedScenarioID: "new-home"),
+            "new-home"
+        )
+    }
+}
+
 final class NetworkEpochSwitchCoordinatorTests: XCTestCase {
     func testSameCommittedScenarioSwitchesWithFreshUnderlay() {
         XCTAssertEqual(

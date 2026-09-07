@@ -223,6 +223,10 @@ final class AppState: ObservableObject {
     private var scenarioSwitchRequiresUnderlayRefresh = false
     private var networkEpochSwitchCoordinator =
         NetworkEpochSwitchCoordinator()
+    private var ssidScenarioSelection = SSIDScenarioSelectionState()
+    private var networkEpochSSIDSelectionReason = "ssid-unavailable"
+    private var automaticReconnectPreparation:
+        ((AutomaticReconnectPreparation?) -> Void)?
     private var networkEpochPowerGate = SystemSleepNetworkEpochGate()
     private var networkEpochQuietWorkItem: DispatchWorkItem?
     private var didEvaluateInitialSSIDAccess = false
@@ -667,6 +671,17 @@ final class AppState: ObservableObject {
             self?.handleUnderlayChange(
                 underlayFingerprint: fingerprint,
                 forceNewEpoch: connectivityRestored
+            )
+        }
+        engine.automaticReconnectPreparationHandler = {
+            [weak self] fingerprint, completion in
+            guard let self else {
+                completion(nil)
+                return
+            }
+            self.prepareAutomaticReconnect(
+                underlayFingerprint: fingerprint,
+                completion: completion
             )
         }
         installation.objectWillChange
@@ -1432,6 +1447,7 @@ final class AppState: ObservableObject {
     }
 
     func disconnect() {
+        cancelNetworkEpochQuietWindow()
         // 用户明确断开必须压过尚未消费的冷启动自动连接意图。
         connectionDesired.userRequestedDisconnection()
         launchAutoConnectPending = false
@@ -1447,6 +1463,7 @@ final class AppState: ObservableObject {
 
     /// 一键重连：把当前配置重新下发给引擎。
     func reconnect() {
+        ssidScenarioSelection.noteManualSelection()
         guard let activeScenario else { return }
         cancelNetworkEpochQuietWindow()
         _ = enqueueScenarioSwitch(
@@ -1459,6 +1476,7 @@ final class AppState: ObservableObject {
     /// SSID / 设置页的激活仍走 `switchScenario`，因此 D39 的显式断开门禁不变。
     @discardableResult
     func connectScenario(_ id: String) -> Bool {
+        ssidScenarioSelection.noteManualSelection()
         cancelNetworkEpochQuietWindow()
         return enqueueScenarioSwitch(
             to: id,
@@ -1471,6 +1489,7 @@ final class AppState: ObservableObject {
     /// 覆盖待切目标，控制面始终 single-flight。
     @discardableResult
     func switchScenario(to id: String) -> Bool {
+        ssidScenarioSelection.noteManualSelection()
         // 手动选择在当前稳定网络上拥有优先级；若 quiet window 中还有
         // 旧 SSID/Underlay 样本，本次 Switch 自己会重新捕获最终 Underlay。
         cancelNetworkEpochQuietWindow()
@@ -1605,6 +1624,13 @@ final class AppState: ObservableObject {
         else {
             return
         }
+        if engine.automaticReconnectState.inProgress {
+            // The Provider that owned this candidate is gone. A late failure
+            // must not restore its source over the pending recovery target.
+            scenarioSwitchInFlight = nil
+            scenarioSwitchCancellationRequested = false
+            return
+        }
         let cancellationWasRequested =
             scenarioSwitchCancellationRequested
         let cancellationNeedsSourceRestore =
@@ -1672,6 +1698,7 @@ final class AppState: ObservableObject {
     /// Clicking the candidate again cancels only that staged Switch. The
     /// committed source generation remains connected and authoritative.
     func cancelPendingScenarioSwitch() {
+        ssidScenarioSelection.noteManualSelection()
         cancelNetworkEpochQuietWindow()
         guard scenarioSwitchTargetID != nil
                 || scenarioSwitchInFlight != nil else {
@@ -1806,7 +1833,9 @@ final class AppState: ObservableObject {
         } else {
             requestSSIDAccess()
         }
-        activateScenarioForCurrentSSIDIfNeeded()
+        activateScenarioForCurrentSSIDIfNeeded(
+            forceMatching: ssid == currentSSID
+        )
         return nil
     }
 
@@ -1857,7 +1886,9 @@ final class AppState: ObservableObject {
         scheduleNetworkEpochSettlement(token)
     }
 
-    private func activateScenarioForCurrentSSIDIfNeeded() {
+    private func activateScenarioForCurrentSSIDIfNeeded(
+        forceMatching: Bool = false
+    ) {
         guard networkEpochPowerGate.observeNetworkSignal()
             == .evaluateCurrentPath else {
             return
@@ -1867,10 +1898,20 @@ final class AppState: ObservableObject {
             ?? connectionDesired.scenarioID
             ?? engine.connectionReport?.scenario.id
             ?? profile.activeScenarioID
-        let matchedScenarioID = currentSSID.flatMap {
+        let rawMatch = currentSSID.flatMap {
             profile.scenario(matchingSSID: $0)?.id
         }
-        if matchedScenarioID == nil, currentSSID != nil {
+        let matchedScenarioID = ssidScenarioSelection.resolve(
+            ssid: currentSSID,
+            matchedScenarioID: rawMatch,
+            forceMatching: forceMatching
+        )
+        recordSSIDSelectionReason(
+            ssid: currentSSID,
+            rawMatch: rawMatch,
+            allowedMatch: matchedScenarioID
+        )
+        if rawMatch == nil, currentSSID != nil {
             networkEpochSwitchCoordinator.noteUnmatchedSSID()
         }
         guard let resolvedScenarioID = matchedScenarioID
@@ -1919,6 +1960,37 @@ final class AppState: ObservableObject {
         scheduleNetworkEpochSettlement(token)
     }
 
+    private func prepareAutomaticReconnect(
+        underlayFingerprint: String,
+        completion: @escaping (AutomaticReconnectPreparation?) -> Void
+    ) {
+        guard !networkEpochPowerGate.defersNetworkWork,
+              automaticScenarioChangeKeepsConnection else {
+            completion(nil)
+            return
+        }
+        let desiredScenarioID = scenarioSwitchTargetID
+            ?? connectionDesired.scenarioID
+            ?? profile.activeScenarioID
+        guard automaticReconnectPreparation == nil,
+              let token = networkEpochSwitchCoordinator.observeUnderlayChange(
+                currentDesiredScenarioID: desiredScenarioID,
+                underlayFingerprint: underlayFingerprint,
+                forceNewEpoch: true
+              ) else {
+            completion(nil)
+            return
+        }
+        // Preserve the latest target above, then release the dead Provider's
+        // candidate before waiting: its late completion must not rewrite the
+        // desired Scenario during the quiet window.
+        scenarioSwitchGeneration += 1
+        scenarioSwitchInFlight = nil
+        scenarioSwitchCancellationRequested = false
+        automaticReconnectPreparation = completion
+        scheduleNetworkEpochSettlement(token)
+    }
+
     private func scheduleNetworkEpochSettlement(
         _ token: NetworkEpochSwitchCoordinator.QuietToken
     ) {
@@ -1936,6 +2008,13 @@ final class AppState: ObservableObject {
                 else {
                     return
                 }
+                let underlayIsStable: Bool
+                if case let .success(fingerprint) = result {
+                    underlayIsStable = self.networkEpochSwitchCoordinator
+                        .hasUnderlayFingerprint(fingerprint)
+                } else {
+                    underlayIsStable = false
+                }
                 guard case let .success(fingerprint) = result,
                       var stableToken = self
                         .networkEpochSwitchCoordinator
@@ -1948,8 +2027,10 @@ final class AppState: ObservableObject {
                     return
                 }
 
+                var ssidIsStable = true
                 if let wifi = self.wifiSSIDMonitor
                     .sampleCurrentForNetworkEpoch() {
+                    ssidIsStable = self.currentSSID == wifi.ssid
                     self.currentSSID = wifi.ssid
                     self.wifiSSIDAccessState = wifi.accessState
                     let currentDesiredScenarioID =
@@ -1957,10 +2038,19 @@ final class AppState: ObservableObject {
                         ?? self.connectionDesired.scenarioID
                         ?? self.engine.connectionReport?.scenario.id
                         ?? self.profile.activeScenarioID
-                    let matchedScenarioID = wifi.ssid.flatMap {
+                    let rawMatch = wifi.ssid.flatMap {
                         self.profile.scenario(matchingSSID: $0)?.id
                     }
-                    if matchedScenarioID == nil, wifi.ssid != nil {
+                    let matchedScenarioID = self.ssidScenarioSelection.resolve(
+                        ssid: wifi.ssid,
+                        matchedScenarioID: rawMatch
+                    )
+                    self.recordSSIDSelectionReason(
+                        ssid: wifi.ssid,
+                        rawMatch: rawMatch,
+                        allowedMatch: matchedScenarioID
+                    )
+                    if rawMatch == nil, wifi.ssid != nil {
                         self.networkEpochSwitchCoordinator
                             .noteUnmatchedSSID()
                     }
@@ -1972,8 +2062,14 @@ final class AppState: ObservableObject {
                         ) {
                         stableToken = refreshed
                     }
+                } else {
+                    self.networkEpochSSIDSelectionReason = "ssid-unavailable"
                 }
 
+                guard underlayIsStable, ssidIsStable else {
+                    self.scheduleNetworkEpochSettlement(stableToken)
+                    return
+                }
                 guard let intent = self
                     .networkEpochSwitchCoordinator.settle(stableToken) else {
                     return
@@ -1997,6 +2093,32 @@ final class AppState: ObservableObject {
         guard profile.scenarios.contains(where: {
             $0.id == intent.desiredScenarioID
         }) else {
+            cancelNetworkEpochQuietWindow()
+            return
+        }
+        if let completion = automaticReconnectPreparation {
+            // Recovery already owns the disconnected Provider transaction.
+            // Hand it the settled decision, rather than queueing a Switch
+            // that waits for this very recovery to become connected.
+            automaticReconnectPreparation = nil
+            connectionDesired.userRequestedConnection(
+                scenarioID: intent.desiredScenarioID
+            )
+            scenarioSwitchTargetID = nil
+            scenarioSwitchRequiresUnderlayRefresh = false
+            _ = persistActiveScenario(intent.desiredScenarioID)
+            let preparation = AutomaticReconnectPreparation(
+                profileJSON: buildProfileJSON(
+                    activeScenarioID: intent.desiredScenarioID
+                ),
+                underlayFingerprint: intent.underlayFingerprint
+            )
+            appLog(
+                "Network epoch \(intent.epoch) prepared automatic recovery Scenario "
+                    + intent.desiredScenarioID
+                    + " reason=" + networkEpochSSIDSelectionReason
+            )
+            completion(preparation)
             return
         }
         let currentDesiredScenarioID = scenarioSwitchTargetID
@@ -2022,6 +2144,8 @@ final class AppState: ObservableObject {
             appLog(
                 "Network epoch \(intent.epoch) selected Scenario "
                     + intent.desiredScenarioID
+                    + " reason=" + networkEpochSSIDSelectionReason
+                    + " underlay-refresh=\(requiresUnderlayRefresh)"
             )
             _ = enqueueScenarioSwitch(
                 to: intent.desiredScenarioID,
@@ -2032,10 +2156,29 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func recordSSIDSelectionReason(
+        ssid: String?,
+        rawMatch: String?,
+        allowedMatch: String?
+    ) {
+        if ssid == nil {
+            networkEpochSSIDSelectionReason = "ssid-unavailable"
+        } else if allowedMatch != nil {
+            networkEpochSSIDSelectionReason = "ssid-match"
+        } else if rawMatch != nil {
+            networkEpochSSIDSelectionReason = "manual-selection-preserved"
+        } else {
+            networkEpochSSIDSelectionReason = "unmatched-ssid-preserved"
+        }
+    }
+
     private func cancelNetworkEpochQuietWindow() {
         networkEpochQuietWorkItem?.cancel()
         networkEpochQuietWorkItem = nil
         networkEpochSwitchCoordinator.cancel()
+        let completion = automaticReconnectPreparation
+        automaticReconnectPreparation = nil
+        completion?(nil)
     }
 
     private var automaticScenarioChangeKeepsConnection: Bool {

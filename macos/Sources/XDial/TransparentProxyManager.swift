@@ -37,6 +37,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     var scenarioSwitchHandler: ScenarioSwitchHandler?
     var activationStatusHandler: ActivationStatusHandler?
     var underlayChangeHandler: ((String, Bool) -> Void)?
+    var automaticReconnectPreparationHandler:
+        ((String, @escaping (AutomaticReconnectPreparation?) -> Void) -> Void)?
     var activeTransactionID: String? {
         TransparentProxyRuntimeGate.connectionProofTransactionID(
             currentTransactionID: currentTransactionID,
@@ -80,6 +82,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         AutomaticReconnectAttemptBudget(
             maxAttempts: automaticReconnectRetryPolicy.maxAttempts
         )
+    private var automaticReconnectPreparationGate =
+        AutomaticReconnectPreparationGate()
     private var automaticReconnectRetryWorkItem: DispatchWorkItem?
     private var automaticReconnectRetryToken: UUID?
     private var automaticReconnectRetryAt: Date?
@@ -2905,7 +2909,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         recordSchedule: Bool = true
     ) {
         guard automaticReconnectRetryWorkItem == nil,
-              automaticReconnectRetryToken == nil else {
+              automaticReconnectRetryToken == nil,
+              automaticReconnectPreparationGate.token == nil else {
             return
         }
         guard let retryNumber =
@@ -2983,9 +2988,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         guard
             automaticReconnectInProgress,
             currentTransactionID == failedTransactionID,
-            let profileJSON = requestedProfileJSON,
+            requestedProfileJSON != nil,
             let manager,
-            startIntentID != nil
+            startIntentID != nil,
+            let preparationID = automaticReconnectPreparationGate.begin()
         else {
             return
         }
@@ -2996,57 +3002,96 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             guard let self else { return }
             guard
                 self.startIntentID == intentID,
-                self.automaticReconnectInProgress
+                self.automaticReconnectInProgress,
+                self.automaticReconnectPreparationGate.isCurrent(preparationID)
             else {
                 return
             }
             switch result {
             case let .success(snapshot):
-                self.automaticReconnectUnderlayWaitEvidence = nil
-                guard self.automaticReconnectAttemptBudget.recordStarted(
-                    retryNumber
-                ) else {
-                    return
-                }
-                do {
-                    let transactionID = try self.beginTransaction(
-                        profileJSON: profileJSON
+                self.latestCapturedUnderlay = snapshot
+                guard !self.powerLifecycleGate.defersNetworkWork,
+                      let handler = self.automaticReconnectPreparationHandler else {
+                    self.rescheduleAutomaticReconnectPreparation(
+                        preparationID: preparationID,
+                        failedTransactionID: failedTransactionID
                     )
-                    self.automaticReconnectTransactionID =
-                        transactionID
-                    if let incidentID = self.activeReconnectIncidentID {
-                        ReconnectIncidentJournal.append(
-                            incidentID: incidentID,
-                            type: "retry-started",
-                            attempt: retryNumber,
-                            transactionID: transactionID
-                        )
-                    }
-                    self.updateReport(transactionID: transactionID) {
-                        $0.updateTask(
-                            id: "underlay:system",
-                            state: .ready
-                        )
-                        $0.setState(.preparing)
-                    }
-                } catch {
-                    self.publishFailure(error)
                     return
                 }
-                appLog(
-                    "Transparent Proxy automatic reconnect retry "
-                        + "\(retryNumber) captured default="
-                        + snapshot.defaultInterface.name
-                )
-                self.publishRuntimeStatus("reconnecting", error: nil)
-                self.startConnection(
-                    manager,
-                    profileJSON: profileJSON,
-                    underlay: snapshot,
-                    intentID: intentID,
-                    debugFailureStage: nil
-                )
+                self.retireScenarioSwitchForAutomaticRecovery()
+                handler(snapshot.epochFingerprint) { [weak self] prepared in
+                    guard let self,
+                          self.automaticReconnectPreparationGate
+                            .isCurrent(preparationID),
+                          self.startIntentID == intentID,
+                          self.currentTransactionID == failedTransactionID,
+                          self.automaticReconnectInProgress else {
+                        return
+                    }
+                    guard !self.powerLifecycleGate.defersNetworkWork,
+                          let prepared,
+                          let stableSnapshot = self.latestCapturedUnderlay,
+                          stableSnapshot.epochFingerprint
+                            == prepared.underlayFingerprint else {
+                        self.rescheduleAutomaticReconnectPreparation(
+                            preparationID: preparationID,
+                            failedTransactionID: failedTransactionID
+                        )
+                        return
+                    }
+                    // Consume once before publishing a new transaction; a
+                    // duplicate or cancelled preparation cannot start again.
+                    guard self.automaticReconnectPreparationGate
+                        .finish(preparationID) else { return }
+                    self.automaticReconnectUnderlayWaitEvidence = nil
+                    self.requestedProfileJSON = prepared.profileJSON
+                    guard self.automaticReconnectAttemptBudget.recordStarted(
+                        retryNumber
+                    ) else {
+                        return
+                    }
+                    do {
+                        let transactionID = try self.beginTransaction(
+                            profileJSON: prepared.profileJSON
+                        )
+                        self.automaticReconnectTransactionID =
+                            transactionID
+                        if let incidentID = self.activeReconnectIncidentID {
+                            ReconnectIncidentJournal.append(
+                                incidentID: incidentID,
+                                type: "retry-started",
+                                attempt: retryNumber,
+                                transactionID: transactionID
+                            )
+                        }
+                        self.updateReport(transactionID: transactionID) {
+                            $0.updateTask(
+                                id: "underlay:system",
+                                state: .ready
+                            )
+                            $0.setState(.preparing)
+                        }
+                    } catch {
+                        self.publishFailure(error)
+                        return
+                    }
+                    appLog(
+                        "Transparent Proxy automatic reconnect retry "
+                            + "\(retryNumber) captured default="
+                            + stableSnapshot.defaultInterface.name
+                    )
+                    self.publishRuntimeStatus("reconnecting", error: nil)
+                    self.startConnection(
+                        manager,
+                        profileJSON: prepared.profileJSON,
+                        underlay: stableSnapshot,
+                        intentID: intentID,
+                        debugFailureStage: nil
+                    )
+                }
             case let .failure(error):
+                guard self.automaticReconnectPreparationGate
+                    .finish(preparationID) else { return }
                 let captureError = error as? HostUnderlayCaptureError
                 self.automaticReconnectUnderlayWaitEvidence =
                     captureError?.evidence
@@ -3063,6 +3108,39 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 )
             }
         }
+    }
+
+    private func retireScenarioSwitchForAutomaticRecovery() {
+        guard let active = activeScenarioSwitch else { return }
+        // Recovery is allowed only after the failed Provider rolled back and
+        // removed takeover. Its old source/target pair can never reconcile
+        // against the new recovery transaction, so retire it locally.
+        activeScenarioSwitch = nil
+        active.timeoutWorkItem?.cancel()
+        active.reconciliationWorkItem?.cancel()
+        active.progressWorkItem?.cancel()
+        recordScenarioSwitch(
+            active,
+            status: "failed",
+            activeTransactionID: "",
+            code: "provider-session-lost",
+            message: ManagerError.providerSessionLost.localizedDescription
+        )
+        active.completionGate.finish(.failure(ManagerError.providerSessionLost))
+    }
+
+    private func rescheduleAutomaticReconnectPreparation(
+        preparationID: UUID,
+        failedTransactionID: String
+    ) {
+        guard automaticReconnectPreparationGate.finish(preparationID) else {
+            return
+        }
+        scheduleAutomaticReconnectRetry(
+            failedTransactionID: failedTransactionID,
+            delay: automaticReconnectRetryPolicy.underlayWaitRetryDelay,
+            recordSchedule: false
+        )
     }
 
     private func resumeAutomaticReconnectRetryAfterWake() {
@@ -3118,6 +3196,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private func cancelAutomaticReconnectRetry(
         resetAttempts: Bool
     ) {
+        automaticReconnectPreparationGate.cancel()
         automaticReconnectRetryWorkItem?.cancel()
         automaticReconnectRetryWorkItem = nil
         automaticReconnectRetryToken = nil
