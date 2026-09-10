@@ -62,6 +62,8 @@ struct LineAddressView: View {
                         HStack {
                             if family == value { Image(systemName: "checkmark") }
                             Text(menuLabel(value))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                     }
                     .disabled(!isAvailable(value))
