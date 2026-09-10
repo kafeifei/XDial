@@ -10,6 +10,11 @@ final class ApplicationLaunchPolicyTests: XCTestCase {
         XCTAssertFalse(configuration.addsToRecentItems)
         XCTAssertFalse(configuration.activates)
         XCTAssertTrue(configuration.createsNewApplicationInstance)
+        XCTAssertFalse(
+            configuration.arguments.contains(
+                ApplicationLaunchPolicy.installedSuccessorArgument
+            )
+        )
     }
 
     func testRelocationRelaunchCarriesPredecessorProcessIdentifier() {
@@ -68,6 +73,90 @@ final class ApplicationLaunchPolicyTests: XCTestCase {
                         "not-a-pid",
                     ]
                 )
+        )
+    }
+
+    func testInstalledSuccessorCarriesDistinctMarkerAndPredecessor() {
+        let configuration = NSWorkspace.OpenConfiguration()
+
+        ApplicationLaunchPolicy.configure(
+            configuration,
+            relocationPredecessorProcessIdentifier: 42,
+            isInstalledSuccessor: true
+        )
+
+        XCTAssertEqual(
+            configuration.arguments,
+            [
+                ApplicationLaunchPolicy.relocationPredecessorArgument,
+                "42",
+                ApplicationLaunchPolicy.installedSuccessorArgument,
+            ]
+        )
+        XCTAssertEqual(
+            ApplicationLaunchPolicy.relocationPredecessorProcessIdentifier(
+                arguments: ["XDial"] + configuration.arguments
+            ),
+            42
+        )
+        XCTAssertTrue(
+            ApplicationLaunchPolicy.shouldRejectInstalledSuccessor(
+                currentIsCanonical: false,
+                arguments: ["XDial"] + configuration.arguments
+            )
+        )
+        XCTAssertFalse(
+            ApplicationLaunchPolicy.shouldRejectInstalledSuccessor(
+                currentIsCanonical: true,
+                arguments: ["XDial"] + configuration.arguments
+            )
+        )
+    }
+
+    func testInstalledSuccessorMarkerDoesNotRequirePredecessorPID() {
+        let configuration = NSWorkspace.OpenConfiguration()
+
+        ApplicationLaunchPolicy.configure(
+            configuration,
+            isInstalledSuccessor: true
+        )
+
+        XCTAssertEqual(
+            configuration.arguments,
+            [ApplicationLaunchPolicy.installedSuccessorArgument]
+        )
+        XCTAssertTrue(
+            ApplicationLaunchPolicy.shouldRejectInstalledSuccessor(
+                currentIsCanonical: false,
+                arguments: ["XDial"] + configuration.arguments
+            )
+        )
+    }
+
+    func testDownloadAndStagedUpdateMayStartOutsideCanonicalLocation() {
+        XCTAssertFalse(
+            ApplicationLaunchPolicy.shouldRejectInstalledSuccessor(
+                currentIsCanonical: false,
+                arguments: ["XDial"]
+            )
+        )
+
+        let stagedConfiguration = NSWorkspace.OpenConfiguration()
+        ApplicationLaunchPolicy.configure(
+            stagedConfiguration,
+            relocationPredecessorProcessIdentifier: 42
+        )
+
+        XCTAssertFalse(
+            stagedConfiguration.arguments.contains(
+                ApplicationLaunchPolicy.installedSuccessorArgument
+            )
+        )
+        XCTAssertFalse(
+            ApplicationLaunchPolicy.shouldRejectInstalledSuccessor(
+                currentIsCanonical: false,
+                arguments: ["XDial"] + stagedConfiguration.arguments
+            )
         )
     }
 

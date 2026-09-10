@@ -256,6 +256,57 @@ final class InstallationTransactionTests: XCTestCase {
         )
     }
 
+    func testExtensionReadinessNeverInstallsFromConnectionOrVerification() {
+        let identifier = "com.kafeifei.xdial.app.transparent-proxy"
+        let unavailableSnapshots: [[SystemExtensionPropertySnapshot]] = [
+            [],
+            [.init(bundleIdentifier: identifier, bundleVersion: "78",
+                   isEnabled: true, isAwaitingUserApproval: false,
+                   isUninstalling: false)],
+            [.init(bundleIdentifier: identifier, bundleVersion: "79",
+                   isEnabled: false, isAwaitingUserApproval: false,
+                   isUninstalling: false)],
+            [.init(bundleIdentifier: identifier, bundleVersion: "79",
+                   isEnabled: true, isAwaitingUserApproval: true,
+                   isUninstalling: false)],
+            [.init(bundleIdentifier: identifier, bundleVersion: "79",
+                   isEnabled: true, isAwaitingUserApproval: false,
+                   isUninstalling: true)],
+        ]
+        for properties in unavailableSnapshots {
+            for phase in [SystemExtensionActivationVerifier.Phase.connection,
+                          .installationCompletion] {
+                XCTAssertEqual(SystemExtensionActivationVerifier.action(
+                    for: properties, expectedIdentifier: identifier,
+                    expectedVersion: "79", phase: phase
+                ), .unavailable)
+            }
+            XCTAssertEqual(SystemExtensionActivationVerifier.action(
+                for: properties, expectedIdentifier: identifier,
+                expectedVersion: "79", phase: .installationPreflight
+            ), .activate)
+        }
+    }
+
+    func testRepeatedInstallationAcceptsCurrentVersionAlongsideRetiredVersions() {
+        let identifier = "com.kafeifei.xdial.app.transparent-proxy"
+        let properties: [SystemExtensionPropertySnapshot] = [
+            .init(bundleIdentifier: identifier, bundleVersion: "78",
+                  isEnabled: false, isAwaitingUserApproval: false,
+                  isUninstalling: true),
+            .init(bundleIdentifier: identifier, bundleVersion: "79",
+                  isEnabled: true, isAwaitingUserApproval: false,
+                  isUninstalling: false),
+        ]
+        for phase in [SystemExtensionActivationVerifier.Phase.connection,
+                      .installationPreflight, .installationCompletion] {
+            XCTAssertEqual(SystemExtensionActivationVerifier.action(
+                for: properties, expectedIdentifier: identifier,
+                expectedVersion: "79", phase: phase
+            ), .ready)
+        }
+    }
+
     func testRelocationAllowsKnownApplicationReplacementForSameTeam() {
         XCTAssertTrue(
             XDialApplicationIdentifierPolicy.permitsReplacement(

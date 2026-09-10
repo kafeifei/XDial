@@ -27,6 +27,77 @@ expect_failure "$contract" validate-inputs v0.7.0-rc.1 98
 expect_failure "$contract" validate-inputs v0.7.0 0
 expect_failure "$contract" validate-inputs v0.7.0 build-98
 
+check_debug_entitlement() (
+    source "$contract"
+    assert_get_task_allow_absent_in_plist fixture "$1"
+)
+
+entitlement_plist_prefix='<?xml version="1.0"?><plist version="1.0"><dict>'
+entitlement_plist_suffix='</dict></plist>'
+debug_entitlement='<key>com.apple.security.get-task-allow</key>'
+expect_failure check_debug_entitlement \
+    "$entitlement_plist_prefix$debug_entitlement<true/>$entitlement_plist_suffix"
+check_debug_entitlement \
+    "$entitlement_plist_prefix$debug_entitlement<false/>$entitlement_plist_suffix"
+check_debug_entitlement "$entitlement_plist_prefix$entitlement_plist_suffix"
+check_debug_entitlement ''
+expect_failure check_debug_entitlement 'invalid plist'
+
+check_system_extension_authorization() (
+    source "$contract"
+    assert_system_extension_authorization_plists "$1" "$2" "$3" 1800000000
+)
+
+for identifier in com.kafeifei.xdial.app com.kafeifei.xdial.app.transparent-proxy; do
+    authorization_dictionary="<dict>
+<key>com.apple.application-identifier</key><string>UVZM439VGU.$identifier</string>
+<key>com.apple.developer.team-identifier</key><string>UVZM439VGU</string>
+<key>com.apple.developer.networking.networkextension</key>
+<array><string>app-proxy-provider-systemextension</string></array>
+<key>com.apple.developer.system-extension.install</key><true/>
+</dict>"
+    signed="<plist version=\"1.0\">$authorization_dictionary</plist>"
+    profile="<plist version=\"1.0\"><dict>
+<key>TeamIdentifier</key><array><string>UVZM439VGU</string></array>
+<key>ProvisionsAllDevices</key><true/>
+<key>CreationDate</key><date>2026-01-01T00:00:00Z</date>
+<key>ExpirationDate</key><date>2044-01-01T00:00:00Z</date>
+<key>Entitlements</key>$authorization_dictionary
+</dict></plist>"
+    check_system_extension_authorization "$identifier" "$signed" "$profile"
+    expect_failure check_system_extension_authorization "$identifier" '' "$profile"
+    expect_failure check_system_extension_authorization "$identifier" "$signed" ''
+    expect_failure check_system_extension_authorization "$identifier" "$signed" 'invalid plist'
+    expect_failure check_system_extension_authorization "$identifier" \
+        "${signed/UVZM439VGU.$identifier/UVZM439VGU.wrong}" "$profile"
+    expect_failure check_system_extension_authorization "$identifier" "$signed" \
+        "${profile/UVZM439VGU.$identifier/UVZM439VGU.wrong}"
+    expect_failure check_system_extension_authorization "$identifier" \
+        "${signed/<string>UVZM439VGU<\//<string>WRONGTEAM<\/}" "$profile"
+    expect_failure check_system_extension_authorization "$identifier" "$signed" \
+        "${profile/<string>UVZM439VGU<\//<string>WRONGTEAM<\/}"
+    expect_failure check_system_extension_authorization "$identifier" \
+        "${signed/app-proxy-provider-systemextension/app-proxy-provider}" "$profile"
+    expect_failure check_system_extension_authorization "$identifier" "$signed" \
+        "${profile/app-proxy-provider-systemextension/app-proxy-provider}"
+    expect_failure check_system_extension_authorization "$identifier" "$signed" \
+        "${profile/2044-01-01/2000-01-01}"
+    expect_failure check_system_extension_authorization "$identifier" "$signed" \
+        "${profile/2026-01-01/2040-01-01}"
+    expect_failure check_system_extension_authorization "$identifier" "$signed" \
+        "${profile/CreationDate/MissingCreationDate}"
+    expect_failure check_system_extension_authorization "$identifier" "$signed" \
+        "${profile/ProvisionsAllDevices/MissingProvisionsAllDevices}"
+    if [[ "$identifier" == com.kafeifei.xdial.app ]]; then
+        expect_failure check_system_extension_authorization "$identifier" \
+            "${signed/system-extension.install/missing.install}" "$profile"
+        expect_failure check_system_extension_authorization "$identifier" "$signed" \
+            "${profile/system-extension.install/missing.install}"
+        expect_failure check_system_extension_authorization "$identifier" \
+            "${signed/<true\//<false\/}" "$profile"
+    fi
+done
+
 notes="$test_root/RELEASE_NOTES.md"
 printf '%s\n' \
     '# XDial v0.7.0' \

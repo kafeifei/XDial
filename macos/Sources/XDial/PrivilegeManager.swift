@@ -2,12 +2,9 @@ import CryptoKit
 import Foundation
 import ServiceManagement
 
-// 特权模型（Surge 同款体验）：
-// - daemon 以 SMAppService 注册，plist 与二进制都在 app bundle 内，由 launchd 以 root 运行
-// - 首次启用在系统设置「登录项」批准一次（支持 Touch ID），之后重编/升级永远免授权：
-//   launchd 直接运行 bundle 里的新二进制，信任绑定在开发者签名身份上，而非二进制快照
-// - 重编后运行中的旧 daemon 通过 respawn 命令原地 re-exec 成新二进制，全程无感
-// - 旧机制（密码安装到 /Library/PrivilegedHelperTools）只保留一次性清理入口
+// daemon 以 SMAppService 注册，plist 与二进制都在 app bundle 内，由 launchd 托管。
+// .enabled 只代表允许运行；更新 plist 或 executable 后必须重新注册。安装协调器
+// 先取得空闲服务的维护租约，再等待 unregister completion 后注册当前 bundle。
 enum PrivilegeManager {
     static let label = "com.kafeifei.xdial.app.daemon"
     static let plistName =
@@ -31,6 +28,350 @@ enum PrivilegeManager {
 
     static func register() throws {
         try service.register()
+    }
+
+    static func registerCurrentBundle() throws -> Bool {
+        let appService = service
+        let statusBefore = appService.status
+        appLog("helper register begin status=\(statusBefore.rawValue)")
+        do {
+            try appService.register()
+        } catch {
+            let statusAfter = appService.status
+            appLog("helper register result=error statusBefore=\(statusBefore.rawValue)"
+                + " statusAfter=\(statusAfter.rawValue) "
+                + ServiceManagementErrorDiagnostics.summary(error))
+            // A newly registered daemon can await user consent. Do not turn an
+            // AlreadyRegistered response into proof of refreshed registration.
+            if ServiceManagementErrorDiagnostics.matches(
+                error, domain: SMAppServiceErrorDomain, code: kSMErrorAlreadyRegistered
+            ) { return false }
+            if statusAfter == .requiresApproval {
+                try recordAcceptedRegistration()
+                return true
+            }
+            throw error
+        }
+        appLog("helper register result=accepted statusBefore=\(statusBefore.rawValue)"
+            + " statusAfter=\(appService.status.rawValue)")
+        try recordAcceptedRegistration()
+        return true
+    }
+
+    static func canReconcileRegistrationFailure(_ error: Error) -> Bool {
+        guard ServiceManagementErrorDiagnostics.matches(
+            error, domain: SMAppServiceErrorDomain, code: Int(EPERM)
+        ), status == .notRegistered else { return false }
+        do {
+            guard let intent = try HelperRegistrationMaintenanceIntent.read(),
+                  intent.phase == "committed",
+                  let executableHash = bundledDaemonSHA256(),
+                  intent.targetHash == executableHash else { return false }
+            appLog("helper register reconciliation eligible status=0 "
+                + ServiceManagementErrorDiagnostics.summary(error))
+            return true
+        } catch { return false }
+    }
+
+    private static func recordAcceptedRegistration() throws {
+        if let intent = try HelperRegistrationMaintenanceIntent.read() {
+            try HelperRegistrationMaintenanceIntent.update(
+                token: intent.token, phase: "registered", targetHash: registrationIdentity().executableHash
+            )
+        }
+    }
+
+    static func verifiedRegistrationMarker(fingerprint: String, executableHash: String, savedMarker: String?) -> String? {
+        do {
+            if let intent = try HelperRegistrationMaintenanceIntent.read() {
+                // Only an acknowledged unregister followed by successful register
+                // can produce this phase. Earlier crashes need a new OS barrier.
+                return intent.phase == "registered" && intent.targetHash == executableHash ? fingerprint : nil
+            }
+            return savedMarker
+        } catch { return nil }
+    }
+
+    static var hasPendingRegistrationRecovery: Bool {
+        do {
+            guard let intent = try HelperRegistrationMaintenanceIntent.read() else { return false }
+            return intent.phase != "registered" || intent.targetHash != bundledDaemonSHA256()
+        } catch { return true }
+    }
+
+    static let registrationMarkerKey = "xdial.helper.registration.v1"
+
+    struct RegistrationIdentity {
+        let fingerprint: String
+        let executableHash: String
+    }
+
+    static func registrationIdentity() throws -> RegistrationIdentity {
+        guard let identifier = Bundle.main.bundleIdentifier,
+              let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              let executableHash = bundledDaemonSHA256() else {
+            throw HelperError.registrationIdentityUnavailable
+        }
+        let plist = Bundle.main.bundleURL.appendingPathComponent(
+            "Contents/Library/LaunchDaemons/\(plistName)"
+        )
+        let plistHash = SHA256.hash(data: try Data(contentsOf: plist))
+            .map { String(format: "%02x", $0) }.joined()
+        return RegistrationIdentity(
+            fingerprint: [identifier, build, plistHash, executableHash].joined(separator: ":"),
+            executableHash: executableHash
+        )
+    }
+
+    static var registrationStatus: HelperRegistrationCoordinator.ServiceStatus {
+        switch status {
+        case .enabled: .enabled
+        case .requiresApproval: .requiresApproval
+        case .notRegistered: .notRegistered
+        case .notFound: .notFound
+        @unknown default: .notFound
+        }
+    }
+
+    static func registrationRuntime() -> HelperRegistrationCoordinator.Runtime {
+        if let info = probeDaemonInfo(), let pid = Int32(exactly: info.pid), pid > 0 {
+            return .running(.init(
+                pid: pid,
+                executableHash: info.exeSHA256,
+                handoffProtocolVersion: info.registrationHandoffVersion ?? 0
+            ))
+        }
+        if canConnectSocket() { return .unresponsive }
+        guard case let .available(entries) = LocalProcessInventory.capture() else { return .unknown }
+        var hasUnknown = false
+        for entry in entries where entry.pid != ProcessInfo.processInfo.processIdentifier {
+            switch entry.matchesExecutableName(in: ["xdial", "xdial-daemon"]) {
+            case true: return .unresponsive
+            case false: continue
+            case nil: hasUnknown = true
+            }
+        }
+        return hasUnknown ? .unknown : .absent
+    }
+
+    static func legacyMaintenanceIsExclusive(daemonPID: Int32) -> Bool {
+        guard case let .available(entries) = LocalProcessInventory.capture() else { return false }
+        let hostPID = ProcessInfo.processInfo.processIdentifier
+        return entries.allSatisfy { entry in
+            if entry.pid == hostPID || entry.pid == daemonPID { return true }
+            return entry.matchesExecutableName(in: ["xdial", "xdial-daemon"]) == false
+        }
+    }
+
+    static func legacyEngineIsIdle() -> Bool {
+        struct Status: Decodable { let status: String }
+        guard let raw = roundTrip(cmd: "status"),
+              let data = raw.data(using: .utf8),
+              let result = try? JSONDecoder().decode(Status.self, from: data) else { return false }
+        return result.status == "disconnected"
+    }
+
+    private static let registrationRefreshLock = NSLock()
+    private static var registrationRefreshInFlight = false
+
+    /// Keep a cooperative live daemon quiesced through the OS completion. A
+    /// timeout reports an unknown result; it never releases a lease while a
+    /// pending unregister could still kill the daemon after it resumes work.
+    static func unregisterForRegistrationRefresh(
+        daemon: HelperRegistrationCoordinator.Daemon?
+    ) async throws {
+        guard await MainActor.run(body: { GoEngine.shared.helperRegistrationMaintenanceAllowed }) else {
+            throw HelperRegistrationCoordinator.Failure.serviceBusy
+        }
+        let previousIntent = try HelperRegistrationMaintenanceIntent.read()
+        // Live services first grant an idle lease. Only the absent path needs
+        // an intent before probing again to cover a racing KeepAlive start.
+        let earlyIntent = daemon == nil ? try HelperRegistrationMaintenanceIntent.establish(
+            targetHash: registrationIdentity().executableHash, previousPID: nil
+        ) : previousIntent
+        let lease: LocalDaemonConnection?
+        do {
+            lease = try await Task.detached { () throws -> LocalDaemonConnection? in
+                let runtime = registrationRuntime()
+                guard case let .running(current) = runtime else {
+                    guard runtime == .absent else {
+                        throw HelperRegistrationCoordinator.Failure.serviceBusy
+                    }
+                    return nil
+                }
+                if current.handoffProtocolVersion < 1 {
+                    // Only the coordinator's full legacy idle window authorizes
+                    // this path. Unknown third-party IPC clients cannot be proven
+                    // idle on the old protocol; no re-exec path can repair that.
+                    guard current == daemon,
+                          legacyMaintenanceIsExclusive(daemonPID: current.pid),
+                          legacyEngineIsIdle() else {
+                        throw HelperRegistrationCoordinator.Failure.serviceBusy
+                    }
+                    return nil
+                }
+                guard let connection = LocalDaemonConnection(timeout: 2) else {
+                    throw HelperRegistrationCoordinator.Failure.serviceBusy
+                }
+                guard connection.peerPID == current.pid,
+                      let response = connection.request("registration-handoff"), response.ok == true,
+                      let raw = response.data?.data(using: .utf8),
+                      let reply = try? JSONDecoder().decode(HandoffReply.self, from: raw),
+                      reply.pid == current.pid, reply.protocolVersion == 1 else {
+                    connection.close()
+                    throw HelperRegistrationCoordinator.Failure.serviceBusy
+                }
+                return connection
+            }.value
+            guard await MainActor.run(body: { GoEngine.shared.helperRegistrationMaintenanceAllowed }) else {
+                lease?.close()
+                throw HelperRegistrationCoordinator.Failure.serviceBusy
+            }
+        } catch {
+            if previousIntent == nil, let earlyIntent {
+                try? HelperRegistrationMaintenanceIntent.clear(token: earlyIntent.token)
+            }
+            throw error
+        }
+        let intent: HelperRegistrationMaintenanceIntent.Record
+        do {
+            intent = try earlyIntent ?? HelperRegistrationMaintenanceIntent.establish(
+                targetHash: registrationIdentity().executableHash, previousPID: daemon?.pid
+            )
+        } catch {
+            lease?.close()
+            throw error
+        }
+        let leasedPID = lease?.peerPID
+        try await Task.detached {
+            try unregisterHoldingLease(lease, intent: intent)
+            // SM completion is the registration barrier; the previous process
+            // must also have exited before a replacement registration is made.
+            try awaitPreviousDaemonExit(pids: [daemon?.pid, leasedPID, intent.previousPID].compactMap { $0 })
+        }.value
+    }
+
+    private static func awaitPreviousDaemonExit(pids: [Int32]) throws {
+        guard !pids.isEmpty else { return }
+        let deadline = ProcessInfo.processInfo.systemUptime + 10
+        while true {
+            guard case let .available(entries) = LocalProcessInventory.capture() else {
+                throw HelperRegistrationCoordinator.Failure.processStateUnknown
+            }
+            if !entries.contains(where: { pids.contains($0.pid) }) { return }
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                throw HelperRegistrationCoordinator.Failure.processStateUnknown
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+    }
+
+    static func finishRegistrationMaintenance() throws {
+        guard let intent = try HelperRegistrationMaintenanceIntent.read() else { return }
+        guard intent.phase == "registered",
+              intent.targetHash == bundledDaemonSHA256(),
+              let connection = LocalDaemonConnection(timeout: 2),
+              connection.request("registration-finalize", fields: ["profile": intent.token])?.ok == true else {
+            throw HelperRegistrationCoordinator.Failure.serviceUnavailable
+        }
+    }
+
+    private static func unregisterHoldingLease(
+        _ lease: LocalDaemonConnection?, intent: HelperRegistrationMaintenanceIntent.Record
+    ) throws {
+        registrationRefreshLock.lock()
+        if registrationRefreshInFlight {
+            registrationRefreshLock.unlock()
+            lease?.close()
+            throw HelperError.registrationRefreshPending
+        }
+        registrationRefreshInFlight = true
+        registrationRefreshLock.unlock()
+
+        do {
+            try HelperRegistrationMaintenanceIntent.update(token: intent.token, phase: "committed")
+        } catch {
+            lease?.close()
+            registrationRefreshLock.lock()
+            registrationRefreshInFlight = false
+            registrationRefreshLock.unlock()
+            throw error
+        }
+        if let lease, lease.request("registration-commit")?.ok != true {
+            // An unanswered commit may have succeeded. Preserve its intent and
+            // quiescence for adoption instead of guessing that it was rejected.
+            lease.close()
+            registrationRefreshLock.lock()
+            registrationRefreshInFlight = false
+            registrationRefreshLock.unlock()
+            throw HelperError.registrationRefreshTimedOut
+        }
+        let result = UnregisterResult()
+        let completion = DispatchSemaphore(value: 0)
+        let appService = service
+        let statusBefore = appService.status
+        appLog("helper unregister begin status=\(statusBefore.rawValue)")
+        appService.unregister { error in
+            result.record(error)
+            appLog("helper unregister completion statusBefore=\(statusBefore.rawValue)"
+                + " statusAfter=\(appService.status.rawValue) "
+                + ServiceManagementErrorDiagnostics.summary(error))
+            if let error, !ServiceManagementErrorDiagnostics.matches(
+                error, domain: SMAppServiceErrorDomain, code: kSMErrorJobNotFound
+            ) {
+                // A definite OS failure is the only pre-verification abort.
+                do {
+                    if let lease {
+                        try HelperRegistrationMaintenanceIntent.update(token: intent.token, phase: "aborted")
+                        _ = lease.request("registration-abort", fields: ["profile": intent.token])
+                    } else {
+                        try HelperRegistrationMaintenanceIntent.clear(token: intent.token)
+                    }
+                } catch {
+                    appLog("helper maintenance intent retained after unregister failure: \(error)")
+                }
+            }
+            lease?.close()
+            registrationRefreshLock.lock()
+            registrationRefreshInFlight = false
+            registrationRefreshLock.unlock()
+            completion.signal()
+        }
+        guard completion.wait(timeout: .now() + 15) == .success else {
+            throw HelperError.registrationRefreshTimedOut
+        }
+        if let error = result.error {
+            if ServiceManagementErrorDiagnostics.matches(
+                error, domain: SMAppServiceErrorDomain, code: kSMErrorJobNotFound
+            ), status == .notRegistered || status == .notFound {
+                return
+            }
+            throw error
+        }
+    }
+
+    private struct HandoffReply: Decodable {
+        let pid: Int32
+        let protocolVersion: Int
+        enum CodingKeys: String, CodingKey {
+            case pid
+            case protocolVersion = "protocol_version"
+        }
+    }
+
+    private final class UnregisterResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Error?
+        func record(_ error: Error?) {
+            lock.lock()
+            value = error
+            lock.unlock()
+        }
+        var error: Error? {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
     }
 
     static func unregister() throws {
@@ -129,19 +470,25 @@ enum PrivilegeManager {
         let version: String
         let exeSHA256: String
         let pid: Int
+        let registrationHandoffVersion: Int?
 
         enum CodingKeys: String, CodingKey {
             case version, pid
             case exeSHA256 = "exe_sha256"
+            case registrationHandoffVersion = "registration_handoff_version"
         }
     }
 
     /// 询问运行中 daemon 的版本与二进制 hash。独立短连接，不掺和 GoEngine 的主 socket。
     static func probeDaemonInfo() -> DaemonInfo? {
-        guard let data = roundTrip(cmd: "daemon-info"), let payload = data.data(using: .utf8) else {
-            return nil
-        }
-        return try? JSONDecoder().decode(DaemonInfo.self, from: payload)
+        guard let connection = LocalDaemonConnection(timeout: 2) else { return nil }
+        defer { connection.close() }
+        guard let response = connection.request("daemon-info"), response.ok == true,
+              let payload = response.data?.data(using: .utf8),
+              let info = try? JSONDecoder().decode(DaemonInfo.self, from: payload),
+              let peerPID = connection.peerPID,
+              Int(peerPID) == info.pid else { return nil }
+        return info
     }
 
     /// Network Extension 以 root 运行，同名 App Group 会映射到 root 容器。
@@ -166,59 +513,107 @@ enum PrivilegeManager {
 
     /// 发一条命令并等对应响应。daemon 连接后会先推 status 事件，逐行过滤到匹配 id 为止。
     private static func roundTrip(cmd: String, expectData: Bool = true, timeout: Double = 2) -> String? {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
-        defer { close(fd) }
+        guard let connection = LocalDaemonConnection(timeout: timeout) else { return nil }
+        defer { connection.close() }
+        guard let response = connection.request(cmd), response.ok == true else { return nil }
+        return expectData ? response.data : ""
+    }
 
-        var tv = timeval(tv_sec: Int(timeout), tv_usec: Int32((timeout - Double(Int(timeout))) * 1_000_000))
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            socketPath.withCString { cstr in
-                _ = strncpy(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self), cstr, 104)
-            }
-        }
-        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let connected = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                Darwin.connect(fd, sockPtr, len) == 0
-            }
-        }
-        guard connected else { return nil }
-
-        let reqID = "probe-\(UInt64.random(in: 1...UInt64.max))"
-        let request = "{\"id\":\"\(reqID)\",\"cmd\":\"\(cmd)\"}\n"
-        let sent = request.withCString { cstr in
-            write(fd, cstr, strlen(cstr))
-        }
-        guard sent > 0 else { return nil }
-
-        struct ProbeResponse: Decodable {
+    private final class LocalDaemonConnection: @unchecked Sendable {
+        struct Response: Decodable {
             let id: String?
             let ok: Bool?
             let data: String?
         }
 
-        var buffer = Data()
-        let deadline = Date().addingTimeInterval(timeout)
-        var chunk = [UInt8](repeating: 0, count: 4096)
-        while Date() < deadline {
-            let n = read(fd, &chunk, chunk.count)
-            guard n > 0 else { return nil }
-            buffer.append(contentsOf: chunk[..<n])
-            while let idx = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                let line = buffer[buffer.startIndex..<idx]
-                buffer = Data(buffer[(idx + 1)...])
-                guard let resp = try? JSONDecoder().decode(ProbeResponse.self, from: line),
-                      resp.id == reqID else { continue }
-                guard resp.ok == true else { return nil }
-                return expectData ? resp.data : ""
+        private let lock = NSLock()
+        private var descriptor: Int32
+        private let timeout: TimeInterval
+
+        init?(timeout: TimeInterval) {
+            let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            guard fd >= 0 else { return nil }
+            var tv = timeval(
+                tv_sec: Int(timeout),
+                tv_usec: Int32((timeout - floor(timeout)) * 1_000_000)
+            )
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+            var noSignal: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+            var address = sockaddr_un()
+            address.sun_family = sa_family_t(AF_UNIX)
+            withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+                socketPath.withCString { source in
+                    _ = strncpy(UnsafeMutableRawPointer(pointer).assumingMemoryBound(to: CChar.self), source, 104)
+                }
             }
+            let connected = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+                }
+            }
+            guard connected else {
+                Darwin.close(fd)
+                return nil
+            }
+            self.descriptor = fd
+            self.timeout = timeout
         }
-        return nil
+
+        deinit { close() }
+
+        func close() {
+            lock.lock()
+            let fd = descriptor
+            descriptor = -1
+            lock.unlock()
+            if fd >= 0 { Darwin.close(fd) }
+        }
+
+        var peerPID: Int32? {
+            var pid: Int32 = 0
+            var size = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERPID, &pid, &size) == 0,
+                  pid > 0 else { return nil }
+            return pid
+        }
+
+        func request(_ command: String, fields: [String: String] = [:]) -> Response? {
+            let requestID = "probe-\(UUID().uuidString)"
+            var payload = fields
+            payload["id"] = requestID
+            payload["cmd"] = command
+            guard var request = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+            request.append(0x0A)
+            let written = request.withUnsafeBytes { bytes -> Bool in
+                var offset = 0
+                while offset < bytes.count {
+                    let count = write(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                    guard count > 0 else { return false }
+                    offset += count
+                }
+                return true
+            }
+            guard written else { return nil }
+            var buffer = Data()
+            let deadline = ProcessInfo.processInfo.systemUptime + timeout
+            var chunk = [UInt8](repeating: 0, count: 4096)
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                let count = read(descriptor, &chunk, chunk.count)
+                guard count > 0 else { return nil }
+                buffer.append(contentsOf: chunk.prefix(count))
+                guard buffer.count <= 4 * 1024 * 1024 else { return nil }
+                while let index = buffer.firstIndex(of: 0x0A) {
+                    let line = Data(buffer[..<index])
+                    buffer.removeSubrange(...index)
+                    guard let response = try? JSONDecoder().decode(Response.self, from: line),
+                          response.id == requestID else { continue }
+                    return response
+                }
+            }
+            return nil
+        }
     }
 
     // MARK: - Socket
@@ -266,6 +661,9 @@ enum PrivilegeManager {
     private enum HelperError: LocalizedError {
         case socketUnavailable
         case unregisterTimedOut
+        case registrationIdentityUnavailable
+        case registrationRefreshPending
+        case registrationRefreshTimedOut
 
         var errorDescription: String? {
             switch self {
@@ -273,6 +671,12 @@ enum PrivilegeManager {
                 "后台服务已注册，但 6 秒内没有建立本地控制通道"
             case .unregisterTimedOut:
                 "旧版后台服务未能在 5 秒内退出"
+            case .registrationIdentityUnavailable:
+                "无法验证安装包中的后台服务注册信息"
+            case .registrationRefreshPending:
+                "macOS 仍在完成上一笔后台服务注册更新"
+            case .registrationRefreshTimedOut:
+                "macOS 未在 15 秒内确认后台服务注销，已停止后续注册操作"
             }
         }
     }

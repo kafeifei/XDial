@@ -58,6 +58,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var activationPurpose: ActivationPurpose?
     private var activationVerificationRequest:
         OSSystemExtensionRequest?
+    private var activationVerificationPhase:
+        SystemExtensionActivationVerifier.Phase?
     private var deactivationRequest: OSSystemExtensionRequest?
     private var deactivationCompletion:
         ((Result<Void, Error>) -> Void)?
@@ -233,7 +235,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 appLog(
                     "Transparent Proxy underlay default=\(snapshot.defaultInterface.name)"
                 )
-                self.activateExtension(purpose: .connection) {
+                self.checkExtensionReadiness(purpose: .connection) {
                     [weak self] result in
                     guard let self else { return }
                     guard self.startIntentID == intentID else { return }
@@ -588,7 +590,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     func prepareSystemExtension(
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        activateExtension(
+        checkExtensionReadiness(
             purpose: .installation,
             completion: completion
         )
@@ -931,7 +933,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         automaticReconnectRetryWorkItem = nil
     }
 
-    private func activateExtension(
+    private func checkExtensionReadiness(
         purpose: ActivationPurpose,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
@@ -948,6 +950,16 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         if purpose == .installation {
             activationStatusHandler?(.submitted)
         }
+        verifyActivatedExtension(
+            phase: purpose == .installation
+                ? .installationPreflight : .connection
+        )
+    }
+
+    private func submitExtensionActivation() {
+        guard activationPurpose == .installation else { return }
+        activationVerificationRequest = nil
+        activationVerificationPhase = nil
         let request = OSSystemExtensionRequest.activationRequest(
             forExtensionWithIdentifier: extensionIdentifier,
             queue: .main
@@ -957,8 +969,10 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         OSSystemExtensionManager.shared.submitRequest(request)
     }
 
-    private func verifyActivatedExtension() {
-        guard let expectedVersion = bundledExtensionVersion else {
+    private func verifyActivatedExtension(
+        phase: SystemExtensionActivationVerifier.Phase
+    ) {
+        guard bundledExtensionVersion != nil else {
             finishActivation(
                 .failure(
                     ManagerError.extensionVerificationFailed(
@@ -975,6 +989,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         )
         request.delegate = self
         activationVerificationRequest = request
+        activationVerificationPhase = phase
         OSSystemExtensionManager.shared.submitRequest(request)
     }
 
@@ -1101,6 +1116,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         activationPurpose = nil
         activationRequest = nil
         activationVerificationRequest = nil
+        activationVerificationPhase = nil
         if purpose == .installation {
             switch result {
             case .success:
@@ -3217,14 +3233,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     }
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
-        if activationPurpose == .installation {
-            activationStatusHandler?(.waitingForApproval)
-        } else {
-            publishRuntimeStatus(
-                "connecting",
-                error: "请在系统设置的「登录项与扩展 → 网络扩展」中启用 XDial"
-            )
-        }
+        guard request === activationRequest,
+              activationPurpose == .installation else { return }
+        activationStatusHandler?(.waitingForApproval)
         if let url = URL(
             string:
                 "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
@@ -3252,11 +3263,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             finishActivation(.failure(ManagerError.rebootRequired))
             return
         }
-        if activationPurpose == .installation {
-            verifyActivatedExtension()
-            return
-        }
-        finishActivation(.success(()))
+        verifyActivatedExtension(phase: .installationCompletion)
     }
 
     func request(
@@ -3275,6 +3282,13 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             return
         }
         if request === activationVerificationRequest {
+            let nsError = error as NSError
+            if nsError.domain == OSSystemExtensionErrorDomain,
+               nsError.code
+                == OSSystemExtensionError.Code.extensionNotFound.rawValue {
+                resolveExtensionProperties([])
+                return
+            }
             finishActivation(.failure(error))
             return
         }
@@ -3299,25 +3313,35 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 isUninstalling: $0.isUninstalling
             )
         }
+        resolveExtensionProperties(snapshots)
+    }
+
+    private func resolveExtensionProperties(
+        _ snapshots: [SystemExtensionPropertySnapshot]
+    ) {
+        guard let phase = activationVerificationPhase else { return }
         let expectedVersion = bundledExtensionVersion ?? "unknown"
-        guard
-            SystemExtensionActivationVerifier
-                .containsReadyCurrentVersion(
-                    snapshots,
-                    expectedIdentifier: extensionIdentifier,
-                    expectedVersion: expectedVersion
-                )
-        else {
-            finishActivation(
-                .failure(
-                    ManagerError.extensionVerificationFailed(
-                        expectedVersion: expectedVersion
-                    )
-                )
+        switch SystemExtensionActivationVerifier.action(
+            for: snapshots,
+            expectedIdentifier: extensionIdentifier,
+            expectedVersion: expectedVersion,
+            phase: phase
+        ) {
+        case .ready:
+            finishActivation(.success(()))
+        case .activate:
+            submitExtensionActivation()
+        case .unavailable:
+            let error = ManagerError.extensionVerificationFailed(
+                expectedVersion: expectedVersion
             )
-            return
+            if phase == .connection {
+                // A user may disable/remove the extension after installation.
+                // Invalidate the shared gate without repairing it from connect.
+                activationStatusHandler?(.failed(error.localizedDescription))
+            }
+            finishActivation(.failure(error))
         }
-        finishActivation(.success(()))
     }
 }
 
@@ -3993,7 +4017,7 @@ private enum ManagerError: LocalizedError {
         case .systemDNSUnavailable:
             "无法读取 XDial 启动前的系统 DNS"
         case let .extensionVerificationFailed(expectedVersion):
-            "macOS 未登记并启用当前 XDial 网络扩展（build \(expectedVersion)）"
+            "macOS 未登记并启用当前 XDial 网络扩展（build \(expectedVersion)）；请先完成 XDial 安装"
         case .deactivationDeferredBySystem:
             "macOS 仍在占用 XDial 网络扩展；请退出其他正在运行的 XDial 后重试卸载"
         case .rebootRequired:

@@ -573,55 +573,39 @@ final class GoEngine: ObservableObject {
 
     // MARK: - Helper lifecycle
 
-    /// 重编自愈：bundle 里的 daemon 二进制和运行中的不一致时，让 daemon 原地
-    /// re-exec 成新版。全程零授权（respawn 走 socket，launchd 无感知）。
-    static nonisolated func syncDaemonBinary() async {
-        guard let bundled = PrivilegeManager.bundledDaemonSHA256(),
-              let info = PrivilegeManager.probeDaemonInfo(),
-              info.exeSHA256 != "unknown", info.exeSHA256 != bundled else { return }
-        appLog("daemon outdated (running \(info.exeSHA256.prefix(8)) vs bundled \(bundled.prefix(8))), respawning")
-        guard PrivilegeManager.requestRespawn() else {
-            appLog("daemon respawn refused (engine busy?), will retry on next operation")
-            return
-        }
-        for _ in 0..<25 {
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            if let fresh = PrivilegeManager.probeDaemonInfo(), fresh.exeSHA256 == bundled {
-                appLog("daemon respawned to bundled binary (pid \(fresh.pid))")
-                return
-            }
-        }
-        appLog("daemon respawn did not converge, continuing with running daemon")
+    /// Registration maintenance must preserve both the Provider transaction
+    /// and in-flight helper requests. The daemon independently gates all its
+    /// clients and Tailscale setup before granting a maintenance lease.
+    var helperRegistrationMaintenanceAllowed: Bool {
+        !requiresTerminationDrain() && pendingCallbacks.isEmpty
     }
 
     private nonisolated func ensureHelperAsync() async -> Bool {
-        guard PrivilegeManager.isInstalled else {
-            await MainActor.run { [weak self] in
-                InstallationCoordinator.shared.start()
-                InstallationCoordinator.shared.present()
-                self?.lastError =
-                    InstallationCoordinator.shared.blockingMessage
-                self?.status = "disconnected"
+        let expectedHash = await MainActor.run { () -> String? in
+            let installation = InstallationCoordinator.shared
+            guard installation.isReady, PrivilegeManager.isInstalled else {
+                installation.start()
+                installation.present()
+                return nil
             }
-            return false
+            return installation.verifiedHelperExecutableHash
         }
+        guard let expectedHash else { return false }
         do {
             try PrivilegeManager.ensureHelperRunning()
-            await Self.syncDaemonBinary()
-            for _ in 0..<20 {
-                if PrivilegeManager.canConnectSocket() { return true }
-                try? await Task.sleep(nanoseconds: 200_000_000)
+            if let info = PrivilegeManager.probeDaemonInfo(),
+               info.exeSHA256 == expectedHash {
+                return true
             }
             await MainActor.run { [weak self] in
-                self?.lastError = "helper 已启动但无法连接 socket"
-                self?.status = "disconnected"
+                self?.lastError = "后台服务版本发生变化，正在重新验证安装"
+                InstallationCoordinator.shared.start(force: true)
             }
             return false
         } catch {
-            let msg = error.localizedDescription
             await MainActor.run { [weak self] in
-                self?.lastError = "启动 helper 失败: \(msg)"
-                self?.status = "disconnected"
+                self?.lastError = "后台服务不可用，正在恢复注册"
+                InstallationCoordinator.shared.start(force: true)
             }
             return false
         }

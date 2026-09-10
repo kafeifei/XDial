@@ -151,6 +151,14 @@ func (m *Manager) Stop() error {
 	return m.stopLocked()
 }
 
+// HasActiveSession observes setup ownership without extending its idle lease.
+// The daemon's registration handoff must preserve an active configuration UI.
+func (m *Manager) HasActiveSession() bool {
+	m.operationMu.Lock()
+	defer m.operationMu.Unlock()
+	return m.runtime != nil
+}
+
 // StopLine closes the setup session only when it still belongs to the requesting UI
 // card. A stale card collapsing must not tear down a newer card's session.
 func (m *Manager) StopLine(lineID string) error {

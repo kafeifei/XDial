@@ -155,6 +155,11 @@ test: public-content-gate $(PATCHED_WORKFILE) test-patched-tailscale test-patche
 test-release-contract:
 	bash test/release_contract_test.sh
 
+# Opt-in macOS login-session check: launches only isolated fixture apps.
+.PHONY: test-installation-launch
+test-installation-launch:
+	bash test/installation_launch_test.sh
+
 macos-identity-contract:
 	cd macos && xcodegen generate
 	bash scripts/verify-macos-identity-contract.sh

@@ -34,6 +34,10 @@ func (m *Manager) Stop() error {
 	return nil
 }
 
+func (m *Manager) HasActiveSession() bool {
+	return false
+}
+
 func (m *Manager) StopLine(string) error {
 	return nil
 }

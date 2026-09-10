@@ -272,6 +272,36 @@ struct SystemExtensionPropertySnapshot: Equatable {
 }
 
 enum SystemExtensionActivationVerifier {
+    enum Phase {
+        case installationPreflight
+        case installationCompletion
+        case connection
+    }
+
+    enum Action: Equatable {
+        case ready
+        case activate
+        case unavailable
+    }
+
+    static func action(
+        for properties: [SystemExtensionPropertySnapshot],
+        expectedIdentifier: String,
+        expectedVersion: String,
+        phase: Phase
+    ) -> Action {
+        if containsReadyCurrentVersion(
+            properties,
+            expectedIdentifier: expectedIdentifier,
+            expectedVersion: expectedVersion
+        ) {
+            return .ready
+        }
+        // Only installation may repair a missing/disabled/outdated extension.
+        // A failed post-activation verification must not resubmit indefinitely.
+        return phase == .installationPreflight ? .activate : .unavailable
+    }
+
     static func containsReadyCurrentVersion(
         _ properties: [SystemExtensionPropertySnapshot],
         expectedIdentifier: String,
@@ -428,6 +458,8 @@ enum ApplicationBundleReplacer {
         destinationURL: URL,
         newBundleURL: URL,
         backupName: String,
+        retainBackupForRecovery: Bool = false,
+        beforeRemovingBackup: (URL) throws -> Void = { _ in },
         validate: (URL) throws -> Bool
     ) throws {
         let backupURL = destinationURL
@@ -476,8 +508,9 @@ enum ApplicationBundleReplacer {
             throw error
         }
 
-        if fileManager.fileExists(atPath: backupURL.path) {
-            try? fileManager.removeItem(at: backupURL)
+        if !retainBackupForRecovery, fileManager.fileExists(atPath: backupURL.path) {
+            try beforeRemovingBackup(backupURL)
+            try fileManager.removeItem(at: backupURL)
         }
     }
 

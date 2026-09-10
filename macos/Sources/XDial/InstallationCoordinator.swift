@@ -133,6 +133,7 @@ final class InstallationCoordinator: ObservableObject {
                     taskID: report.currentTask?.id ?? "bundle"
                 )
             }
+            ApplicationRelocator.finishOwnedArtifactRecovery()
             xdialDefaults.set(
                 currentBuildMarker,
                 forKey: completionMarkerKey
@@ -176,68 +177,95 @@ final class InstallationCoordinator: ObservableObject {
         if PrivilegeManager.legacyInstalled {
             try PrivilegeManager.cleanupLegacy()
         }
-
-        if !PrivilegeManager.isInstalled {
-            do {
-                try PrivilegeManager.register()
-            } catch {
-                // register() 在等待系统批准时也可能抛错；真实结论只看
-                // SMAppService 的结构化 status。
-                appLog(
-                    "installation helper register returned: "
-                        + error.localizedDescription
-                )
-            }
-            // SMAppService 的 status 可能比 register() 返回晚一拍；等待它收敛到
-            // 可判定状态，不能把瞬时 notRegistered 当成安装失败。
-            for _ in 0..<20 {
-                if PrivilegeManager.isInstalled
-                    || PrivilegeManager.requiresApproval {
-                    break
+        let identity = try PrivilegeManager.registrationIdentity()
+        let coordinator = HelperRegistrationCoordinator(
+            fingerprint: identity.fingerprint,
+            expectedExecutableHash: identity.executableHash,
+            io: .init(
+                status: { PrivilegeManager.registrationStatus },
+                runtime: {
+                    await Task.detached { PrivilegeManager.registrationRuntime() }.value
+                },
+                registrationMarker: {
+                    PrivilegeManager.verifiedRegistrationMarker(
+                        fingerprint: identity.fingerprint, executableHash: identity.executableHash,
+                        savedMarker: xdialDefaults.string(forKey: PrivilegeManager.registrationMarkerKey)
+                    )
+                },
+                pendingMaintenanceRecovery: { PrivilegeManager.hasPendingRegistrationRecovery },
+                storeRegistrationMarker: {
+                    xdialDefaults.set($0, forKey: PrivilegeManager.registrationMarkerKey)
+                },
+                maintenanceAllowed: {
+                    GoEngine.shared.helperRegistrationMaintenanceAllowed
+                },
+                legacyMaintenanceIsExclusive: { pid in
+                    await Task.detached {
+                        PrivilegeManager.legacyMaintenanceIsExclusive(daemonPID: pid)
+                    }.value
+                },
+                legacyEngineIsIdle: {
+                    await Task.detached { PrivilegeManager.legacyEngineIsIdle() }.value
+                },
+                unregister: {
+                    try await PrivilegeManager.unregisterForRegistrationRefresh(daemon: $0)
+                },
+                register: { try PrivilegeManager.registerCurrentBundle() },
+                canReconcileRegistrationFailure: { PrivilegeManager.canReconcileRegistrationFailure($0) },
+                finishMaintenance: {
+                    try await Task.detached { try PrivilegeManager.finishRegistrationMaintenance() }.value
+                    xdialDefaults.set(identity.fingerprint, forKey: PrivilegeManager.registrationMarkerKey)
+                },
+                stageChanged: { [weak self] stage in
+                    guard let self else { return }
+                    let waitingForApproval = stage == .waitingForApproval
+                    self.report.updateTask(
+                        id: "helper", state: waitingForApproval ? .waitingForApproval : .running
+                    )
+                    if let index = self.report.tasks.firstIndex(where: { $0.id == "helper" }) {
+                        let task = self.report.tasks[index]
+                        self.report.tasks[index] = InstallationTaskReport(
+                            id: task.id, name: task.name, detail: Self.helperDetail(for: stage),
+                            state: task.state, error: task.error
+                        )
+                    }
+                    appLog("installation helper stage=\(stage)")
+                    if waitingForApproval {
+                        self.present()
+                        PrivilegeManager.openApprovalSettings()
+                    }
+                },
+                now: { ProcessInfo.processInfo.systemUptime },
+                sleep: { duration in
+                    try await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
                 }
-                try await Task.sleep(nanoseconds: 200_000_000)
-            }
-        }
-
-        if PrivilegeManager.requiresApproval {
-            report.updateTask(
-                id: "helper",
-                state: .waitingForApproval
             )
-            present()
-            PrivilegeManager.openApprovalSettings()
-            for _ in 0..<180 {
-                try Task.checkCancellation()
-                try await Task.sleep(nanoseconds: 1_000_000_000)
-                if PrivilegeManager.isInstalled { break }
-            }
-        }
-        guard PrivilegeManager.isInstalled else {
+        )
+        do {
+            try await coordinator.prepare()
+            verifiedHelperExecutableHash = identity.executableHash
+            ApplicationRelocator.finishOwnedArtifactRecovery()
+        } catch let failure as HelperRegistrationCoordinator.Failure {
             throw InstallationFailure(
-                code: "helper-not-approved",
-                message: "后台服务尚未获得 macOS 批准",
+                code: "helper-\(failure.rawValue)",
+                message: failure.localizedDescription,
                 taskID: "helper"
             )
         }
+    }
 
-        report.updateTask(id: "helper", state: .running)
-        try await Task.detached {
-            try PrivilegeManager.ensureHelperRunning()
-        }.value
-        await GoEngine.syncDaemonBinary()
+    private(set) var verifiedHelperExecutableHash: String?
 
-        guard
-            let bundledHash = PrivilegeManager.bundledDaemonSHA256(),
-            let daemonInfo = await Task.detached(
-                operation: { PrivilegeManager.probeDaemonInfo() }
-            ).value,
-            daemonInfo.exeSHA256 == bundledHash
-        else {
-            throw InstallationFailure(
-                code: "helper-version-mismatch",
-                message: "后台服务未运行当前安装包中的版本",
-                taskID: "helper"
-            )
+    private static func helperDetail(for stage: HelperRegistrationCoordinator.Stage) -> String {
+        switch stage {
+        case .checking: "检查后台服务注册与运行版本"
+        case .waitingForApproval: "请在 macOS 系统设置中允许后台服务"
+        case .waitingForIdle: "保留当前连接和操作，空闲后自动继续升级"
+        case .waitingForLegacyIdle: "等待旧版后台服务结束配置会话后自动升级"
+        case .refreshingRegistration: "安全更新后台服务注册"
+        case .reconcilingRegistration: "正在完成后台服务更新"
+        case .verifying: "验证后台服务运行当前安装包中的版本"
+        case .ready: "后台服务注册和运行版本已验证"
         }
     }
 

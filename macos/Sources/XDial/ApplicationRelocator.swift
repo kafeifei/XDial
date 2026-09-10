@@ -127,37 +127,15 @@ enum ApplicationRelocator {
     /// /Applications 中的最终 bundle。这样不会先启动构建目录副本、建立一次
     /// 网络事务，随后又因自动安装被终止并建立第二次事务。
     static func installCurrentBundleWithoutRelaunch() throws {
-        if isRunningFromApplications {
-            try validateCurrentBundle()
-            return
-        }
-
         let sourceURL = Bundle.main.bundleURL
         let sourceIdentity = try validateDistributionBundle(at: sourceURL)
-        let destinationExists = FileManager.default.fileExists(
-            atPath: destinationURL.path
-        )
-        var replacedIdentity: SigningIdentity?
-        if destinationExists {
-            let identity = try existingApplicationIdentity(
-                at: destinationURL
-            )
-            guard XDialApplicationIdentifierPolicy.permitsReplacement(
-                existingIdentifier: identity.identifier,
-                incomingIdentifier: sourceIdentity.identifier,
-                teamIdentifiersMatch:
-                    identity.teamIdentifier == sourceIdentity.teamIdentifier
-            ) else {
-                throw InstallationError.existingApplicationNotReplaceable
-            }
-            replacedIdentity = identity
+        if isRunningFromApplications {
+            recoverOwnedArtifactsAfterSuccessfulLaunch(sourceIdentity: sourceIdentity)
+            return
         }
-
         try install(
             sourceURL: sourceURL,
-            sourceIdentity: sourceIdentity,
-            replacedIdentity: replacedIdentity,
-            replaceExisting: destinationExists
+            sourceIdentity: sourceIdentity
         )
     }
 
@@ -173,10 +151,28 @@ enum ApplicationRelocator {
         )
     }
 
+    /// A helper may have held the replaced bundle during launch. Installation
+    /// retries receipt cleanup once platform preparation has released it.
+    static func finishOwnedArtifactRecovery() {
+        guard isRunningFromApplications,
+              let identity = try? validateDistributionBundle(at: destinationURL) else { return }
+        recoverOwnedArtifactsAfterSuccessfulLaunch(sourceIdentity: identity)
+    }
+
     static func prepareForLaunch() -> ApplicationLaunchPreparation {
         let sourceURL = Bundle.main.bundleURL
         do {
             let sourceIdentity = try validateDistributionBundle(at: sourceURL)
+            // Only the final /Applications launch carries this marker. A
+            // staged automatic update still needs to perform installation.
+            // Never recurse into replacement if LaunchServices relocates the
+            // final successor: its predecessor is waiting for this launch.
+            guard !ApplicationLaunchPolicy.shouldRejectInstalledSuccessor(
+                currentIsCanonical: isRunningFromApplications,
+                arguments: CommandLine.arguments
+            ) else {
+                throw InstallationError.installedSuccessorLocationMismatch
+            }
             if AppUpdateStager.isOwnedStagedApplication(sourceURL) {
                 let sourceVersion = ApplicationBundleInfo.string(
                     forKey: "CFBundleShortVersionString",
@@ -189,6 +185,11 @@ enum ApplicationRelocator {
                     throw InstallationError
                         .automaticUpdateIdentityMismatch
                 }
+            }
+            if isRunningFromApplications {
+                recoverOwnedArtifactsAfterSuccessfulLaunch(sourceIdentity: sourceIdentity)
+            } else {
+                try recoverOwnedArtifacts(sourceIdentity: sourceIdentity)
             }
             let destinationExists = FileManager.default.fileExists(
                 atPath: destinationURL.path
@@ -240,11 +241,16 @@ enum ApplicationRelocator {
                 do {
                     try install(
                         sourceURL: sourceURL,
-                        sourceIdentity: sourceIdentity,
-                        replacedIdentity: destinationIdentity,
-                        replaceExisting: destinationExists
+                        sourceIdentity: sourceIdentity
                     )
                     try relaunchInstalledApplication()
+                    // A legacy temporary app may itself have been launched.
+                    // Once its successor is ready, this installer can release
+                    // its own artifact without touching the user's download.
+                    recoverOwnedArtifactsAfterSuccessfulLaunch(
+                        sourceIdentity: sourceIdentity,
+                        ignoringCurrentInstaller: true
+                    )
                     AppUpdateStager.discardOwnedRoot(
                         containing: sourceURL
                     )
@@ -268,28 +274,61 @@ enum ApplicationRelocator {
 
     private static func install(
         sourceURL: URL,
-        sourceIdentity: SigningIdentity,
-        replacedIdentity: SigningIdentity?,
-        replaceExisting: Bool
+        sourceIdentity: SigningIdentity
     ) throws {
-        let fileManager = FileManager.default
-        let temporaryURL = destinationURL
-            .deletingLastPathComponent()
-            .appendingPathComponent(
-                ".XDial.install-\(UUID().uuidString).app",
-                isDirectory: true
-            )
-        defer {
-            if fileManager.fileExists(atPath: temporaryURL.path) {
-                try? fileManager.removeItem(at: temporaryURL)
+        let artifacts = installationArtifacts(sourceIdentity: sourceIdentity)
+        try artifacts.withExclusiveAccess {
+            try artifacts.recoverAbandonedTransactions()
+            // Another installer may have run since launch preparation. Re-read
+            // the destination while holding the same lock as the replacement.
+            let replaceExisting = FileManager.default.fileExists(atPath: destinationURL.path)
+            let replacedIdentity = replaceExisting
+                ? try existingApplicationIdentity(at: destinationURL) : nil
+            if let replacedIdentity {
+                guard XDialApplicationIdentifierPolicy.permitsReplacement(
+                    existingIdentifier: replacedIdentity.identifier,
+                    incomingIdentifier: sourceIdentity.identifier,
+                    teamIdentifiersMatch:
+                        replacedIdentity.teamIdentifier == sourceIdentity.teamIdentifier
+                ) else {
+                    throw InstallationError.existingApplicationNotReplaceable
+                }
+            }
+            try artifacts.perform { transaction in
+                try installApplicationFiles(
+                    sourceURL: sourceURL,
+                    sourceIdentity: sourceIdentity,
+                    replacedIdentity: replacedIdentity,
+                    replaceExisting: replaceExisting,
+                    temporaryURL: artifacts.stagingURL(for: transaction),
+                    backupName: transaction.backupName
+                )
             }
         }
+        // Release the lock before waiting for the final successor, which also
+        // reconciles abandoned artifacts during its own startup.
+    }
 
+    private static func installApplicationFiles(
+        sourceURL: URL,
+        sourceIdentity: SigningIdentity,
+        replacedIdentity: SigningIdentity?,
+        replaceExisting: Bool,
+        temporaryURL: URL,
+        backupName: String
+    ) throws {
+        let fileManager = FileManager.default
         try fileManager.copyItem(at: sourceURL, to: temporaryURL)
         guard try validateDistributionBundle(at: temporaryURL)
             == sourceIdentity else {
             throw InstallationError.copiedBundleIdentityChanged
         }
+        try ApplicationInstallationQuarantine.prepareValidatedCopy(
+            at: temporaryURL
+        )
+        try ApplicationInstallationQuarantine.validateInstalledCopy(
+            at: temporaryURL
+        )
 
         if replaceExisting {
             try terminateOtherCopies(
@@ -318,34 +357,30 @@ enum ApplicationRelocator {
                 )
                 try unregisterApplication(at: destinationURL)
             }
-            let backupName =
-                ".XDial.backup-\(UUID().uuidString).app"
-            let backupURL = destinationURL
-                .deletingLastPathComponent()
-                .appendingPathComponent(
-                    backupName,
-                    isDirectory: true
-                )
             try ApplicationBundleReplacer.replace(
                 fileManager: fileManager,
                 destinationURL: destinationURL,
                 newBundleURL: temporaryURL,
-                backupName: backupName
+                backupName: backupName,
+                retainBackupForRecovery: true
             ) { installedURL in
-                try validateDistributionBundle(at: installedURL)
+                try ApplicationInstallationQuarantine.validateInstalledCopy(
+                    at: installedURL
+                )
+                return try validateDistributionBundle(at: installedURL)
                     == sourceIdentity
             }
-            // ApplicationBundleReplacer 成功时会清理备份；这里的显式检查让
-            // 安装过程不会把一份意外遗留的旧 app 当作成功终态。
-            if fileManager.fileExists(atPath: backupURL.path) {
-                throw InstallationError.backupCleanupFailed
-            }
+            // The receipt owns removal: it first checks background-process
+            // occupancy and unregisters the backup while it still exists.
         } else {
             try fileManager.moveItem(
                 at: temporaryURL,
                 to: destinationURL
             )
             do {
+                try ApplicationInstallationQuarantine.validateInstalledCopy(
+                    at: destinationURL
+                )
                 guard try validateDistributionBundle(
                     at: destinationURL
                 ) == sourceIdentity else {
@@ -390,6 +425,106 @@ enum ApplicationRelocator {
         }
         return process.terminationReason == .exit
             && process.terminationStatus == 0
+    }
+
+    private static func installationArtifacts(
+        sourceIdentity: SigningIdentity,
+        ignoringCurrentInstaller: Bool = false
+    ) -> ApplicationInstallationArtifacts {
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let identifiers = XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
+            forInstalledIdentifier: sourceIdentity.identifier
+        ).union([sourceIdentity.identifier])
+        return ApplicationInstallationArtifacts(
+            destinationURL: destinationURL,
+            applicationIdentifier: sourceIdentity.identifier,
+            teamIdentifier: sourceIdentity.teamIdentifier,
+            isTrustedApplication: { url in
+                guard let identity = try? existingApplicationIdentity(at: url),
+                      XDialApplicationIdentifierPolicy.permitsReplacement(
+                        existingIdentifier: identity.identifier,
+                        incomingIdentifier: sourceIdentity.identifier,
+                        teamIdentifiersMatch:
+                            identity.teamIdentifier == sourceIdentity.teamIdentifier
+                      ) else { return false }
+                if canonical(url) == canonical(destinationURL) {
+                    return (try? validateDistributionBundle(at: url)) == sourceIdentity
+                }
+                return true
+            },
+            isInUse: { url in
+                var runningURLs = NSWorkspace.shared.runningApplications.compactMap {
+                    application -> URL? in
+                    if ignoringCurrentInstaller, application.processIdentifier == currentPID {
+                        return nil
+                    }
+                    return application.bundleURL
+                }
+                // CLI installers need not have registered with AppKit yet.
+                if !ignoringCurrentInstaller { runningURLs.append(Bundle.main.bundleURL) }
+                return ApplicationInstallationOccupancy.mayBeInUse(
+                    url,
+                    processes: LocalProcessInventory.capture(),
+                    applicationURLs: runningURLs,
+                    ignoringPID: ignoringCurrentInstaller ? currentPID : nil
+                )
+            },
+            unregisterApplication: { url in
+                for identifier in identifiers {
+                    if NSWorkspace.shared.urlsForApplications(
+                        withBundleIdentifier: identifier
+                    ).contains(where: { canonical($0) == canonical(url) }) {
+                        try unregisterApplication(at: url)
+                        return
+                    }
+                }
+            }
+        )
+    }
+
+    private static func recoverOwnedArtifactsAfterSuccessfulLaunch(
+        sourceIdentity: SigningIdentity,
+        ignoringCurrentInstaller: Bool = false
+    ) {
+        do {
+            try recoverOwnedArtifacts(
+                sourceIdentity: sourceIdentity,
+                ignoringCurrentInstaller: ignoringCurrentInstaller,
+                successfulLaunch: true
+            )
+        } catch {
+            NSLog("XDial installation cleanup deferred: %@", error.localizedDescription)
+        }
+    }
+
+    private static func recoverOwnedArtifacts(
+        sourceIdentity: SigningIdentity,
+        ignoringCurrentInstaller: Bool = false,
+        successfulLaunch: Bool = false
+    ) throws {
+        // A canonical app can be run by a user without write access to
+        // /Applications. Do not create installation state when none is pending.
+        let names = try FileManager.default.contentsOfDirectory(
+            atPath: destinationURL.deletingLastPathComponent().path
+        )
+        guard names.contains(where: {
+            $0.hasPrefix(".XDial.transaction-")
+                || $0.hasPrefix(".XDial.install-")
+                || $0.hasPrefix(".XDial.backup-")
+        }) else { return }
+        let artifacts = installationArtifacts(
+            sourceIdentity: sourceIdentity,
+            ignoringCurrentInstaller: ignoringCurrentInstaller
+        )
+        if successfulLaunch {
+            if let failure = artifacts.recoverAfterSuccessfulLaunch() {
+                NSLog("XDial installation cleanup deferred: %@", failure)
+            }
+        } else {
+            try artifacts.withExclusiveAccess {
+                try artifacts.recoverAbandonedTransactions()
+            }
+        }
     }
 
     private static func unregisterConflictingApplications(
@@ -458,7 +593,8 @@ enum ApplicationRelocator {
         ApplicationLaunchPolicy.configure(
             configuration,
             relocationPredecessorProcessIdentifier:
-                NSRunningApplication.current.processIdentifier
+                ProcessInfo.processInfo.processIdentifier,
+            isInstalledSuccessor: true
         )
         let completion = DispatchSemaphore(value: 0)
         let result = LaunchResult()
@@ -495,7 +631,7 @@ enum ApplicationRelocator {
         guard otherRunningCopies(
             bundleIdentifiers: identifiers,
             currentProcessIdentifier:
-                NSRunningApplication.current.processIdentifier
+                ProcessInfo.processInfo.processIdentifier
         ).isEmpty else {
             return
         }
@@ -525,7 +661,7 @@ enum ApplicationRelocator {
         bundleIdentifiers: Set<String>
     ) throws {
         let currentProcessIdentifier =
-            NSRunningApplication.current.processIdentifier
+            ProcessInfo.processInfo.processIdentifier
         let terminated =
             ApplicationReplacementExitWaiter.wait(
                 requestGracefulTermination: {
@@ -803,6 +939,7 @@ enum ApplicationRelocator {
         case signatureInvalid(String)
         case signatureMetadataMissing(String)
         case relaunchFailed
+        case installedSuccessorLocationMismatch
         case existingApplicationDidNotTerminate
         case existingApplicationNotReplaceable
         case applicationNotInstalled
@@ -856,6 +993,9 @@ enum ApplicationRelocator {
                 "\(name) 的签名缺少开发团队信息"
             case .relaunchFailed:
                 "XDial 已安装，但无法从“应用程序”重新启动"
+            case .installedSuccessorLocationMismatch:
+                "XDial 已复制到“应用程序”，但系统仍从下载隔离位置启动它。"
+                    + "请退出此窗口，再从“应用程序”打开 XDial。"
             case .existingApplicationDidNotTerminate:
                 "旧版 XDial 仍在运行，无法安全替换。"
                     + "XDial 不会强制结束它；请稍等后重试，"

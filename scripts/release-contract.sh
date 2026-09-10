@@ -132,11 +132,23 @@ assert_developer_id_signature() {
 assert_get_task_allow_absent() {
     local path="$1"
     local entitlements
-    entitlements="$(/usr/bin/codesign -d --entitlements :- "$path" 2>/dev/null || true)"
-    if printf '%s' "$entitlements" \
-        | /usr/bin/plutil -extract com.apple.security.get-task-allow raw -o - - \
-            2>/dev/null \
-        | grep -qx true; then
+    entitlements="$(/usr/bin/codesign -d --entitlements :- "$path" 2>/dev/null)" \
+        || fail "cannot read entitlements from $path"
+    assert_get_task_allow_absent_in_plist "$path" "$entitlements"
+}
+
+assert_get_task_allow_absent_in_plist() {
+    local path="$1"
+    local entitlements="$2"
+    # codesign may emit no plist for a binary with no entitlements.
+    [[ -n "$entitlements" ]] || return 0
+    printf '%s' "$entitlements" | /usr/bin/plutil -lint - >/dev/null \
+        || fail "$path has invalid entitlements"
+    local actual
+    actual="$(printf '%s' "$entitlements" \
+        | /usr/bin/plutil -extract 'com\.apple\.security\.get-task-allow' \
+            raw -o - - 2>/dev/null || true)"
+    if [[ "$actual" == true ]]; then
         fail "$path contains the forbidden get-task-allow entitlement"
     fi
 }
@@ -152,6 +164,87 @@ assert_location_entitlement() {
             raw -o - - 2>/dev/null || true)"
     [[ "$actual" == true ]] \
         || fail "$path is missing the required location entitlement"
+}
+
+assert_xml_value() {
+    local xml="$1" key="$2" type="$3" expected="$4" label="$5"
+    local actual
+    actual="$(printf '%s' "$xml" | /usr/bin/plutil -extract "$key" raw \
+        -expect "$type" -o - - 2>/dev/null)" \
+        || fail "$label is missing a valid $key"
+    [[ "$actual" == "$expected" ]] || fail "$label has an unexpected $key"
+}
+
+assert_xml_array_contains() {
+    local xml="$1" key="$2" expected="$3" label="$4"
+    local count index value
+    count="$(printf '%s' "$xml" | /usr/bin/plutil -extract "$key" raw \
+        -expect array -o - - 2>/dev/null)" \
+        || fail "$label is missing array $key"
+    for ((index = 0; index < count; index++)); do
+        value="$(printf '%s' "$xml" | /usr/bin/plutil \
+            -extract "$key.$index" raw -expect string -o - - 2>/dev/null)" \
+            || fail "$label has an invalid $key entry"
+        [[ "$value" == "$expected" ]] && return 0
+    done
+    fail "$label does not authorize $expected"
+}
+
+profile_date_epoch() {
+    local profile="$1" key="$2" value
+    value="$(printf '%s' "$profile" | /usr/bin/plutil -extract "$key" raw \
+        -expect date -o - - 2>/dev/null)" || fail "profile is missing $key"
+    /bin/date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$value" '+%s' 2>/dev/null \
+        || fail "profile has an invalid $key"
+}
+
+assert_system_extension_authorization_plists() {
+    local identifier="$1" signed="$2" profile="$3" now="$4"
+    local authorized created expires entitlements network_key
+    [[ "$identifier" == "$RELEASE_APPLICATION_IDENTIFIER" \
+        || "$identifier" == "$RELEASE_EXTENSION_IDENTIFIER" ]] \
+        || fail "unexpected System Extension authorization identity"
+    authorized="$RELEASE_TEAM_IDENTIFIER.$identifier"
+    assert_xml_value "$profile" TeamIdentifier.0 string \
+        "$RELEASE_TEAM_IDENTIFIER" profile
+    assert_xml_value "$profile" ProvisionsAllDevices bool true profile
+    created="$(profile_date_epoch "$profile" CreationDate)" || exit 1
+    expires="$(profile_date_epoch "$profile" ExpirationDate)" || exit 1
+    [[ "$created" -le "$now" && "$expires" -gt "$now" ]] \
+        || fail "$identifier provisioning profile is outside its validity period"
+    entitlements="$(printf '%s' "$profile" | /usr/bin/plutil \
+        -extract Entitlements xml1 -expect dictionary -o - - 2>/dev/null)" \
+        || fail "$identifier provisioning profile has no entitlements"
+    network_key='com\.apple\.developer\.networking\.networkextension'
+    local payload label
+    for label in signed profile; do
+        if [[ "$label" == signed ]]; then payload="$signed"; else payload="$entitlements"; fi
+        assert_xml_value "$payload" 'com\.apple\.application-identifier' \
+            string "$authorized" "$identifier $label"
+        assert_xml_value "$payload" 'com\.apple\.developer\.team-identifier' \
+            string "$RELEASE_TEAM_IDENTIFIER" "$identifier $label"
+        assert_xml_array_contains "$payload" "$network_key" \
+            app-proxy-provider-systemextension "$identifier $label"
+        if [[ "$identifier" == "$RELEASE_APPLICATION_IDENTIFIER" ]]; then
+            assert_xml_value "$payload" 'com\.apple\.developer\.system-extension\.install' \
+                bool true "$identifier $label"
+        fi
+    done
+    # The profile can permit other extension types; this product only requests one.
+    assert_xml_value "$signed" "$network_key" array 1 "$identifier signed"
+}
+
+assert_system_extension_authorization() {
+    local path="$1" identifier="$2" profile_path signed profile
+    profile_path="$path/Contents/embedded.provisionprofile"
+    [[ -f "$profile_path" && ! -L "$profile_path" ]] \
+        || fail "$path has no embedded provisioning profile"
+    signed="$(/usr/bin/codesign -d --entitlements :- "$path" 2>/dev/null)" \
+        || fail "cannot read signed entitlements from $path"
+    profile="$(/usr/bin/security cms -D -i "$profile_path" 2>/dev/null)" \
+        || fail "cannot decode provisioning profile in $path"
+    assert_system_extension_authorization_plists \
+        "$identifier" "$signed" "$profile" "$(/bin/date -u +%s)"
 }
 
 verify_app() {
@@ -202,6 +295,8 @@ verify_app() {
     assert_developer_id_signature "$settings_path" "$RELEASE_SETTINGS_IDENTIFIER"
     assert_developer_id_signature "$extension_path" "$RELEASE_EXTENSION_IDENTIFIER"
     assert_developer_id_signature "$app_path" "$RELEASE_APPLICATION_IDENTIFIER"
+    assert_system_extension_authorization "$app_path" "$RELEASE_APPLICATION_IDENTIFIER"
+    assert_system_extension_authorization "$extension_path" "$RELEASE_EXTENSION_IDENTIFIER"
     assert_location_entitlement "$app_path"
     assert_get_task_allow_absent "$app_path"
     assert_get_task_allow_absent "$extension_path"
@@ -354,6 +449,11 @@ verify_archive() {
     cleanup
     cleanup_root=""
 }
+
+# Permit focused, offline contract tests without invoking signing or notary tools.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
 
 [[ $# -ge 1 ]] || usage
 command="$1"

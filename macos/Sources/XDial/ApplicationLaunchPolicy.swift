@@ -3,10 +3,12 @@ import AppKit
 enum ApplicationLaunchPolicy {
     static let relocationPredecessorArgument =
         "--xdial-relocation-predecessor-pid"
+    static let installedSuccessorArgument = "--xdial-installed-successor"
 
     static func configure(
         _ configuration: NSWorkspace.OpenConfiguration,
-        relocationPredecessorProcessIdentifier: Int32? = nil
+        relocationPredecessorProcessIdentifier: Int32? = nil,
+        isInstalledSuccessor: Bool = false
     ) {
         // XDial is a menu-bar agent. It becomes a regular application only
         // while the settings window is open, so relaunching it must not create
@@ -23,6 +25,19 @@ enum ApplicationLaunchPolicy {
                 String(processIdentifier),
             ]
         }
+        if isInstalledSuccessor {
+            configuration.arguments.append(installedSuccessorArgument)
+        }
+    }
+
+    // Staged updates also carry a predecessor PID, but are expected to install
+    // themselves first. Only the final installed successor must already be at
+    // the canonical location; otherwise it would enter installation again.
+    static func shouldRejectInstalledSuccessor(
+        currentIsCanonical: Bool,
+        arguments: [String]
+    ) -> Bool {
+        !currentIsCanonical && arguments.contains(installedSuccessorArgument)
     }
 
     static func relocationPredecessorProcessIdentifier(

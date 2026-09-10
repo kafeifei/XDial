@@ -115,6 +115,7 @@ func runDaemon(socketPath string) {
 	}
 	tailscaleSetup := tailscalesetup.New(networkStatePath)
 	var networkRuntimeMu sync.Mutex
+	registrationGate := &daemonRegistrationGate{intentPresent: currentRegistrationIntentPresent}
 	// daemon 是唯一有资格接管系统 DNS 的宿主：它由 launchd KeepAlive 托管，被
 	// SIGKILL 后会被拉起并立刻跑下面的 RestoreLeftoverDNS 自愈。
 	eng.AllowSystemDNSTakeover(true)
@@ -162,7 +163,7 @@ func runDaemon(socketPath string) {
 				conn.Close()
 				continue
 			}
-			go handleClient(conn, eng, tailscaleSetup, &networkRuntimeMu, clients)
+			go handleClient(conn, eng, tailscaleSetup, &networkRuntimeMu, clients, registrationGate)
 		}
 	}()
 
@@ -203,10 +204,13 @@ func handleClient(
 	tailscaleSetup *tailscalesetup.Manager,
 	networkRuntimeMu *sync.Mutex,
 	clients *ClientSet,
+	registrationGate *daemonRegistrationGate,
 ) {
 	client := NewClient(conn)
+	handoffOwner := nextRequestID()
 	clients.Add(client)
 	defer func() {
+		registrationGate.release(handoffOwner)
 		clients.Remove(client)
 		client.Close()
 	}()
@@ -218,171 +222,206 @@ func handleClient(
 
 	for req := range reqCh {
 		switch req.Cmd {
-		case "start":
-			profile, err := config.ParseProfile([]byte(req.Profile))
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
-				continue
-			}
-			networkRuntimeMu.Lock()
-			setupErr := tailscaleSetup.Stop()
-			var startErr error
-			if setupErr == nil {
-				startErr = preflightTailscale(profile, req.Profile, tailscaleSetup)
-			}
-			if setupErr == nil && startErr == nil {
-				startErr = eng.Start(profile)
-			}
-			networkRuntimeMu.Unlock()
-			if setupErr != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: setupErr.Error()})
-			} else if startErr != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: startErr.Error()})
-			} else {
-				client.SendResponse(Response{ID: req.ID, OK: true})
-			}
-
-		case "stop":
-			networkRuntimeMu.Lock()
-			err := eng.Stop()
-			networkRuntimeMu.Unlock()
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-			} else {
-				client.SendResponse(Response{ID: req.ID, OK: true})
-			}
-
-		case "kill-session":
-			eng.KillSession()
-			client.SendResponse(Response{ID: req.ID, OK: true})
-
-		case "status":
-			client.SendResponse(Response{ID: req.ID, OK: true, Data: eng.Status()})
-
-		case "daemon-info":
-			data, _ := json.Marshal(struct {
-				Version   string `json:"version"`
-				ExeSHA256 string `json:"exe_sha256"`
-				PID       int    `json:"pid"`
-			}{Version: version, ExeSHA256: daemonExeHash, PID: os.Getpid()})
-			client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
-
-		case "connection-report":
-			data, err := readProviderConnectionReport()
-			if err != nil {
-				client.SendResponse(Response{
-					ID:      req.ID,
-					OK:      false,
-					Message: err.Error(),
+		case "registration-commit", "registration-abort", "registration-finalize":
+			var accepted bool
+			switch req.Cmd {
+			case "registration-commit":
+				accepted = registrationGate.commit(handoffOwner)
+			case "registration-abort":
+				accepted = registrationGate.abort(handoffOwner, func() bool {
+					uid, ok := registrationConsoleUID()
+					return ok && finishRegistrationIntent(registrationIntentPath, uid, req.Profile, "aborted", "")
 				})
-			} else {
-				client.SendResponse(Response{
-					ID:   req.ID,
-					OK:   true,
-					Data: string(data),
+			case "registration-finalize":
+				accepted = registrationGate.finalize(func() bool {
+					uid, ok := registrationConsoleUID()
+					return ok && finishRegistrationIntent(registrationIntentPath, uid, req.Profile, "registered", daemonExeHash)
 				})
 			}
-
-		case "respawn":
-			// 仅在引擎空闲时允许：re-exec 后 killOrphanSingBox 会扫掉数据面，
-			// 连接中 respawn 等于静默断流。app 侧本就只在断开时发，这里兜底。
-			var st struct {
-				Status string `json:"status"`
-			}
-			if json.Unmarshal([]byte(eng.Status()), &st) == nil && st.Status != "disconnected" {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: "engine busy: " + st.Status})
-				continue
-			}
-			networkRuntimeMu.Lock()
-			if err := tailscaleSetup.Stop(); err != nil {
-				networkRuntimeMu.Unlock()
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-				continue
-			}
-			client.SendResponse(Response{ID: req.ID, OK: true})
-			slog.Info("respawn requested")
-			networkRuntimeMu.Unlock()
-			respawnDaemon()
-
-		case "parse-sub":
-			result, err := subscription.Parse(req.SubURL, req.SubContent, req.SubFormat)
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-			} else {
-				subscription.ExpandRulesets(result)
-				data, _ := json.Marshal(result)
-				client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
-			}
-
-		case "runtime-lines":
-			profile, err := config.ParseProfile([]byte(req.Profile))
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
-			} else {
-				data, _ := json.Marshal(config.BuildLineRuntimeCatalog(profile))
-				client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
-			}
-
-		case "tailscale-prepare":
-			networkRuntimeMu.Lock()
-			if status := engineStatus(eng); status != "disconnected" {
-				networkRuntimeMu.Unlock()
-				req.AuthKey = ""
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: "disconnect XDial before configuring Tailscale"})
-				continue
-			}
-			data, err := tailscaleSetup.Prepare(req.Profile, req.LineID, req.AuthKey)
-			req.AuthKey = ""
-			networkRuntimeMu.Unlock()
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-			} else {
-				client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
-			}
-
-		case "tailscale-status":
-			networkRuntimeMu.Lock()
-			data, err := tailscaleSetup.Status(req.LineID)
-			networkRuntimeMu.Unlock()
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-			} else {
-				client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
-			}
-
-		case "tailscale-login":
-			networkRuntimeMu.Lock()
-			data, err := tailscaleSetup.BeginLogin(req.LineID)
-			networkRuntimeMu.Unlock()
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-			} else {
-				client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
-			}
-
-		case "tailscale-logout":
-			networkRuntimeMu.Lock()
-			data, err := tailscaleSetup.Logout(req.LineID)
-			networkRuntimeMu.Unlock()
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-			} else {
-				client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
-			}
-
-		case "tailscale-stop-setup":
-			networkRuntimeMu.Lock()
-			err := tailscaleSetup.StopLine(req.LineID)
-			networkRuntimeMu.Unlock()
-			if err != nil {
-				client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-			} else {
-				client.SendResponse(Response{ID: req.ID, OK: true})
-			}
-
-		default:
-			client.SendResponse(Response{ID: req.ID, OK: false, Message: "unknown command: " + req.Cmd})
+			client.SendResponse(Response{ID: req.ID, OK: accepted})
+			continue
 		}
+		if req.Cmd == "registration-handoff" || req.Cmd == "respawn" {
+			accepted := registrationGate.prepare(handoffOwner, func() bool {
+				networkRuntimeMu.Lock()
+				defer networkRuntimeMu.Unlock()
+				return engineStatus(eng) == "disconnected" && !tailscaleSetup.HasActiveSession()
+			})
+			if !accepted {
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: "helper has active work"})
+				continue
+			}
+			data, _ := json.Marshal(struct {
+				PID             int `json:"pid"`
+				ProtocolVersion int `json:"protocol_version"`
+			}{PID: os.Getpid(), ProtocolVersion: 1})
+			if err := client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)}); err != nil {
+				return
+			}
+			if req.Cmd == "respawn" {
+				// Legacy clients still use this command. Give it the same atomic
+				// idle guarantee; do not stop someone else's Tailscale setup.
+				slog.Info("idle respawn requested")
+				respawnDaemon()
+			}
+			continue
+		}
+		protectedWork := !registrationDiagnosticCommand(req.Cmd)
+		if protectedWork && !registrationGate.beginWork() {
+			client.SendResponse(Response{ID: req.ID, OK: false, Message: "helper registration handoff in progress"})
+			continue
+		}
+		func() {
+			if protectedWork {
+				defer registrationGate.endWork()
+			}
+			switch req.Cmd {
+			case "start":
+				profile, err := config.ParseProfile([]byte(req.Profile))
+				if err != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
+					return
+				}
+				networkRuntimeMu.Lock()
+				setupErr := tailscaleSetup.Stop()
+				var startErr error
+				if setupErr == nil {
+					startErr = preflightTailscale(profile, req.Profile, tailscaleSetup)
+				}
+				if setupErr == nil && startErr == nil {
+					startErr = eng.Start(profile)
+				}
+				networkRuntimeMu.Unlock()
+				if setupErr != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: setupErr.Error()})
+				} else if startErr != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: startErr.Error()})
+				} else {
+					client.SendResponse(Response{ID: req.ID, OK: true})
+				}
+
+			case "stop":
+				networkRuntimeMu.Lock()
+				err := eng.Stop()
+				networkRuntimeMu.Unlock()
+				if err != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+				} else {
+					client.SendResponse(Response{ID: req.ID, OK: true})
+				}
+
+			case "kill-session":
+				eng.KillSession()
+				client.SendResponse(Response{ID: req.ID, OK: true})
+
+			case "status":
+				client.SendResponse(Response{ID: req.ID, OK: true, Data: eng.Status()})
+
+			case "daemon-info":
+				data, _ := json.Marshal(struct {
+					Version                    string `json:"version"`
+					ExeSHA256                  string `json:"exe_sha256"`
+					PID                        int    `json:"pid"`
+					RegistrationHandoffVersion int    `json:"registration_handoff_version"`
+				}{Version: version, ExeSHA256: daemonExeHash, PID: os.Getpid(), RegistrationHandoffVersion: 1})
+				client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
+
+			case "connection-report":
+				data, err := readProviderConnectionReport()
+				if err != nil {
+					client.SendResponse(Response{
+						ID:      req.ID,
+						OK:      false,
+						Message: err.Error(),
+					})
+				} else {
+					client.SendResponse(Response{
+						ID:   req.ID,
+						OK:   true,
+						Data: string(data),
+					})
+				}
+
+			case "parse-sub":
+				result, err := subscription.Parse(req.SubURL, req.SubContent, req.SubFormat)
+				if err != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+				} else {
+					subscription.ExpandRulesets(result)
+					data, _ := json.Marshal(result)
+					client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
+				}
+
+			case "runtime-lines":
+				profile, err := config.ParseProfile([]byte(req.Profile))
+				if err != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
+				} else {
+					data, _ := json.Marshal(config.BuildLineRuntimeCatalog(profile))
+					client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
+				}
+
+			case "tailscale-prepare":
+				networkRuntimeMu.Lock()
+				if status := engineStatus(eng); status != "disconnected" {
+					networkRuntimeMu.Unlock()
+					req.AuthKey = ""
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: "disconnect XDial before configuring Tailscale"})
+					return
+				}
+				data, err := tailscaleSetup.Prepare(req.Profile, req.LineID, req.AuthKey)
+				req.AuthKey = ""
+				networkRuntimeMu.Unlock()
+				if err != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+				} else {
+					client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
+				}
+
+			case "tailscale-status":
+				networkRuntimeMu.Lock()
+				data, err := tailscaleSetup.Status(req.LineID)
+				networkRuntimeMu.Unlock()
+				if err != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+				} else {
+					client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
+				}
+
+			case "tailscale-login":
+				networkRuntimeMu.Lock()
+				data, err := tailscaleSetup.BeginLogin(req.LineID)
+				networkRuntimeMu.Unlock()
+				if err != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+				} else {
+					client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
+				}
+
+			case "tailscale-logout":
+				networkRuntimeMu.Lock()
+				data, err := tailscaleSetup.Logout(req.LineID)
+				networkRuntimeMu.Unlock()
+				if err != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+				} else {
+					client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
+				}
+
+			case "tailscale-stop-setup":
+				networkRuntimeMu.Lock()
+				err := tailscaleSetup.StopLine(req.LineID)
+				networkRuntimeMu.Unlock()
+				if err != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
+				} else {
+					client.SendResponse(Response{ID: req.ID, OK: true})
+				}
+
+			default:
+				client.SendResponse(Response{ID: req.ID, OK: false, Message: "unknown command: " + req.Cmd})
+			}
+		}()
 	}
 }
 
