@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -127,6 +129,217 @@ func TestProbeOutboundIPReturnsCurrentGenerationResult(t *testing.T) {
 	}
 	if address != "203.0.113.9" {
 		t.Fatalf("probe address = %q", address)
+	}
+}
+
+func TestProbeOutboundIPForFamilyUsesFixedNumericEndpoints(t *testing.T) {
+	for family, endpoints := range outboundAddressProbeEndpointsByFamily {
+		if len(endpoints) != 2 {
+			t.Fatalf("%s endpoint count = %d", family, len(endpoints))
+		}
+		for _, endpoint := range endpoints {
+			parsedURL, err := url.Parse(endpoint.url)
+			if err != nil {
+				t.Fatalf("parse %s endpoint URL: %v", family, err)
+			}
+			address, err := netip.ParseAddr(parsedURL.Hostname())
+			if err != nil {
+				t.Fatalf("%s endpoint is not numeric: %q", family, endpoint.url)
+			}
+			if family == "ipv4" && !address.Is4() {
+				t.Fatalf("IPv4 endpoint is not IPv4: %q", endpoint.url)
+			}
+			if family == "ipv6" && (!address.Is6() || address.Is4In6()) {
+				t.Fatalf("IPv6 endpoint is not IPv6: %q", endpoint.url)
+			}
+			if parsedURL.Scheme != "https" || parsedURL.Path != "/cdn-cgi/trace" {
+				t.Fatalf("unexpected %s endpoint URL: %q", family, endpoint.url)
+			}
+			if endpoint.destination.Addr != address || endpoint.destination.Port != 443 {
+				t.Fatalf(
+					"%s endpoint destination = %s, URL host = %s",
+					family,
+					endpoint.destination,
+					address,
+				)
+			}
+		}
+	}
+}
+
+func TestProbeOutboundIPForFamilyFallsBackAndRejectsWrongFamily(t *testing.T) {
+	instance := New(nil)
+	instance.platform.setDefaultInterface("test0", 1)
+	if err := instance.StartStandalone(outboundProbeTestConfig); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop()
+
+	var attempts []string
+	instance.probeOutboundAddressFunc = func(
+		_ context.Context,
+		_ adapter.Outbound,
+		endpoint outboundAddressProbeEndpoint,
+		_ int,
+	) (string, error) {
+		attempts = append(attempts, endpoint.url)
+		if len(attempts) == 1 {
+			return "", fmt.Errorf("temporary failure")
+		}
+		return "2606:4700:4700::1111", nil
+	}
+
+	address, err := instance.ProbeOutboundIPForFamily("direct", "ipv6", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if address != "2606:4700:4700::1111" || len(attempts) != 2 {
+		t.Fatalf("fallback result = (%q, %d attempts)", address, len(attempts))
+	}
+
+	attempts = nil
+	instance.probeOutboundAddressFunc = func(
+		_ context.Context,
+		_ adapter.Outbound,
+		endpoint outboundAddressProbeEndpoint,
+		_ int,
+	) (string, error) {
+		attempts = append(attempts, endpoint.url)
+		return "8.8.8.8", nil
+	}
+	_, err = instance.ProbeOutboundIPForFamily("direct", "ipv6", 500)
+	if err == nil || !strings.Contains(err.Error(), "ipv6-endpoint-1-wrong-family") {
+		t.Fatalf("wrong-family result was accepted: %v", err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("wrong-family fallback attempts = %d", len(attempts))
+	}
+}
+
+func TestProbeOutboundIPForFamilyAggregatesOnlySafeStageCodes(t *testing.T) {
+	instance := New(nil)
+	instance.platform.setDefaultInterface("test0", 1)
+	if err := instance.StartStandalone(outboundProbeTestConfig); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop()
+
+	attempt := 0
+	instance.probeOutboundAddressFunc = func(
+		context.Context,
+		adapter.Outbound,
+		outboundAddressProbeEndpoint,
+		int,
+	) (string, error) {
+		attempt++
+		code := "dial-failed"
+		if attempt == 2 {
+			code = "http-status-403"
+		}
+		return "", newOutboundAddressProbeError(
+			code,
+			fmt.Errorf("sensitive underlying detail %d", attempt),
+		)
+	}
+
+	_, err := instance.ProbeOutboundIPForFamily("direct", "ipv4", 500)
+	if err == nil {
+		t.Fatal("family probe unexpectedly succeeded")
+	}
+	want := "outbound address probe failed: ipv4-endpoint-1-dial-failed; ipv4-endpoint-2-http-status-403"
+	if err.Error() != want {
+		t.Fatalf("family probe error = %q, want %q", err, want)
+	}
+	if strings.Contains(err.Error(), "sensitive") {
+		t.Fatalf("family probe leaked underlying error: %v", err)
+	}
+}
+
+func TestProbeOutboundIPLegacyKeepsDetailedErrors(t *testing.T) {
+	instance := New(nil)
+	instance.platform.setDefaultInterface("test0", 1)
+	if err := instance.StartStandalone(outboundProbeTestConfig); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop()
+	instance.probeOutboundAddressFunc = func(
+		context.Context,
+		adapter.Outbound,
+		outboundAddressProbeEndpoint,
+		int,
+	) (string, error) {
+		return "", fmt.Errorf("legacy detailed error")
+	}
+
+	_, err := instance.ProbeOutboundIP("direct", 500)
+	if err == nil || !strings.Contains(err.Error(), "legacy detailed error") {
+		t.Fatalf("legacy probe error changed: %v", err)
+	}
+}
+
+func TestProbeOutboundIPForFamilyRejectsUnknownFamily(t *testing.T) {
+	instance := New(nil)
+	_, err := instance.ProbeOutboundIPForFamily("direct", "IPv4", 500)
+	if err == nil || !strings.Contains(err.Error(), "must be ipv4 or ipv6") {
+		t.Fatalf("unknown family error = %v", err)
+	}
+}
+
+func TestProbeOutboundIPForFamilyStopCancelsAndWaitsForProbeLease(t *testing.T) {
+	instance := New(nil)
+	instance.platform.setDefaultInterface("test0", 1)
+	if err := instance.StartStandalone(outboundProbeTestConfig); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	instance.probeOutboundAddressFunc = func(
+		ctx context.Context,
+		_ adapter.Outbound,
+		_ outboundAddressProbeEndpoint,
+		_ int,
+	) (string, error) {
+		close(entered)
+		<-ctx.Done()
+		<-release
+		return "8.8.8.8", nil
+	}
+
+	probeDone := make(chan error, 1)
+	go func() {
+		_, err := instance.ProbeOutboundIPForFamily("direct", "ipv4", 10_000)
+		probeDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("family probe did not start")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- instance.Stop() }()
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop returned before the family probe released its lease: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-probeDone:
+		if err == nil || !strings.Contains(err.Error(), "connection changed") {
+			t.Fatalf("stale family probe result was accepted: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("family probe did not finish")
+	}
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not finish after the family probe released its lease")
 	}
 }
 

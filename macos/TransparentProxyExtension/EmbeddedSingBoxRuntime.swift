@@ -1908,6 +1908,7 @@ final class EmbeddedSingBoxRuntime {
 
     func probeLineOutboundAddress(
         lineID: String,
+        addressFamily: LineAddressFamily,
         session: Session
     ) throws -> ProviderLineOutboundAddress {
         guard
@@ -1919,11 +1920,15 @@ final class EmbeddedSingBoxRuntime {
         }
         var probeError: NSError?
         let address = engine.probeOutboundIP(
-            outboundTag,
-            timeoutMS: 3_000,
+            forFamily: outboundTag,
+            addressFamily: addressFamily.rawValue,
+            timeoutMS: 5_000,
             error: &probeError
         )
         guard probeError == nil, !address.isEmpty else {
+            self.logger.warning(
+                "line-outbound-address-probe-failed line=\(lineID, privacy: .private) family=\(addressFamily.rawValue, privacy: .public) code=\(probeError?.localizedDescription ?? "empty-result", privacy: .public)"
+            )
             throw RuntimeError.diagnosticsUnavailable
         }
         return ProviderLineOutboundAddress(

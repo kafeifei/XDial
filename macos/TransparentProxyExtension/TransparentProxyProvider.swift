@@ -2109,6 +2109,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             let result = Result {
                 try runtime.probeLineOutboundAddress(
                     lineID: lineID,
+                    addressFamily: request.effectiveAddressFamily,
                     session: session
                 )
             }

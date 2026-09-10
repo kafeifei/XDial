@@ -883,26 +883,26 @@ struct MainPopover: View {
     }
 
     private func lineOverview(_ report: ConnectionReport) -> some View {
-        Grid(
-            alignment: .leading,
-            horizontalSpacing: 6,
-            verticalSpacing: 6
-        ) {
+        VStack(alignment: .leading, spacing: 8) {
             ForEach(lineTasks(in: report)) { task in
-                GridRow {
-                    Circle()
-                        .fill(successColor)
-                        .frame(width: 7, height: 7)
-                    Text(task.name)
-                        .font(.system(size: 12))
-                        .lineLimit(1)
-                    Text("·")
-                        .foregroundStyle(.tertiary)
-                    Text(lineSummary(task, report: report))
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+                LineAddressView(
+                    name: task.name,
+                    info: networkInfo.observation(
+                        for: task.resourceID, transactionID: report.transactionID
+                    ),
+                    capability: LineConnectionSummaryProjection.addressFamilyCapability(
+                        taskID: task.id, report: report
+                    ),
+                    language: state.language,
+                    retry: { family in
+                        state.retryLineAddress(
+                            lineID: task.resourceID,
+                            transactionID: report.transactionID,
+                            family: family
+                        )
+                    }
+                )
+                .id(report.transactionID + ":" + task.id)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1447,27 +1447,6 @@ struct MainPopover: View {
     ) -> String? {
         report.error?.message
             ?? report.tasks.compactMap { $0.error?.message }.first
-    }
-
-    private func lineSummary(
-        _ task: ConnectionTaskReport,
-        report: ConnectionReport
-    ) -> String {
-        let publicNetworkSummary = networkInfo.observation(
-            for: task.resourceID,
-            transactionID: report.transactionID
-        )?.summary.nonEmpty
-        let degradation =
-            LineConnectionSummaryProjection.addressFamilyDegradation(
-                taskID: task.id,
-                report: report
-            )
-        return LineConnectionSummaryProjection.summary(
-            publicNetworkSummary: publicNetworkSummary,
-            degradation: degradation,
-            ipv4OnlyLabel: state.tr("仅 IPv4", "IPv4 only"),
-            ipv6OnlyLabel: state.tr("仅 IPv6", "IPv6 only")
-        )
     }
 
     private func ingressFact(

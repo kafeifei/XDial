@@ -1,6 +1,84 @@
 import XCTest
 
 final class LineConnectionSummaryProjectionTests: XCTestCase {
+    func testAddressFamilyCapabilityUsesLatestValidCurrentLineFacts() {
+        var report = makeReport()
+        report.note(
+            code: "line-ipv6-egress-unavailable",
+            message: "older IPv4-only result",
+            taskID: "line:company",
+            facts: [
+                "ipv4_available": true,
+                "ipv6_available": false,
+                "degraded": true,
+            ]
+        )
+        report.note(
+            code: "line-address-family-ready",
+            message: "latest dual-stack result",
+            taskID: "line:company",
+            facts: [
+                "ipv4_available": true,
+                "ipv6_available": true,
+                "degraded": false,
+            ]
+        )
+
+        XCTAssertEqual(
+            LineConnectionSummaryProjection.addressFamilyCapability(
+                taskID: "line:company",
+                report: report
+            ),
+            .dualStack
+        )
+    }
+
+    func testAddressFamilyCapabilityRejectsOtherLineAndInvalidFacts() {
+        var report = makeReport()
+        report.note(
+            code: "line-address-family-ready",
+            message: "belongs to another Line",
+            taskID: "line:japan",
+            facts: [
+                "ipv4_available": true,
+                "ipv6_available": true,
+                "degraded": false,
+            ]
+        )
+        report.note(
+            code: "line-address-family-ready",
+            message: "degraded flag contradicts dual-stack facts",
+            taskID: "line:company",
+            facts: [
+                "ipv4_available": true,
+                "ipv6_available": true,
+                "degraded": true,
+            ]
+        )
+        report.note(
+            code: "line-address-family-ready",
+            message: "missing structured facts",
+            taskID: "line:company"
+        )
+
+        XCTAssertNil(
+            LineConnectionSummaryProjection.addressFamilyCapability(
+                taskID: "line:company",
+                report: report
+            )
+        )
+    }
+
+    func testAddressFamilyCapabilityDoesNotInferUnknownLine() {
+        let report = makeReport()
+        XCTAssertNil(
+            LineConnectionSummaryProjection.addressFamilyCapability(
+                taskID: "line:unknown",
+                report: report
+            )
+        )
+    }
+
     func testProjectsLatestValidDiagnosticForExactTask() {
         var report = makeReport()
         report.note(

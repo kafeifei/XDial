@@ -13,6 +13,7 @@ struct ProviderDiagnosticsRequest: Codable, Equatable {
     let cmd: ProviderDiagnosticsCommand
     let transactionID: String
     let lineID: String?
+    let addressFamily: LineAddressFamily?
     let probeID: String?
     let host: String?
     let port: Int?
@@ -23,6 +24,7 @@ struct ProviderDiagnosticsRequest: Codable, Equatable {
         case cmd
         case transactionID = "transaction_id"
         case lineID = "line_id"
+        case addressFamily = "address_family"
         case probeID = "probe_id"
         case host
         case port
@@ -34,6 +36,7 @@ struct ProviderDiagnosticsRequest: Codable, Equatable {
         cmd: ProviderDiagnosticsCommand,
         transactionID: String,
         lineID: String? = nil,
+        addressFamily: LineAddressFamily? = nil,
         probeID: String? = nil,
         host: String? = nil,
         port: Int? = nil,
@@ -43,10 +46,15 @@ struct ProviderDiagnosticsRequest: Codable, Equatable {
         self.cmd = cmd
         self.transactionID = transactionID
         self.lineID = lineID
+        self.addressFamily = addressFamily
         self.probeID = probeID
         self.host = host
         self.port = port
         self.timeoutMS = timeoutMS
+    }
+
+    var effectiveAddressFamily: LineAddressFamily {
+        addressFamily ?? .ipv4
     }
 }
 
@@ -481,6 +489,9 @@ enum ProviderDiagnosticsCodec {
             allowedKeys.insert("probe_id")
         case .probeLineOutboundAddress:
             allowedKeys.insert("line_id")
+            if dictionary["address_family"] != nil {
+                allowedKeys.insert("address_family")
+            }
         case .beginRouteProbe:
             allowedKeys.formUnion(["host", "port", "timeout_ms"])
         }

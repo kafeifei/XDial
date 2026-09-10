@@ -226,11 +226,13 @@ final class GoEngine: ObservableObject {
     func probeLineOutboundAddress(
         transactionID: String,
         lineID: String,
+        addressFamily: LineAddressFamily = .ipv4,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
         transparentProxy.probeLineOutboundAddress(
             transactionID: transactionID,
             lineID: lineID,
+            addressFamily: addressFamily,
             completion: completion
         )
     }
