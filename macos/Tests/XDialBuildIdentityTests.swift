@@ -32,6 +32,11 @@ final class XDialBuildIdentityTests: XCTestCase {
             XDialBuildIdentity.applicationBundleName,
             "Xdial debug.app"
         )
+        XCTAssertEqual(
+            XDialBuildIdentity.applicationDisplayName,
+            "Xdial debug"
+        )
+        XCTAssertEqual(XDialBuildIdentity.productTitle, "XDial Debug")
         XCTAssertEqual(XDialBuildIdentity.dataIdentifier, "com.kafeifei.xdial.debug")
         XCTAssertEqual(XDialBuildIdentity.userDataDirectoryName, ".xdial-debug")
         XCTAssertEqual(XDialBuildIdentity.applicationSupportDirectoryName, "XDial Debug")
@@ -64,6 +69,8 @@ final class XDialBuildIdentityTests: XCTestCase {
             "UVZM439VGU.com.kafeifei.xdial.network"
         )
         XCTAssertEqual(XDialBuildIdentity.applicationBundleName, "XDial.app")
+        XCTAssertEqual(XDialBuildIdentity.applicationDisplayName, "XDial")
+        XCTAssertEqual(XDialBuildIdentity.productTitle, "XDial")
         XCTAssertEqual(XDialBuildIdentity.dataIdentifier, "com.kafeifei.xdial")
         XCTAssertEqual(XDialBuildIdentity.userDataDirectoryName, ".xdial")
         XCTAssertEqual(XDialBuildIdentity.applicationSupportDirectoryName, "XDial")
