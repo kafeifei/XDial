@@ -216,8 +216,15 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
     /// Atomically publishes a new endpoint for future flows while allowing
     /// already-attached relays from the previous generation to finish on their
     /// original endpoint. This is the Switch commit primitive: no flow can be
-    /// claimed between the old and new generations, and an old flow never
-    /// changes its SOCKS destination midway through its lifetime.
+    /// claimed between the old and new generations, and an established relay
+    /// never changes its SOCKS destination midway through its lifetime.
+    ///
+    /// What a registry entry owns differs by flow kind. A TCP entry owns the
+    /// flow, so cancelling it ends the application's connection and the
+    /// application reconnects. A UDP entry owns only one SOCKS association:
+    /// cancelling it retires that association while its flow stays open and
+    /// re-associates against the generation active at that point, because
+    /// macOS never hands the same application socket back as a second flow.
     ///
     /// Reservations which have not attached yet lose the race and are removed;
     /// their caller observes `attach == false` and closes that claimed flow

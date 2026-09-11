@@ -41,6 +41,7 @@ enum XDialBuildIdentity {
         "UVZM439VGU.com.kafeifei.xdial.debug.network"
     static let applicationBundleName = "Xdial debug.app"
     static let applicationDisplayName = "Xdial debug"
+    static let productTitle = "XDial Debug"
     static let dataIdentifier = "com.kafeifei.xdial.debug"
     static let userDataDirectoryName = ".xdial-debug"
     static let applicationSupportDirectoryName = "XDial Debug"
@@ -66,6 +67,7 @@ enum XDialBuildIdentity {
         "UVZM439VGU.com.kafeifei.xdial.network"
     static let applicationBundleName = "XDial.app"
     static let applicationDisplayName = "XDial"
+    static let productTitle = "XDial"
     static let dataIdentifier = formalDataIdentifier
     static let userDataDirectoryName = formalUserDataDirectoryName
     static let applicationSupportDirectoryName = "XDial"

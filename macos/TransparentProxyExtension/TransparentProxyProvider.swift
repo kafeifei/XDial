@@ -1944,14 +1944,23 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 logger: logger
             )
         } else if let udpFlow = flow as? NEAppProxyUDPFlow {
-            handle = UDPFlowSOCKSRelay.makeHandle(
+            // 一个 UDP flow 对应 App 的一个 socket，macOS 不会为同一个 socket 再造
+            // flow。关流等于让 mDNSResponder 这类长驻查询者永久黑洞，所以 UDP flow
+            // 的寿命必须跨越 engine generation：注册到 registry 的是 association，
+            // 被替换时只拆 association，由 supervisor 换代重建。
+            UDPFlowSOCKSRelay.start(
                 flow: udpFlow,
-                socksPort: reservation.endpoint.port,
-                credentials: credentials,
-                trialID: reservation.generation,
+                initialTicket: udpAssociationTicket(
+                    reservation: reservation,
+                    credentials: credentials
+                ),
+                nextTicket: { [weak self] in
+                    self?.nextUDPAssociationTicket(for: udpFlow)
+                },
                 traffic: traffic,
                 logger: logger
             )
+            return true
         } else {
             relayRegistry.finish(reservation)
             Self.reject(flow)
@@ -1971,6 +1980,49 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             handle.cancel(with: AppProxyFlowCloseError.aborted)
         }
         return true
+    }
+
+    private func udpAssociationTicket(
+        reservation: ProviderRelayRegistry<
+            ProviderRelayEndpoint
+        >.Reservation,
+        credentials: SOCKSCredentials
+    ) -> UDPFlowSOCKSRelay.AssociationTicket {
+        UDPFlowSOCKSRelay.AssociationTicket(
+            socksPort: reservation.endpoint.port,
+            credentials: credentials,
+            generation: reservation.generation,
+            attach: { [weak self] handle in
+                self?.relayRegistry.attach(handle, to: reservation) ?? false
+            },
+            finish: { [weak self] in
+                self?.relayRegistry.finish(reservation)
+            }
+        )
+    }
+
+    /// Re-claims the currently active generation for a UDP flow whose SOCKS
+    /// association is gone. `nil` means no generation can carry the flow at
+    /// all — the Provider is stopping, rejecting, or already inactive — and the
+    /// supervisor then fails the flow closed.
+    private func nextUDPAssociationTicket(
+        for flow: NEAppProxyUDPFlow
+    ) -> UDPFlowSOCKSRelay.AssociationTicket? {
+        guard let reservation = relayRegistry.reserve() else {
+            return nil
+        }
+        guard let credentials = credentials(
+            for: flow,
+            endpoint: reservation.endpoint,
+            transactionID: reservation.generation
+        ) else {
+            relayRegistry.finish(reservation)
+            return nil
+        }
+        return udpAssociationTicket(
+            reservation: reservation,
+            credentials: credentials
+        )
     }
 
     /// Resolve the real executable path from the kernel-provided audit token

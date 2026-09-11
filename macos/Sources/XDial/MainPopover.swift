@@ -106,7 +106,7 @@ struct MainPopover: View {
     private var header: some View {
         HStack(spacing: 10) {
             HStack(spacing: 8) {
-                Text("XDial")
+                Text(XDialBuildIdentity.productTitle)
                     .font(.system(size: 15, weight: .semibold))
                     .tracking(0.25)
                 if state.isConnected,

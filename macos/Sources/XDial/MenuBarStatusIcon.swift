@@ -95,7 +95,7 @@ enum MenuBarStatusIcon {
             return true
         }
         image.isTemplate = isTemplate
-        image.accessibilityDescription = "XDial"
+        image.accessibilityDescription = XDialBuildIdentity.productTitle
         return image
     }
 
