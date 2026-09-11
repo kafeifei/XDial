@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 )
 
-const connectionReportGroup = "UVZM439VGU.com.kafeifei.xdial.network"
 const providerReportHome = "/var/root"
 
 func readProviderConnectionReport() ([]byte, error) {
@@ -17,11 +16,15 @@ func readProviderConnectionReport() ([]byte, error) {
 }
 
 func readProviderConnectionReportAt(home string) ([]byte, error) {
+	return readProviderConnectionReportForIdentity(home, currentRuntimeIdentity())
+}
+
+func readProviderConnectionReportForIdentity(home string, identity runtimeIdentity) ([]byte, error) {
 	path := filepath.Join(
 		home,
 		"Library",
 		"Group Containers",
-		connectionReportGroup,
+		identity.sharedAppGroup,
 		"Transactions",
 		"connection-report.json",
 	)

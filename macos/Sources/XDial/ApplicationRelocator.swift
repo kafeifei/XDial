@@ -32,10 +32,8 @@ enum ApplicationRelocator {
         }
     }
 
-    private static let destinationURL = URL(
-        fileURLWithPath: "/Applications/XDial.app",
-        isDirectory: true
-    )
+    private static let destinationURL =
+        XDialBuildIdentity.applicationDestinationURL
     private static let launchServicesRegistrarURL = URL(
         fileURLWithPath:
             "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
@@ -51,9 +49,10 @@ enum ApplicationRelocator {
     }
 
     static var permitsAutomaticUpdates: Bool {
-        isRunningFromApplications
+        XDialBuildIdentity.allowsAutomaticUpdates
+            && isRunningFromApplications
             && Bundle.main.bundleIdentifier
-                == XDialApplicationIdentifierPolicy.release
+                == XDialBuildIdentity.applicationIdentifier
     }
 
     static func validateIncomingUpdateBundle(
@@ -507,10 +506,11 @@ enum ApplicationRelocator {
         let names = try FileManager.default.contentsOfDirectory(
             atPath: destinationURL.deletingLastPathComponent().path
         )
+        let prefix = XDialBuildIdentity.installationArtifactPrefix
         guard names.contains(where: {
-            $0.hasPrefix(".XDial.transaction-")
-                || $0.hasPrefix(".XDial.install-")
-                || $0.hasPrefix(".XDial.backup-")
+            $0.hasPrefix(prefix + ".transaction-")
+                || $0.hasPrefix(prefix + ".install-")
+                || $0.hasPrefix(prefix + ".backup-")
         }) else { return }
         let artifacts = installationArtifacts(
             sourceIdentity: sourceIdentity,
@@ -788,7 +788,8 @@ enum ApplicationRelocator {
         guard let extensionIdentifier = ApplicationBundleInfo.string(
             forKey: "XDialTransparentProxyBundleIdentifier",
             at: bundleURL
-        ) else {
+        ), extensionIdentifier
+            == XDialBuildIdentity.transparentProxyIdentifier else {
             throw InstallationError.extensionIdentifierMissing
         }
         let extensionsURL = bundleURL.appendingPathComponent(

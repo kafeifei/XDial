@@ -1,5 +1,5 @@
 BUILD_DIR := build
-APP_BUNDLE := $(BUILD_DIR)/XDial.app
+APP_BUNDLE := $(BUILD_DIR)/Xdial debug.app
 RELEASE_BUNDLE := $(BUILD_DIR)/release/XDial.app
 RELEASE_TAG ?=
 RELEASE_BUILD_NUMBER ?=
@@ -43,9 +43,10 @@ MACOS_APP_LAUNCHER := $(BUILD_DIR)/launch-macos-app
 # 系统会把重编后的 daemon 当新程序、要求重新批准。默认用开发者证书
 # （partial match，本机唯一），无证书环境可 SIGN_IDENTITY=- 回落 ad-hoc。
 SIGN_IDENTITY ?= Apple Development
+MACOS_DEBUG_XCODEBUILD_FLAGS ?=
 MACOS_TEST_XCODEBUILD_FLAGS ?=
 
-.PHONY: all cli app ci-macos-build macos-identity-contract release-inputs release-app release test-release-contract restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios mobile-app-icons FORCE_PATCHED_GO
+.PHONY: all cli cli-debug app ci-macos-build macos-identity-contract release-inputs release-app release test-release-contract restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios mobile-app-icons FORCE_PATCHED_GO
 
 $(MACOS_ICON_GENERATOR_BINARY): $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
 	@mkdir -p "$(BUILD_DIR)"
@@ -222,32 +223,38 @@ cli: $(PATCHED_WORKFILE)
 	@mkdir -p $(BUILD_DIR)
 	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS)" -o $(BUILD_DIR)/xdial ./cmd/xdial/
 
+# Debug helper has its own executable so release builds cannot overwrite it.
+cli-debug: $(PATCHED_WORKFILE)
+	@mkdir -p $(BUILD_DIR)
+	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS) -X main.buildFlavor=debug" -o $(BUILD_DIR)/xdial-debug ./cmd/xdial/
+
 # debug 构建(含 DebugServer,仅本地开发用,不得分发)
-app: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
+app: cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Debug \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
 		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
-		build
+		$(MACOS_DEBUG_XCODEBUILD_FLAGS) build
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration Debug \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
 		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
-		build
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Info.plist')" = com.kafeifei.xdial.app
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = com.kafeifei.xdial.app.settings-ui
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Library/SystemExtensions/com.kafeifei.xdial.app.transparent-proxy.systemextension/Contents/Info.plist')" = com.kafeifei.xdial.app.transparent-proxy
-	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Info.plist')" = true
-	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = false
-	@test "$$(plutil -extract CFBundleDisplayName raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = XDial
-	@test -f '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app/Contents/Helpers/XDial Settings UI.app/Contents/Resources/SettingsDockIcon.icns'
+		$(MACOS_DEBUG_XCODEBUILD_FLAGS) build
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Info.plist')" = com.kafeifei.xdial.debug
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = com.kafeifei.xdial.debug.settings-ui
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Library/SystemExtensions/com.kafeifei.xdial.debug.transparent-proxy.systemextension/Contents/Info.plist')" = com.kafeifei.xdial.debug.transparent-proxy
+	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Info.plist')" = true
+	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = false
+	@test "$$(plutil -extract CFBundleDisplayName raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = 'Xdial debug'
+	@test -f '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Resources/SettingsDockIcon.icns'
 	rm -rf "$(APP_BUNDLE)"
-	ditto "$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDial.app" "$(APP_BUNDLE)"
+	ditto "$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app" "$(APP_BUNDLE)"
 	@test "$$(plutil -extract LSUIElement raw '$(APP_BUNDLE)/Contents/Info.plist')" = true
+	python3 scripts/verify-macos-debug-app.py "$(APP_BUNDLE)"
 
 # GitHub 托管 runner 不持有 System Extension 的签名证书和 provisioning profile。
 # 这里分别编译 Debug / Release 的扩展与宿主，只验证源码和链接；产物没有签名、不可分发。
-ci-macos-build: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
+ci-macos-build: cli cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
 	@set -e; for configuration in Debug Release; do \
 		xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy \
 			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
@@ -255,7 +262,8 @@ ci-macos-build: cli libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDo
 		xcodebuild -project macos/XDial.xcodeproj -scheme XDial \
 			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
 			-derivedDataPath $(BUILD_DIR)/macos-xcode-ci CODE_SIGNING_ALLOWED=NO build; \
-		test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode-ci/Build/Products/'"$$configuration"'/XDial.app/Contents/Info.plist')" = true; \
+		product_name=XDial; if [ "$$configuration" = Debug ]; then product_name='Xdial debug'; fi; \
+		test "$$(plutil -extract LSUIElement raw "$(BUILD_DIR)/macos-xcode-ci/Build/Products/$$configuration/$$product_name.app/Contents/Info.plist")" = true; \
 	done
 
 # Release 的 marketing version 只来自 RELEASE_TAG；build number 是独立、

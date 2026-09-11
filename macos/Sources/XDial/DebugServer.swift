@@ -6,7 +6,7 @@ import Network
 
 final class DebugServer {
     private var listener: NWListener?
-    private let port: UInt16 = 19876
+    private let port = XDialBuildIdentity.debugServerPort
 
     func start() {
         let params = NWParameters.tcp

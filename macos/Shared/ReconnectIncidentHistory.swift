@@ -248,7 +248,8 @@ enum ReconnectIncidentJournal {
     private static var fileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(
-                "Library/Application Support/XDial",
+                "Library/Application Support/"
+                    + XDialBuildIdentity.applicationSupportDirectoryName,
                 isDirectory: true
             )
             .appendingPathComponent("reconnect-incidents.json")

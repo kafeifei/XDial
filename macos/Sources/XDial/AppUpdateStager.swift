@@ -30,7 +30,8 @@ enum AppUpdateStagingError: LocalizedError {
 
 enum AppUpdateStager {
     static let staleRootMaximumAge: TimeInterval = 24 * 60 * 60
-    private static let rootDirectoryName = "XDialUpdates"
+    private static let rootDirectoryName =
+        XDialBuildIdentity.updateStagingDirectoryName
     private static let archiveName = "download.zip"
 
     static func makeStagingRoot(
@@ -208,7 +209,8 @@ enum AppUpdateStager {
         _ applicationURL: URL,
         fileManager: FileManager = .default
     ) -> Bool {
-        guard applicationURL.lastPathComponent == "XDial.app",
+        guard applicationURL.lastPathComponent
+                == XDialBuildIdentity.applicationBundleName,
               applicationURL.deletingLastPathComponent()
                 .lastPathComponent == "expanded" else {
             return false

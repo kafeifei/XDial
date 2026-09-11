@@ -7,11 +7,11 @@ import (
 	"os/exec"
 )
 
-func killOrphanSingBox() {
-	out, err := exec.Command("pgrep", "-f", "sing-box run.*xdial-engine").Output()
+func killOrphanSingBox(pattern string) {
+	out, err := exec.Command("pgrep", "-f", pattern).Output()
 	if err != nil || len(out) == 0 {
 		return
 	}
 	slog.Info("killing orphan sing-box processes")
-	exec.Command("pkill", "-f", "sing-box run.*xdial-engine").Run()
+	exec.Command("pkill", "-f", pattern).Run()
 }

@@ -207,10 +207,15 @@ enum TransparentProxyFlowMetadata {
     /// A connect-by-name UDP flow must stay a name at the SOCKS boundary.
     /// That lets the resolver selected by the matched App/Line rule choose the
     /// usable address family instead of inheriting NetworkExtension's stale IP.
+    /// DNS is different: its payload already carries the queried name, while
+    /// the SOCKS destination must retain the resolver endpoint selected by the
+    /// system so Direct can forward the original query to that exact server.
     static func datagramSOCKSHost(
         hostname: String?,
-        endpointHost: Network.NWEndpoint.Host
+        endpointHost: Network.NWEndpoint.Host,
+        endpointPort: Network.NWEndpoint.Port
     ) -> Network.NWEndpoint.Host {
+        guard endpointPort.rawValue != 53 else { return endpointHost }
         guard let hostname else { return endpointHost }
         let hostnameBytes = Data(hostname.utf8)
         guard

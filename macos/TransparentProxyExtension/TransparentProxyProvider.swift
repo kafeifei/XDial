@@ -136,26 +136,30 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     private static let debugFailureStageOption = "debug_failure_stage"
 
     private let logger = Logger(
-        subsystem: "com.kafeifei.xdial.app.transparent-proxy",
+        subsystem: XDialBuildIdentity.transparentProxyIdentifier,
         category: "provider"
     )
     private let engineQueue = DispatchQueue(
-        label: "com.kafeifei.xdial.app.transparent-proxy.engine",
+        label: XDialBuildIdentity.queueLabelPrefix
+            + ".transparent-proxy.engine",
         qos: .userInitiated
     )
     /// Candidate construction may enter an uninterruptible third-party
     /// AnyConnect dial. It must never occupy the queue which owns Provider
     /// stop, fatal teardown and system-settings rollback.
     private let scenarioSwitchPreparationQueue = DispatchQueue(
-        label: "com.kafeifei.xdial.app.transparent-proxy.switch-preparation",
+        label: XDialBuildIdentity.queueLabelPrefix
+            + ".transparent-proxy.switch-preparation",
         qos: .userInitiated
     )
     private let scenarioSwitchCancellationQueue = DispatchQueue(
-        label: "com.kafeifei.xdial.app.transparent-proxy.switch-cancellation",
+        label: XDialBuildIdentity.queueLabelPrefix
+            + ".transparent-proxy.switch-cancellation",
         qos: .userInitiated
     )
     private let diagnosticsQueue = DispatchQueue(
-        label: "com.kafeifei.xdial.app.transparent-proxy.diagnostics",
+        label: XDialBuildIdentity.queueLabelPrefix
+            + ".transparent-proxy.diagnostics",
         qos: .utility,
         attributes: .concurrent
     )
@@ -2539,7 +2543,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
 
     private static func providerNSError(_ error: Error) -> NSError {
         NSError(
-            domain: "com.kafeifei.xdial.app.transparent-proxy.start",
+            domain: XDialBuildIdentity.transparentProxyIdentifier
+                + ".start",
             code: 1,
             userInfo: [
                 NSLocalizedDescriptionKey:

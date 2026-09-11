@@ -6,11 +6,11 @@ import ServiceManagement
 // .enabled 只代表允许运行；更新 plist 或 executable 后必须重新注册。安装协调器
 // 先取得空闲服务的维护租约，再等待 unregister completion 后注册当前 bundle。
 enum PrivilegeManager {
-    static let label = "com.kafeifei.xdial.app.daemon"
-    static let plistName =
-        "com.kafeifei.xdial.app.daemon.plist"
-    private static let legacyLabel = "com.kafeifei.xdial.helper"
-    static let socketPath = "/tmp/xdial.sock"
+    static let label = XDialBuildIdentity.daemonIdentifier
+    static let plistName = XDialBuildIdentity.daemonIdentifier + ".plist"
+    private static let legacyLabel =
+        XDialBuildIdentity.legacyHelperIdentifier
+    static let socketPath = XDialBuildIdentity.daemonSocketPath
 
     static var service: SMAppService { SMAppService.daemon(plistName: plistName) }
 
@@ -84,8 +84,10 @@ enum PrivilegeManager {
 
     private static func recordAcceptedRegistration() throws {
         if let intent = try HelperRegistrationMaintenanceIntent.read() {
+            let identity = try registrationIdentity()
             try HelperRegistrationMaintenanceIntent.update(
-                token: intent.token, phase: "registered", targetHash: registrationIdentity().executableHash
+                token: intent.token, phase: "registered", targetHash: identity.executableHash,
+                registrationFingerprint: identity.fingerprint
             )
         }
     }
@@ -95,7 +97,9 @@ enum PrivilegeManager {
             if let intent = try HelperRegistrationMaintenanceIntent.read() {
                 // Only an acknowledged unregister followed by successful register
                 // can produce this phase. Earlier crashes need a new OS barrier.
-                return intent.phase == "registered" && intent.targetHash == executableHash ? fingerprint : nil
+                return intent.verifiedRegistrationFingerprint(
+                    matching: fingerprint, executableHash: executableHash
+                )
             }
             return savedMarker
         } catch { return nil }
@@ -154,10 +158,16 @@ enum PrivilegeManager {
         guard case let .available(entries) = LocalProcessInventory.capture() else { return .unknown }
         var hasUnknown = false
         for entry in entries where entry.pid != ProcessInfo.processInfo.processIdentifier {
-            switch entry.matchesExecutableName(in: ["xdial", "xdial-daemon"]) {
-            case true: return .unresponsive
-            case false: continue
-            case nil: hasUnknown = true
+            switch entry.belongsToProductBundle(
+                XDialBuildIdentity.applicationDestinationURL,
+                excludingSiblingBundleURLs: [
+                    XDialBuildIdentity.siblingApplicationDestinationURL,
+                ],
+                executableNames: ["xdial", "xdial-daemon"]
+            ) {
+            case .some(true): return .unresponsive
+            case .some(false): continue
+            case .none: hasUnknown = true
             }
         }
         return hasUnknown ? .unknown : .absent
@@ -168,7 +178,13 @@ enum PrivilegeManager {
         let hostPID = ProcessInfo.processInfo.processIdentifier
         return entries.allSatisfy { entry in
             if entry.pid == hostPID || entry.pid == daemonPID { return true }
-            return entry.matchesExecutableName(in: ["xdial", "xdial-daemon"]) == false
+            return entry.belongsToProductBundle(
+                XDialBuildIdentity.applicationDestinationURL,
+                excludingSiblingBundleURLs: [
+                    XDialBuildIdentity.siblingApplicationDestinationURL,
+                ],
+                executableNames: ["xdial", "xdial-daemon"]
+            ) == false
         }
     }
 
@@ -453,13 +469,16 @@ enum PrivilegeManager {
         "/Library/LaunchDaemons/\(legacyLabel).plist"
 
     static var legacyInstalled: Bool {
-        FileManager.default.fileExists(atPath: legacyPlistPath)
+        XDialBuildIdentity.allowsLegacyCleanup
+            && (FileManager.default.fileExists(atPath: legacyPlistPath)
             || FileManager.default.fileExists(atPath: legacyHelperPath)
+            )
     }
 
     /// 清掉旧安装（bootout + 删文件）。这是整个生命周期里最后一次要密码的操作，
     /// 且只发生在从旧机制迁移的机器上。
     static func cleanupLegacy() throws {
+        guard XDialBuildIdentity.allowsLegacyCleanup else { return }
         let shell = """
         launchctl bootout system/\(legacyLabel) 2>/dev/null || true
         rm -f '\(legacyPlistPath)' '\(legacyHelperPath)'
@@ -484,7 +503,14 @@ enum PrivilegeManager {
         if deleteData {
             // /Library/Application Support/XDial 是 root 属主，得借 root daemon 或
             // 管理员权限删；daemon 已被注销，这里只能走一次管理员授权。
-            _ = runAdminShell("rm -rf '/Library/Application Support/XDial' '/tmp/xdial-engine' '/tmp/xdial.log' '\(socketPath)'")
+            let supportPath = "/Library/Application Support/"
+                + XDialBuildIdentity.applicationSupportDirectoryName
+            _ = runAdminShell(
+                "rm -rf '\(supportPath)' "
+                    + "'\(XDialBuildIdentity.engineRuntimePath)' "
+                    + "'\(XDialBuildIdentity.daemonLogPath)' "
+                    + "'\(socketPath)'"
+            )
         }
     }
 

@@ -1164,7 +1164,7 @@ enum ConnectionReportCodec {
 
 enum ConnectionReportJournal {
     private static let groupIdentifier =
-        "UVZM439VGU.com.kafeifei.xdial.network"
+        XDialBuildIdentity.appGroupIdentifier
     private static let fileName = "connection-report.json"
     private static let switchCandidateFileName =
         "connection-report-switch-candidate.json"
@@ -1353,7 +1353,8 @@ enum ConnectionReportJournal {
         // The process suffix also isolates concurrent XCTest workers.
         let container = FileManager.default.temporaryDirectory
             .appendingPathComponent(
-                "com.kafeifei.xdial.tests-\(ProcessInfo.processInfo.processIdentifier)",
+                XDialBuildIdentity.dataIdentifier
+                    + ".tests-\(ProcessInfo.processInfo.processIdentifier)",
                 isDirectory: true
             )
 #else

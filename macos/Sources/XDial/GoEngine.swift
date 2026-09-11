@@ -4,7 +4,8 @@ import Foundation
 // 会把 parse-sub 响应里的节点密码等敏感内容暴露给同机任意用户。
 func appLogPath() -> String {
     let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Logs/XDial")
+        .appendingPathComponent("Library/Logs")
+        .appendingPathComponent(XDialBuildIdentity.logDirectoryName)
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir.appendingPathComponent("xdial-app.log").path
 }
@@ -28,7 +29,7 @@ final class GoEngine: ObservableObject {
     static let shared = GoEngine()
 
     private let transparentProxy = TransparentProxyManager.shared
-    private let socketPath = "/tmp/xdial.sock"
+    private let socketPath = XDialBuildIdentity.daemonSocketPath
     private var fd: Int32 = -1
     private var readSource: DispatchSourceRead?
     private var readBuffer = Data()

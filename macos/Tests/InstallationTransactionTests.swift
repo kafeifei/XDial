@@ -308,12 +308,20 @@ final class InstallationTransactionTests: XCTestCase {
     }
 
     func testRelocationAllowsKnownApplicationReplacementForSameTeam() {
-        XCTAssertTrue(
+        XCTAssertEqual(
             XDialApplicationIdentifierPolicy.permitsReplacement(
                 existingIdentifier:
                     XDialApplicationIdentifierPolicy.legacyRelease,
                 incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
+                    XDialBuildIdentity.applicationIdentifier,
+                teamIdentifiersMatch: true
+            ),
+            XDialBuildIdentity.allowsFormalDataMigration
+        )
+        XCTAssertTrue(
+            XDialApplicationIdentifierPolicy.permitsReplacement(
+                existingIdentifier: XDialBuildIdentity.applicationIdentifier,
+                incomingIdentifier: XDialBuildIdentity.applicationIdentifier,
                 teamIdentifiersMatch: true
             )
         )
@@ -328,18 +336,15 @@ final class InstallationTransactionTests: XCTestCase {
         )
         XCTAssertFalse(
             XDialApplicationIdentifierPolicy.permitsReplacement(
-                existingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
-                incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.legacyProbe,
-                teamIdentifiersMatch: false
+                existingIdentifier: XDialApplicationIdentifierPolicy.release,
+                incomingIdentifier: XDialApplicationIdentifierPolicy.development,
+                teamIdentifiersMatch: true
             )
         )
         XCTAssertFalse(
             XDialApplicationIdentifierPolicy.permitsReplacement(
-                existingIdentifier: "com.example.not-xdial",
-                incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
+                existingIdentifier: XDialApplicationIdentifierPolicy.development,
+                incomingIdentifier: XDialApplicationIdentifierPolicy.release,
                 teamIdentifiersMatch: true
             )
         )
@@ -349,7 +354,7 @@ final class InstallationTransactionTests: XCTestCase {
         XCTAssertTrue(
             XDialApplicationIdentifierPolicy
                 .permitsIncomingInstallation(
-                    identifier: XDialApplicationIdentifierPolicy.release
+                    identifier: XDialBuildIdentity.applicationIdentifier
                 )
         )
         XCTAssertFalse(
@@ -369,15 +374,18 @@ final class InstallationTransactionTests: XCTestCase {
     }
 
     func testReleaseUnregistersObsoleteApplicationIdentities() {
-        XCTAssertEqual(
-            XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
-                forInstalledIdentifier:
-                    XDialApplicationIdentifierPolicy.release
-            ),
-            [
+        let expected: Set<String> = XDialBuildIdentity.allowsFormalDataMigration
+            ? [
                 XDialApplicationIdentifierPolicy.legacyProbe,
                 XDialApplicationIdentifierPolicy.legacyRelease,
             ]
+            : []
+        XCTAssertEqual(
+            XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
+                forInstalledIdentifier:
+                    XDialBuildIdentity.applicationIdentifier
+            ),
+            expected
         )
         XCTAssertEqual(
             XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
@@ -399,49 +407,51 @@ final class InstallationTransactionTests: XCTestCase {
             XDialApplicationIdentifierPolicy
                 .shouldUnregisterApplicationRegistration(
                     installedIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
+                        XDialBuildIdentity.applicationIdentifier,
                     registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
+                        XDialBuildIdentity.applicationIdentifier,
                     onDiskIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
+                        XDialBuildIdentity.applicationIdentifier,
                     isInstalledDestination: false
                 )
         )
-        XCTAssertTrue(
+        XCTAssertEqual(
             XDialApplicationIdentifierPolicy
                 .shouldUnregisterApplicationRegistration(
                     installedIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
+                        XDialBuildIdentity.applicationIdentifier,
                     registeredIdentifier:
                         XDialApplicationIdentifierPolicy.legacyRelease,
                     onDiskIdentifier:
                         XDialApplicationIdentifierPolicy.legacyRelease,
                     isInstalledDestination: false
-                )
+                ),
+            XDialBuildIdentity.allowsFormalDataMigration
         )
         XCTAssertFalse(
             XDialApplicationIdentifierPolicy
                 .shouldUnregisterApplicationRegistration(
                     installedIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
+                        XDialBuildIdentity.applicationIdentifier,
                     registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
+                        XDialBuildIdentity.applicationIdentifier,
                     onDiskIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
+                        XDialBuildIdentity.applicationIdentifier,
                     isInstalledDestination: true
                 )
         )
-        XCTAssertTrue(
+        XCTAssertEqual(
             XDialApplicationIdentifierPolicy
                 .shouldUnregisterApplicationRegistration(
                     installedIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
+                        XDialBuildIdentity.applicationIdentifier,
                     registeredIdentifier:
                         XDialApplicationIdentifierPolicy.legacyProbe,
                     onDiskIdentifier:
                         XDialApplicationIdentifierPolicy.legacyProbe,
                     isInstalledDestination: false
-                )
+                ),
+            XDialBuildIdentity.allowsFormalDataMigration
         )
         XCTAssertFalse(
             XDialApplicationIdentifierPolicy
@@ -449,13 +459,13 @@ final class InstallationTransactionTests: XCTestCase {
                     installedIdentifier:
                         XDialApplicationIdentifierPolicy.legacyProbe,
                     registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
+                        XDialBuildIdentity.applicationIdentifier,
                     onDiskIdentifier:
                         XDialApplicationIdentifierPolicy.release,
                     isInstalledDestination: false
                 )
         )
-        XCTAssertTrue(
+        XCTAssertEqual(
             XDialApplicationIdentifierPolicy
                 .shouldUnregisterApplicationRegistration(
                     installedIdentifier:
@@ -465,7 +475,8 @@ final class InstallationTransactionTests: XCTestCase {
                     onDiskIdentifier:
                         XDialApplicationIdentifierPolicy.release,
                     isInstalledDestination: false
-                )
+                ),
+            XDialBuildIdentity.allowsFormalDataMigration
         )
         XCTAssertFalse(
             XDialApplicationIdentifierPolicy
@@ -482,57 +493,51 @@ final class InstallationTransactionTests: XCTestCase {
     }
 
     func testOutgoingCleanupPlansForIdentityOrComponentMigration() throws {
-        let existingURL = URL(
-            fileURLWithPath: "/Applications/XDial.app",
-            isDirectory: true
-        )
-        let plan = try XCTUnwrap(
+        let existingURL = XDialBuildIdentity.applicationDestinationURL
+        XCTAssertEqual(
             OutgoingApplicationCleanup.plan(
                 existingBundleURL: existingURL,
                 existingIdentifier:
                     XDialApplicationIdentifierPolicy.legacyProbe,
                 incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
+                    XDialBuildIdentity.applicationIdentifier,
                 teamIdentifiersMatch: true
-            )
+            ) != nil,
+            XDialBuildIdentity.allowsFormalDataMigration
         )
-        XCTAssertEqual(
-            plan.executableURL.path,
-            "/Applications/XDial.app/Contents/MacOS/XDial"
-        )
-        XCTAssertEqual(
-            plan.arguments,
-            [OutgoingApplicationCleanup.replacementArgument]
-        )
-        XCTAssertEqual(plan.timeout, 5 * 60)
         XCTAssertNil(
             OutgoingApplicationCleanup.plan(
                 existingBundleURL: existingURL,
-                existingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
-                incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
+                existingIdentifier: XDialBuildIdentity.applicationIdentifier,
+                incomingIdentifier: XDialBuildIdentity.applicationIdentifier,
                 teamIdentifiersMatch: true
             )
         )
-        XCTAssertNotNil(
+        let componentPlan = try XCTUnwrap(
             OutgoingApplicationCleanup.plan(
                 existingBundleURL: existingURL,
-                existingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
-                incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
+                existingIdentifier: XDialBuildIdentity.applicationIdentifier,
+                incomingIdentifier: XDialBuildIdentity.applicationIdentifier,
                 teamIdentifiersMatch: true,
                 requiresComponentCleanup: true
             )
         )
+        XCTAssertEqual(
+            componentPlan.executableURL.path,
+            existingURL.appendingPathComponent("Contents/MacOS/XDial").path
+        )
+        XCTAssertEqual(
+            componentPlan.arguments,
+            [OutgoingApplicationCleanup.replacementArgument]
+        )
+        XCTAssertEqual(componentPlan.timeout, 5 * 60)
         XCTAssertNil(
             OutgoingApplicationCleanup.plan(
                 existingBundleURL: existingURL,
                 existingIdentifier:
                     XDialApplicationIdentifierPolicy.legacyProbe,
                 incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
+                    XDialBuildIdentity.applicationIdentifier,
                 teamIdentifiersMatch: false
             )
         )
@@ -542,14 +547,16 @@ final class InstallationTransactionTests: XCTestCase {
         let plan = try XCTUnwrap(
             OutgoingApplicationCleanup.plan(
                 existingBundleURL: URL(
-                    fileURLWithPath: "/Applications/XDial.app",
+                    fileURLWithPath:
+                        XDialBuildIdentity.applicationDestinationURL.path,
                     isDirectory: true
                 ),
                 existingIdentifier:
-                    XDialApplicationIdentifierPolicy.legacyProbe,
+                    XDialBuildIdentity.applicationIdentifier,
                 incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
-                teamIdentifiersMatch: true
+                    XDialBuildIdentity.applicationIdentifier,
+                teamIdentifiersMatch: true,
+                requiresComponentCleanup: true
             )
         )
         var invocation: OutgoingApplicationCleanup.Plan?
@@ -571,14 +578,16 @@ final class InstallationTransactionTests: XCTestCase {
         let plan = try XCTUnwrap(
             OutgoingApplicationCleanup.plan(
                 existingBundleURL: URL(
-                    fileURLWithPath: "/Applications/XDial.app",
+                    fileURLWithPath:
+                        XDialBuildIdentity.applicationDestinationURL.path,
                     isDirectory: true
                 ),
                 existingIdentifier:
-                    XDialApplicationIdentifierPolicy.legacyProbe,
+                    XDialBuildIdentity.applicationIdentifier,
                 incomingIdentifier:
-                    XDialApplicationIdentifierPolicy.release,
-                teamIdentifiersMatch: true
+                    XDialBuildIdentity.applicationIdentifier,
+                teamIdentifiersMatch: true,
+                requiresComponentCleanup: true
             )
         )
 

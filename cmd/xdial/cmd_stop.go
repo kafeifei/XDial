@@ -8,7 +8,7 @@ import (
 
 func runStopCmd(args []string) {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
-	socketPath := fs.String("socket", "/tmp/xdial.sock", "unix socket path")
+	socketPath := fs.String("socket", currentRuntimeIdentity().socketPath, "unix socket path")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: xdial stop [--socket PATH]\n\nTell daemon to disconnect VPN.\n\n")
 		fs.PrintDefaults()

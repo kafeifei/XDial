@@ -85,7 +85,8 @@ enum UnderlayIPv6TLSProbe {
     ) -> Bool {
         let coordinator = Coordinator(attemptCount: targets.count)
         let callbackQueue = DispatchQueue(
-            label: "com.kafeifei.xdial.underlay-ipv6-tls-probe"
+            label: XDialBuildIdentity.queueLabelPrefix
+                + ".underlay-ipv6-tls-probe"
         )
         let port = NWEndpoint.Port(rawValue: 443)!
         var connections: [NWConnection] = []

@@ -4,7 +4,7 @@ import Foundation
 /// Bridges an asynchronous OS unregister and a launchd KeepAlive start. A token
 /// prevents a late completion from changing a successor installation's intent.
 enum HelperRegistrationMaintenanceIntent {
-    static let path = "/tmp/xdial-registration-maintenance"
+    static let path = XDialBuildIdentity.registrationMaintenancePath
 
     struct Record: Codable, Equatable {
         let version: Int
@@ -12,10 +12,20 @@ enum HelperRegistrationMaintenanceIntent {
         var targetHash: String
         var phase: String
         var previousPID: Int32?
+        var registrationFingerprint: String?
         enum CodingKeys: String, CodingKey {
             case version, token, phase
             case targetHash = "target_hash"
             case previousPID = "previous_pid"
+            case registrationFingerprint = "registration_fingerprint"
+        }
+
+        func verifiedRegistrationFingerprint(
+            matching fingerprint: String, executableHash: String
+        ) -> String? {
+            guard phase == "registered", targetHash == executableHash,
+                  registrationFingerprint == fingerprint else { return nil }
+            return registrationFingerprint
         }
     }
 
@@ -43,17 +53,22 @@ enum HelperRegistrationMaintenanceIntent {
         try withMutationLock(at: path) {
             if let existing = try readUnlocked(at: path) { return existing }
             let record = Record(version: 1, token: UUID().uuidString, targetHash: targetHash,
-                                phase: "prepared", previousPID: previousPID)
+                                phase: "prepared", previousPID: previousPID,
+                                registrationFingerprint: nil)
             try atomicWrite(record, at: path, replacing: false)
             return record
         }
     }
 
-    static func update(token: String, phase: String, targetHash: String? = nil, at path: String = path) throws {
+    static func update(
+        token: String, phase: String, targetHash: String? = nil,
+        registrationFingerprint: String? = nil, at path: String = path
+    ) throws {
         try withMutationLock(at: path) {
             guard var record = try readUnlocked(at: path), record.token == token else { throw denied() }
             record.phase = phase
             if let targetHash { record.targetHash = targetHash }
+            if let registrationFingerprint { record.registrationFingerprint = registrationFingerprint }
             try atomicWrite(record, at: path, replacing: true)
         }
     }

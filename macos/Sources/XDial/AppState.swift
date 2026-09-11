@@ -76,7 +76,8 @@ private final class ProfilePersistenceWriter: @unchecked Sendable {
     private let defaults: UserDefaults
     private let profileKey: String
     private let queue = DispatchQueue(
-        label: "com.kafeifei.xdial.profile-persistence",
+        label: XDialBuildIdentity.queueLabelPrefix
+            + ".profile-persistence",
         qos: .utility
     )
     private let generationLock = NSLock()
@@ -600,19 +601,24 @@ final class AppState: ObservableObject {
     /// 桌面端回到 root helper 后，进程重新使用正常用户目录；这里做一次有界迁移，
     /// 只搬 XDial 自己的 profile/语言/登录项开关，不触碰任何系统网络配置。
     private static func importSandboxPreferencesIfNeeded() {
+        guard XDialBuildIdentity.allowsFormalDataMigration else { return }
         let marker = "xdial.migratedFromSandboxProfileV1"
         let defaults = xdialDefaults
         guard !defaults.bool(forKey: marker) else { return }
 
         let home = FileManager.default.homeDirectoryForCurrentUser
         let source = home.appendingPathComponent(
-            "Library/Containers/com.kafeifei.xdial/Data/Library/Preferences/com.kafeifei.xdial.plist"
+            "Library/Containers/"
+                + XDialBuildIdentity.legacyApplicationIdentifier
+                + "/Data/Library/Preferences/"
+                + XDialBuildIdentity.formalDataIdentifier + ".plist"
         )
         guard let values = NSDictionary(contentsOf: source),
               let profileData = values["xdial.profile"] as? Data else { return }
 
         let destination = home.appendingPathComponent(
-            "Library/Preferences/com.kafeifei.xdial.plist"
+            "Library/Preferences/"
+                + XDialBuildIdentity.formalDataIdentifier + ".plist"
         )
         let sourceValues = try? source.resourceValues(forKeys: [.contentModificationDateKey])
         let destinationValues = try? destination.resourceValues(

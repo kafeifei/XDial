@@ -5,8 +5,9 @@
 
 ## 安全边界
 
-- Debug 构建只在 `127.0.0.1:19876` 提供 HTTP 接口，Release 构建完全排除。统一使用
-  `127.0.0.1`，不要依赖 `localhost` 的 IPv6 解析。
+- 独立开发版 `Xdial debug.app` 只在 `127.0.0.1:19877` 提供 HTTP 接口，Release 构建完全排除。统一使用
+  `127.0.0.1`，不要依赖 `localhost` 的 IPv6 解析。旧的正式身份 Debug 包仍可能使用
+  `19876`；操作前必须核对 `/health` 的 PID、可执行路径和 bundle identity，不能跨通道发送动作。
 - `GET /health`、`GET /state` 和 `GET /ax` 是默认的只读入口。
 - HTTP 方法不代表副作用边界；POST 和 AX 动作都必须先判断实际行为。connect、disconnect、
   reconnect、select-scenario、prepare-system-extension、故障注入，以及可能保存配置的
@@ -22,47 +23,47 @@
 
 ```bash
 # 存活与进程
-curl -sS 127.0.0.1:19876/health
+curl -sS 127.0.0.1:19877/health
 
 # engine/profile/network/windows；敏感字段已脱敏
-curl -sS 127.0.0.1:19876/state
+curl -sS 127.0.0.1:19877/state
 
 # 当前 UI 元素树
-curl -sS "127.0.0.1:19876/ax?depth=8"
+curl -sS "127.0.0.1:19877/ax?depth=8"
 
 # 连接、断开、重连；需要本次明确授权
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"connect"}'
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"disconnect"}'
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"reconnect"}'
 
 # Debug-only 故障注入；会真实启动并回滚网络会话，需要本次断连授权
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"connect-with-failure","stage":"commit"}'
 
 # 安装或替换 System Extension；需要本次平台变更授权
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"prepare-system-extension"}'
 
 # 打开设置、选择场景；选择场景需要本次状态变更授权
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"open-settings"}'
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"select-scenario","id":"scenario-id"}'
 
 # 在当前已提交事务中建立固定 443 端口的路由归因探针，再读取结构化快照。
 # host 只接受 ASCII DNS 名；Provider 会再次校验当前 transaction。
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"begin-route-probe","host":"example.com","timeout_ms":10000}'
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"routing-probe-snapshot","probe_id":"<上一步返回的 probeID>"}'
 
 # 按 /ax 返回的 title 操作 UI；可能改变配置，先判断并取得相应授权
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"ax-press","title":"连接"}'
-curl -sS -X POST 127.0.0.1:19876/action \
+curl -sS -X POST 127.0.0.1:19877/action \
   -d '{"action":"ax-set-value","title":"字段当前值","value":"新值"}'
 ```
 

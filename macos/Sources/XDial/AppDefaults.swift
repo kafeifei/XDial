@@ -1,6 +1,7 @@
 import Foundation
 
-/// Executable identities may change during signed migrations, but the user
-/// profile remains in this stable data domain and must never be discarded.
+/// Formal builds retain the established data domain. Development builds use a
+/// separate domain and never import or mutate formal data.
 let xdialDefaults =
-    UserDefaults(suiteName: "com.kafeifei.xdial") ?? UserDefaults.standard
+    UserDefaults(suiteName: XDialBuildIdentity.dataIdentifier)
+        ?? UserDefaults.standard

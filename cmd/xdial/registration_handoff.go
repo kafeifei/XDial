@@ -7,8 +7,6 @@ import (
 	"syscall"
 )
 
-const registrationIntentPath = "/tmp/xdial-registration-maintenance"
-
 type registrationIntent struct {
 	Version    int    `json:"version"`
 	Token      string `json:"token"`
@@ -127,7 +125,7 @@ func currentRegistrationIntentPresent() bool {
 	if !ok {
 		return true
 	}
-	return registrationIntentPresent(registrationIntentPath, uid)
+	return registrationIntentPresent(currentRuntimeIdentity().registrationIntentPath, uid)
 }
 
 func finishRegistrationIntent(path string, uid uint32, token, phase, executableHash string) bool {

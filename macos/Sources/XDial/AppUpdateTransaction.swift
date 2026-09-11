@@ -167,7 +167,7 @@ enum AppUpdateArchivePolicy {
     static func containsExactlyOneRootApplication(
         _ names: [String]
     ) -> Bool {
-        names == ["XDial.app"]
+        names == [XDialBuildIdentity.applicationBundleName]
     }
 }
 
@@ -357,9 +357,9 @@ enum AppUpdateRelaunchIntentStore {
 
 enum AutomaticUpdateBundlePolicy {
     static let releaseHelperIdentifier =
-        "com.kafeifei.xdial.app.helper"
+        XDialBuildIdentity.helperIdentifier
     static let releaseExtensionIdentifier =
-        "com.kafeifei.xdial.app.transparent-proxy"
+        XDialBuildIdentity.transparentProxyIdentifier
 
     static func permits(
         currentIdentifier: String,
@@ -369,8 +369,9 @@ enum AutomaticUpdateBundlePolicy {
         incomingVersion: String,
         expectedVersion: String
     ) -> Bool {
-        currentIdentifier == XDialApplicationIdentifierPolicy.release
-            && incomingIdentifier == XDialApplicationIdentifierPolicy.release
+        XDialBuildIdentity.allowsAutomaticUpdates
+            && currentIdentifier == XDialBuildIdentity.applicationIdentifier
+            && incomingIdentifier == XDialBuildIdentity.applicationIdentifier
             && !currentTeamIdentifier.isEmpty
             && currentTeamIdentifier == incomingTeamIdentifier
             && incomingVersion == expectedVersion

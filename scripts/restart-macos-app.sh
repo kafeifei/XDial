@@ -4,10 +4,6 @@ set -euo pipefail
 
 source_bundle="${1:-}"
 application_launcher="${2:-}"
-destination_bundle="/Applications/XDial.app"
-health_url="http://127.0.0.1:19876/health"
-state_url="http://127.0.0.1:19876/state"
-action_url="http://127.0.0.1:19876/action"
 probe_url="${XDIAL_RESTART_PROBE_URL:-https://www.apple.com/}"
 
 fail() {
@@ -64,6 +60,33 @@ command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 [[ -x "${application_launcher}" ]] \
 	|| fail "application launcher is not executable"
 
+# A development build must never address the formal app's install path or
+# Debug Server. Determine the channel from signed bundle metadata, not its name.
+source_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+    "${source_bundle}/Contents/Info.plist")"
+case "$source_identifier" in
+    com.kafeifei.xdial.debug)
+        destination_bundle="/Applications/Xdial debug.app"
+        debug_port=19877
+        ;;
+    com.kafeifei.xdial.app)
+        destination_bundle="/Applications/XDial.app"
+        debug_port=19876
+        ;;
+    *) fail "unsupported application identity: $source_identifier" ;;
+esac
+health_url="http://127.0.0.1:${debug_port}/health"
+state_url="http://127.0.0.1:${debug_port}/state"
+action_url="http://127.0.0.1:${debug_port}/action"
+target_executable="${destination_bundle}/Contents/MacOS/XDial"
+
+target_is_running() {
+    /bin/ps -axo comm= | /usr/bin/awk -v executable="$target_executable" '
+        $0 == executable { found=1 }
+        END { exit !found }
+    '
+}
+
 # Swift 的 JSONEncoder 使用 2001-01-01 作为 Date 基准。向前留一秒只用于
 # 容纳序列化到整数秒时的取整；transaction ID 是有旧实例时的首选边界。
 restart_started_at="$(( $(date +%s) - 978307200 - 1 ))"
@@ -80,6 +103,13 @@ if health_json="$(curl -fsS --max-time 2 "${health_url}" 2>/dev/null)"; then
 	old_pid="$(printf '%s' "${health_json}" | json_pid)"
 	[[ "${old_pid}" =~ ^[0-9]+$ ]] \
 		|| fail "Debug Server health response did not identify XDial"
+    old_executable="$(/bin/ps -p "$old_pid" -o comm= 2>/dev/null || true)"
+    [[ "$old_executable" == "$target_executable" ]] \
+        || fail "Debug Server belongs to another app; refusing to quit it"
+    installed_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+        "${destination_bundle}/Contents/Info.plist")"
+    [[ "$installed_identifier" == "$source_identifier" ]] \
+        || fail "installed app identity differs; refusing cross-channel replacement"
 	old_state_json="$(curl -fsS --max-time 2 "${state_url}" 2>/dev/null)" \
 		|| fail "could not capture restart state baseline"
 	baseline_fields="$(
@@ -95,7 +125,7 @@ if health_json="$(curl -fsS --max-time 2 "${health_url}" 2>/dev/null)"; then
 	fi
 	curl -fsS --max-time 5 -X POST "${action_url}" \
 		-d '{"action":"quit"}' >/dev/null || true
-elif pgrep -x XDial >/dev/null 2>&1; then
+elif target_is_running; then
 	fail "XDial is running without Debug Server; refusing to force it closed"
 fi
 
@@ -127,7 +157,7 @@ new_pid=""
 for _ in {1..60}; do
 	if health_json="$(curl -fsS --max-time 1 "${health_url}" 2>/dev/null)"; then
 		candidate_pid="$(printf '%s' "${health_json}" | json_pid)"
-		candidate_command="$(ps -p "${candidate_pid}" -o command= 2>/dev/null || true)"
+		candidate_command="$(ps -p "${candidate_pid}" -o comm= 2>/dev/null || true)"
 		if [[ "${candidate_command}" == \
 			"${destination_bundle}/Contents/MacOS/XDial" ]]; then
 			new_pid="${candidate_pid}"

@@ -11,9 +11,15 @@ struct ApplicationInstallationArtifacts {
         let applicationIdentifier: String
         let teamIdentifier: String
 
-        var stagingName: String { ".XDial.install-\(id.uuidString).app" }
-        var backupName: String { ".XDial.backup-\(id.uuidString).app" }
-        var receiptName: String { ".XDial.transaction-\(id.uuidString).json" }
+        var stagingName: String {
+            "\(XDialBuildIdentity.installationArtifactPrefix).install-\(id.uuidString).app"
+        }
+        var backupName: String {
+            "\(XDialBuildIdentity.installationArtifactPrefix).backup-\(id.uuidString).app"
+        }
+        var receiptName: String {
+            "\(XDialBuildIdentity.installationArtifactPrefix).transaction-\(id.uuidString).json"
+        }
     }
 
     let destinationURL: URL
@@ -29,7 +35,10 @@ struct ApplicationInstallationArtifacts {
     /// Keep one zero-byte lock as coordination state. Unlinking a lock while
     /// another process holds its old inode would permit two concurrent installs.
     func withExclusiveAccess<T>(_ body: () throws -> T) throws -> T {
-        let lockURL = directoryURL.appendingPathComponent(".XDial.installation.lock")
+        let lockURL = directoryURL.appendingPathComponent(
+            XDialBuildIdentity.installationArtifactPrefix
+                + ".installation.lock"
+        )
         let descriptor = open(
             lockURL.path, O_RDONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o644
         )
@@ -102,8 +111,9 @@ struct ApplicationInstallationArtifacts {
             includingPropertiesForKeys: [.isSymbolicLinkKey, .isRegularFileKey],
             options: []
         )
-        for url in entries where url.lastPathComponent.hasPrefix(".XDial.transaction-") {
-            guard let id = artifactID(url, prefix: ".XDial.transaction-", suffix: ".json"),
+        let prefix = XDialBuildIdentity.installationArtifactPrefix
+        for url in entries where url.lastPathComponent.hasPrefix(prefix + ".transaction-") {
+            guard let id = artifactID(url, prefix: prefix + ".transaction-", suffix: ".json"),
                   let values = try? url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey]),
                   values.isSymbolicLink != true, values.isRegularFile == true,
                   let data = try? Data(contentsOf: url),
@@ -119,10 +129,10 @@ struct ApplicationInstallationArtifacts {
         // and only when the canonical app is itself a verified replacement.
         guard isTrustedApplication(destinationURL) else { return }
         for url in entries {
-            guard let id = artifactID(url, prefix: ".XDial.install-", suffix: ".app")
-                    ?? artifactID(url, prefix: ".XDial.backup-", suffix: ".app"),
+            guard let id = artifactID(url, prefix: prefix + ".install-", suffix: ".app")
+                    ?? artifactID(url, prefix: prefix + ".backup-", suffix: ".app"),
                   !entries.contains(where: {
-                    artifactID($0, prefix: ".XDial.transaction-", suffix: ".json") == id
+                    artifactID($0, prefix: prefix + ".transaction-", suffix: ".json") == id
                         && exists($0)
                   }),
                   exists(url), !isSymbolicLink(url),

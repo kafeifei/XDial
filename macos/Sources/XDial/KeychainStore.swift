@@ -2,12 +2,14 @@ import Foundation
 import Security
 
 enum KeychainStore {
-    private static let service = "com.kafeifei.xdial"
+    private static let service = XDialBuildIdentity.dataIdentifier
     private static let vaultAccount = "xdial-vault"
 
     private static var vaultDir: URL {
         let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".xdial")
+            .appendingPathComponent(
+                XDialBuildIdentity.userDataDirectoryName
+            )
         // 目录 0700：只有属主能进入，保护里面的明文凭据文件。
         // createDirectory 的 attributes 只对新建目录生效；旧版本可能已用默认 0755 建过，
         // 所以再显式 setAttributes 一次，把升级用户的旧目录也收紧。
@@ -60,13 +62,18 @@ enum KeychainStore {
     /// 合并而不是替换：保留旧桌面版本已有的订阅凭据；同名条目以较新的容器
     /// 快照为准。全程不记录 key、value 或正文。
     static func importSandboxVaultIfNeeded() {
+        guard XDialBuildIdentity.allowsFormalDataMigration else { return }
         let marker = "xdial.migratedFromSandboxVaultV1"
         let defaults = xdialDefaults
         guard !defaults.bool(forKey: marker) else { return }
 
         let source = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(
-                "Library/Containers/com.kafeifei.xdial/Data/.xdial/vault.json"
+                "Library/Containers/"
+                    + XDialBuildIdentity.legacyApplicationIdentifier
+                    + "/Data/"
+                    + XDialBuildIdentity.formalUserDataDirectoryName
+                    + "/vault.json"
             )
         guard let data = try? Data(contentsOf: source),
               let sandboxVault = try? JSONDecoder().decode([String: String].self, from: data)

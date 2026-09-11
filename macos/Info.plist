@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>XDial</string>
+	<string>$(XDIAL_PRODUCT_DISPLAY_NAME)</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIconFile</key>
@@ -51,9 +51,11 @@
 			<key>UTTypeDescription</key>
 			<string>XDial Settings Reorder Item</string>
 			<key>UTTypeIdentifier</key>
-			<string>com.kafeifei.xdial.app.settings-entry</string>
+			<string>$(XDIAL_SETTINGS_ENTRY_IDENTIFIER)</string>
 		</dict>
 	</array>
+	<key>XDialBuildFlavor</key>
+	<string>$(XDIAL_BUILD_FLAVOR)</string>
 	<key>XDialTransparentProxyBundleIdentifier</key>
 	<string>$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)</string>
 </dict>

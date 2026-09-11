@@ -209,26 +209,27 @@ final class AppUpdateCheckerTests: XCTestCase {
         )
         XCTAssertTrue(
             AppUpdateArchivePolicy.containsExactlyOneRootApplication(
-                ["XDial.app"]
+                [XDialBuildIdentity.applicationBundleName]
             )
         )
         XCTAssertFalse(
             AppUpdateArchivePolicy.containsExactlyOneRootApplication(
-                ["README.md", "XDial.app"]
+                ["README.md", XDialBuildIdentity.applicationBundleName]
             )
         )
     }
 
     func testAutomaticUpdateBundleMustMatchReleaseIdentityTeamAndVersion() {
-        XCTAssertTrue(
+        XCTAssertEqual(
             AutomaticUpdateBundlePolicy.permits(
-                currentIdentifier: XDialApplicationIdentifierPolicy.release,
+                currentIdentifier: XDialBuildIdentity.applicationIdentifier,
                 currentTeamIdentifier: "TEAM",
-                incomingIdentifier: XDialApplicationIdentifierPolicy.release,
+                incomingIdentifier: XDialBuildIdentity.applicationIdentifier,
                 incomingTeamIdentifier: "TEAM",
                 incomingVersion: "0.8.0",
                 expectedVersion: "0.8.0"
-            )
+            ),
+            XDialBuildIdentity.allowsAutomaticUpdates
         )
         XCTAssertFalse(
             AutomaticUpdateBundlePolicy.permits(
@@ -361,14 +362,17 @@ final class AppUpdateCheckerTests: XCTestCase {
 
     func testStagesExactRootApplicationAndDiscardsOwnedRoot() throws {
         let fixture = try AppUpdateArchiveFixture(
-            rootEntries: ["XDial.app"]
+            rootEntries: [XDialBuildIdentity.applicationBundleName]
         )
         defer { fixture.cleanup() }
 
         let staged = try AppUpdateStager.stageArchive(
             at: fixture.archiveURL
         ) { applicationURL in
-            XCTAssertEqual(applicationURL.lastPathComponent, "XDial.app")
+            XCTAssertEqual(
+                applicationURL.lastPathComponent,
+                XDialBuildIdentity.applicationBundleName
+            )
             XCTAssertEqual(
                 try String(
                     contentsOf: applicationURL.appendingPathComponent(
@@ -398,7 +402,10 @@ final class AppUpdateCheckerTests: XCTestCase {
 
     func testAmbiguousArchiveAndValidationFailureCleanOwnedRoot() throws {
         let ambiguous = try AppUpdateArchiveFixture(
-            rootEntries: ["XDial.app", "README.md"]
+            rootEntries: [
+                XDialBuildIdentity.applicationBundleName,
+                "README.md",
+            ]
         )
         XCTAssertThrowsError(
             try AppUpdateStager.stageArchive(at: ambiguous.archiveURL) {
@@ -411,7 +418,7 @@ final class AppUpdateCheckerTests: XCTestCase {
         ambiguous.cleanup()
 
         let rejected = try AppUpdateArchiveFixture(
-            rootEntries: ["XDial.app"]
+            rootEntries: [XDialBuildIdentity.applicationBundleName]
         )
         struct ValidationFailure: Error {}
         XCTAssertThrowsError(
@@ -513,7 +520,7 @@ final class AppUpdateCheckerTests: XCTestCase {
 
     func testStagedSuccessorCanRemoveOnlyItsOwnedUpdateRoot() throws {
         let fixture = try AppUpdateArchiveFixture(
-            rootEntries: ["XDial.app"]
+            rootEntries: [XDialBuildIdentity.applicationBundleName]
         )
         defer { fixture.cleanup() }
         let staged = try AppUpdateStager.stageArchive(
@@ -528,7 +535,7 @@ final class AppUpdateCheckerTests: XCTestCase {
         )
 
         let unrelated = fixture.sourceRoot.appendingPathComponent(
-            "XDial.app",
+            XDialBuildIdentity.applicationBundleName,
             isDirectory: true
         )
         AppUpdateStager.discardOwnedRoot(containing: unrelated)
@@ -678,7 +685,7 @@ private final class AppUpdateArchiveFixture {
         )
         for entry in rootEntries {
             let entryURL = sourceRoot.appendingPathComponent(entry)
-            if entry == "XDial.app" {
+            if entry == XDialBuildIdentity.applicationBundleName {
                 try FileManager.default.createDirectory(
                     at: entryURL,
                     withIntermediateDirectories: true

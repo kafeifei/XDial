@@ -9,7 +9,7 @@ import (
 
 func runStatusCmd(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	socketPath := fs.String("socket", "/tmp/xdial.sock", "unix socket path")
+	socketPath := fs.String("socket", currentRuntimeIdentity().socketPath, "unix socket path")
 	jsonOutput := fs.Bool("json", false, "output as JSON")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: xdial status [--socket PATH] [--json]\n\nQuery daemon VPN status.\n\nExit codes: 0=connected, 1=disconnected, 2=transient, 3=daemon not running\n\n")
