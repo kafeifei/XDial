@@ -126,6 +126,13 @@ jobs:
 
       - name: Stage immutable release assets for verification
         run: |
+          python3 - <<'PY'
+          import plistlib
+          with open('build/release/XDial.app/Contents/Info.plist', 'rb') as stream:
+              info = plistlib.load(stream)
+          acceptance_id = info.get('XDialUpdateAcceptanceID', '')
+          assert isinstance(acceptance_id, str) and not acceptance_id, 'acceptance builds cannot enter a public stable release'
+          PY
           gh release create "$RELEASE_TAG" \
             "build/release/XDial-${RELEASE_TAG}.zip" \
             "build/release/XDial-${RELEASE_TAG}.zip.sha256" \

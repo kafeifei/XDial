@@ -29,6 +29,7 @@ settings:
     XDIAL_PRODUCT_DISPLAY_NAME: XDial
     XDIAL_SETTINGS_ENTRY_IDENTIFIER: com.kafeifei.xdial.app.settings-entry
     XDIAL_BUILD_FLAVOR: release
+    XDIAL_UPDATE_ACCEPTANCE_ID: ""
   configs:
     Debug:
       XDIAL_APPLICATION_BUNDLE_IDENTIFIER: com.kafeifei.xdial.debug
@@ -167,6 +168,7 @@ targets:
               - public.data
             UTTypeDescription: XDial Settings Reorder Item
         XDialBuildFlavor: "$(XDIAL_BUILD_FLAVOR)"
+        XDialUpdateAcceptanceID: "$(XDIAL_UPDATE_ACCEPTANCE_ID)"
         XDialTransparentProxyBundleIdentifier: "$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)"
     settings:
       base:
@@ -313,6 +315,7 @@ targets:
       - Sources/XDial/ApplicationLaunchPolicy.swift
       - Sources/XDial/AppVersion.swift
       - Sources/XDial/AppUpdateStager.swift
+      - Sources/XDial/AppUpdateChecker.swift
       - Sources/XDial/AppUpdateDownloader.swift
       - Sources/XDial/AppUpdateReleaseLookup.swift
       - Sources/XDial/AppUpdateTransaction.swift

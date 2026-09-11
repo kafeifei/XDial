@@ -42,13 +42,7 @@ struct AppUpdateView: View {
                 Text(state.tr("更新了什么", "What’s New"))
                     .font(.system(size: 12, weight: .semibold))
                 ScrollView {
-                    Text(
-                        candidate.releaseNotes
-                            ?? state.tr(
-                                "此版本没有更新说明。",
-                                "No release notes were provided."
-                            )
-                    )
+                    Text(candidate.releaseNotes)
                     .font(.system(size: 11.5))
                     .foregroundStyle(XDialPalette.textPrimary)
                     .textSelection(.enabled)
@@ -155,7 +149,7 @@ struct AppUpdateView: View {
                 }
                 .buttonStyle(.bordered)
             }
-        case .idle, .upToDate:
+        case .idle, .upToDate, .noRelease:
             Button(state.tr("检查更新", "Check for Updates")) {
                 Task { await updater.checkNow() }
             }
@@ -179,13 +173,15 @@ struct AppUpdateView: View {
     }
 
     private var statusDetail: String {
-        switch updater.phase {
+        let detail = switch updater.phase {
         case .idle:
             state.tr("可以手动检查新版本", "Ready to check for updates")
         case .checking:
             state.tr("正在检查更新…", "Checking for updates…")
         case .upToDate:
             state.tr("已经是最新版本", "XDial is up to date")
+        case .noRelease:
+            state.tr("当前没有可用更新", "No update is currently available")
         case .available:
             state.tr("新版本已经可以下载", "A new version is available")
         case .downloading:
@@ -199,11 +195,23 @@ struct AppUpdateView: View {
         case .failed:
             state.tr("更新没有完成，可以重试", "The update did not finish; you can retry")
         }
+        guard let lastCheckedAt = updater.lastCheckedAt else {
+            return detail
+        }
+        let checked = lastCheckedAt.formatted(
+            date: .abbreviated,
+            time: .shortened
+        )
+        return detail + state.tr(
+            " · 上次成功检查：\(checked)",
+            " · Last successful check: \(checked)"
+        )
     }
 
     private var statusSymbol: String {
         switch updater.phase {
         case .upToDate: "checkmark.circle.fill"
+        case .noRelease: "minus.circle.fill"
         case .failed: "exclamationmark.octagon.fill"
         case .ready: "checkmark.seal.fill"
         case .downloading, .validating, .checking, .handingOff:
@@ -215,6 +223,7 @@ struct AppUpdateView: View {
     private var statusColor: Color {
         switch updater.phase {
         case .upToDate, .ready: XDialPalette.success
+        case .noRelease: XDialPalette.progress
         case .failed: XDialPalette.danger
         case .available: XDialPalette.warning
         default: XDialPalette.progress
@@ -266,6 +275,8 @@ struct AppUpdateView: View {
         switch code {
         case .checkUnavailable:
             state.tr("无法检查更新", "Couldn’t Check for Updates")
+        case .candidateChanged:
+            state.tr("更新清单已经变化", "The Update Has Changed")
         case .downloadFailed:
             state.tr("更新包下载失败", "Update Download Failed")
         case .validationFailed:

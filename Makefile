@@ -3,6 +3,8 @@ APP_BUNDLE := $(BUILD_DIR)/Xdial debug.app
 RELEASE_BUNDLE := $(BUILD_DIR)/release/XDial.app
 RELEASE_TAG ?=
 RELEASE_BUILD_NUMBER ?=
+RELEASE_UPDATE_ACCEPTANCE_ID ?=
+RELEASE_NOTES_FILE ?= RELEASE_NOTES.md
 RELEASE_VERSION = $(patsubst v%,%,$(RELEASE_TAG))
 RELEASE_ARCHIVE = $(BUILD_DIR)/release/XDial-$(RELEASE_TAG).zip
 RELEASE_NOTARIZATION_LOG = $(BUILD_DIR)/release/XDial-$(RELEASE_TAG)-notarization.json
@@ -46,7 +48,7 @@ SIGN_IDENTITY ?= Apple Development
 MACOS_DEBUG_XCODEBUILD_FLAGS ?=
 MACOS_TEST_XCODEBUILD_FLAGS ?=
 
-.PHONY: all cli cli-debug app ci-macos-build macos-identity-contract release-inputs release-app release test-release-contract restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios mobile-app-icons FORCE_PATCHED_GO
+.PHONY: all cli cli-debug app ci-macos-build macos-identity-contract release-inputs release-app release publish test-release-contract restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios mobile-app-icons FORCE_PATCHED_GO
 
 $(MACOS_ICON_GENERATOR_BINARY): $(MACOS_BRAND_PALETTE_SOURCE) $(MACOS_ICON_SOURCE) $(MACOS_ICON_GENERATOR)
 	@mkdir -p "$(BUILD_DIR)"
@@ -155,6 +157,7 @@ test: public-content-gate $(PATCHED_WORKFILE) test-patched-tailscale test-patche
 
 test-release-contract:
 	bash test/release_contract_test.sh
+	python3 -m unittest discover -s test -p publish_release_test.py
 
 # Opt-in macOS login-session check: launches only isolated fixture apps.
 .PHONY: test-installation-launch
@@ -271,7 +274,8 @@ ci-macos-build: cli cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/
 # 分发一律使用 make release 在所有门禁后产生的 zip。
 release-inputs:
 	@$(RELEASE_CONTRACT) validate-inputs "$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
-	@$(RELEASE_CONTRACT) validate-notes "$(RELEASE_TAG)" RELEASE_NOTES.md
+	@$(RELEASE_CONTRACT) validate-notes "$(RELEASE_TAG)" "$(RELEASE_NOTES_FILE)"
+	@python3 -c 'import re,sys; sys.exit(0 if not sys.argv[1] or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,79}", sys.argv[1]) else "invalid update acceptance ID")' "$(RELEASE_UPDATE_ACCEPTANCE_ID)"
 
 release-app: release-inputs libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
 	@mkdir -p $(BUILD_DIR)
@@ -283,12 +287,14 @@ release-app: release-inputs libbox-macos-xcframework macos/AppIcon.icns macos/Se
 		-derivedDataPath $(BUILD_DIR)/macos-xcode-release \
 		MARKETING_VERSION="$(RELEASE_VERSION)" \
 		CURRENT_PROJECT_VERSION="$(RELEASE_BUILD_NUMBER)" \
+		XDIAL_UPDATE_ACCEPTANCE_ID="$(RELEASE_UPDATE_ACCEPTANCE_ID)" \
 		build
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration Release \
 		-destination 'platform=macOS,arch=arm64' \
 		-derivedDataPath $(BUILD_DIR)/macos-xcode-release \
 		MARKETING_VERSION="$(RELEASE_VERSION)" \
 		CURRENT_PROJECT_VERSION="$(RELEASE_BUILD_NUMBER)" \
+		XDIAL_UPDATE_ACCEPTANCE_ID="$(RELEASE_UPDATE_ACCEPTANCE_ID)" \
 		build
 	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode-release/Build/Products/Release/XDial.app/Contents/Info.plist')" = true
 	rm -rf "$(RELEASE_BUNDLE)"
@@ -308,6 +314,11 @@ release: release-app
 		"$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
 	@echo "release archive: $(RELEASE_ARCHIVE)"
 	@echo "release checksum: $(RELEASE_ARCHIVE).sha256"
+
+# 显式公开已验收的 Release，再触发 saymiao/xdial-updates 的 Pages 部署。
+# 使用操作者现有 gh 登录；不把跨仓库凭据嵌入 App 或 Actions。
+publish:
+	python3 scripts/publish-release.py "$(RELEASE_TAG)"
 
 # 一键重启：先完整构建并签名新版本，成功后才让旧实例完成网络回滚并退出。
 # 构建目录中的进程紧接着执行无 UI 的原子安装，然后只启动

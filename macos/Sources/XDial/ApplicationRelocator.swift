@@ -57,7 +57,8 @@ enum ApplicationRelocator {
 
     static func validateIncomingUpdateBundle(
         at bundleURL: URL,
-        expectedVersion: String
+        expectedVersion: String,
+        expectedBuild: String
     ) throws {
         guard permitsAutomaticUpdates else {
             throw InstallationError.automaticUpdateUnsupported
@@ -74,6 +75,12 @@ enum ApplicationRelocator {
             forKey: "CFBundleVersion",
             at: bundleURL
         ) ?? ""
+        let currentAcceptanceID = try AppUpdateFeedConfiguration.current(
+            at: Bundle.main.bundleURL
+        ).acceptanceID
+        let incomingAcceptanceID = try AppUpdateFeedConfiguration.current(
+            at: bundleURL
+        ).acceptanceID
         let settingsURL = bundleURL.appendingPathComponent(
             "Contents/Helpers/XDial Settings UI.app",
             isDirectory: true
@@ -88,10 +95,14 @@ enum ApplicationRelocator {
         guard AutomaticUpdateBundlePolicy.permits(
             currentIdentifier: currentIdentity.identifier,
             currentTeamIdentifier: currentIdentity.teamIdentifier,
+            currentAcceptanceID: currentAcceptanceID,
             incomingIdentifier: incomingIdentity.identifier,
             incomingTeamIdentifier: incomingIdentity.teamIdentifier,
+            incomingAcceptanceID: incomingAcceptanceID,
             incomingVersion: incomingVersion,
-            expectedVersion: expectedVersion
+            expectedVersion: expectedVersion,
+            incomingBuild: incomingBuild,
+            expectedBuild: expectedBuild
         ),
         ApplicationBundleInfo.string(
             forKey: "XDialTransparentProxyBundleIdentifier",
@@ -99,6 +110,7 @@ enum ApplicationRelocator {
         ) == AutomaticUpdateBundlePolicy.releaseExtensionIdentifier,
         AutomaticUpdateBundlePolicy.permitsVersionSet(
             expectedVersion: expectedVersion,
+            expectedBuild: expectedBuild,
             hostVersion: incomingVersion,
             hostBuild: incomingBuild,
             settingsVersion: ApplicationBundleInfo.string(

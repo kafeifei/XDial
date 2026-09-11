@@ -3,216 +3,169 @@ import Foundation
 struct AppUpdateReleaseCandidate: Equatable, Sendable {
     let tag: String
     let version: String
+    let build: String
+    let minimumSystemVersion: String
+    let publishedAt: Date
     let archiveName: String
     let archiveURL: URL
-    let releaseNotes: String?
+    let archiveSize: Int64
+    let archiveSHA256: String
+    let releaseNotes: String
+
+    var identity: AppUpdateCandidateIdentity {
+        AppUpdateCandidateIdentity(
+            version: version,
+            build: build,
+            archiveSHA256: archiveSHA256
+        )
+    }
+}
+
+struct AppUpdateCandidateIdentity: Equatable, Sendable {
+    let version: String
+    let build: String
+    let archiveSHA256: String
 }
 
 enum AppUpdateReleaseSelectionError: Error, Equatable {
-    case malformedResponse
-    case draftRelease
-    case prerelease
     case invalidVersionTag
+    case invalidBuild
+    case invalidMinimumSystemVersion
+    case unsupportedSystemVersion
+    case invalidPublishedAt
+    case releaseNotesMissing
     case notNewer
-    case archiveMissing
+    case archiveSizeInvalid
+    case archiveSHA256Invalid
     case archiveURLRejected
-    case latestReleaseURLRejected
 }
 
 enum AppUpdateReleasePolicy {
-    private static let owner = "kafeifei"
-    private static let repository = "XDial"
-
     static func selectCandidate(
-        from data: Data,
-        currentVersion: String
+        from release: AppUpdateFeedRelease,
+        generatedAt: Date,
+        configuration: AppUpdateFeedConfiguration,
+        currentVersion: String,
+        currentSystemVersion: String
     ) throws -> AppUpdateReleaseCandidate {
-        let release: GitHubRelease
-        do {
-            release = try JSONDecoder().decode(
-                GitHubRelease.self,
-                from: data
-            )
-        } catch {
-            throw AppUpdateReleaseSelectionError.malformedResponse
-        }
-        guard !release.draft else {
-            throw AppUpdateReleaseSelectionError.draftRelease
-        }
-        guard !release.prerelease else {
-            throw AppUpdateReleaseSelectionError.prerelease
-        }
-        guard let version = VersionUpdatePolicy.stableReleaseVersion(
-            fromTag: release.tagName
-        ) else {
+        guard VersionUpdatePolicy.stableReleaseVersion(
+            fromTag: release.tag
+        ) == release.version else {
             throw AppUpdateReleaseSelectionError.invalidVersionTag
         }
-        guard VersionUpdatePolicy.isNewer(
-            latestTag: release.tagName,
-            than: currentVersion
+        guard isPositiveInteger(release.build) else {
+            throw AppUpdateReleaseSelectionError.invalidBuild
+        }
+        guard let minimumSystemVersion = NumericSystemVersion(
+            release.minimumSystemVersion
         ) else {
-            throw AppUpdateReleaseSelectionError.notNewer
+            throw AppUpdateReleaseSelectionError
+                .invalidMinimumSystemVersion
+        }
+        guard let currentSystemVersion = NumericSystemVersion(
+            currentSystemVersion
+        ), currentSystemVersion >= minimumSystemVersion else {
+            throw AppUpdateReleaseSelectionError.unsupportedSystemVersion
+        }
+        guard release.publishedAt <= generatedAt else {
+            throw AppUpdateReleaseSelectionError.invalidPublishedAt
         }
 
-        let archiveName = "XDial-\(release.tagName).zip"
-        guard let asset = release.assets.first(where: {
-            $0.name == archiveName
-        }) else {
-            throw AppUpdateReleaseSelectionError.archiveMissing
-        }
-        guard permitsArchiveURL(
-            asset.browserDownloadURL,
-            tag: release.tagName,
-            archiveName: archiveName
-        ) else {
-            throw AppUpdateReleaseSelectionError.archiveURLRejected
-        }
-
-        return AppUpdateReleaseCandidate(
-            tag: release.tagName,
-            version: version,
-            archiveName: archiveName,
-            archiveURL: asset.browserDownloadURL,
-            releaseNotes: releaseNotes(from: release.body)
-        )
-    }
-
-    static func selectPublicFallbackCandidate(
-        fromLatestReleaseURL url: URL,
-        currentVersion: String
-    ) throws -> AppUpdateReleaseCandidate {
-        guard url.scheme?.lowercased() == "https",
-              url.host?.lowercased() == "github.com",
-              url.port == nil,
-              url.user == nil,
-              url.password == nil,
-              url.query == nil,
-              url.fragment == nil,
-              url.pathComponents.count == 6,
-              url.pathComponents[0] == "/",
-              url.pathComponents[1] == owner,
-              url.pathComponents[2] == repository,
-              url.pathComponents[3] == "releases",
-              url.pathComponents[4] == "tag" else {
-            throw AppUpdateReleaseSelectionError.latestReleaseURLRejected
-        }
-        let tag = url.pathComponents[5]
-        guard url.absoluteString
-                == "https://github.com/\(owner)/\(repository)"
-                    + "/releases/tag/\(tag)",
-              let version = VersionUpdatePolicy.stableReleaseVersion(
-                  fromTag: tag
-              ) else {
-            throw AppUpdateReleaseSelectionError.latestReleaseURLRejected
-        }
-        guard VersionUpdatePolicy.isNewer(
-            latestTag: tag,
-            than: currentVersion
-        ) else {
-            throw AppUpdateReleaseSelectionError.notNewer
-        }
-
-        let archiveName = "XDial-\(tag).zip"
-        guard let archiveURL = URL(
-            string: "https://github.com/\(owner)/\(repository)"
-                + "/releases/download/\(tag)/\(archiveName)"
-        ), permitsArchiveURL(
-            archiveURL,
-            tag: tag,
-            archiveName: archiveName
-        ) else {
-            throw AppUpdateReleaseSelectionError.archiveURLRejected
-        }
-        return AppUpdateReleaseCandidate(
-            tag: tag,
-            version: version,
-            archiveName: archiveName,
-            archiveURL: archiveURL,
-            releaseNotes: nil
-        )
-    }
-
-    static func releaseNotes(from body: String?) -> String? {
-        guard let body else { return nil }
-        let trimmedBody = body.trimmingCharacters(
+        let releaseNotes = release.releaseNotes.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
-        guard !trimmedBody.isEmpty else { return nil }
-
-        let acceptedHeadings = Set(["更新了什么", "更新内容", "更新"])
-        var capturesSection = false
-        var capturedLines: [String] = []
-        for line in body.components(separatedBy: .newlines) {
-            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
-            if trimmedLine.hasPrefix("## ") {
-                if capturesSection { break }
-                let heading = String(trimmedLine.dropFirst(3))
-                    .trimmingCharacters(in: .whitespaces)
-                capturesSection = acceptedHeadings.contains(heading)
-                continue
-            }
-            if capturesSection {
-                capturedLines.append(line)
-            }
+        guard !releaseNotes.isEmpty else {
+            throw AppUpdateReleaseSelectionError.releaseNotesMissing
+        }
+        guard AppUpdateArchivePolicy.permitsArchiveByteCount(
+            release.archiveSize
+        ) else {
+            throw AppUpdateReleaseSelectionError.archiveSizeInvalid
+        }
+        guard release.archiveSHA256.count == 64,
+              release.archiveSHA256.utf8.allSatisfy({
+                  (48 ... 57).contains($0) || (97 ... 102).contains($0)
+              }) else {
+            throw AppUpdateReleaseSelectionError.archiveSHA256Invalid
         }
 
-        let section = capturedLines.joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return section.isEmpty ? trimmedBody : section
+        let archiveName = "XDial-\(release.tag).zip"
+        guard configuration.permitsArchiveURL(
+            release.archiveURL,
+            tag: release.tag,
+            archiveName: archiveName
+        ) else {
+            throw AppUpdateReleaseSelectionError.archiveURLRejected
+        }
+        guard VersionUpdatePolicy.isNewer(
+            latestTag: release.tag,
+            than: currentVersion
+        ) else {
+            throw AppUpdateReleaseSelectionError.notNewer
+        }
+
+        return AppUpdateReleaseCandidate(
+            tag: release.tag,
+            version: release.version,
+            build: release.build,
+            minimumSystemVersion: release.minimumSystemVersion,
+            publishedAt: release.publishedAt,
+            archiveName: archiveName,
+            archiveURL: release.archiveURL,
+            archiveSize: release.archiveSize,
+            archiveSHA256: release.archiveSHA256,
+            releaseNotes: releaseNotes
+        )
     }
 
-    static func permitsArchiveURL(
-        _ url: URL,
-        tag: String,
-        archiveName: String
-    ) -> Bool {
-        guard url.scheme?.lowercased() == "https",
-              url.host?.lowercased() == "github.com",
-              url.port == nil,
-              url.user == nil,
-              url.password == nil,
-              url.query == nil,
-              url.fragment == nil else {
+    private static func isPositiveInteger(_ value: String) -> Bool {
+        guard let first = value.utf8.first,
+              (49 ... 57).contains(first) else {
             return false
         }
-        return url.pathComponents == [
-            "/",
-            owner,
-            repository,
-            "releases",
-            "download",
-            tag,
-            archiveName,
-        ]
-    }
-
-    private struct GitHubRelease: Decodable {
-        let tagName: String
-        let body: String?
-        let draft: Bool
-        let prerelease: Bool
-        let assets: [GitHubAsset]
-
-        enum CodingKeys: String, CodingKey {
-            case tagName = "tag_name"
-            case body
-            case draft
-            case prerelease
-            case assets
+        return value.utf8.dropFirst().allSatisfy {
+            (48 ... 57).contains($0)
         }
     }
 
-    private struct GitHubAsset: Decodable {
-        let name: String
-        let browserDownloadURL: URL
+    private struct NumericSystemVersion: Comparable {
+        let components: [Int]
 
-        enum CodingKeys: String, CodingKey {
-            case name
-            case browserDownloadURL = "browser_download_url"
+        init?(_ value: String) {
+            let parts = value.split(
+                separator: ".",
+                omittingEmptySubsequences: false
+            )
+            guard (2 ... 3).contains(parts.count),
+                  parts.allSatisfy({
+                      !$0.isEmpty
+                          && $0.utf8.allSatisfy {
+                              (48 ... 57).contains($0)
+                          }
+                          && ($0 == "0" || $0.first != "0")
+                  }) else {
+                return nil
+            }
+            components = parts.compactMap { Int($0) }
+            guard components.count == parts.count else { return nil }
+        }
+
+        static func < (
+            lhs: NumericSystemVersion,
+            rhs: NumericSystemVersion
+        ) -> Bool {
+            let count = max(lhs.components.count, rhs.components.count)
+            for index in 0..<count {
+                let left = index < lhs.components.count
+                    ? lhs.components[index] : 0
+                let right = index < rhs.components.count
+                    ? rhs.components[index] : 0
+                if left != right { return left < right }
+            }
+            return false
         }
     }
 }
-
 enum AppUpdateArchivePolicy {
     static let maximumArchiveBytes: Int64 = 512 * 1024 * 1024
 
@@ -269,6 +222,7 @@ enum AppUpdatePhase: String, Equatable {
     case idle
     case checking
     case upToDate = "up_to_date"
+    case noRelease = "no_release"
     case available
     case downloading
     case validating
@@ -279,6 +233,7 @@ enum AppUpdatePhase: String, Equatable {
 
 enum AppUpdateFailureCode: String, Equatable {
     case checkUnavailable = "check_unavailable"
+    case candidateChanged = "candidate_changed"
     case downloadFailed = "download_failed"
     case validationFailed = "validation_failed"
 }
@@ -420,21 +375,38 @@ enum AutomaticUpdateBundlePolicy {
     static func permits(
         currentIdentifier: String,
         currentTeamIdentifier: String,
+        currentAcceptanceID: String?,
         incomingIdentifier: String,
         incomingTeamIdentifier: String,
+        incomingAcceptanceID: String?,
         incomingVersion: String,
-        expectedVersion: String
+        expectedVersion: String,
+        incomingBuild: String,
+        expectedBuild: String
     ) -> Bool {
         XDialBuildIdentity.allowsAutomaticUpdates
             && currentIdentifier == XDialBuildIdentity.applicationIdentifier
             && incomingIdentifier == XDialBuildIdentity.applicationIdentifier
             && !currentTeamIdentifier.isEmpty
             && currentTeamIdentifier == incomingTeamIdentifier
+            && permitsAcceptanceTransition(
+                currentAcceptanceID: currentAcceptanceID,
+                incomingAcceptanceID: incomingAcceptanceID
+            )
             && incomingVersion == expectedVersion
+            && incomingBuild == expectedBuild
+    }
+
+    static func permitsAcceptanceTransition(
+        currentAcceptanceID: String?,
+        incomingAcceptanceID: String?
+    ) -> Bool {
+        currentAcceptanceID == incomingAcceptanceID
     }
 
     static func permitsVersionSet(
         expectedVersion: String,
+        expectedBuild: String,
         hostVersion: String,
         hostBuild: String,
         settingsVersion: String,
@@ -442,7 +414,7 @@ enum AutomaticUpdateBundlePolicy {
         extensionVersion: String,
         extensionBuild: String
     ) -> Bool {
-        !hostBuild.isEmpty
+        hostBuild == expectedBuild
             && hostVersion == expectedVersion
             && settingsVersion == expectedVersion
             && extensionVersion == expectedVersion

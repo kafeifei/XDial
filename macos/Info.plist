@@ -58,5 +58,7 @@
 	<string>$(XDIAL_BUILD_FLAVOR)</string>
 	<key>XDialTransparentProxyBundleIdentifier</key>
 	<string>$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)</string>
+	<key>XDialUpdateAcceptanceID</key>
+	<string>$(XDIAL_UPDATE_ACCEPTANCE_ID)</string>
 </dict>
 </plist>
