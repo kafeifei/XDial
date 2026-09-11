@@ -19,16 +19,13 @@ final class RelayAssociationSlot<Value: AnyObject>: @unchecked Sendable {
 
     func waitForCurrent() async throws -> Value? {
         try Task.checkCancellation()
-        lock.lock()
-        if closed {
-            lock.unlock()
+        let snapshot = currentSnapshot()
+        if snapshot.closed {
             return nil
         }
-        if let value {
-            lock.unlock()
+        if let value = snapshot.value {
             return value
         }
-        lock.unlock()
 
         // Keep the healthy data path allocation-free. A waiter identity is
         // needed only across a genuine readiness gap.
@@ -53,6 +50,12 @@ final class RelayAssociationSlot<Value: AnyObject>: @unchecked Sendable {
         } onCancel: {
             self.cancel(waiterID: waiterID)
         }
+    }
+
+    private func currentSnapshot() -> (closed: Bool, value: Value?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (closed, value)
     }
 
     /// Publishes a ready value and returns the value it replaced. A closed slot
