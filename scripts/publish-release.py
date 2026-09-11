@@ -27,6 +27,7 @@ PAGES_REPOSITORY = "saymiao/xdial-updates"
 FEED_URL = "https://saymiao.github.io/xdial-updates/stable.json"
 ROOT = Path(__file__).resolve().parents[1]
 TAG_PATTERN = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
+DRAFT_RELEASE_PATTERN = re.compile(r"untagged-[0-9a-f]{20}\Z")
 
 
 def gh_json(*arguments: str):
@@ -83,6 +84,27 @@ def verify_remote_tag_on_main(tag: str, source_url: str = SOURCE_GIT_URL) -> str
         return tagged_commit
 
 
+def find_source_release(tag: str) -> dict:
+    pages = gh_json(
+        "api", f"repos/{SOURCE_REPOSITORY}/releases?per_page=100",
+        "--paginate", "--slurp",
+    )
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise ValueError("cannot enumerate source releases")
+    matches = [
+        release
+        for page in pages
+        for release in page
+        if isinstance(release, dict) and release.get("tag_name") == tag
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected exactly one source release for {tag}")
+    release_id = matches[0].get("id")
+    if not isinstance(release_id, int) or isinstance(release_id, bool) or release_id <= 0:
+        raise ValueError("source release ID is missing")
+    return matches[0]
+
+
 def validate_release(release: dict, tag: str) -> tuple[str, str]:
     if not TAG_PATTERN.fullmatch(tag):
         raise ValueError("release tag must be canonical vMAJOR.MINOR.PATCH")
@@ -94,9 +116,21 @@ def validate_release(release: dict, tag: str) -> tuple[str, str]:
         raise ValueError("release notes must not be empty")
     archive = f"XDial-{tag}.zip"
     checksum = f"{archive}.sha256"
+    if release["draft"]:
+        html_prefix = f"https://github.com/{SOURCE_REPOSITORY}/releases/tag/"
+        html_url = release.get("html_url", "")
+        draft_name = html_url.removeprefix(html_prefix)
+        if not html_url.startswith(html_prefix) or not DRAFT_RELEASE_PATTERN.fullmatch(draft_name):
+            raise ValueError("draft release URL is unexpected")
+        download_name = draft_name
+    else:
+        expected_html_url = f"https://github.com/{SOURCE_REPOSITORY}/releases/tag/{tag}"
+        if release.get("html_url") != expected_html_url:
+            raise ValueError("published release URL is unexpected")
+        download_name = tag
     for name in (archive, checksum):
         assets = [asset for asset in release.get("assets", []) if asset.get("name") == name]
-        expected = f"https://github.com/{SOURCE_REPOSITORY}/releases/download/{tag}/{name}"
+        expected = f"https://github.com/{SOURCE_REPOSITORY}/releases/download/{download_name}/{name}"
         if len(assets) != 1 or assets[0].get("browser_download_url") != expected:
             raise ValueError(f"missing or unexpected release asset: {name}")
         if assets[0].get("state") != "uploaded" or assets[0].get("size", 0) <= 0:
@@ -203,7 +237,7 @@ def main() -> None:
         parser.error("provide a canonical stable tag and a positive timeout")
 
     verify_remote_tag_on_main(args.tag)
-    release = gh_json("api", f"repos/{SOURCE_REPOSITORY}/releases/tags/{args.tag}")
+    release = find_source_release(args.tag)
     archive, checksum = validate_release(release, args.tag)
     latest = gh_json("api", f"repos/{SOURCE_REPOSITORY}/releases/latest")
     latest_tag = latest.get("tag_name", "")
@@ -226,6 +260,12 @@ def main() -> None:
                  "--draft=false", "--latest"],
                 check=True,
             )
+            published = gh_json(
+                "api", f"repos/{SOURCE_REPOSITORY}/releases/{release['id']}"
+            )
+            if published.get("id") != release["id"] or published.get("draft") is not False:
+                raise ValueError("the exact source release was not published")
+            validate_release(published, args.tag)
         print(f"Release is public: https://github.com/{SOURCE_REPOSITORY}/releases/tag/{args.tag}", flush=True)
         dispatch_and_wait(args.tag, args.pages_timeout)
         verify_feed(args.tag, build, digest)
