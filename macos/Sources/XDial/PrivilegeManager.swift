@@ -164,9 +164,9 @@ enum PrivilegeManager {
         var hasUnknown = false
         for entry in entries where entry.pid != ProcessInfo.processInfo.processIdentifier {
             switch entry.matchesExecutableName(in: ["xdial", "xdial-daemon"]) {
-            case true: return .unresponsive
-            case false: continue
-            case nil: hasUnknown = true
+            case .some(true): return .unresponsive
+            case .some(false): continue
+            case .none: hasUnknown = true
             }
         }
         return hasUnknown ? .unknown : .absent
