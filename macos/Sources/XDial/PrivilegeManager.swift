@@ -61,16 +61,25 @@ enum PrivilegeManager {
     static func canReconcileRegistrationFailure(_ error: Error) -> Bool {
         guard ServiceManagementErrorDiagnostics.matches(
             error, domain: SMAppServiceErrorDomain, code: Int(EPERM)
-        ), status == .notRegistered else { return false }
+        ), status == .notRegistered,
+              registrationMaintenanceTarget() != nil else { return false }
+        appLog("helper register reconciliation eligible status=0 "
+            + ServiceManagementErrorDiagnostics.summary(error))
+        return true
+    }
+
+    static func registrationMaintenanceTarget() -> HelperRegistrationCoordinator.MaintenanceTarget? {
         do {
             guard let intent = try HelperRegistrationMaintenanceIntent.read(),
                   intent.phase == "committed",
-                  let executableHash = bundledDaemonSHA256(),
-                  intent.targetHash == executableHash else { return false }
-            appLog("helper register reconciliation eligible status=0 "
-                + ServiceManagementErrorDiagnostics.summary(error))
-            return true
-        } catch { return false }
+                  let identity = try? registrationIdentity(),
+                  intent.targetHash == identity.executableHash else { return nil }
+            return .init(
+                token: intent.token,
+                targetHash: intent.targetHash,
+                registrationFingerprint: identity.fingerprint
+            )
+        } catch { return nil }
     }
 
     private static func recordAcceptedRegistration() throws {
@@ -179,15 +188,16 @@ enum PrivilegeManager {
     /// pending unregister could still kill the daemon after it resumes work.
     static func unregisterForRegistrationRefresh(
         daemon: HelperRegistrationCoordinator.Daemon?
-    ) async throws {
+    ) async throws -> HelperRegistrationCoordinator.MaintenanceTarget {
         guard await MainActor.run(body: { GoEngine.shared.helperRegistrationMaintenanceAllowed }) else {
             throw HelperRegistrationCoordinator.Failure.serviceBusy
         }
+        let targetIdentity = try registrationIdentity()
         let previousIntent = try HelperRegistrationMaintenanceIntent.read()
         // Live services first grant an idle lease. Only the absent path needs
         // an intent before probing again to cover a racing KeepAlive start.
         let earlyIntent = daemon == nil ? try HelperRegistrationMaintenanceIntent.establish(
-            targetHash: registrationIdentity().executableHash, previousPID: nil
+            targetHash: targetIdentity.executableHash, previousPID: nil
         ) : previousIntent
         let lease: LocalDaemonConnection?
         do {
@@ -236,19 +246,26 @@ enum PrivilegeManager {
         let intent: HelperRegistrationMaintenanceIntent.Record
         do {
             intent = try earlyIntent ?? HelperRegistrationMaintenanceIntent.establish(
-                targetHash: registrationIdentity().executableHash, previousPID: daemon?.pid
+                targetHash: targetIdentity.executableHash, previousPID: daemon?.pid
             )
         } catch {
             lease?.close()
             throw error
         }
+        let maintenanceTarget = HelperRegistrationCoordinator.MaintenanceTarget(
+            token: intent.token,
+            targetHash: targetIdentity.executableHash,
+            registrationFingerprint: targetIdentity.fingerprint
+        )
+        let targetHash = targetIdentity.executableHash
         let leasedPID = lease?.peerPID
         try await Task.detached {
-            try unregisterHoldingLease(lease, intent: intent)
+            try unregisterHoldingLease(lease, intent: intent, targetHash: targetHash)
             // SM completion is the registration barrier; the previous process
             // must also have exited before a replacement registration is made.
             try awaitPreviousDaemonExit(pids: [daemon?.pid, leasedPID, intent.previousPID].compactMap { $0 })
         }.value
+        return maintenanceTarget
     }
 
     private static func awaitPreviousDaemonExit(pids: [Int32]) throws {
@@ -277,7 +294,8 @@ enum PrivilegeManager {
     }
 
     private static func unregisterHoldingLease(
-        _ lease: LocalDaemonConnection?, intent: HelperRegistrationMaintenanceIntent.Record
+        _ lease: LocalDaemonConnection?, intent: HelperRegistrationMaintenanceIntent.Record,
+        targetHash: String
     ) throws {
         registrationRefreshLock.lock()
         if registrationRefreshInFlight {
@@ -289,7 +307,13 @@ enum PrivilegeManager {
         registrationRefreshLock.unlock()
 
         do {
-            try HelperRegistrationMaintenanceIntent.update(token: intent.token, phase: "committed")
+            // A new completed unregister barrier may adopt an interrupted older
+            // intent for the currently installed bundle. Delayed retries then
+            // remain pinned to this token and target without blocking recovery
+            // merely because the previous attempt named an older helper hash.
+            try HelperRegistrationMaintenanceIntent.update(
+                token: intent.token, phase: "committed", targetHash: targetHash
+            )
         } catch {
             lease?.close()
             registrationRefreshLock.lock()

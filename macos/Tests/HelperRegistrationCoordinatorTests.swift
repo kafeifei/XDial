@@ -262,6 +262,15 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.finalizations, 1)
     }
 
+    func testCompletedMissingJobBarrierCanRegisterCurrentBundle() async throws {
+        let fixture = Fixture()
+        fixture.onUnregister = { _ in fixture.status = .notFound }
+        try await fixture.coordinator().prepare()
+        XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
+        XCTAssertEqual(fixture.registrations, 1)
+        XCTAssertEqual(fixture.savedMarkers, ["current-registration"])
+    }
+
     func testMatchingMarkerWithInterruptedUnregisterStillRefreshes() async throws {
         let fixture = Fixture()
         fixture.marker = "current-registration"
@@ -293,17 +302,16 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
         XCTAssertFalse(fixture.stages.contains(.ready))
     }
 
-    func testPostUnregisterSMDenialReconcilesOnceWithinSameInstallation() async throws {
+    func testPostUnregisterSMDenialWaitsThenRetriesWithoutAnotherUnregister() async throws {
         let fixture = Fixture()
         var operations: [String] = []
         fixture.onUnregister = { _ in
             operations.append("unregister-completed")
             fixture.status = .notRegistered
             fixture.runtime = .absent
-            fixture.pendingRecovery = true
-            fixture.hasOwnedCommittedTarget = true
             XCTAssertTrue(fixture.savedMarkers.isEmpty)
         }
+        fixture.onSleep = { operations.append("sleep-completed") }
         fixture.onRegister = {
             operations.append("register")
             if fixture.registrations == 1 { throw Self.smDenial }
@@ -313,33 +321,51 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
         }
         fixture.onFinalize = { operations.append("finalize-acknowledged") }
         try await fixture.coordinator().prepare()
-        XCTAssertEqual(operations, ["unregister-completed", "register", "unregister-completed", "register", "finalize-acknowledged"])
+        XCTAssertEqual(
+            operations,
+            ["unregister-completed", "register", "sleep-completed", "register", "finalize-acknowledged"]
+        )
         XCTAssertEqual(fixture.registrations, 2)
-        XCTAssertEqual(fixture.unregisteredPIDs, [Fixture.currentDaemon.pid, nil])
+        XCTAssertEqual(fixture.registrationTimes, [0, 1])
+        XCTAssertEqual(fixture.unregisteredPIDs, [Fixture.currentDaemon.pid])
         XCTAssertEqual(fixture.stages.filter { $0 == .reconcilingRegistration }.count, 1)
         XCTAssertEqual(fixture.savedMarkers, ["current-registration"])
         XCTAssertEqual(fixture.stages.last, .ready)
     }
 
-    func testRepeatedPostUnregisterDenialStopsAfterOneReconciliation() async {
+    func testRepeatedPostUnregisterDenialUsesThirtySecondRetryBudget() async {
         let fixture = reconciliationFixture()
-        fixture.onRegister = { throw Self.smDenial }
-        await assertRegistrationDenied(fixture)
-        XCTAssertEqual(fixture.registrations, 2)
-        XCTAssertEqual(fixture.unregisteredPIDs.count, 2)
+        let originalError = NSError(domain: "SMAppServiceErrorDomain", code: 1)
+        fixture.onRegister = {
+            if fixture.registrations == 1 { throw originalError }
+            throw Self.smDenial
+        }
+        do {
+            try await fixture.coordinator().prepare()
+            XCTFail("retry budget did not stop registration")
+        } catch {
+            XCTAssertTrue(error as NSError === originalError)
+        }
+        XCTAssertEqual(fixture.registrations, 6)
+        XCTAssertEqual(fixture.registrationTimes, [0, 1, 3, 7, 15, 30])
+        XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
         XCTAssertEqual(fixture.finalizations, 0)
         XCTAssertTrue(fixture.savedMarkers.isEmpty)
+        XCTAssertTrue(fixture.pendingRecovery)
+        XCTAssertEqual(fixture.currentMaintenanceTarget, Fixture.maintenanceTarget)
     }
 
     func testReconciliationRequiresServiceDomainCodeAndOwnedCommittedTarget() async {
-        for invalidCase in 0..<4 {
+        for invalidCase in 0..<6 {
             let fixture = reconciliationFixture()
             fixture.onRegister = {
                 switch invalidCase {
                 case 0: throw NSError(domain: NSPOSIXErrorDomain, code: 1)
                 case 1: throw NSError(domain: "SMAppServiceErrorDomain", code: 4)
                 case 2: fixture.hasOwnedCommittedTarget = false
-                default: fixture.pendingRecovery = false
+                case 3: fixture.pendingRecovery = false
+                case 4: fixture.currentMaintenanceTarget?.targetHash = "replacement-binary"
+                default: fixture.currentMaintenanceTarget?.registrationFingerprint = "replacement-registration"
                 }
                 throw Self.smDenial
             }
@@ -354,8 +380,8 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
         }
     }
 
-    func testReconciliationPreservesUnknownLiveBusyAndApprovalStates() async {
-        for invalidCase in 0..<5 {
+    func testRetryBoundaryRejectsUnknownLiveBusyApprovalAndEnabledStates() async {
+        for invalidCase in 0..<6 {
             let fixture = reconciliationFixture()
             fixture.onRegister = {
                 switch invalidCase {
@@ -363,7 +389,8 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
                 case 1: fixture.runtime = .unresponsive
                 case 2: fixture.runtime = .running(Fixture.currentDaemon)
                 case 3: fixture.maintenanceAllowed = false
-                default: fixture.status = .requiresApproval
+                case 4: fixture.status = .requiresApproval
+                default: fixture.status = .enabled
                 }
                 throw Self.smDenial
             }
@@ -372,6 +399,134 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
             XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
             XCTAssertFalse(fixture.stages.contains(.reconcilingRegistration))
         }
+    }
+
+    func testWaitRevalidatesStatusBeforeRetrying() async {
+        for status: HelperRegistrationCoordinator.ServiceStatus in [.enabled, .requiresApproval, .notFound] {
+            let fixture = reconciliationFixture()
+            fixture.onRegister = { throw Self.smDenial }
+            fixture.onSleep = { fixture.status = status }
+            await assertRegistrationDenied(fixture)
+            XCTAssertEqual(fixture.registrations, 1)
+            XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
+        }
+    }
+
+    func testWaitRevalidatesMaintenanceAndRuntimeBeforeRetrying() async {
+        for invalidCase in 0..<4 {
+            let fixture = reconciliationFixture()
+            fixture.onRegister = { throw Self.smDenial }
+            fixture.onSleep = {
+                switch invalidCase {
+                case 0: fixture.maintenanceAllowed = false
+                case 1: fixture.runtime = .unknown
+                case 2: fixture.runtime = .unresponsive
+                default: fixture.runtime = .running(Fixture.currentDaemon)
+                }
+            }
+            await assertRegistrationDenied(fixture)
+            XCTAssertEqual(fixture.registrations, 1)
+            XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
+        }
+    }
+
+    func testWaitRejectsReplacementTransactionWithTheSameTargetHash() async {
+        let fixture = reconciliationFixture()
+        fixture.onRegister = { throw Self.smDenial }
+        fixture.onSleep = {
+            fixture.currentMaintenanceTarget?.token = "replacement-token"
+        }
+        await assertRegistrationDenied(fixture)
+        XCTAssertEqual(fixture.registrations, 1)
+        XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
+    }
+
+    func testWaitRejectsChangedBundleFingerprintWithTheSameHelperHash() async {
+        let fixture = reconciliationFixture()
+        fixture.onRegister = { throw Self.smDenial }
+        fixture.onSleep = {
+            fixture.currentMaintenanceTarget?.registrationFingerprint = "replacement-registration"
+        }
+        await assertRegistrationDenied(fixture)
+        XCTAssertEqual(fixture.registrations, 1)
+        XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
+    }
+
+    func testRuntimeProbeRevalidatesTransactionBeforeRetrying() async {
+        let fixture = reconciliationFixture()
+        fixture.onRegister = { throw Self.smDenial }
+        fixture.onRuntime = {
+            if fixture.runtimeReads == 4 {
+                fixture.currentMaintenanceTarget?.token = "replacement-during-runtime-probe"
+            }
+            return fixture.runtime
+        }
+        await assertRegistrationDenied(fixture)
+        XCTAssertEqual(fixture.registrations, 1)
+        XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
+    }
+
+    func testRuntimeProbeCrossingDeadlineDoesNotStartAnotherRegister() async {
+        let fixture = reconciliationFixture()
+        fixture.onRegister = { throw Self.smDenial }
+        fixture.onRuntime = {
+            if fixture.runtimeReads == 4 { fixture.time = 31 }
+            return fixture.runtime
+        }
+        await assertRegistrationDenied(fixture)
+        XCTAssertEqual(fixture.registrations, 1)
+        XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
+    }
+
+    func testCancellationDuringRetryWaitPreservesCommittedRecovery() async {
+        let fixture = reconciliationFixture()
+        fixture.onRegister = { throw Self.smDenial }
+        fixture.onSleep = { throw CancellationError() }
+        do {
+            try await fixture.coordinator().prepare()
+            XCTFail("cancelled retry continued")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(fixture.registrations, 1)
+        XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
+        XCTAssertTrue(fixture.pendingRecovery)
+        XCTAssertTrue(fixture.savedMarkers.isEmpty)
+    }
+
+    func testNonEPERMRetryFailureStopsImmediately() async {
+        let fixture = reconciliationFixture()
+        fixture.onRegister = {
+            if fixture.registrations == 1 { throw Self.smDenial }
+            throw TestFailure.registration
+        }
+        do {
+            try await fixture.coordinator().prepare()
+            XCTFail("general registration failure was retried")
+        } catch {
+            XCTAssertEqual(error as? TestFailure, .registration)
+        }
+        XCTAssertEqual(fixture.registrations, 2)
+        XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
+    }
+
+    func testAlreadyRegisteredResultIsNotAcceptedAsRetrySuccess() async {
+        let fixture = reconciliationFixture()
+        fixture.onRegister = {
+            if fixture.registrations == 1 { throw Self.smDenial }
+            fixture.status = .enabled
+            return false
+        }
+        do {
+            try await fixture.coordinator().prepare()
+            XCTFail("AlreadyRegistered result became ready")
+        } catch {
+            XCTAssertEqual(error as? HelperRegistrationCoordinator.Failure, .registrationFailed)
+        }
+        XCTAssertEqual(fixture.registrations, 2)
+        XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
+        XCTAssertEqual(fixture.finalizations, 0)
+        XCTAssertTrue(fixture.savedMarkers.isEmpty)
     }
 
     func testFreshRegistrationDenialDoesNotInventAnUnregisterRecovery() async {
@@ -385,24 +540,7 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
         XCTAssertTrue(fixture.unregisteredPIDs.isEmpty)
     }
 
-    func testReconciliationBarrierFailureCannotProceedToRegister() async {
-        let fixture = reconciliationFixture()
-        fixture.onRegister = {
-            fixture.onUnregister = { _ in throw TestFailure.unregistration }
-            throw Self.smDenial
-        }
-        do {
-            try await fixture.coordinator().prepare()
-            XCTFail("second registration bypassed failed unregister barrier")
-        } catch {
-            XCTAssertEqual(error as? TestFailure, .unregistration)
-        }
-        XCTAssertEqual(fixture.registrations, 1)
-        XCTAssertEqual(fixture.unregisteredPIDs.count, 2)
-        XCTAssertTrue(fixture.savedMarkers.isEmpty)
-    }
-
-    func testReconciledRegistrationStillRequiresTheCurrentRuntimeHash() async {
+    func testRetriedRegistrationStillRequiresTheCurrentRuntimeHash() async {
         let fixture = reconciliationFixture()
         fixture.onRegister = {
             if fixture.registrations == 1 { throw Self.smDenial }
@@ -417,6 +555,7 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
             XCTAssertEqual(error as? HelperRegistrationCoordinator.Failure, .versionMismatch)
         }
         XCTAssertEqual(fixture.registrations, 2)
+        XCTAssertEqual(fixture.unregisteredPIDs.count, 1)
         XCTAssertEqual(fixture.finalizations, 0)
         XCTAssertTrue(fixture.savedMarkers.isEmpty)
     }
@@ -456,24 +595,33 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
         static let legacyDaemon = HelperRegistrationCoordinator.Daemon(
             pid: 42, executableHash: "legacy-binary", handoffProtocolVersion: 0
         )
+        static let maintenanceTarget = HelperRegistrationCoordinator.MaintenanceTarget(
+            token: "committed-transaction",
+            targetHash: "current-binary",
+            registrationFingerprint: "current-registration"
+        )
         var time: TimeInterval = 0
         var status: HelperRegistrationCoordinator.ServiceStatus = .enabled
         var runtime: HelperRegistrationCoordinator.Runtime = .running(currentDaemon)
         var marker: String?
         var pendingRecovery = false
         var hasOwnedCommittedTarget = false
+        var currentMaintenanceTarget: HelperRegistrationCoordinator.MaintenanceTarget?
         var finalizations = 0
         var onFinalize: (() throws -> Void)?
         var maintenanceAllowed = true
         var legacyExclusive = true
         var legacyIdle = true
         var registrations = 0
+        var registrationTimes: [TimeInterval] = []
+        var runtimeReads = 0
         var unregisteredPIDs: [Int32?] = []
         var unregisterTimes: [TimeInterval] = []
         var respawnTimes: [TimeInterval] = []
         var savedMarkers: [String] = []
         var stages: [HelperRegistrationCoordinator.Stage] = []
         var onSleep: (() throws -> Void)?
+        var onRuntime: (() -> HelperRegistrationCoordinator.Runtime)?
         var onRegister: (() throws -> Bool)?
         var onUnregister: ((HelperRegistrationCoordinator.Daemon?) throws -> Void)?
         var onRespawn: (() -> Bool)?
@@ -490,7 +638,10 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
                 limits: limits,
                 io: .init(
                     status: { self.status },
-                    runtime: { self.runtime },
+                    runtime: {
+                        self.runtimeReads += 1
+                        return self.onRuntime?() ?? self.runtime
+                    },
                     registrationMarker: { self.pendingRecovery ? nil : self.marker },
                     pendingMaintenanceRecovery: { self.pendingRecovery },
                     storeRegistrationMarker: {
@@ -505,9 +656,18 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
                         self.unregisterTimes.append(self.time)
                         if let operation = self.onUnregister { try operation($0) }
                         else { self.status = .notRegistered }
+                        self.runtime = .absent
+                        self.pendingRecovery = true
+                        self.hasOwnedCommittedTarget = true
+                        self.currentMaintenanceTarget = Self.maintenanceTarget
+                        return Self.maintenanceTarget
+                    },
+                    registrationMaintenanceTarget: {
+                        self.hasOwnedCommittedTarget ? self.currentMaintenanceTarget : nil
                     },
                     register: {
                         self.registrations += 1
+                        self.registrationTimes.append(self.time)
                         if let operation = self.onRegister { return try operation() }
                         self.status = .enabled
                         self.runtime = .running(Self.currentDaemon)
@@ -527,7 +687,7 @@ final class HelperRegistrationCoordinatorTests: XCTestCase {
                     now: { self.time },
                     sleep: {
                         self.time += $0
-                        guard self.time < 30 else { throw TestFailure.runaway }
+                        guard self.time <= 60 else { throw TestFailure.runaway }
                         try self.onSleep?()
                     }
                 )
