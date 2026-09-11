@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
 
@@ -88,9 +87,10 @@ func runDaemon(socketPath string) {
 
 	initDaemonExeHash()
 
-	basePath := filepath.Join(os.TempDir(), "xdial-engine")
+	identity := currentRuntimeIdentity()
+	basePath := identity.engineBasePath
 	os.MkdirAll(basePath, 0700) // 内含明文节点密码的 sing-box.json，收紧目录权限
-	statePath := filepath.Join("/Library", "Application Support", "XDial")
+	statePath := identity.rootStatePath
 	if err := os.MkdirAll(statePath, 0700); err != nil {
 		slog.Error("create state directory failed", "path", statePath, "err", err)
 		os.Exit(1)
@@ -136,7 +136,7 @@ func runDaemon(socketPath string) {
 	// 退出时由 eng.Close() 收摊。
 	eng.StartDNSSelfHeal()
 
-	killOrphanSingBox()
+	killOrphanSingBox(identity.orphanSingBoxPattern())
 
 	os.Remove(socketPath)
 	ln, err := net.Listen("unix", socketPath)
@@ -230,12 +230,12 @@ func handleClient(
 			case "registration-abort":
 				accepted = registrationGate.abort(handoffOwner, func() bool {
 					uid, ok := registrationConsoleUID()
-					return ok && finishRegistrationIntent(registrationIntentPath, uid, req.Profile, "aborted", "")
+					return ok && finishRegistrationIntent(currentRuntimeIdentity().registrationIntentPath, uid, req.Profile, "aborted", "")
 				})
 			case "registration-finalize":
 				accepted = registrationGate.finalize(func() bool {
 					uid, ok := registrationConsoleUID()
-					return ok && finishRegistrationIntent(registrationIntentPath, uid, req.Profile, "registered", daemonExeHash)
+					return ok && finishRegistrationIntent(currentRuntimeIdentity().registrationIntentPath, uid, req.Profile, "registered", daemonExeHash)
 				})
 			}
 			client.SendResponse(Response{ID: req.ID, OK: accepted})

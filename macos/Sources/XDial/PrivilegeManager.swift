@@ -6,11 +6,11 @@ import ServiceManagement
 // .enabled 只代表允许运行；更新 plist 或 executable 后必须重新注册。安装协调器
 // 先取得空闲服务的维护租约，再等待 unregister completion 后注册当前 bundle。
 enum PrivilegeManager {
-    static let label = "com.kafeifei.xdial.app.daemon"
-    static let plistName =
-        "com.kafeifei.xdial.app.daemon.plist"
-    private static let legacyLabel = "com.kafeifei.xdial.helper"
-    static let socketPath = "/tmp/xdial.sock"
+    static let label = XDialBuildIdentity.daemonIdentifier
+    static let plistName = XDialBuildIdentity.daemonIdentifier + ".plist"
+    private static let legacyLabel =
+        XDialBuildIdentity.legacyHelperIdentifier
+    static let socketPath = XDialBuildIdentity.daemonSocketPath
 
     static var service: SMAppService { SMAppService.daemon(plistName: plistName) }
 
@@ -75,16 +75,25 @@ enum PrivilegeManager {
     static func canReconcileRegistrationFailure(_ error: Error) -> Bool {
         guard ServiceManagementErrorDiagnostics.matches(
             error, domain: SMAppServiceErrorDomain, code: Int(EPERM)
-        ), status == .notRegistered else { return false }
+        ), status == .notRegistered,
+              registrationMaintenanceTarget() != nil else { return false }
+        appLog("helper register reconciliation eligible status=0 "
+            + ServiceManagementErrorDiagnostics.summary(error))
+        return true
+    }
+
+    static func registrationMaintenanceTarget() -> HelperRegistrationCoordinator.MaintenanceTarget? {
         do {
             guard let intent = try HelperRegistrationMaintenanceIntent.read(),
                   intent.phase == "committed",
-                  let executableHash = bundledDaemonSHA256(),
-                  intent.targetHash == executableHash else { return false }
-            appLog("helper register reconciliation eligible status=0 "
-                + ServiceManagementErrorDiagnostics.summary(error))
-            return true
-        } catch { return false }
+                  let identity = try? registrationIdentity(),
+                  intent.targetHash == identity.executableHash else { return nil }
+            return .init(
+                token: intent.token,
+                targetHash: intent.targetHash,
+                registrationFingerprint: identity.fingerprint
+            )
+        } catch { return nil }
     }
 
     private static func recordAcceptedRegistration() throws {
@@ -163,7 +172,13 @@ enum PrivilegeManager {
         guard case let .available(entries) = LocalProcessInventory.capture() else { return .unknown }
         var hasUnknown = false
         for entry in entries where entry.pid != ProcessInfo.processInfo.processIdentifier {
-            switch entry.matchesExecutableName(in: ["xdial", "xdial-daemon"]) {
+            switch entry.belongsToProductBundle(
+                XDialBuildIdentity.applicationDestinationURL,
+                excludingSiblingBundleURLs: [
+                    XDialBuildIdentity.siblingApplicationDestinationURL,
+                ],
+                executableNames: ["xdial", "xdial-daemon"]
+            ) {
             case .some(true): return .unresponsive
             case .some(false): continue
             case .none: hasUnknown = true
@@ -177,7 +192,13 @@ enum PrivilegeManager {
         let hostPID = ProcessInfo.processInfo.processIdentifier
         return entries.allSatisfy { entry in
             if entry.pid == hostPID || entry.pid == daemonPID { return true }
-            return entry.matchesExecutableName(in: ["xdial", "xdial-daemon"]) == false
+            return entry.belongsToProductBundle(
+                XDialBuildIdentity.applicationDestinationURL,
+                excludingSiblingBundleURLs: [
+                    XDialBuildIdentity.siblingApplicationDestinationURL,
+                ],
+                executableNames: ["xdial", "xdial-daemon"]
+            ) == false
         }
     }
 
@@ -196,15 +217,16 @@ enum PrivilegeManager {
     /// pending unregister could still kill the daemon after it resumes work.
     static func unregisterForRegistrationRefresh(
         daemon: HelperRegistrationCoordinator.Daemon?
-    ) async throws {
+    ) async throws -> HelperRegistrationCoordinator.MaintenanceTarget {
         guard await MainActor.run(body: { GoEngine.shared.helperRegistrationMaintenanceAllowed }) else {
             throw HelperRegistrationCoordinator.Failure.serviceBusy
         }
+        let targetIdentity = try registrationIdentity()
         let previousIntent = try HelperRegistrationMaintenanceIntent.read()
         // Live services first grant an idle lease. Only the absent path needs
         // an intent before probing again to cover a racing KeepAlive start.
         let earlyIntent = daemon == nil ? try HelperRegistrationMaintenanceIntent.establish(
-            targetHash: registrationIdentity().executableHash, previousPID: nil
+            targetHash: targetIdentity.executableHash, previousPID: nil
         ) : previousIntent
         let lease: LocalDaemonConnection?
         do {
@@ -253,19 +275,26 @@ enum PrivilegeManager {
         let intent: HelperRegistrationMaintenanceIntent.Record
         do {
             intent = try earlyIntent ?? HelperRegistrationMaintenanceIntent.establish(
-                targetHash: registrationIdentity().executableHash, previousPID: daemon?.pid
+                targetHash: targetIdentity.executableHash, previousPID: daemon?.pid
             )
         } catch {
             lease?.close()
             throw error
         }
+        let maintenanceTarget = HelperRegistrationCoordinator.MaintenanceTarget(
+            token: intent.token,
+            targetHash: targetIdentity.executableHash,
+            registrationFingerprint: targetIdentity.fingerprint
+        )
+        let targetHash = targetIdentity.executableHash
         let leasedPID = lease?.peerPID
         try await Task.detached {
-            try unregisterHoldingLease(lease, intent: intent)
+            try unregisterHoldingLease(lease, intent: intent, targetHash: targetHash)
             // SM completion is the registration barrier; the previous process
             // must also have exited before a replacement registration is made.
             try awaitPreviousDaemonExit(pids: [daemon?.pid, leasedPID, intent.previousPID].compactMap { $0 })
         }.value
+        return maintenanceTarget
     }
 
     private static func awaitPreviousDaemonExit(pids: [Int32]) throws {
@@ -294,7 +323,8 @@ enum PrivilegeManager {
     }
 
     private static func unregisterHoldingLease(
-        _ lease: LocalDaemonConnection?, intent: HelperRegistrationMaintenanceIntent.Record
+        _ lease: LocalDaemonConnection?, intent: HelperRegistrationMaintenanceIntent.Record,
+        targetHash: String
     ) throws {
         do {
             try registrationMutationGate.beginUnregister()
@@ -304,7 +334,13 @@ enum PrivilegeManager {
         }
 
         do {
-            try HelperRegistrationMaintenanceIntent.update(token: intent.token, phase: "committed")
+            // A new completed unregister barrier may adopt an interrupted older
+            // intent for the currently installed bundle. Delayed retries then
+            // remain pinned to this token and target without blocking recovery
+            // merely because the previous attempt named an older helper hash.
+            try HelperRegistrationMaintenanceIntent.update(
+                token: intent.token, phase: "committed", targetHash: targetHash
+            )
         } catch {
             lease?.close()
             registrationMutationGate.completeUnregister()
@@ -462,13 +498,16 @@ enum PrivilegeManager {
         "/Library/LaunchDaemons/\(legacyLabel).plist"
 
     static var legacyInstalled: Bool {
-        FileManager.default.fileExists(atPath: legacyPlistPath)
+        XDialBuildIdentity.allowsLegacyCleanup
+            && (FileManager.default.fileExists(atPath: legacyPlistPath)
             || FileManager.default.fileExists(atPath: legacyHelperPath)
+            )
     }
 
     /// 清掉旧安装（bootout + 删文件）。这是整个生命周期里最后一次要密码的操作，
     /// 且只发生在从旧机制迁移的机器上。
     static func cleanupLegacy() throws {
+        guard XDialBuildIdentity.allowsLegacyCleanup else { return }
         let shell = """
         launchctl bootout system/\(legacyLabel) 2>/dev/null || true
         rm -f '\(legacyPlistPath)' '\(legacyHelperPath)'
@@ -560,7 +599,14 @@ enum PrivilegeManager {
         if deleteData {
             // /Library/Application Support/XDial 是 root 属主，得借 root daemon 或
             // 管理员权限删；daemon 已被注销，这里只能走一次管理员授权。
-            _ = runAdminShell("rm -rf '/Library/Application Support/XDial' '/tmp/xdial-engine' '/tmp/xdial.log' '\(socketPath)'")
+            let supportPath = "/Library/Application Support/"
+                + XDialBuildIdentity.applicationSupportDirectoryName
+            _ = runAdminShell(
+                "rm -rf '\(supportPath)' "
+                    + "'\(XDialBuildIdentity.engineRuntimePath)' "
+                    + "'\(XDialBuildIdentity.daemonLogPath)' "
+                    + "'\(socketPath)'"
+            )
         }
     }
 

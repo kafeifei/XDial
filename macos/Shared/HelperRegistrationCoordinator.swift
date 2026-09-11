@@ -14,6 +14,12 @@ final class HelperRegistrationCoordinator {
         var handoffProtocolVersion: Int
     }
 
+    struct MaintenanceTarget: Equatable {
+        var token: String
+        var targetHash: String
+        var registrationFingerprint: String
+    }
+
     enum Runtime: Equatable {
         case absent
         case running(Daemon)
@@ -55,6 +61,10 @@ final class HelperRegistrationCoordinator {
         // setup expires after two idle minutes; never refresh its idle timer.
         var legacyIdle: TimeInterval = 125
         var poll: TimeInterval = 0.2
+        // This is a retry budget, not a guarantee about ServiceManagement's
+        // synchronous call duration. No new retry starts after 30 seconds.
+        var registrationRetryDelays: [TimeInterval] = [1, 2, 4, 8, 15]
+        var registrationRetryBudget: TimeInterval = 30
     }
 
     struct IO {
@@ -68,7 +78,9 @@ final class HelperRegistrationCoordinator {
         var legacyEngineIsIdle: () async -> Bool
         /// The live path must hold a daemon-issued quiescence lease until the
         /// SMAppService unregister completion, including a late completion.
-        var unregister: (Daemon?) async throws -> Void
+        var unregister: (Daemon?) async throws -> MaintenanceTarget
+        /// The currently owned committed transaction and exact bundle target.
+        var registrationMaintenanceTarget: () -> MaintenanceTarget?
         /// True only for an accepted registration of the current bundle.
         var register: () throws -> Bool
         /// True only for the observed SM denial of this committed maintenance
@@ -174,8 +186,9 @@ final class HelperRegistrationCoordinator {
                 publish(.refreshingRegistration)
                 publishedRefreshAttempt = true
             }
+            let maintenanceTarget: MaintenanceTarget
             do {
-                try await io.unregister(daemon)
+                maintenanceTarget = try await io.unregister(daemon)
             } catch Failure.serviceBusy {
                 // No registration mutation was made: keep serving the current
                 // operation and continue this same installation automatically.
@@ -185,33 +198,87 @@ final class HelperRegistrationCoordinator {
             }
             publish(.refreshingRegistration)
             refreshedRegistration = true
-            registeredCurrentBundle = try await registerAfterRefresh()
+            registeredCurrentBundle = try await registerAfterRefresh(maintenanceTarget)
             guard registeredCurrentBundle else { throw Failure.registrationFailed }
             try await awaitRegistrationStatus()
             needsVerificationStage = true
         }
     }
 
-    private func registerAfterRefresh() async throws -> Bool {
+    private func registerAfterRefresh(_ maintenanceTarget: MaintenanceTarget) async throws -> Bool {
+        let runtime = await io.runtime()
+        try Task.checkCancellation()
+        let status = io.status()
+        guard runtime == .absent,
+              status == .notRegistered || status == .notFound,
+              io.pendingMaintenanceRecovery(),
+              io.maintenanceAllowed(),
+              ownsExpectedMaintenanceTarget(maintenanceTarget) else {
+            throw Failure.registrationFailed
+        }
         do {
             return try io.register()
         } catch {
-            // Observed on two real updates: successful unregister completion,
-            // then SMAppService/EPERM with notRegistered and no helper. A later
-            // unregister completion + register succeeded. Reconcile once under
-            // that same owned maintenance boundary; never retry a general EPERM.
-            guard io.canReconcileRegistrationFailure(error),
-                  io.status() == .notRegistered,
-                  io.pendingMaintenanceRecovery(),
-                  io.maintenanceAllowed(),
-                  await io.runtime() == .absent else { throw error }
-            try Task.checkCancellation()
+            let originalError = error
+            let deadline = io.now() + limits.registrationRetryBudget
+            guard try await canRetryRegistration(
+                after: error, maintenanceTarget: maintenanceTarget, deadline: deadline
+            ) else { throw originalError }
             publish(.reconcilingRegistration)
-            try await io.unregister(nil)
-            // This second attempt deliberately has no catch/retry loop. Its
-            // accepted registration still requires runtime hash + finalize ACK.
-            return try io.register()
+
+            for requestedDelay in limits.registrationRetryDelays {
+                let remaining = deadline - io.now()
+                guard remaining > 0 else { throw originalError }
+                try await io.sleep(min(requestedDelay, remaining))
+                guard try await canRetryRegistration(
+                    after: originalError,
+                    maintenanceTarget: maintenanceTarget,
+                    deadline: deadline
+                ) else { throw originalError }
+                try Task.checkCancellation()
+                guard io.now() <= deadline else { throw originalError }
+                do {
+                    // A false result (including AlreadyRegistered) is not an
+                    // accepted registration and still fails in the caller.
+                    return try io.register()
+                } catch {
+                    let canContinue = try await canRetryRegistration(
+                        after: error,
+                        maintenanceTarget: maintenanceTarget,
+                        deadline: deadline
+                    )
+                    guard canContinue else {
+                        if io.now() > deadline { throw originalError }
+                        throw error
+                    }
+                }
+            }
+            // Keep the committed recovery record for a later installation run
+            // and report the first observed denial when this budget is spent.
+            throw originalError
         }
+    }
+
+    private func canRetryRegistration(
+        after error: Error,
+        maintenanceTarget: MaintenanceTarget,
+        deadline: TimeInterval
+    ) async throws -> Bool {
+        let runtime = await io.runtime()
+        try Task.checkCancellation()
+        guard runtime == .absent
+            && io.status() == .notRegistered
+            && io.pendingMaintenanceRecovery()
+            && io.maintenanceAllowed()
+            && io.canReconcileRegistrationFailure(error)
+            && ownsExpectedMaintenanceTarget(maintenanceTarget) else { return false }
+        return io.now() <= deadline
+    }
+
+    private func ownsExpectedMaintenanceTarget(_ target: MaintenanceTarget) -> Bool {
+        target.targetHash == expectedExecutableHash
+            && target.registrationFingerprint == fingerprint
+            && io.registrationMaintenanceTarget() == target
     }
 
     private func awaitRegistrationStatus() async throws {

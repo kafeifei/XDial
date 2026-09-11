@@ -39,6 +39,7 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility)" = public
           scripts/release-contract.sh validate-inputs "$RELEASE_TAG" "$RELEASE_BUILD_NUMBER"
           scripts/release-contract.sh validate-notes "$RELEASE_TAG" RELEASE_NOTES.md
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           scripts/release-contract.sh assert-git-tag "$RELEASE_TAG"
           make public-content-gate
 
@@ -124,12 +125,20 @@ jobs:
             NOTARY_KEY_ID="$NOTARY_KEY_ID" \
             NOTARY_ISSUER="$NOTARY_ISSUER"
 
-      - name: Publish immutable release assets
+      - name: Stage immutable release assets for verification
         run: |
+          python3 - <<'PY'
+          import plistlib
+          with open('build/release/XDial.app/Contents/Info.plist', 'rb') as stream:
+              info = plistlib.load(stream)
+          acceptance_id = info.get('XDialUpdateAcceptanceID', '')
+          assert isinstance(acceptance_id, str) and not acceptance_id, 'acceptance builds cannot enter a public stable release'
+          PY
           gh release create "$RELEASE_TAG" \
             "build/release/XDial-${RELEASE_TAG}.zip" \
             "build/release/XDial-${RELEASE_TAG}.zip.sha256" \
             --verify-tag \
+            --draft \
             --title "XDial $RELEASE_TAG" \
             --notes-file RELEASE_NOTES.md
 

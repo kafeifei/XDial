@@ -87,11 +87,14 @@ XDial 是 macOS 菜单栏网络工具：SwiftUI 提供控制面，sing-box 提�
   会隐藏既有全流量 VPN，只能用于诊断，不能作为 sing-box 的 Underlay。
 - 分发产物只能使用 `make release` 生成的 `build/release/XDial.app`。Debug 构建包含本地调试
   接口，不得分发；不得为让 Release 通过而删除 entitlement 或把 Debug 标识带入 Release。
-- Debug、FormalDevelopment 与 Release 始终使用同一套正式身份：Host
-  `com.kafeifei.xdial.app`、Settings UI `com.kafeifei.xdial.app.settings-ui`、System Extension
-  `com.kafeifei.xdial.app.transparent-proxy`、helper `com.kafeifei.xdial.app.helper`。配置之间只允许
-  编译条件与签名方式不同，不得再用不同 bundle identity 隔离 Debug；正式 Release 必须保留
-  host 与 extension 所需的 System Extension provisioning profile。
+- 日常开发使用独立 Debug 身份，安装名固定为 `Xdial debug.app`：Host
+  `com.kafeifei.xdial.debug`，Settings UI、System Extension、helper 与 daemon 分别使用
+  `.settings-ui`、`.transparent-proxy`、`.helper`、`.daemon` 后缀；用户数据、App Group、
+  IPC 和安装维护范围也必须与正式版隔离，不自动迁移或删除正式数据，不跨通道安装更新。
+- FormalDevelopment 与 Release 保持现有正式配置：Host `com.kafeifei.xdial.app`，其余正式
+  组件身份及签名配置不变。FormalDevelopment 只用于正式身份验证，不是日常开发入口；
+  `XDIAL_DEVELOPMENT_IDENTITY` 仅用于 Debug。Release 必须保留 host 与 extension 所需的
+  System Extension provisioning profile；缺少 Debug profile 不得借用正式身份绕过隔离。
 - 未完成真实运行验证时明确报告剩余边界，不把源码、测试或旧日志包装成现场结论。
 
 ## 仓库纪律
@@ -99,6 +102,8 @@ XDial 是 macOS 菜单栏网络工具：SwiftUI 提供控制面，sing-box 提�
 - 概念命名固定为线路 Line / 规则 RuleSet / 场景 Scenario。
 - 不修改 `third_party/`；需要上游变更时使用本地补丁并留痕。Go 代码提交前执行 `gofmt`。
 - 未经授权不 commit、push、merge、发布或清理 worktree / build 产物。
+- 正式 Release 必须先把本次改动合入并推送 `main`，再从 `main` 上确认的提交创建 tag；
+  发布前核对远端主线、tag 和产物源码提交。不得从尚未合入主线的分支直接打正式 tag 发布。
 - 回复用户用中文，代码标识符保持英文。使用精确工程术语，不用含义不明的社区俗语。
 
 ## 文档职责

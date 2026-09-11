@@ -291,6 +291,221 @@ final class ProviderRelayRegistryTests: XCTestCase {
         XCTAssertTrue(drain.wait(timeout: 1))
         XCTAssertEqual(fixture.shutdownCount, 1)
     }
+
+    /// macOS never creates a second `NEAppProxyUDPFlow` for one application
+    /// socket, so a UDP entry registers only its SOCKS association. Replacing
+    /// the generation must retire that association — the bounded drain still
+    /// has to complete — while the flow stays open and re-associates.
+    func testReplacedGenerationRePointsUDPRelayInsteadOfClosingItsFlow() async {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let supervisor = UDPFlowSupervisorFixture(registry: registry)
+        supervisor.start()
+        let reachedA = await supervisor.waitForAssociation(generation: "A")
+        XCTAssertTrue(reachedA)
+
+        let drain = registry.activate(
+            generation: "B",
+            endpoint: "endpoint-B"
+        )
+
+        XCTAssertEqual(drain.count, 1)
+        XCTAssertTrue(drain.wait(timeout: 1))
+        XCTAssertEqual(supervisor.associationTeardownCount, 1)
+        XCTAssertEqual(supervisor.flowCloseCount, 0)
+
+        let reachedB = await supervisor.waitForAssociation(generation: "B")
+        XCTAssertTrue(reachedB)
+        XCTAssertEqual(registry.registeredCount, 1)
+        XCTAssertEqual(supervisor.flowCloseCount, 0)
+    }
+
+    func testHandoffDrainCancellationRePointsUDPRelayToTheNewGeneration() async {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let supervisor = UDPFlowSupervisorFixture(registry: registry)
+        supervisor.start()
+        let reachedA = await supervisor.waitForAssociation(generation: "A")
+        XCTAssertTrue(reachedA)
+
+        let drain = registry.handoff(
+            generation: "B",
+            endpoint: "endpoint-B"
+        )
+        XCTAssertEqual(drain.count, 1)
+        XCTAssertFalse(drain.wait(timeout: 0.01))
+
+        drain.cancel()
+
+        XCTAssertTrue(drain.wait(timeout: 1))
+        let reachedB = await supervisor.waitForAssociation(generation: "B")
+        XCTAssertTrue(reachedB)
+        XCTAssertEqual(supervisor.flowCloseCount, 0)
+    }
+
+    func testUDPFlowIsClosedOnlyWhenNoGenerationCanCarryIt() async {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let supervisor = UDPFlowSupervisorFixture(registry: registry)
+        supervisor.start()
+        let reachedA = await supervisor.waitForAssociation(generation: "A")
+        XCTAssertTrue(reachedA)
+
+        let drain = registry.deactivateCurrent()
+
+        XCTAssertTrue(drain.wait(timeout: 1))
+        let closed = await supervisor.waitUntilFlowClosed()
+        XCTAssertTrue(closed)
+        XCTAssertEqual(supervisor.flowCloseCount, 1)
+        XCTAssertEqual(registry.registeredCount, 0)
+    }
+}
+
+/// Models the Provider's UDP supervisor: the flow outlives every association,
+/// each association is what the registry owns, and the flow is closed only when
+/// no generation is available any more.
+private final class UDPFlowSupervisorFixture: @unchecked Sendable {
+    private let registry: ProviderRelayRegistry<String>
+    private let lock = NSLock()
+    private var activeGeneration: String?
+    private var teardowns = 0
+    private var closes = 0
+    private var task: Task<Void, Never>?
+
+    init(registry: ProviderRelayRegistry<String>) {
+        self.registry = registry
+    }
+
+    var associationTeardownCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return teardowns
+    }
+
+    var flowCloseCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return closes
+    }
+
+    var currentGeneration: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeGeneration
+    }
+
+    func start() {
+        task = Task { [self] in
+            while !Task.isCancelled {
+                guard let reservation = registry.reserve() else {
+                    closeFlow()
+                    return
+                }
+                let association = AssociationFixture { [self] in
+                    noteTearDown()
+                }
+                let generation = reservation.generation
+                let handle = ProviderRelayHandle(
+                    shutdown: RelayTaskShutdown { _ in
+                        association.tearDown()
+                    },
+                    operation: { [self] in
+                        setActiveGeneration(generation)
+                        await association.waitUntilTornDown()
+                        clearActiveGeneration(generation)
+                    }
+                )
+                guard registry.attach(handle, to: reservation) else {
+                    registry.finish(reservation)
+                    association.tearDown()
+                    await Task.yield()
+                    continue
+                }
+                guard handle.start(onFinish: {
+                    self.registry.finish(reservation)
+                }) else {
+                    registry.finish(reservation)
+                    association.tearDown()
+                    await Task.yield()
+                    continue
+                }
+                await association.waitUntilTornDown()
+            }
+        }
+    }
+
+    private func setActiveGeneration(_ generation: String) {
+        lock.lock()
+        activeGeneration = generation
+        lock.unlock()
+    }
+
+    private func clearActiveGeneration(_ generation: String) {
+        lock.lock()
+        if activeGeneration == generation {
+            activeGeneration = nil
+        }
+        lock.unlock()
+    }
+
+    private func noteTearDown() {
+        lock.lock()
+        teardowns += 1
+        lock.unlock()
+    }
+
+    private func closeFlow() {
+        lock.lock()
+        activeGeneration = nil
+        closes += 1
+        lock.unlock()
+    }
+
+    func waitForAssociation(generation: String) async -> Bool {
+        await waitUntil { self.currentGeneration == generation }
+    }
+
+    func waitUntilFlowClosed() async -> Bool {
+        await waitUntil { self.flowCloseCount > 0 }
+    }
+
+    private func waitUntil(_ condition: @escaping () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if condition() {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        return condition()
+    }
+}
+
+private final class AssociationFixture: @unchecked Sendable {
+    private let gate = RegistryAsyncGate()
+    private let lock = NSLock()
+    private var torn = false
+    private let onTearDown: () -> Void
+
+    init(onTearDown: @escaping () -> Void) {
+        self.onTearDown = onTearDown
+    }
+
+    func tearDown() {
+        lock.lock()
+        guard !torn else {
+            lock.unlock()
+            return
+        }
+        torn = true
+        lock.unlock()
+        onTearDown()
+        gate.open()
+    }
+
+    func waitUntilTornDown() async {
+        await gate.wait()
+    }
 }
 
 private final class RelayFixture: @unchecked Sendable {

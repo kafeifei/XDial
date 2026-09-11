@@ -144,7 +144,8 @@ enum ProxyResourceReadiness {
 
         let state = ProxyResourceProbeState()
         let queue = OperationQueue()
-        queue.name = "com.kafeifei.xdial.proxy-readiness"
+        queue.name = XDialBuildIdentity.queueLabelPrefix
+            + ".proxy-readiness"
         queue.qualityOfService = .userInitiated
         queue.maxConcurrentOperationCount = max(
             1,

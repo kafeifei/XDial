@@ -4,10 +4,10 @@ enum SettingsDockProxyProtocol {
     static let hostPIDArgumentPrefix = "--settings-dock-host-pid="
 
     static let activationNotification = Notification.Name(
-        "com.kafeifei.xdial.settings-dock.activate"
+        XDialBuildIdentity.settingsDockActivationNotification
     )
     static let dismissalNotification = Notification.Name(
-        "com.kafeifei.xdial.settings-dock.dismiss"
+        XDialBuildIdentity.settingsDockDismissalNotification
     )
 
     static func hostPID(in arguments: [String]) -> pid_t? {

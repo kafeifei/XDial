@@ -33,10 +33,8 @@ enum ApplicationRelocator {
         }
     }
 
-    private static let destinationURL = URL(
-        fileURLWithPath: "/Applications/XDial.app",
-        isDirectory: true
-    )
+    private static let destinationURL =
+        XDialBuildIdentity.applicationDestinationURL
     private static let launchServicesRegistrarURL = URL(
         fileURLWithPath:
             "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
@@ -52,14 +50,16 @@ enum ApplicationRelocator {
     }
 
     static var permitsAutomaticUpdates: Bool {
-        isRunningFromApplications
+        XDialBuildIdentity.allowsAutomaticUpdates
+            && isRunningFromApplications
             && Bundle.main.bundleIdentifier
-                == XDialApplicationIdentifierPolicy.release
+                == XDialBuildIdentity.applicationIdentifier
     }
 
     static func validateIncomingUpdateBundle(
         at bundleURL: URL,
-        expectedVersion: String
+        expectedVersion: String,
+        expectedBuild: String
     ) throws {
         guard permitsAutomaticUpdates else {
             throw InstallationError.automaticUpdateUnsupported
@@ -76,6 +76,12 @@ enum ApplicationRelocator {
             forKey: "CFBundleVersion",
             at: bundleURL
         ) ?? ""
+        let currentAcceptanceID = try AppUpdateFeedConfiguration.current(
+            at: Bundle.main.bundleURL
+        ).acceptanceID
+        let incomingAcceptanceID = try AppUpdateFeedConfiguration.current(
+            at: bundleURL
+        ).acceptanceID
         let settingsURL = bundleURL.appendingPathComponent(
             "Contents/Helpers/XDial Settings UI.app",
             isDirectory: true
@@ -90,10 +96,14 @@ enum ApplicationRelocator {
         guard AutomaticUpdateBundlePolicy.permits(
             currentIdentifier: currentIdentity.identifier,
             currentTeamIdentifier: currentIdentity.teamIdentifier,
+            currentAcceptanceID: currentAcceptanceID,
             incomingIdentifier: incomingIdentity.identifier,
             incomingTeamIdentifier: incomingIdentity.teamIdentifier,
+            incomingAcceptanceID: incomingAcceptanceID,
             incomingVersion: incomingVersion,
-            expectedVersion: expectedVersion
+            expectedVersion: expectedVersion,
+            incomingBuild: incomingBuild,
+            expectedBuild: expectedBuild
         ),
         ApplicationBundleInfo.string(
             forKey: "XDialTransparentProxyBundleIdentifier",
@@ -101,6 +111,7 @@ enum ApplicationRelocator {
         ) == AutomaticUpdateBundlePolicy.releaseExtensionIdentifier,
         AutomaticUpdateBundlePolicy.permitsVersionSet(
             expectedVersion: expectedVersion,
+            expectedBuild: expectedBuild,
             hostVersion: incomingVersion,
             hostBuild: incomingBuild,
             settingsVersion: ApplicationBundleInfo.string(
@@ -553,10 +564,11 @@ enum ApplicationRelocator {
         let names = try FileManager.default.contentsOfDirectory(
             atPath: destinationURL.deletingLastPathComponent().path
         )
+        let prefix = XDialBuildIdentity.installationArtifactPrefix
         guard names.contains(where: {
-            $0.hasPrefix(".XDial.transaction-")
-                || $0.hasPrefix(".XDial.install-")
-                || $0.hasPrefix(".XDial.backup-")
+            $0.hasPrefix(prefix + ".transaction-")
+                || $0.hasPrefix(prefix + ".install-")
+                || $0.hasPrefix(prefix + ".backup-")
         }) else { return }
         let artifacts = installationArtifacts(
             sourceIdentity: sourceIdentity,
@@ -794,7 +806,8 @@ enum ApplicationRelocator {
         guard let extensionIdentifier = ApplicationBundleInfo.string(
             forKey: "XDialTransparentProxyBundleIdentifier",
             at: bundleURL
-        ) else {
+        ), extensionIdentifier
+            == XDialBuildIdentity.transparentProxyIdentifier else {
             throw InstallationError.extensionIdentifierMissing
         }
         let extensionsURL = bundleURL.appendingPathComponent(

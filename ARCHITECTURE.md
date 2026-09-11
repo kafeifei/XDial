@@ -578,11 +578,39 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   平台前置条件，不属于某个 Scenario 编译出的 `ConnectionPlan`。它们由独立的
   `InstallationReport` 表达；安装成功不能推导任意 Line、RuleSet、DNS 或真实出口已经
   就绪，连接事务也不得通过打开设置页来补做安装。
-- **自动定位与替换**：从 `/Applications` 之外启动时，XDial 复制自身到
-  `/Applications/XDial.app`，核对主程序、helper 和 System Extension 的完整签名及
-  bundle identity 后重新启动。已存在同一签名身份的旧版本可以自动替换，但必须先保留
+- **开发与正式身份隔离**：日常 Debug 使用独立 Host `com.kafeifei.xdial.debug`，
+  Settings UI、System Extension、helper 与 daemon 分别使用其 `.settings-ui`、
+  `.transparent-proxy`、`.helper`、`.daemon` 子身份。只有 Debug 定义
+  `XDIAL_DEVELOPMENT_IDENTITY`。FormalDevelopment 与 Release 保持现有
+  `com.kafeifei.xdial.app` 正式组件身份、签名和 provisioning 配置；FormalDevelopment
+  仅用于正式身份验证，不是日常开发入口。开发签名缺少对应 profile 时必须明确失败，
+  不得退回正式身份、移除 entitlement 或借用正式 profile。
+- **数据与维护隔离**：Debug 的用户偏好、凭据、持久 Line 身份、App Group journal、
+  缓存、日志、helper socket、本地调试端口和安装维护标记均属于 Debug 通道。Debug 不得
+  自动导入旧正式版或其沙盒的数据，不得清理正式 helper、System Extension、网络配置或
+  安装副本。通道隔离只保证各自所有权，不构成两个数据面同时接管流量的验收；连接仍遵守
+  D35–D36 与当前运行态授权边界。
+- **自动定位与替换**：从 `/Applications` 之外启动时，正式版复制自身到
+  `/Applications/XDial.app`，Debug 复制自身到 `/Applications/Xdial debug.app`，核对
+  主程序、helper 和 System Extension 的完整签名及 bundle identity 后重新启动。
+  已存在同一通道、同一签名身份的旧版本可以自动替换，但必须先保留
   临时备份，新版本二次验签成功后才清除；签名或 bundle identity 不一致时禁止覆盖。
   下载目录里的原文件不删除。
+- **更新不跨通道**：正式更新始终只接受正式组件身份并安装到正式目标。Debug 不消费正式
+  更新包；Debug 的安装、替换、卸载及历史残留清理也只能触及自己的组件与数据。独立安装名
+  不能代替对嵌套组件签名和身份的完整校验。
+- **更新元数据原子发布**：客户端只从固定 HTTPS Pages 地址读取一份有版本的完整清单，
+  版本、构建号、更新说明、最低系统版本及归档 URL、大小、SHA-256 必须同时有效；不得再
+  依赖匿名 GitHub API 或 HTML 回退拼装候选。安装包仍由 GitHub Releases 托管。发布端先
+  验证公开归档的真实字节，再部署清单并读取 canonical 地址确认；串行发布、单调 revision、
+  同 tag 防改写和撤回记录共同约束候选。具体协议与发布步骤见 `docs/agent/updates.md`。
+- **缓存不是安装许可**：缓存仅在 HTTP 200/304 成功验证后刷新检查时间；失败、限流或无
+  当前发布均不得显示为“已是最新”。下载前和安装前必须重新确认同一候选仍有效；撤回、
+  候选变化或无法确认时停止该操作。归档须通过大小、SHA-256、实际版本及构建号和既有
+  嵌套签名校验，才进入原有安装交接。
+- **正式身份验收隔离**：双包更新验收使用签名 Info.plist 中固定的 acceptance ID，映射到
+  独立 Pages 路径与验收资产仓库；不允许运行时任意 URL 覆盖。当前与传入 App 的 ID 必须
+  相同，普通正式包均为空。验收包不得进入正式更新清单；长期本地 Debug 不承担此验收。
 - **唯一流程**：首次启动和升级都依次验证当前 bundle、注册并验证 helper、激活并验证
   System Extension。macOS 要求人工批准时，状态停在准确任务并自动打开对应系统设置；
   批准后继续原事务。Tailscale 配置和完整连接只消费“安装已就绪”这一事实，不得各自

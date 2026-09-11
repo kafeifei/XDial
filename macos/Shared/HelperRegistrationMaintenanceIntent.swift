@@ -4,7 +4,7 @@ import Foundation
 /// Bridges an asynchronous OS unregister and a launchd KeepAlive start. A token
 /// prevents a late completion from changing a successor installation's intent.
 enum HelperRegistrationMaintenanceIntent {
-    static let path = "/tmp/xdial-registration-maintenance"
+    static let path = XDialBuildIdentity.registrationMaintenancePath
 
     struct Record: Codable, Equatable {
         let version: Int

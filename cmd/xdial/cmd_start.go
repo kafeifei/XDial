@@ -81,15 +81,16 @@ func runStartCmd(args []string) {
 		os.Exit(1)
 	}
 
-	basePath := filepath.Join(os.TempDir(), "xdial-engine")
+	identity := currentRuntimeIdentity()
+	basePath := identity.engineBasePath
 	os.MkdirAll(basePath, 0755)
 	statePath := filepath.Join(basePath, "state")
 	if home, err := os.UserHomeDir(); err == nil {
-		statePath = filepath.Join(home, ".xdial")
+		statePath = identity.userStatePath(home)
 	}
 	os.MkdirAll(statePath, 0700)
 
-	killOrphanSingBox()
+	killOrphanSingBox(identity.orphanSingBoxPattern())
 
 	cb := &cliCallback{jsonMode: *jsonOutput}
 	eng := engine.New(basePath, statePath, cb)

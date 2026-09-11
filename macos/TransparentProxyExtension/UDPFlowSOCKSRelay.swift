@@ -3,102 +3,487 @@ import Network
 @preconcurrency import NetworkExtension
 import OSLog
 
+/// Relays one `NEAppProxyUDPFlow` over SOCKS5 UDP ASSOCIATE.
+///
+/// The flow and the association have different lifetimes. A SOCKS association
+/// belongs to one engine generation and dies with it; the flow belongs to an
+/// application socket that macOS will never hand us again. The supervisor
+/// therefore owns the flow, each association registers itself with the relay
+/// registry on its own, and a replaced generation only tears the association
+/// down — the flow is re-associated against the new generation instead of
+/// being closed underneath the application.
 enum UDPFlowSOCKSRelay {
+    /// One association attempt against the registry's current generation.
+    struct AssociationTicket: @unchecked Sendable {
+        let socksPort: UInt16
+        let credentials: SOCKSCredentials?
+        let generation: String
+        /// Registers the association handle with the relay registry.
+        let attach: (ProviderRelayHandle) -> Bool
+        /// Releases the registry reservation this ticket holds.
+        let finish: () -> Void
+
+        init(
+            socksPort: UInt16,
+            credentials: SOCKSCredentials?,
+            generation: String,
+            attach: @escaping (ProviderRelayHandle) -> Bool,
+            finish: @escaping () -> Void
+        ) {
+            self.socksPort = socksPort
+            self.credentials = credentials
+            self.generation = generation
+            self.attach = attach
+            self.finish = finish
+        }
+    }
+
     private enum RelayError: Error {
         case invalidEndpoint
         case socksUnavailable
         case socksProtocol(String)
-        case fragmentedDatagram
+        case flowClosed
+        case generationUnavailable
+        case associationEnded
     }
 
-    static func makeHandle(
+    /// Raised by the downlink half when the application flow itself failed.
+    /// Re-associating cannot help, so the supervisor stops.
+    private struct FlowFailure: Error {
+        let underlying: Error
+    }
+
+    private enum AssociationOutcome {
+        case associationEnded(stage: String, error: Error?, duration: TimeInterval)
+        case flowEnded(stage: String, error: Error?)
+    }
+
+    static func start(
         flow: NEAppProxyUDPFlow,
-        socksPort: UInt16,
-        credentials: SOCKSCredentials? = nil,
+        initialTicket: AssociationTicket,
+        nextTicket: @escaping @Sendable () -> AssociationTicket?,
+        policy: RelayReassociationPolicy = .default,
+        traffic: ProviderTrafficLedger,
+        logger: Logger
+    ) {
+        let channel = UDPFlowChannel(flow: flow)
+        Task.detached(priority: .userInitiated) {
+            await supervise(
+                channel: channel,
+                initialTicket: initialTicket,
+                nextTicket: nextTicket,
+                policy: policy,
+                traffic: traffic,
+                logger: logger
+            )
+        }
+    }
+
+    private static func supervise(
+        channel: UDPFlowChannel,
+        initialTicket: AssociationTicket,
+        nextTicket: @escaping @Sendable () -> AssociationTicket?,
+        policy: RelayReassociationPolicy,
+        traffic: ProviderTrafficLedger,
+        logger: Logger
+    ) async {
+        let trialID = initialTicket.generation
+        do {
+            // UDP callers may send and close before a SOCKS association can
+            // finish. Open immediately so NetworkExtension retains and buffers
+            // the flow while the fail-closed relay is prepared.
+            try await open(channel.flow)
+        } catch {
+            if isExpectedFlowClosure(error) {
+                logger.debug(
+                    "udp-relay-closed trial=\(trialID, privacy: .public) stage=flow-open code=\(diagnosticCode(error), privacy: .public)"
+                )
+            } else {
+                logger.error(
+                    "udp-relay-error trial=\(trialID, privacy: .public) stage=flow-open code=\(diagnosticCode(error), privacy: .public)"
+                )
+            }
+            initialTicket.finish()
+            channel.close(with: error)
+            return
+        }
+
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await uplink(
+                    channel: channel,
+                    trialID: trialID,
+                    traffic: traffic,
+                    logger: logger
+                )
+            }
+            group.addTask {
+                await associationLoop(
+                    channel: channel,
+                    initialTicket: initialTicket,
+                    nextTicket: nextTicket,
+                    policy: policy,
+                    traffic: traffic,
+                    logger: logger
+                )
+            }
+            await group.next()
+            // Whichever half finished has already closed the channel, which
+            // unblocks the pending NetworkExtension callback of the other.
+            group.cancelAll()
+            await group.waitForAll()
+        }
+        logger.debug(
+            "udp-relay-finished trial=\(trialID, privacy: .public)"
+        )
+    }
+
+    /// Reads the application's datagrams for the whole life of the flow.
+    ///
+    /// When no association is ready, this loop retains only the bounded batch
+    /// already returned by NetworkExtension. This prevents the first datagram
+    /// from being consumed during the initial SOCKS handshake without creating
+    /// an unbounded application-side queue.
+    private static func uplink(
+        channel: UDPFlowChannel,
         trialID: String,
         traffic: ProviderTrafficLedger,
         logger: Logger
-    ) -> ProviderRelayHandle {
-        let control = NWConnection(
-            host: .ipv4(IPv4Address.loopback),
-            port: Network.NWEndpoint.Port(rawValue: socksPort)!,
-            using: .tcp
-        )
-        let resources = UDPRelayResources(flow: flow, control: control)
-        let shutdown = RelayTaskShutdown { error in
-            resources.close(with: error)
-        }
-        return ProviderRelayHandle(
-            shutdown: shutdown,
-            operation: {
-                var stage = "flow-open"
-                await withTaskCancellationHandler {
-                    do {
-                        // UDP callers may send and close before a SOCKS
-                        // association can finish. Open immediately so
-                        // NetworkExtension retains and buffers the flow while
-                        // the fail-closed relay is prepared.
-                        try await open(flow)
-                        stage = "control-connect"
-                        try await start(control)
-                        stage = "udp-associate"
-                        let boundInterface: String?
-                        if flow.isBound {
-                            guard let interfaceName = flow.interface?.name,
-                                  !interfaceName.isEmpty else {
-                                throw RelayError.invalidEndpoint
-                            }
-                            boundInterface = interfaceName
-                        } else {
-                            boundInterface = nil
-                        }
-                        let relayEndpoint = try await associateUDP(
-                            control,
-                            credentials: credentials,
-                            boundInterface: boundInterface
-                        )
-                        stage = "relay-connect"
-                        let udpRelay = NWConnection(
-                            to: relayEndpoint,
-                            using: .udp
-                        )
-                        resources.install(relay: udpRelay)
-                        try await start(udpRelay)
-                        logger.debug(
-                            "udp-relay-started trial=\(trialID, privacy: .public) endpoint=\(String(describing: relayEndpoint), privacy: .public)"
-                        )
-                        stage = "relay"
-                        try await relay(
-                            flow: flow,
-                            connection: udpRelay,
-                            control: control,
-                            remoteHostname: flow.remoteHostname,
-                            trialID: trialID,
-                            logger: logger,
-                            shutdown: shutdown,
-                            traffic: traffic
-                        )
-                        logger.debug(
-                            "udp-relay-finished trial=\(trialID, privacy: .public)"
-                        )
-                        shutdown.finish(with: nil)
-                    } catch {
-                        if isExpectedFlowClosure(error) {
-                            logger.debug(
-                                "udp-relay-closed trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
-                            )
-                        } else {
-                            logger.error(
-                                "udp-relay-error trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
-                            )
-                        }
-                        shutdown.finish(with: error)
+    ) async {
+        let remoteHostname = channel.flow.remoteHostname
+        do {
+            while !Task.isCancelled {
+                let datagrams = try await readDatagrams(from: channel.flow)
+                guard let datagrams, !datagrams.isEmpty else {
+                    channel.close(with: nil)
+                    return
+                }
+                for (payload, endpoint) in datagrams {
+                    guard let association = try await channel.waitForCurrent()
+                    else { return }
+                    try Task.checkCancellation()
+                    guard let datagramConnection = association.datagramConnection
+                    else {
+                        channel.release(association)
+                        continue
                     }
-                } onCancel: {
-                    shutdown.finish(with: CancellationError())
+                    let packet: Data
+                    do {
+                        packet = try channel.codec.encode(
+                            payload: payload,
+                            destination: endpoint,
+                            remoteHostname: remoteHostname
+                        )
+                    } catch {
+                        logger.debug(
+                            "udp-send-dropped trial=\(trialID, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                        )
+                        continue
+                    }
+                    do {
+                        try await send(packet, to: datagramConnection)
+                    } catch {
+                        // An upstream send failure invalidates the association,
+                        // not the flow. Retire it and let the supervisor
+                        // re-associate.
+                        channel.release(association, with: error)
+                        continue
+                    }
+                    traffic.recordUpload(
+                        payload.count,
+                        transactionID: association.generation
+                    )
                 }
             }
+        } catch {
+            if Task.isCancelled {
+                return
+            }
+            if isExpectedFlowClosure(error) {
+                logger.debug(
+                    "udp-relay-closed trial=\(trialID, privacy: .public) stage=flow-read code=\(diagnosticCode(error), privacy: .public)"
+                )
+            } else {
+                logger.error(
+                    "udp-relay-error trial=\(trialID, privacy: .public) stage=flow-read code=\(diagnosticCode(error), privacy: .public)"
+                )
+            }
+            channel.close(with: error)
+        }
+    }
+
+    private static func associationLoop(
+        channel: UDPFlowChannel,
+        initialTicket: AssociationTicket,
+        nextTicket: @escaping @Sendable () -> AssociationTicket?,
+        policy: RelayReassociationPolicy,
+        traffic: ProviderTrafficLedger,
+        logger: Logger
+    ) async {
+        let trialID = initialTicket.generation
+        var ticket = initialTicket
+        var budget = RelayReassociationBudget(policy: policy)
+
+        while !Task.isCancelled {
+            let outcome = await runAssociation(
+                channel: channel,
+                ticket: ticket,
+                traffic: traffic,
+                logger: logger
+            )
+            if channel.isClosed || Task.isCancelled {
+                return
+            }
+            switch outcome {
+            case let .flowEnded(stage, error):
+                if let error, !isExpectedFlowClosure(error) {
+                    logger.error(
+                        "udp-relay-error trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                    )
+                }
+                channel.close(with: error)
+                return
+            case let .associationEnded(stage, error, duration):
+                guard
+                    let delay = budget.nextDelay(
+                        afterAssociationLasting: duration
+                    )
+                else {
+                    logger.error(
+                        "udp-relay-reassociate-exhausted trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) attempt=\(budget.attempt) code=\(diagnosticCode(error), privacy: .public)"
+                    )
+                    channel.close(
+                        with: error ?? AppProxyFlowCloseError.aborted
+                    )
+                    return
+                }
+                if delay > 0 {
+                    do {
+                        try await Task.sleep(
+                            nanoseconds: UInt64(delay * 1_000_000_000)
+                        )
+                    } catch {
+                        return
+                    }
+                }
+                guard let next = nextTicket() else {
+                    logger.notice(
+                        "udp-relay-reassociate-unavailable trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) attempt=\(budget.attempt)"
+                    )
+                    channel.close(with: AppProxyFlowCloseError.aborted)
+                    return
+                }
+                logger.notice(
+                    "udp-relay-reassociate trial=\(trialID, privacy: .public) generation=\(next.generation, privacy: .public) attempt=\(budget.attempt) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                )
+                ticket = next
+            }
+        }
+    }
+
+    /// Runs one association to completion and reports why it ended.
+    ///
+    /// The handle registered here owns only the association's loopback
+    /// connections: registry cancellation tears those down promptly — keeping
+    /// the bounded handoff drain honest — and never touches the flow.
+    private static func runAssociation(
+        channel: UDPFlowChannel,
+        ticket: AssociationTicket,
+        traffic: ProviderTrafficLedger,
+        logger: Logger
+    ) async -> AssociationOutcome {
+        guard
+            let socksPort = Network.NWEndpoint.Port(
+                rawValue: ticket.socksPort
+            )
+        else {
+            ticket.finish()
+            return .associationEnded(
+                stage: "control-connect",
+                error: RelayError.invalidEndpoint,
+                duration: 0
+            )
+        }
+        let control = NWConnection(
+            host: .ipv4(IPv4Address.loopback),
+            port: socksPort,
+            using: .tcp
         )
+        let association = UDPAssociation(
+            control: control,
+            generation: ticket.generation
+        )
+        let shutdown = RelayTaskShutdown { error in
+            association.tearDown(with: error)
+        }
+        let box = UDPRelayOneShotBox<AssociationOutcome>()
+        let handle = ProviderRelayHandle(
+            shutdown: shutdown,
+            operation: {
+                let outcome = await withTaskCancellationHandler {
+                    await establish(
+                        channel: channel,
+                        association: association,
+                        control: control,
+                        ticket: ticket,
+                        shutdown: shutdown,
+                        traffic: traffic,
+                        logger: logger
+                    )
+                } onCancel: {
+                    shutdown.finish(with: AppProxyFlowCloseError.aborted)
+                }
+                channel.release(association)
+                shutdown.finish(with: AppProxyFlowCloseError.aborted)
+                box.resolve(
+                    outcome
+                )
+            }
+        )
+        guard ticket.attach(handle) else {
+            // The generation moved on between the reservation and here.
+            ticket.finish()
+            association.tearDown(with: AppProxyFlowCloseError.aborted)
+            return .associationEnded(
+                stage: "attach",
+                error: RelayError.generationUnavailable,
+                duration: 0
+            )
+        }
+        guard handle.start(onFinish: { ticket.finish() }) else {
+            ticket.finish()
+            association.tearDown(with: AppProxyFlowCloseError.aborted)
+            return .associationEnded(
+                stage: "attach",
+                error: RelayError.generationUnavailable,
+                duration: 0
+            )
+        }
+        return await box.wait()
+    }
+
+    private static func establish(
+        channel: UDPFlowChannel,
+        association: UDPAssociation,
+        control: NWConnection,
+        ticket: AssociationTicket,
+        shutdown: RelayTaskShutdown,
+        traffic: ProviderTrafficLedger,
+        logger: Logger
+    ) async -> AssociationOutcome {
+        var stage = "control-connect"
+        var healthClock = RelayAssociationHealthClock()
+        do {
+            try await start(control)
+            stage = "udp-associate"
+            let boundInterface: String?
+            if channel.flow.isBound {
+                guard
+                    let interfaceName = channel.flow.interface?.name,
+                    !interfaceName.isEmpty
+                else {
+                    throw RelayError.invalidEndpoint
+                }
+                boundInterface = interfaceName
+            } else {
+                boundInterface = nil
+            }
+            let relayEndpoint = try await associateUDP(
+                control,
+                credentials: ticket.credentials,
+                boundInterface: boundInterface
+            )
+            stage = "relay-connect"
+            let datagramConnection = NWConnection(
+                to: relayEndpoint,
+                using: .udp
+            )
+            association.install(datagram: datagramConnection)
+            try await start(datagramConnection)
+            guard channel.adopt(association) else {
+                throw RelayError.flowClosed
+            }
+            healthClock.markReady()
+            logger.debug(
+                "udp-relay-started trial=\(ticket.generation, privacy: .public) endpoint=\(String(describing: relayEndpoint), privacy: .public)"
+            )
+            stage = "relay"
+            try await RelayTaskGroup.run(
+                operations: [
+                    {
+                        try await downlink(
+                            channel: channel,
+                            association: association,
+                            traffic: traffic,
+                            logger: logger
+                        )
+                    },
+                    {
+                        try await monitorControl(control)
+                    },
+                ],
+                shutdown: shutdown
+            )
+            return .associationEnded(
+                stage: stage,
+                error: RelayError.associationEnded,
+                duration: healthClock.duration()
+            )
+        } catch let failure as FlowFailure {
+            return .flowEnded(stage: stage, error: failure.underlying)
+        } catch {
+            return .associationEnded(
+                stage: stage,
+                error: error,
+                duration: healthClock.duration()
+            )
+        }
+    }
+
+    private static func downlink(
+        channel: UDPFlowChannel,
+        association: UDPAssociation,
+        traffic: ProviderTrafficLedger,
+        logger: Logger
+    ) async throws {
+        while !Task.isCancelled {
+            guard let datagramConnection = association.datagramConnection else {
+                throw RelayError.socksUnavailable
+            }
+            let packet = try await receiveMessage(from: datagramConnection)
+            if packet.isEmpty {
+                return
+            }
+            let decoded: (payload: Data, endpoint: Network.NWEndpoint)?
+            do {
+                decoded = try channel.codec.decode(packet: packet)
+            } catch {
+                // A single malformed datagram is not a reason to retire the
+                // association, let alone the application's socket.
+                logger.debug(
+                    "udp-receive-dropped trial=\(association.generation, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                )
+                continue
+            }
+            guard let decoded else {
+                logger.debug(
+                    "udp-receive-unmapped trial=\(association.generation, privacy: .public)"
+                )
+                continue
+            }
+            do {
+                try await writeDatagrams(
+                    [(decoded.payload, decoded.endpoint)],
+                    to: channel.flow
+                )
+            } catch {
+                throw FlowFailure(underlying: error)
+            }
+            traffic.recordDownload(
+                decoded.payload.count,
+                transactionID: association.generation
+            )
+        }
     }
 
     private static func isExpectedFlowClosure(_ error: Error) -> Bool {
@@ -110,7 +495,10 @@ enum UDPFlowSOCKSRelay {
         return nsError.code == 2 || nsError.code == 5
     }
 
-    private static func diagnosticCode(_ error: Error) -> String {
+    private static func diagnosticCode(_ error: Error?) -> String {
+        guard let error else {
+            return "none"
+        }
         switch error {
         case RelayError.invalidEndpoint:
             return "invalid-endpoint"
@@ -118,8 +506,18 @@ enum UDPFlowSOCKSRelay {
             return "socks-unavailable"
         case RelayError.socksProtocol:
             return "socks-protocol"
-        case RelayError.fragmentedDatagram:
+        case RelayError.flowClosed:
+            return "flow-closed"
+        case RelayError.generationUnavailable:
+            return "generation-unavailable"
+        case RelayError.associationEnded:
+            return "association-ended"
+        case UDPRelayDatagramError.invalidDestination:
+            return "invalid-endpoint"
+        case UDPRelayDatagramError.fragmentedDatagram:
             return "fragmented-datagram"
+        case UDPRelayDatagramError.malformedPacket:
+            return "socks-protocol"
         case let networkError as NWError:
             switch networkError {
             case let .posix(code):
@@ -245,71 +643,6 @@ enum UDPFlowSOCKSRelay {
         }
     }
 
-    private static func relay(
-        flow: NEAppProxyUDPFlow,
-        connection: NWConnection,
-        control: NWConnection,
-        remoteHostname: String?,
-        trialID: String,
-        logger: Logger,
-        shutdown: RelayTaskShutdown,
-        traffic: ProviderTrafficLedger
-    ) async throws {
-        try await RelayTaskGroup.run(
-            operations: [
-                {
-                    while !Task.isCancelled {
-                        let datagrams =
-                            try await readDatagrams(from: flow)
-                        guard let datagrams, !datagrams.isEmpty else {
-                            return
-                        }
-                        for (payload, endpoint) in datagrams {
-                            let packet = try encode(
-                                payload: payload,
-                                destination: endpoint,
-                                remoteHostname: remoteHostname
-                            )
-                            logger.debug(
-                                "udp-send trial=\(trialID, privacy: .public) bytes=\(payload.count)"
-                            )
-                            try await send(packet, to: connection)
-                            traffic.recordUpload(
-                                payload.count,
-                                transactionID: trialID
-                            )
-                        }
-                    }
-                },
-                {
-                    while !Task.isCancelled {
-                        let packet =
-                            try await receiveMessage(from: connection)
-                        if packet.isEmpty {
-                            return
-                        }
-                        let decoded = try decode(packet: packet)
-                        logger.debug(
-                            "udp-receive trial=\(trialID, privacy: .public) bytes=\(decoded.payload.count)"
-                        )
-                        try await writeDatagrams(
-                            [(decoded.payload, decoded.endpoint)],
-                            to: flow
-                        )
-                        traffic.recordDownload(
-                            decoded.payload.count,
-                            transactionID: trialID
-                        )
-                    }
-                },
-                {
-                    try await monitorControl(control)
-                },
-            ],
-            shutdown: shutdown
-        )
-    }
-
     private static func readDatagrams(
         from flow: NEAppProxyUDPFlow
     ) async throws -> [(Data, Network.NWEndpoint)]? {
@@ -360,118 +693,12 @@ enum UDPFlowSOCKSRelay {
                         )
                     )
                 } else if isComplete {
-                    completion(.failure(CancellationError()))
+                    completion(.failure(RelayError.associationEnded))
                 } else {
                     completion(.failure(RelayError.socksUnavailable))
                 }
             }
         }
-    }
-
-    private static func encode(
-        payload: Data,
-        destination: Network.NWEndpoint,
-        remoteHostname: String?
-    ) throws -> Data {
-        guard case let .hostPort(host, port) = destination else {
-            throw RelayError.invalidEndpoint
-        }
-        let socksHost = TransparentProxyFlowMetadata.datagramSOCKSHost(
-            hostname: remoteHostname,
-            endpointHost: host,
-            endpointPort: port
-        )
-        var packet = Data([0x00, 0x00, 0x00])
-        switch socksHost {
-        case let .ipv4(address):
-            packet.append(0x01)
-            packet.append(address.rawValue)
-        case let .ipv6(address):
-            packet.append(0x04)
-            packet.append(address.rawValue)
-        case let .name(name, _):
-            let raw = Array(name.utf8)
-            guard !raw.isEmpty, raw.count <= 255 else {
-                throw RelayError.invalidEndpoint
-            }
-            packet.append(0x03)
-            packet.append(UInt8(raw.count))
-            packet.append(contentsOf: raw)
-        @unknown default:
-            throw RelayError.invalidEndpoint
-        }
-        packet.append(UInt8(port.rawValue >> 8))
-        packet.append(UInt8(port.rawValue & 0xff))
-        packet.append(payload)
-        return packet
-    }
-
-    private static func decode(
-        packet: Data
-    ) throws -> (payload: Data, endpoint: Network.NWEndpoint) {
-        guard packet.count >= 7, packet[0] == 0, packet[1] == 0 else {
-            throw RelayError.socksProtocol("invalid UDP packet")
-        }
-        guard packet[2] == 0 else {
-            throw RelayError.fragmentedDatagram
-        }
-        var offset = 4
-        let host: Network.NWEndpoint.Host
-        switch packet[3] {
-        case 0x01:
-            guard packet.count >= offset + 4 + 2 else {
-                throw RelayError.socksProtocol("short IPv4 UDP packet")
-            }
-            host = Network.NWEndpoint.Host(
-                "\(packet[offset]).\(packet[offset + 1]).\(packet[offset + 2]).\(packet[offset + 3])"
-            )
-            offset += 4
-        case 0x03:
-            guard packet.count > offset else {
-                throw RelayError.socksProtocol("short domain UDP packet")
-            }
-            let length = Int(packet[offset])
-            offset += 1
-            guard packet.count >= offset + length + 2 else {
-                throw RelayError.socksProtocol("short domain UDP packet")
-            }
-            guard
-                let name = String(
-                    data: packet.subdata(in: offset ..< offset + length),
-                    encoding: .utf8
-                )
-            else {
-                throw RelayError.socksProtocol("invalid UDP hostname")
-            }
-            host = Network.NWEndpoint.Host(name)
-            offset += length
-        case 0x04:
-            guard packet.count >= offset + 16 + 2 else {
-                throw RelayError.socksProtocol("short IPv6 UDP packet")
-            }
-            guard
-                let address = IPv6Address(
-                    packet.subdata(in: offset ..< offset + 16)
-                )
-            else {
-                throw RelayError.socksProtocol("invalid IPv6 UDP packet")
-            }
-            host = .ipv6(address)
-            offset += 16
-        default:
-            throw RelayError.socksProtocol("invalid UDP address type")
-        }
-        let port = UInt16(packet[offset]) << 8 | UInt16(packet[offset + 1])
-        offset += 2
-        guard
-            let endpointPort = Network.NWEndpoint.Port(rawValue: port)
-        else {
-            throw RelayError.socksProtocol("invalid UDP port")
-        }
-        return (
-            packet.subdata(in: offset ..< packet.count),
-            .hostPort(host: host, port: endpointPort)
-        )
     }
 
     private static func open(_ flow: NEAppProxyFlow) async throws {
@@ -593,49 +820,159 @@ private final class UDPRelayGate: @unchecked Sendable {
     }
 }
 
-private final class UDPRelayResources: @unchecked Sendable {
+/// The loopback connections of one SOCKS UDP association.
+///
+/// Tearing an association down is idempotent and never touches the flow, so a
+/// registry cancellation and a natural failure cannot turn into a double close
+/// or into an application-visible socket death.
+private final class UDPAssociation: @unchecked Sendable {
+    let id = UUID()
+    let generation: String
+
     private let lock = NSLock()
-    private let flow: NEAppProxyUDPFlow
     private let control: NWConnection
-    private var relay: NWConnection?
-    private var closed = false
+    private var datagram: NWConnection?
+    private var torn = false
 
-    init(flow: NEAppProxyUDPFlow, control: NWConnection) {
-        self.flow = flow
+    init(control: NWConnection, generation: String) {
         self.control = control
+        self.generation = generation
     }
 
-    func install(relay: NWConnection) {
+    var datagramConnection: NWConnection? {
         lock.lock()
-        if closed {
+        defer { lock.unlock() }
+        return torn ? nil : datagram
+    }
+
+    func install(datagram: NWConnection) {
+        lock.lock()
+        if torn {
             lock.unlock()
-            relay.forceCancel()
+            datagram.forceCancel()
             return
         }
-        self.relay = relay
+        self.datagram = datagram
         lock.unlock()
     }
 
-    func close(with error: Error?) {
+    func tearDown(with error: Error?) {
         lock.lock()
-        guard !closed else {
+        guard !torn else {
             lock.unlock()
             return
         }
-        closed = true
-        let currentRelay = relay
-        relay = nil
+        torn = true
+        let datagramConnection = datagram
+        datagram = nil
         lock.unlock()
 
-        RelayConnectionCancellation.cancel(control, error: error)
-        if let currentRelay {
+        // An association is only ever retired because its engine generation or
+        // its listener is gone. Graceful protocol shutdown of a loopback
+        // connection whose peer has vanished can hang, so always force.
+        let cancellationError = error ?? AppProxyFlowCloseError.aborted
+        RelayConnectionCancellation.cancel(control, error: cancellationError)
+        if let datagramConnection {
             RelayConnectionCancellation.cancel(
-                currentRelay,
-                error: error
+                datagramConnection,
+                error: cancellationError
             )
         }
+    }
+}
+
+/// Owns the application-facing flow across every association it outlives.
+private final class UDPFlowChannel: @unchecked Sendable {
+    let flow: NEAppProxyUDPFlow
+    let codec = UDPRelayDatagramCodec()
+
+    private let associationSlot = RelayAssociationSlot<UDPAssociation>()
+
+    init(flow: NEAppProxyUDPFlow) {
+        self.flow = flow
+    }
+
+    var isClosed: Bool {
+        associationSlot.isClosed
+    }
+
+    func waitForCurrent() async throws -> UDPAssociation? {
+        try await associationSlot.waitForCurrent()
+    }
+
+    /// Publishes a ready association. Returns false once the flow has ended.
+    func adopt(_ candidate: UDPAssociation) -> Bool {
+        let result = associationSlot.adopt(candidate)
+        guard result.accepted else {
+            return false
+        }
+        if let previous = result.replaced, previous.id != candidate.id {
+            previous.tearDown(with: AppProxyFlowCloseError.aborted)
+        }
+        return true
+    }
+
+    func release(
+        _ candidate: UDPAssociation,
+        with error: Error? = AppProxyFlowCloseError.aborted
+    ) {
+        associationSlot.release(candidate)
+        candidate.tearDown(with: error)
+    }
+
+    /// Closes the application's flow exactly once. This is the only place a
+    /// UDP flow dies, and it happens only when the flow itself failed or no
+    /// engine generation can carry it any more.
+    func close(with error: Error?) {
+        let result = associationSlot.close()
+        guard result.didClose else {
+            return
+        }
+
+        result.current?.tearDown(
+            with: error ?? AppProxyFlowCloseError.aborted
+        )
         let sourceError = AppProxyFlowCloseError.normalize(error)
         flow.closeReadWithError(sourceError)
         flow.closeWriteWithError(sourceError)
+    }
+}
+
+/// One-shot hand-off from the association's unstructured task to the
+/// supervisor awaiting its outcome.
+private final class UDPRelayOneShotBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: Value?
+    private var continuation: CheckedContinuation<Value, Never>?
+    private var resolved = false
+
+    func resolve(_ value: Value) {
+        lock.lock()
+        guard !resolved else {
+            lock.unlock()
+            return
+        }
+        resolved = true
+        let waiter = continuation
+        continuation = nil
+        if waiter == nil {
+            pending = value
+        }
+        lock.unlock()
+        waiter?.resume(returning: value)
+    }
+
+    func wait() async -> Value {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let value = pending {
+                pending = nil
+                lock.unlock()
+                continuation.resume(returning: value)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
     }
 }

@@ -245,7 +245,7 @@ private struct MenuBarLabel: View {
             // 系统 status item 还会增加自身左右 inset；缩窄 label 布局宽度，
             // 但不裁剪 20 pt 的拨盘。
             .frame(width: 16, height: 22)
-            .accessibilityLabel("XDial")
+            .accessibilityLabel(XDialBuildIdentity.productTitle)
             .task(id: animates) {
                 // 状态离开连接中时任务被取消并复位帧号，静态图始终是第 0 帧。
                 guard animates else {

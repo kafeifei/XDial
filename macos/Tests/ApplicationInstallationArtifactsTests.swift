@@ -25,8 +25,9 @@ final class ApplicationInstallationArtifactsTests: XCTestCase {
         XCTAssertTrue(try fixture.ownedArtifacts().isEmpty)
         // The replacer may consume the stage entirely or leave its old contents;
         // any such bundle must be unregistered before removal.
-        XCTAssertTrue(unregistered.allSatisfy { $0.hasPrefix(".XDial.") })
-        XCTAssertTrue(unregistered.contains { $0.hasPrefix(".XDial.backup-") })
+        let prefix = XDialBuildIdentity.installationArtifactPrefix
+        XCTAssertTrue(unregistered.allSatisfy { $0.hasPrefix(prefix + ".") })
+        XCTAssertTrue(unregistered.contains { $0.hasPrefix(prefix + ".backup-") })
     }
 
     func testCopyFailureCleansIncompleteStageAndKeepsExistingApp() throws {
@@ -120,9 +121,10 @@ final class ApplicationInstallationArtifactsTests: XCTestCase {
     func testLegacyCleanupPreservesLiveUntrustedAndUserCopies() throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
-        let stale = fixture.root.appendingPathComponent(".XDial.install-\(UUID()).app")
-        let live = fixture.root.appendingPathComponent(".XDial.backup-\(UUID()).app")
-        let untrusted = fixture.root.appendingPathComponent(".XDial.install-\(UUID()).app")
+        let prefix = XDialBuildIdentity.installationArtifactPrefix
+        let stale = fixture.root.appendingPathComponent("\(prefix).install-\(UUID()).app")
+        let live = fixture.root.appendingPathComponent("\(prefix).backup-\(UUID()).app")
+        let untrusted = fixture.root.appendingPathComponent("\(prefix).install-\(UUID()).app")
         let download = fixture.root.appendingPathComponent("My XDial.app")
         for url in [stale, live, download] { try fixture.makeApp(at: url, marker: "old") }
         try fixture.makeApp(at: untrusted, marker: "unrelated")
@@ -242,7 +244,11 @@ final class ApplicationInstallationArtifactsTests: XCTestCase {
     }
 
     func testUnknownDaemonPathPreservesBundleButUnrelatedProcessDoesNot() {
-        let bundle = URL(fileURLWithPath: "/Applications/.XDial.backup-test.app")
+        let bundle = URL(
+            fileURLWithPath: "/Applications/"
+                + XDialBuildIdentity.installationArtifactPrefix
+                + ".backup-test.app"
+        )
         for snapshot: LocalProcessInventory.Snapshot in [
             .unknown,
             .available([.init(pid: 42, name: "xdial-daemon", executableURL: nil)]),
@@ -271,7 +277,11 @@ final class ApplicationInstallationArtifactsTests: XCTestCase {
 
     private struct Fixture {
         let root: URL
-        var destination: URL { root.appendingPathComponent("XDial.app") }
+        var destination: URL {
+            root.appendingPathComponent(
+                XDialBuildIdentity.applicationBundleName
+            )
+        }
 
         init() throws {
             root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -296,7 +306,8 @@ final class ApplicationInstallationArtifactsTests: XCTestCase {
         ) -> ApplicationInstallationArtifacts {
             ApplicationInstallationArtifacts(
                 destinationURL: destination,
-                applicationIdentifier: "com.kafeifei.xdial.app",
+                applicationIdentifier:
+                    XDialBuildIdentity.applicationIdentifier,
                 teamIdentifier: "test-team",
                 isTrustedApplication: isTrusted,
                 isInUse: isInUse,
@@ -306,7 +317,9 @@ final class ApplicationInstallationArtifactsTests: XCTestCase {
         func abandonedTransaction(team: String = "test-team") throws -> ApplicationInstallationArtifacts.Transaction {
             let transaction = ApplicationInstallationArtifacts.Transaction(
                 schemaVersion: 1, id: UUID(),
-                applicationIdentifier: "com.kafeifei.xdial.app", teamIdentifier: team
+                applicationIdentifier:
+                    XDialBuildIdentity.applicationIdentifier,
+                teamIdentifier: team
             )
             try JSONEncoder().encode(transaction).write(
                 to: root.appendingPathComponent(transaction.receiptName)
@@ -315,7 +328,9 @@ final class ApplicationInstallationArtifactsTests: XCTestCase {
         }
         func ownedArtifacts() throws -> [String] {
             try FileManager.default.contentsOfDirectory(atPath: root.path).filter {
-                $0.hasPrefix(".XDial.") && $0 != ".XDial.installation.lock"
+                let prefix = XDialBuildIdentity.installationArtifactPrefix
+                return $0.hasPrefix(prefix + ".")
+                    && $0 != prefix + ".installation.lock"
             }
         }
     }

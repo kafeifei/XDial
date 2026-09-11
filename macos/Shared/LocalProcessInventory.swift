@@ -19,6 +19,38 @@ enum LocalProcessInventory {
             guard !observed.isEmpty else { return nil }
             return observed.contains { names.contains($0) }
         }
+
+        /// Resolve a daemon process to one installed product channel. A path
+        /// in the explicit sibling bundle is unrelated to this channel; a
+        /// matching name at any other external or unavailable path stays
+        /// unknown because build and recovery copies remain possible.
+        func belongsToProductBundle(
+            _ bundleURL: URL,
+            excludingSiblingBundleURLs: [URL],
+            executableNames: Set<String>
+        ) -> Bool? {
+            if let executableURL {
+                guard matchesExecutableName(in: executableNames) == true
+                else { return false }
+                let executablePath = executableURL.resolvingSymlinksInPath()
+                    .standardizedFileURL.path
+                func isInside(_ candidate: URL) -> Bool {
+                    let path = candidate.resolvingSymlinksInPath()
+                        .standardizedFileURL.path
+                    return executablePath == path
+                        || executablePath.hasPrefix(path + "/")
+                }
+                if isInside(bundleURL) { return true }
+                if excludingSiblingBundleURLs.contains(where: isInside) {
+                    return false
+                }
+                return nil
+            }
+            switch matchesExecutableName(in: executableNames) {
+            case .some(true), .none: return nil
+            case .some(false): return false
+            }
+        }
     }
 
     enum Snapshot: Equatable {

@@ -17,12 +17,32 @@ settings:
     # and monotonically increasing build number.
     MARKETING_VERSION: "0.0.0"
     CURRENT_PROJECT_VERSION: "1"
-    # Bundle identity is a product invariant, not a build-configuration knob.
-    # Debug differs only in code and signing so permissions and macOS-owned
-    # state remain attached to the one XDial identity.
+    # Formal configurations retain their installed identity. Debug owns a
+    # separate app, helper, extension, and data namespace.
     XDIAL_APPLICATION_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app
     XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.transparent-proxy
     XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.app.settings-ui
+    XDIAL_HELPER_IDENTIFIER: com.kafeifei.xdial.app.helper
+    XDIAL_DAEMON_PLIST: com.kafeifei.xdial.app.daemon.plist
+    XDIAL_DAEMON_ENTITLEMENTS: XDialDaemon.entitlements
+    XDIAL_HELPER_SOURCE: "$(SRCROOT)/../build/xdial"
+    XDIAL_PRODUCT_DISPLAY_NAME: XDial
+    XDIAL_SETTINGS_ENTRY_IDENTIFIER: com.kafeifei.xdial.app.settings-entry
+    XDIAL_BUILD_FLAVOR: release
+    XDIAL_UPDATE_ACCEPTANCE_ID: ""
+  configs:
+    Debug:
+      XDIAL_APPLICATION_BUNDLE_IDENTIFIER: com.kafeifei.xdial.debug
+      XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.debug.transparent-proxy
+      XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.debug.settings-ui
+      XDIAL_HELPER_IDENTIFIER: com.kafeifei.xdial.debug.helper
+      XDIAL_DAEMON_PLIST: com.kafeifei.xdial.debug.daemon.plist
+      XDIAL_DAEMON_ENTITLEMENTS: XDialDaemonDebug.entitlements
+      XDIAL_HELPER_SOURCE: "$(SRCROOT)/../build/xdial-debug"
+      XDIAL_PRODUCT_DISPLAY_NAME: Xdial debug
+      XDIAL_SETTINGS_ENTRY_IDENTIFIER: com.kafeifei.xdial.debug.settings-entry
+      XDIAL_BUILD_FLAVOR: debug
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG XDIAL_DEVELOPMENT_IDENTITY"
 
 targets:
   XDialTransparentProxy:
@@ -34,7 +54,7 @@ targets:
     info:
       path: TransparentProxyExtension/Info.plist
       properties:
-        CFBundleDisplayName: XDial Network Extension
+        CFBundleDisplayName: "$(XDIAL_PRODUCT_DISPLAY_NAME) Network Extension"
         CFBundlePackageType: SYSX
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
@@ -55,7 +75,7 @@ targets:
         Debug:
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
-          CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxy.entitlements
+          CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxyDebug.entitlements
         FormalDevelopment:
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
@@ -82,13 +102,14 @@ targets:
     sources:
       - SettingsDockUI
       - Sources/XDial/SettingsDockProxyProtocol.swift
+      - Shared/XDialBuildIdentity.swift
       - path: SettingsDockIcon.icns
         buildPhase: resources
     info:
       path: SettingsDockUI/Info.plist
       properties:
-        CFBundleDisplayName: XDial
-        CFBundleName: XDial
+        CFBundleDisplayName: "$(XDIAL_PRODUCT_DISPLAY_NAME)"
+        CFBundleName: "$(XDIAL_PRODUCT_DISPLAY_NAME)"
         CFBundleIconFile: SettingsDockIcon.icns
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
@@ -128,7 +149,7 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: XDial
+        CFBundleDisplayName: "$(XDIAL_PRODUCT_DISPLAY_NAME)"
         CFBundleIconFile: AppIcon
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
@@ -142,10 +163,12 @@ targets:
         NSLocationUsageDescription: XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。
         NSLocationWhenInUseUsageDescription: XDial 使用当前 Wi-Fi 名称自动选择你配置的场景。
         UTExportedTypeDeclarations:
-          - UTTypeIdentifier: com.kafeifei.xdial.app.settings-entry
+          - UTTypeIdentifier: "$(XDIAL_SETTINGS_ENTRY_IDENTIFIER)"
             UTTypeConformsTo:
               - public.data
             UTTypeDescription: XDial Settings Reorder Item
+        XDialBuildFlavor: "$(XDIAL_BUILD_FLAVOR)"
+        XDialUpdateAcceptanceID: "$(XDIAL_UPDATE_ACCEPTANCE_ID)"
         XDialTransparentProxyBundleIdentifier: "$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)"
     settings:
       base:
@@ -156,7 +179,10 @@ targets:
         Debug:
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
-          CODE_SIGN_ENTITLEMENTS: XDial.entitlements
+          CODE_SIGN_ENTITLEMENTS: XDialDebug.entitlements
+          PRODUCT_NAME: Xdial debug
+          PRODUCT_MODULE_NAME: XDial
+          EXECUTABLE_NAME: XDial
         FormalDevelopment:
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
@@ -248,35 +274,35 @@ targets:
       - name: Embed and sign XDial helper
         script: |
           set -eu
-          helper_source="${SRCROOT}/../build/xdial"
+          helper_source="${XDIAL_HELPER_SOURCE}"
           helper_dir="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/MacOS"
           launchd_dir="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchDaemons"
           test -x "${helper_source}"
           mkdir -p "${helper_dir}" "${launchd_dir}"
           cp "${helper_source}" "${helper_dir}/xdial-daemon"
-          cp "${SRCROOT}/com.kafeifei.xdial.app.daemon.plist" "${launchd_dir}/"
+          cp "${SRCROOT}/${XDIAL_DAEMON_PLIST}" "${launchd_dir}/"
           if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ]; then
             exit 0
           fi
           if [ "${CONFIGURATION}" = "Release" ]; then
             /usr/bin/codesign --force --options runtime --timestamp \
               --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
-              --identifier com.kafeifei.xdial.app.helper \
-              --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
+              --identifier "${XDIAL_HELPER_IDENTIFIER}" \
+              --entitlements "${SRCROOT}/${XDIAL_DAEMON_ENTITLEMENTS}" \
               "${helper_dir}/xdial-daemon"
           else
             /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
-              --identifier com.kafeifei.xdial.app.helper \
-              --entitlements "${SRCROOT}/XDialDaemon.entitlements" \
+              --identifier "${XDIAL_HELPER_IDENTIFIER}" \
+              --entitlements "${SRCROOT}/${XDIAL_DAEMON_ENTITLEMENTS}" \
               "${helper_dir}/xdial-daemon"
           fi
         inputFiles:
-          - "$(SRCROOT)/../build/xdial"
-          - "$(SRCROOT)/com.kafeifei.xdial.app.daemon.plist"
-          - "$(SRCROOT)/XDialDaemon.entitlements"
+          - "$(XDIAL_HELPER_SOURCE)"
+          - "$(SRCROOT)/$(XDIAL_DAEMON_PLIST)"
+          - "$(SRCROOT)/$(XDIAL_DAEMON_ENTITLEMENTS)"
         outputFiles:
           - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/xdial-daemon"
-          - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchDaemons/com.kafeifei.xdial.app.daemon.plist"
+          - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchDaemons/$(XDIAL_DAEMON_PLIST)"
 
   XDialTests:
     type: bundle.unit-test
@@ -289,7 +315,9 @@ targets:
       - Sources/XDial/ApplicationLaunchPolicy.swift
       - Sources/XDial/AppVersion.swift
       - Sources/XDial/AppUpdateStager.swift
+      - Sources/XDial/AppUpdateChecker.swift
       - Sources/XDial/AppUpdateDownloader.swift
+      - Sources/XDial/AppUpdateReleaseLookup.swift
       - Sources/XDial/AppUpdateTransaction.swift
       - Sources/XDial/ApplicationRelocator.swift
       - Sources/XDial/DebugStateRedactor.swift

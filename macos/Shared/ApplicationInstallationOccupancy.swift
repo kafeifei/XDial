@@ -14,18 +14,28 @@ enum ApplicationInstallationOccupancy {
         }
         if applicationURLs.contains(where: contains) { return true }
         guard case let .available(entries) = processes else { return true }
-        let productNames: Set<String> = [
+        var productNames: Set<String> = [
             "XDial", "xdial", "xdial-daemon", "XDial Settings UI",
-            "com.kafeifei.xdial.app.transparent-proxy",
-            "com.kafeifei.xdial.transparent-proxy",
+            XDialBuildIdentity.applicationDisplayName,
+            XDialBuildIdentity.applicationIdentifier,
+            XDialBuildIdentity.helperIdentifier,
+            XDialBuildIdentity.daemonIdentifier,
+            XDialBuildIdentity.transparentProxyIdentifier,
+            XDialBuildIdentity.settingsUIIdentifier,
         ]
+        if XDialBuildIdentity.allowsLegacyCleanup {
+            productNames.formUnion([
+                XDialBuildIdentity.legacyHelperIdentifier,
+                XDialBuildIdentity.legacyTransparentProxyIdentifier,
+            ])
+        }
         return entries.contains { entry in
             guard entry.pid != ignoringPID else { return false }
             if let executableURL = entry.executableURL { return contains(executableURL) }
             // A missing path for a possible product process cannot prove that
             // the bundle is unused. Unrelated named system processes are safe.
             guard let name = entry.name else { return true }
-            return productNames.contains(name) || name.hasPrefix("com.kafeifei.xdial")
+            return productNames.contains(name)
         }
     }
 }

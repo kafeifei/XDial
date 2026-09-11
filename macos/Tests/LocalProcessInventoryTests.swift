@@ -2,6 +2,85 @@ import Foundation
 import XCTest
 
 final class LocalProcessInventoryTests: XCTestCase {
+    func testKnownSiblingPathDoesNotMatchCurrentProductBundle() {
+        let siblingURL = XDialBuildIdentity.isDevelopment
+            ? URL(fileURLWithPath: "/Applications/XDial.app")
+            : URL(fileURLWithPath: "/Applications/Xdial debug.app")
+        let entry = LocalProcessInventory.Entry(
+            pid: 42,
+            name: "xdial-daemon",
+            executableURL: siblingURL.appendingPathComponent(
+                "Contents/MacOS/xdial-daemon"
+            )
+        )
+        XCTAssertEqual(
+            entry.belongsToProductBundle(
+                XDialBuildIdentity.applicationDestinationURL,
+                excludingSiblingBundleURLs: [siblingURL],
+                executableNames: ["xdial", "xdial-daemon"]
+            ),
+            false
+        )
+    }
+
+    func testNameOnlyCommonExecutableHasUnknownProductChannel() {
+        let entry = LocalProcessInventory.Entry(
+            pid: 42,
+            name: "xdial-daemon",
+            executableURL: nil
+        )
+        XCTAssertNil(
+            entry.belongsToProductBundle(
+                XDialBuildIdentity.applicationDestinationURL,
+                excludingSiblingBundleURLs: [
+                    XDialBuildIdentity.siblingApplicationDestinationURL,
+                ],
+                executableNames: ["xdial", "xdial-daemon"]
+            )
+        )
+    }
+
+    func testNonDaemonInCurrentBundleIsNotDaemonOccupancy() {
+        let entry = LocalProcessInventory.Entry(
+            pid: 42,
+            name: "XDial Settings UI",
+            executableURL: XDialBuildIdentity.applicationDestinationURL
+                .appendingPathComponent(
+                    "Contents/Helpers/XDial Settings UI.app/Contents/MacOS/"
+                        + "XDial Settings UI"
+                )
+        )
+        XCTAssertEqual(
+            entry.belongsToProductBundle(
+                XDialBuildIdentity.applicationDestinationURL,
+                excludingSiblingBundleURLs: [
+                    XDialBuildIdentity.siblingApplicationDestinationURL,
+                ],
+                executableNames: ["xdial", "xdial-daemon"]
+            ),
+            false
+        )
+    }
+
+    func testSameNamedDaemonAtUnclassifiedPathRemainsUnknown() {
+        let entry = LocalProcessInventory.Entry(
+            pid: 42,
+            name: "xdial-daemon",
+            executableURL: URL(
+                fileURLWithPath: "/private/tmp/build/xdial-daemon"
+            )
+        )
+        XCTAssertNil(
+            entry.belongsToProductBundle(
+                XDialBuildIdentity.applicationDestinationURL,
+                excludingSiblingBundleURLs: [
+                    XDialBuildIdentity.siblingApplicationDestinationURL,
+                ],
+                executableNames: ["xdial", "xdial-daemon"]
+            )
+        )
+    }
+
     private let productNames: Set<String> = ["xdial", "xdial-daemon"]
 
     func testDeniedNameWithKnownSystemExecutableIsUnrelated() {

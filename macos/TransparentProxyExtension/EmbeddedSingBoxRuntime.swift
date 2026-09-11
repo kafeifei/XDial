@@ -24,7 +24,7 @@ struct ApplicationProcessCredential: Sendable {
 
 final class EmbeddedSingBoxRuntime {
     private static let networkStateGroup =
-        "UVZM439VGU.com.kafeifei.xdial.network"
+        XDialBuildIdentity.appGroupIdentifier
 
     struct Session {
         let networkEpochID: String
@@ -1478,7 +1478,8 @@ final class EmbeddedSingBoxRuntime {
         }
         let probeState = LineAddressFamilyProbeState()
         let queue = OperationQueue()
-        queue.name = "com.kafeifei.xdial.line-address-family"
+        queue.name = XDialBuildIdentity.queueLabelPrefix
+            + ".line-address-family"
         queue.qualityOfService = .userInitiated
         queue.maxConcurrentOperationCount = max(
             1,

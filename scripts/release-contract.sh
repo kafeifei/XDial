@@ -8,6 +8,8 @@ readonly RELEASE_SETTINGS_IDENTIFIER="com.kafeifei.xdial.app.settings-ui"
 readonly RELEASE_EXTENSION_IDENTIFIER="com.kafeifei.xdial.app.transparent-proxy"
 readonly RELEASE_HELPER_IDENTIFIER="com.kafeifei.xdial.app.helper"
 readonly RELEASE_TEAM_IDENTIFIER="UVZM439VGU"
+readonly RELEASE_CONTRACT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly DEPLOYMENT_TARGET_VERIFIER="$RELEASE_CONTRACT_DIRECTORY/verify-macos-deployment-target.py"
 
 cleanup_root=""
 cleanup() {
@@ -77,12 +79,17 @@ assert_git_tag() {
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
         || fail "release must run inside a Git worktree"
 
-    local head tagged_commit
+    local head tagged_commit remote_main main_history
     head="$(git rev-parse HEAD)"
     tagged_commit="$(git rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null || true)"
     [[ -n "$tagged_commit" ]] || fail "release tag does not exist locally: $tag"
     [[ "$tagged_commit" == "$head" ]] \
         || fail "release tag $tag does not point at HEAD"
+    remote_main="$(git rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null || true)"
+    [[ -n "$remote_main" ]] || fail "fetch origin/main before validating a release tag"
+    main_history="$(git rev-list --first-parent "$remote_main")"
+    grep -Fxq "$tagged_commit" <<<"$main_history" \
+        || fail "release tag $tag must point to a commit on origin/main's first-parent history"
     [[ -z "$(git status --porcelain)" ]] \
         || fail "release worktree must be clean"
 }
@@ -112,6 +119,12 @@ assert_plist_nonempty() {
     [[ -f "$plist" ]] || fail "missing Info.plist: $plist"
     actual="$(plist_value "$plist" "$key")"
     [[ -n "$actual" ]] || fail "$plist $key must not be empty"
+}
+
+assert_app_deployment_target() {
+    local app_path="$1"
+    python3 "$DEPLOYMENT_TARGET_VERIFIER" "$app_path" >/dev/null \
+        || fail "$app_path contains an executable newer than its declared macOS minimum"
 }
 
 assert_developer_id_signature() {
@@ -270,6 +283,8 @@ verify_app() {
         || fail "missing System Extension: $extension_path"
     [[ -x "$helper_path" && ! -L "$helper_path" ]] \
         || fail "missing bundled helper: $helper_path"
+
+    assert_app_deployment_target "$app_path"
 
     assert_plist_value "$app_path/Contents/Info.plist" CFBundleIdentifier \
         "$RELEASE_APPLICATION_IDENTIFIER"

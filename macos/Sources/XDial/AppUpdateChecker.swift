@@ -14,6 +14,10 @@ final class AppUpdateChecker: ObservableObject {
     @Published private(set) var downloadProgress: Double = 0
     @Published private(set) var failure: AppUpdateFailure?
     @Published private(set) var stagedUpdate: StagedAppUpdate?
+    @Published private(set) var lastCheckedAt: Date?
+    #if XDIAL_TESTING
+    private(set) var launchAttemptCount = 0
+    #endif
 
     var isUpdateAvailable: Bool { releaseCandidate != nil }
     var isBusy: Bool {
@@ -28,30 +32,31 @@ final class AppUpdateChecker: ObservableObject {
     func installPreparedUpdate(
         reconnectScenarioID: String?
     ) {
-        guard phase == .ready,
+        guard handoffTask == nil,
+              phase == .ready,
               let candidate = releaseCandidate,
               let stagedUpdate else {
             return
         }
-        stopObservingHandoffTermination()
-        do {
-            try AppUpdateRelaunchIntentStore.write(
-                targetVersion: candidate.version,
-                reconnectScenarioID: reconnectScenarioID
-            )
-        } catch {
-            failure = AppUpdateFailure(
-                code: .validationFailed,
-                detail: error.localizedDescription
-            )
-            phase = .failed
-            return
-        }
         failure = nil
-        phase = .handingOff
-        Task { [weak self] in
+        phase = .checking
+        handoffTask = Task { [weak self] in
             guard let self else { return }
+            guard let freshCandidate = await self.revalidate(
+                candidate,
+                preserving: .ready
+            ), self.stagedUpdate == stagedUpdate else {
+                self.handoffTask = nil
+                return
+            }
             do {
+                self.releaseCandidate = freshCandidate
+                try AppUpdateRelaunchIntentStore.write(
+                    targetVersion: freshCandidate.version,
+                    reconnectScenarioID: reconnectScenarioID
+                )
+                self.stopObservingHandoffTermination()
+                self.phase = .handingOff
                 let application = try await self.launchStagedApplication(
                     stagedUpdate.applicationURL
                 )
@@ -64,20 +69,45 @@ final class AppUpdateChecker: ObservableObject {
                 )
                 self.phase = .failed
             }
+            self.handoffTask = nil
         }
     }
 
     private static let pollingInterval: UInt64 = 600_000_000_000
-    private static let latestReleaseURL = URL(
-        string: "https://api.github.com/repos/kafeifei/XDial/releases/latest"
-    )!
+    private static let manualCheckCooldown: TimeInterval = 5
 
+    private let releaseLookup: AppUpdateReleaseLookup
+    private let automaticUpdatesPermitted: @MainActor () -> Bool
     private var checkInFlight = false
     private var downloadTask: Task<Void, Never>?
+    private var handoffTask: Task<Void, Never>?
+    private var cacheRestoreTask: Task<Void, Never>?
     private var handoffTerminationObserver: NSObjectProtocol?
+    private var lastManualCheckStartedAt: Date?
 
-    init() {
-        AppUpdateStager.pruneStaleRoots()
+    init(
+        releaseLookup: AppUpdateReleaseLookup = AppUpdateReleaseLookup(),
+        automaticUpdatesPermitted:
+            @escaping @MainActor () -> Bool = {
+                ApplicationRelocator.permitsAutomaticUpdates
+            },
+        pruneStaleStaging:
+            @escaping @MainActor () -> Void = {
+                AppUpdateStager.pruneStaleRoots()
+            }
+    ) {
+        self.releaseLookup = releaseLookup
+        self.automaticUpdatesPermitted = automaticUpdatesPermitted
+        pruneStaleStaging()
+        cacheRestoreTask = Task { [weak self, releaseLookup] in
+            guard let validatedAt = await releaseLookup.lastValidatedAt(),
+                  let self else { return }
+            if let lastCheckedAt = self.lastCheckedAt,
+               lastCheckedAt >= validatedAt {
+                return
+            }
+            self.lastCheckedAt = validatedAt
+        }
         #if DEBUG
         Self.current = self
         #endif
@@ -85,6 +115,8 @@ final class AppUpdateChecker: ObservableObject {
 
     deinit {
         downloadTask?.cancel()
+        handoffTask?.cancel()
+        cacheRestoreTask?.cancel()
         if let handoffTerminationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(
                 handoffTerminationObserver
@@ -93,7 +125,7 @@ final class AppUpdateChecker: ObservableObject {
     }
 
     func pollForUpdates() async {
-        guard ApplicationRelocator.permitsAutomaticUpdates else { return }
+        guard automaticUpdatesPermitted() else { return }
         while !Task.isCancelled {
             await check(manual: false)
             do {
@@ -107,22 +139,24 @@ final class AppUpdateChecker: ObservableObject {
     }
 
     func checkNow() async {
+        let now = Date()
+        if let lastManualCheckStartedAt,
+           now.timeIntervalSince(lastManualCheckStartedAt)
+            < Self.manualCheckCooldown {
+            return
+        }
+        lastManualCheckStartedAt = now
         await check(manual: true)
     }
 
     func downloadAndPrepare() {
         guard downloadTask == nil,
               let candidate = releaseCandidate,
-              ApplicationRelocator.permitsAutomaticUpdates else {
+              automaticUpdatesPermitted() else {
             return
         }
-        if let stagedUpdate {
-            AppUpdateStager.discard(stagedUpdate)
-            self.stagedUpdate = nil
-        }
-        downloadProgress = 0
         failure = nil
-        phase = .downloading
+        phase = .checking
         downloadTask = Task { [weak self] in
             guard let self else { return }
             await self.runDownload(candidate)
@@ -139,10 +173,15 @@ final class AppUpdateChecker: ObservableObject {
         releaseCandidate = AppUpdateReleaseCandidate(
             tag: tag,
             version: version,
+            build: "9999999999",
+            minimumSystemVersion: "15.0",
+            publishedAt: Date(),
             archiveName: "XDial-\(tag).zip",
             archiveURL: URL(
                 string: "https://github.com/kafeifei/XDial/releases/download/\(tag)/XDial-\(tag).zip"
             )!,
+            archiveSize: 1,
+            archiveSHA256: String(repeating: "0", count: 64),
             releaseNotes: notes
         )
         failure = nil
@@ -164,9 +203,10 @@ final class AppUpdateChecker: ObservableObject {
     private func check(manual: Bool) async {
         guard !checkInFlight,
               downloadTask == nil,
+              handoffTask == nil,
               phase != .ready,
               phase != .handingOff,
-              ApplicationRelocator.permitsAutomaticUpdates else {
+              automaticUpdatesPermitted() else {
             return
         }
         checkInFlight = true
@@ -176,51 +216,35 @@ final class AppUpdateChecker: ObservableObject {
         defer { checkInFlight = false }
 
         do {
-            var request = URLRequest(url: Self.latestReleaseURL)
-            request.timeoutInterval = 8
-            request.cachePolicy = .reloadRevalidatingCacheData
-            request.setValue(
-                "application/vnd.github+json",
-                forHTTPHeaderField: "Accept"
+            let result = try await releaseLookup.check(
+                currentVersion: currentVersion
             )
-            request.setValue(
-                "XDial/\(currentVersion)",
-                forHTTPHeaderField: "User-Agent"
-            )
-
-            let (data, response) = try await URLSession.shared.data(
-                for: request
-            )
-            guard let http = response as? HTTPURLResponse,
-                  http.statusCode == 200 else {
-                throw URLError(.badServerResponse)
-            }
-            do {
-                releaseCandidate = try AppUpdateReleasePolicy
-                    .selectCandidate(
-                        from: data,
-                        currentVersion: currentVersion
-                    )
+            lastCheckedAt = result.checkedAt
+            switch result.availability {
+            case let .available(candidate):
+                releaseCandidate = candidate
                 phase = .available
-            } catch AppUpdateReleaseSelectionError.notNewer {
+            case .upToDate:
                 releaseCandidate = nil
                 phase = .upToDate
+            case .noRelease:
+                releaseCandidate = nil
+                phase = .noRelease
             }
+        } catch is CancellationError {
+            releaseCandidate = previousCandidate
+            phase = previousCandidate == nil ? .idle : .available
         } catch {
             releaseCandidate = previousCandidate
-            if previousCandidate != nil {
-                phase = .available
-            } else if manual {
-                failure = AppUpdateFailure(
-                    code: .checkUnavailable,
-                    detail: error.localizedDescription
-                )
-                phase = .failed
-            } else {
-                phase = .idle
-                appLog(
-                    "update check unavailable: "
-                        + error.localizedDescription
+            failure = AppUpdateFailure(
+                code: .checkUnavailable,
+                detail: error.localizedDescription
+            )
+            phase = previousCandidate == nil ? .failed : .available
+            if !manual {
+                NSLog(
+                    "XDial update check unavailable: %@",
+                    error.localizedDescription
                 )
             }
         }
@@ -230,14 +254,28 @@ final class AppUpdateChecker: ObservableObject {
         _ candidate: AppUpdateReleaseCandidate
     ) async {
         var stagingRoot: URL?
+        guard let candidate = await revalidate(
+            candidate,
+            preserving: .available
+        ) else { return }
         do {
+            if let stagedUpdate {
+                AppUpdateStager.discard(stagedUpdate)
+                self.stagedUpdate = nil
+            }
+            releaseCandidate = candidate
+            downloadProgress = 0
+            failure = nil
+            phase = .downloading
             let rootURL = try AppUpdateStager.makeStagingRoot()
             stagingRoot = rootURL
             let archiveURL = AppUpdateStager.archiveURL(in: rootURL)
             let downloader = AppUpdateDownloader()
             _ = try await downloader.download(
                 from: candidate.archiveURL,
-                to: archiveURL
+                to: archiveURL,
+                expectedSize: candidate.archiveSize,
+                expectedSHA256: candidate.archiveSHA256
             ) { progress in
                 Task { @MainActor [weak self] in
                     guard self?.phase == .downloading else { return }
@@ -252,7 +290,8 @@ final class AppUpdateChecker: ObservableObject {
                     try ApplicationRelocator
                         .validateIncomingUpdateBundle(
                             at: applicationURL,
-                            expectedVersion: candidate.version
+                            expectedVersion: candidate.version,
+                            expectedBuild: candidate.build
                         )
                 }
             }.value
@@ -275,6 +314,57 @@ final class AppUpdateChecker: ObservableObject {
         }
     }
 
+    private func revalidate(
+        _ expected: AppUpdateReleaseCandidate,
+        preserving phaseOnFailure: AppUpdatePhase
+    ) async -> AppUpdateReleaseCandidate? {
+        do {
+            let result = try await releaseLookup.check(
+                currentVersion: currentVersion
+            )
+            lastCheckedAt = result.checkedAt
+            switch result.availability {
+            case let .available(candidate)
+                where candidate.identity == expected.identity:
+                return candidate
+            case let .available(candidate):
+                discardPreparedUpdate()
+                releaseCandidate = candidate
+                failure = AppUpdateFailure(
+                    code: .candidateChanged,
+                    detail: "发布清单已更改，请确认新版本后重试。"
+                )
+                phase = .available
+            case .upToDate, .noRelease:
+                discardPreparedUpdate()
+                releaseCandidate = nil
+                failure = AppUpdateFailure(
+                    code: .candidateChanged,
+                    detail: "这个更新已被撤回或不再适用于当前版本，请重新检查。"
+                )
+                phase = .failed
+            }
+        } catch is CancellationError {
+            phase = phaseOnFailure
+        } catch {
+            releaseCandidate = expected
+            failure = AppUpdateFailure(
+                code: .checkUnavailable,
+                detail: "无法重新确认更新：\(error.localizedDescription)"
+            )
+            phase = phaseOnFailure
+        }
+        return nil
+    }
+
+    private func discardPreparedUpdate() {
+        if let stagedUpdate {
+            AppUpdateStager.discard(stagedUpdate)
+        }
+        stagedUpdate = nil
+        downloadProgress = 0
+    }
+
     private func cleanupStagingRoot(_ rootURL: URL?) {
         guard let rootURL,
               FileManager.default.fileExists(atPath: rootURL.path) else {
@@ -286,6 +376,9 @@ final class AppUpdateChecker: ObservableObject {
     private func launchStagedApplication(
         _ applicationURL: URL
     ) async throws -> NSRunningApplication {
+        #if XDIAL_TESTING
+        launchAttemptCount += 1
+        #endif
         let configuration = NSWorkspace.OpenConfiguration()
         ApplicationLaunchPolicy.configure(
             configuration,
@@ -366,4 +459,25 @@ final class AppUpdateChecker: ObservableObject {
             forInfoDictionaryKey: "CFBundleShortVersionString"
         ) as? String ?? "0"
     }
+
+    #if XDIAL_TESTING
+    func configureForTesting(
+        candidate: AppUpdateReleaseCandidate,
+        stagedUpdate: StagedAppUpdate? = nil,
+        phase: AppUpdatePhase
+    ) {
+        releaseCandidate = candidate
+        self.stagedUpdate = stagedUpdate
+        self.phase = phase
+        failure = nil
+        lastCheckedAt = nil
+        launchAttemptCount = 0
+    }
+
+    func waitForTasksForTesting() async {
+        if let task = cacheRestoreTask { await task.value }
+        while let task = downloadTask { await task.value }
+        while let task = handoffTask { await task.value }
+    }
+    #endif
 }

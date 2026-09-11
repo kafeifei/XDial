@@ -95,7 +95,7 @@ struct InstallationReport: Codable, Equatable {
                 InstallationTaskReport(
                     id: "application",
                     name: "安装 XDial",
-                    detail: "验证并运行 /Applications/XDial.app",
+                    detail: "验证并运行 \(XDialBuildIdentity.applicationDestinationURL.path)",
                     state: applicationAlreadyInstalled ? .ready : .pending,
                     error: nil
                 ),
@@ -321,15 +321,21 @@ enum XDialApplicationIdentifierPolicy {
     // Migration-only identity from old local builds. It is accepted only as
     // the installed predecessor of the canonical app and can never be an
     // incoming replacement identity.
-    static let legacyProbe = "com.kafeifei.xdial.ne-probe"
-    static let legacyRelease = "com.kafeifei.xdial"
-    static let release = "com.kafeifei.xdial.app"
+    static let legacyProbe =
+        XDialBuildIdentity.legacyProbeApplicationIdentifier
+    static let legacyRelease =
+        XDialBuildIdentity.legacyApplicationIdentifier
+    static let release = XDialBuildIdentity.formalApplicationIdentifier
+    static let development =
+        XDialBuildIdentity.developmentApplicationIdentifier
     static let legacyProbeSettingsUI =
-        "com.kafeifei.xdial.ne-probe.settings-ui"
+        XDialBuildIdentity.legacyProbeSettingsUIIdentifier
     static let legacyReleaseSettingsUI =
-        "com.kafeifei.xdial.settings-ui"
+        XDialBuildIdentity.legacySettingsUIIdentifier
     static let releaseSettingsUI =
-        "com.kafeifei.xdial.app.settings-ui"
+        XDialBuildIdentity.formalSettingsUIIdentifier
+    static let developmentSettingsUI =
+        XDialBuildIdentity.developmentSettingsUIIdentifier
 
     static func settingsUIIdentifier(
         forApplicationIdentifier identifier: String
@@ -338,12 +344,13 @@ enum XDialApplicationIdentifierPolicy {
         case legacyProbe: legacyProbeSettingsUI
         case legacyRelease: legacyReleaseSettingsUI
         case release: releaseSettingsUI
+        case development: developmentSettingsUI
         default: nil
         }
     }
 
     static func permitsIncomingInstallation(identifier: String) -> Bool {
-        identifier == release
+        identifier == XDialBuildIdentity.applicationIdentifier
     }
 
     static func permitsReplacement(
@@ -352,19 +359,26 @@ enum XDialApplicationIdentifierPolicy {
         teamIdentifiersMatch: Bool
     ) -> Bool {
         guard teamIdentifiersMatch else { return false }
-        guard incomingIdentifier == release else { return false }
-        let replaceableExistingIdentifiers = Set([
-            legacyProbe,
-            legacyRelease,
-            release,
-        ])
+        guard incomingIdentifier == XDialBuildIdentity.applicationIdentifier
+        else { return false }
+        let replaceableExistingIdentifiers: Set<String>
+        if XDialBuildIdentity.isDevelopment {
+            replaceableExistingIdentifiers = [development]
+        } else {
+            replaceableExistingIdentifiers = [
+                legacyProbe,
+                legacyRelease,
+                release,
+            ]
+        }
         return replaceableExistingIdentifiers.contains(existingIdentifier)
     }
 
     static func obsoleteIdentifiers(
         forInstalledIdentifier identifier: String
     ) -> Set<String> {
-        guard identifier == release else { return [] }
+        guard XDialBuildIdentity.allowsFormalDataMigration,
+              identifier == release else { return [] }
         return [legacyProbe, legacyRelease]
     }
 }

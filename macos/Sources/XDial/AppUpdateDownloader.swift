@@ -1,9 +1,12 @@
+import CryptoKit
 import Foundation
 
 enum AppUpdateDownloadError: LocalizedError {
     case redirectRejected
     case responseRejected
     case archiveTooLarge
+    case archiveSizeMismatch
+    case archiveIntegrityMismatch
     case downloadMissing
     case alreadyRunning
 
@@ -15,6 +18,10 @@ enum AppUpdateDownloadError: LocalizedError {
             "更新服务器返回了无效响应"
         case .archiveTooLarge:
             "更新包超过 512 MiB"
+        case .archiveSizeMismatch:
+            "更新包大小与发布清单不一致"
+        case .archiveIntegrityMismatch:
+            "更新包 SHA-256 与发布清单不一致"
         case .downloadMissing:
             "更新下载完成后没有找到文件"
         case .alreadyRunning:
@@ -33,42 +40,59 @@ final class AppUpdateDownloader: NSObject,
     private var continuation: CheckedContinuation<URL, Error>?
     private var session: URLSession?
     private var destinationURL: URL?
+    private var expectedSize: Int64?
+    private var expectedSHA256: String?
     private var progressHandler: ProgressHandler?
     private var completed = false
 
     func download(
         from url: URL,
         to destinationURL: URL,
+        expectedSize: Int64,
+        expectedSHA256: String,
         progress: @escaping ProgressHandler
     ) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
-            lock.lock()
-            guard self.continuation == nil else {
+        guard AppUpdateArchivePolicy.permitsArchiveByteCount(expectedSize)
+        else { throw AppUpdateDownloadError.archiveSizeMismatch }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                lock.lock()
+                guard self.continuation == nil else {
+                    lock.unlock()
+                    continuation.resume(
+                        throwing: AppUpdateDownloadError.alreadyRunning
+                    )
+                    return
+                }
+                self.continuation = continuation
+                self.destinationURL = destinationURL
+                self.expectedSize = expectedSize
+                self.expectedSHA256 = expectedSHA256
+                progressHandler = progress
+                completed = false
                 lock.unlock()
-                continuation.resume(
-                    throwing: AppUpdateDownloadError.alreadyRunning
-                )
-                return
-            }
-            self.continuation = continuation
-            self.destinationURL = destinationURL
-            progressHandler = progress
-            completed = false
-            lock.unlock()
 
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = 30
-            configuration.timeoutIntervalForResource = 15 * 60
-            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-            let session = URLSession(
-                configuration: configuration,
-                delegate: self,
-                delegateQueue: nil
-            )
-            lock.lock()
-            self.session = session
-            lock.unlock()
-            session.downloadTask(with: url).resume()
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.timeoutIntervalForRequest = 30
+                configuration.timeoutIntervalForResource = 15 * 60
+                configuration.requestCachePolicy =
+                    .reloadIgnoringLocalCacheData
+                let session = URLSession(
+                    configuration: configuration,
+                    delegate: self,
+                    delegateQueue: nil
+                )
+                lock.lock()
+                self.session = session
+                lock.unlock()
+                session.downloadTask(with: url).resume()
+            }
+        } onCancel: {
+            self.cancel()
         }
     }
 
@@ -130,8 +154,10 @@ final class AppUpdateDownloader: NSObject,
         }
         lock.lock()
         let destinationURL = self.destinationURL
+        let expectedSize = self.expectedSize
+        let expectedSHA256 = self.expectedSHA256
         lock.unlock()
-        guard let destinationURL else {
+        guard let destinationURL, let expectedSize, let expectedSHA256 else {
             finish(.failure(AppUpdateDownloadError.downloadMissing))
             return
         }
@@ -146,6 +172,11 @@ final class AppUpdateDownloader: NSObject,
                 finish(.failure(AppUpdateDownloadError.archiveTooLarge))
                 return
             }
+            try AppUpdateArchiveIntegrity.validate(
+                fileURL: location,
+                expectedSize: expectedSize,
+                expectedSHA256: expectedSHA256
+            )
             try FileManager.default.moveItem(
                 at: location,
                 to: destinationURL
@@ -162,6 +193,11 @@ final class AppUpdateDownloader: NSObject,
         didCompleteWithError error: Error?
     ) {
         if let error {
+            if let urlError = error as? URLError,
+               urlError.code == .cancelled {
+                finish(.failure(CancellationError()))
+                return
+            }
             finish(.failure(error))
         }
     }
@@ -175,6 +211,8 @@ final class AppUpdateDownloader: NSObject,
         completed = true
         self.continuation = nil
         destinationURL = nil
+        expectedSize = nil
+        expectedSHA256 = nil
         progressHandler = nil
         let activeSession = session
         session = nil
@@ -182,5 +220,45 @@ final class AppUpdateDownloader: NSObject,
 
         activeSession?.invalidateAndCancel()
         continuation.resume(with: result)
+    }
+
+    private func cancel() {
+        lock.lock()
+        let session = self.session
+        lock.unlock()
+        session?.invalidateAndCancel()
+    }
+
+}
+
+enum AppUpdateArchiveIntegrity {
+    static func validate(
+        fileURL: URL,
+        expectedSize: Int64,
+        expectedSHA256: String
+    ) throws {
+        let values = try fileURL.resourceValues(
+            forKeys: [.fileSizeKey, .isRegularFileKey]
+        )
+        guard values.isRegularFile == true,
+              Int64(values.fileSize ?? 0) == expectedSize else {
+            throw AppUpdateDownloadError.archiveSizeMismatch
+        }
+        guard try sha256(of: fileURL) == expectedSHA256 else {
+            throw AppUpdateDownloadError.archiveIntegrityMismatch
+        }
+    }
+
+    private static func sha256(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let data = try handle.read(upToCount: 1024 * 1024),
+              !data.isEmpty {
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map {
+            String(format: "%02x", $0)
+        }.joined()
     }
 }

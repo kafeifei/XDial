@@ -234,6 +234,7 @@ final class InstallationCoordinator: ObservableObject {
                 unregister: {
                     try await PrivilegeManager.unregisterForRegistrationRefresh(daemon: $0)
                 },
+                registrationMaintenanceTarget: { PrivilegeManager.registrationMaintenanceTarget() },
                 register: { try PrivilegeManager.registerCurrentBundle() },
                 canReconcileRegistrationFailure: { PrivilegeManager.canReconcileRegistrationFailure($0) },
                 finishMaintenance: {
