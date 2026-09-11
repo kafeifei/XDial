@@ -1,5 +1,17 @@
 import Foundation
 
+/// A structured Provider failure; callers must classify `code`, never the
+/// localized display message, when deciding whether an automatic intent retries.
+struct ProviderScenarioSwitchRejectedError: LocalizedError {
+    let code: String
+    let message: String?
+
+    var errorDescription: String? {
+        if let message, !message.isEmpty { return message }
+        return "场景切换失败（\(code)）"
+    }
+}
+
 /// Host-to-Provider control messages for replacing one committed Scenario
 /// transaction while the existing transaction remains live.
 ///
@@ -30,6 +42,7 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
     let underlayDefaultIndex: Int?
     let systemDNSJSON: String?
     let refreshLineRuntimes: Bool?
+    var networkEpochID: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case v
@@ -44,6 +57,7 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
         case underlayDefaultIndex = "underlay_default_index"
         case systemDNSJSON = "system_dns"
         case refreshLineRuntimes = "refresh_line_runtimes"
+        case networkEpochID = "network_epoch_id"
     }
 
     static func switchScenario(
@@ -56,7 +70,8 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
         underlayDefaultName: String,
         underlayDefaultIndex: Int,
         systemDNSJSON: String,
-        refreshLineRuntimes: Bool
+        refreshLineRuntimes: Bool,
+        networkEpochID: String? = nil
     ) -> ProviderScenarioSwitchRequest {
         ProviderScenarioSwitchRequest(
             v: ProviderScenarioSwitchCodec.version,
@@ -70,7 +85,8 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
             underlayDefaultName: underlayDefaultName,
             underlayDefaultIndex: underlayDefaultIndex,
             systemDNSJSON: systemDNSJSON,
-            refreshLineRuntimes: refreshLineRuntimes
+            refreshLineRuntimes: refreshLineRuntimes,
+            networkEpochID: networkEpochID
         )
     }
 
@@ -256,6 +272,11 @@ enum ProviderScenarioSwitchCodec {
         } else if command == .reconcileSwitch {
             allowedKeys.insert("target_transaction_id")
         }
+        // Older hosts have no epoch field. New hosts keep the same opaque
+        // token through every retry of one settled physical network change.
+        if command == .switchScenario, object["network_epoch_id"] != nil {
+            allowedKeys.insert("network_epoch_id")
+        }
         guard Set(object.keys) == allowedKeys else {
             throw ProviderScenarioSwitchCodecError.malformed
         }
@@ -291,7 +312,8 @@ enum ProviderScenarioSwitchCodec {
                 defaultIndex <= Int(Int32.max),
                 let systemDNSJSON = request.systemDNSJSON,
                 isJSONArray(systemDNSJSON),
-                request.refreshLineRuntimes != nil
+                request.refreshLineRuntimes != nil,
+                request.networkEpochID.map(isSafeIdentifier) ?? true
             else {
                 throw ProviderScenarioSwitchCodecError.malformed
             }

@@ -368,7 +368,7 @@ final class InstallationTransactionTests: XCTestCase {
         )
     }
 
-    func testReleaseUnregistersObsoleteApplicationIdentities() {
+    func testReleaseRecognizesObsoleteApplicationIdentities() {
         XCTAssertEqual(
             XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
                 forInstalledIdentifier:
@@ -391,93 +391,6 @@ final class InstallationTransactionTests: XCTestCase {
                 forInstalledIdentifier: "com.example.not-xdial"
             ),
             []
-        )
-    }
-
-    func testReleaseUnregistersNonInstalledApplicationCopies() {
-        XCTAssertTrue(
-            XDialApplicationIdentifierPolicy
-                .shouldUnregisterApplicationRegistration(
-                    installedIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    onDiskIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    isInstalledDestination: false
-                )
-        )
-        XCTAssertTrue(
-            XDialApplicationIdentifierPolicy
-                .shouldUnregisterApplicationRegistration(
-                    installedIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.legacyRelease,
-                    onDiskIdentifier:
-                        XDialApplicationIdentifierPolicy.legacyRelease,
-                    isInstalledDestination: false
-                )
-        )
-        XCTAssertFalse(
-            XDialApplicationIdentifierPolicy
-                .shouldUnregisterApplicationRegistration(
-                    installedIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    onDiskIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    isInstalledDestination: true
-                )
-        )
-        XCTAssertTrue(
-            XDialApplicationIdentifierPolicy
-                .shouldUnregisterApplicationRegistration(
-                    installedIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.legacyProbe,
-                    onDiskIdentifier:
-                        XDialApplicationIdentifierPolicy.legacyProbe,
-                    isInstalledDestination: false
-                )
-        )
-        XCTAssertFalse(
-            XDialApplicationIdentifierPolicy
-                .shouldUnregisterApplicationRegistration(
-                    installedIdentifier:
-                        XDialApplicationIdentifierPolicy.legacyProbe,
-                    registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    onDiskIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    isInstalledDestination: false
-                )
-        )
-        XCTAssertTrue(
-            XDialApplicationIdentifierPolicy
-                .shouldUnregisterApplicationRegistration(
-                    installedIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.legacyProbe,
-                    onDiskIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    isInstalledDestination: false
-                )
-        )
-        XCTAssertFalse(
-            XDialApplicationIdentifierPolicy
-                .shouldUnregisterApplicationRegistration(
-                    installedIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    registeredIdentifier:
-                        XDialApplicationIdentifierPolicy.legacyProbe,
-                    onDiskIdentifier:
-                        XDialApplicationIdentifierPolicy.release,
-                    isInstalledDestination: true
-                )
         )
     }
 

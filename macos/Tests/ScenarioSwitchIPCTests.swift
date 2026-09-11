@@ -14,9 +14,11 @@ final class ScenarioSwitchIPCTests: XCTestCase {
             underlayDefaultName: "en0",
             underlayDefaultIndex: 7,
             systemDNSJSON: "[\"192.0.2.53\"]",
-            refreshLineRuntimes: true
+            refreshLineRuntimes: true,
+            networkEpochID: "host-session.epoch-7"
         )
         XCTAssertEqual(request.refreshLineRuntimes, true)
+        XCTAssertEqual(request.networkEpochID, "host-session.epoch-7")
 
         XCTAssertEqual(
             try ProviderScenarioSwitchCodec.decodeRequest(
@@ -24,6 +26,45 @@ final class ScenarioSwitchIPCTests: XCTestCase {
             ),
             request
         )
+    }
+
+    func testNetworkEpochMustBeBoundedOpaqueIdentifier() throws {
+        for epoch in ["", "Wi-Fi name", String(repeating: "x", count: 129)] {
+            let request = ProviderScenarioSwitchRequest.switchScenario(
+                requestID: "request-1",
+                expectedTransactionID: "source-1",
+                targetTransactionID: "target-1",
+                profileJSON: "{}",
+                connectionReportJSON: "{}",
+                underlayInterfacesJSON: "[]",
+                underlayDefaultName: "en0",
+                underlayDefaultIndex: 7,
+                systemDNSJSON: "[]",
+                refreshLineRuntimes: true,
+                networkEpochID: epoch
+            )
+            XCTAssertThrowsError(try ProviderScenarioSwitchCodec.decodeRequest(
+                ProviderScenarioSwitchCodec.encodeRequest(request)
+            ))
+        }
+    }
+
+    func testOlderHostWithoutNetworkEpochRemainsDecodable() throws {
+        let request = ProviderScenarioSwitchRequest.switchScenario(
+            requestID: "request-1",
+            expectedTransactionID: "source-1",
+            targetTransactionID: "target-1",
+            profileJSON: "{}",
+            connectionReportJSON: "{}",
+            underlayInterfacesJSON: "[]",
+            underlayDefaultName: "en0",
+            underlayDefaultIndex: 7,
+            systemDNSJSON: "[]",
+            refreshLineRuntimes: false
+        )
+        XCTAssertEqual(try ProviderScenarioSwitchCodec.decodeRequest(
+            ProviderScenarioSwitchCodec.encodeRequest(request)
+        ), request)
     }
 
     func testCancelRequestCannotCarryCandidateConfiguration() throws {

@@ -27,10 +27,24 @@ enum PrivilegeManager {
     }
 
     static func register() throws {
-        try service.register()
+        do {
+            try registrationMutationGate.withRegistration { try service.register() }
+        } catch HelperRegistrationMutationGate.Failure.unregisterPending {
+            throw HelperError.registrationRefreshPending
+        }
     }
 
     static func registerCurrentBundle() throws -> Bool {
+        do {
+            return try registrationMutationGate.withRegistration {
+                try registerCurrentBundleWithoutMutationGate()
+            }
+        } catch HelperRegistrationMutationGate.Failure.unregisterPending {
+            throw HelperError.registrationRefreshPending
+        }
+    }
+
+    private static func registerCurrentBundleWithoutMutationGate() throws -> Bool {
         let appService = service
         let statusBefore = appService.status
         appLog("helper register begin status=\(statusBefore.rawValue)")
@@ -75,8 +89,10 @@ enum PrivilegeManager {
 
     private static func recordAcceptedRegistration() throws {
         if let intent = try HelperRegistrationMaintenanceIntent.read() {
+            let identity = try registrationIdentity()
             try HelperRegistrationMaintenanceIntent.update(
-                token: intent.token, phase: "registered", targetHash: registrationIdentity().executableHash
+                token: intent.token, phase: "registered", targetHash: identity.executableHash,
+                registrationFingerprint: identity.fingerprint
             )
         }
     }
@@ -86,7 +102,9 @@ enum PrivilegeManager {
             if let intent = try HelperRegistrationMaintenanceIntent.read() {
                 // Only an acknowledged unregister followed by successful register
                 // can produce this phase. Earlier crashes need a new OS barrier.
-                return intent.phase == "registered" && intent.targetHash == executableHash ? fingerprint : nil
+                return intent.verifiedRegistrationFingerprint(
+                    matching: fingerprint, executableHash: executableHash
+                )
             }
             return savedMarker
         } catch { return nil }
@@ -171,8 +189,7 @@ enum PrivilegeManager {
         return result.status == "disconnected"
     }
 
-    private static let registrationRefreshLock = NSLock()
-    private static var registrationRefreshInFlight = false
+    private static let registrationMutationGate = HelperRegistrationMutationGate()
 
     /// Keep a cooperative live daemon quiesced through the OS completion. A
     /// timeout reports an unknown result; it never releases a lease while a
@@ -279,43 +296,31 @@ enum PrivilegeManager {
     private static func unregisterHoldingLease(
         _ lease: LocalDaemonConnection?, intent: HelperRegistrationMaintenanceIntent.Record
     ) throws {
-        registrationRefreshLock.lock()
-        if registrationRefreshInFlight {
-            registrationRefreshLock.unlock()
+        do {
+            try registrationMutationGate.beginUnregister()
+        } catch {
             lease?.close()
             throw HelperError.registrationRefreshPending
         }
-        registrationRefreshInFlight = true
-        registrationRefreshLock.unlock()
 
         do {
             try HelperRegistrationMaintenanceIntent.update(token: intent.token, phase: "committed")
         } catch {
             lease?.close()
-            registrationRefreshLock.lock()
-            registrationRefreshInFlight = false
-            registrationRefreshLock.unlock()
+            registrationMutationGate.completeUnregister()
             throw error
         }
         if let lease, lease.request("registration-commit")?.ok != true {
             // An unanswered commit may have succeeded. Preserve its intent and
             // quiescence for adoption instead of guessing that it was rejected.
             lease.close()
-            registrationRefreshLock.lock()
-            registrationRefreshInFlight = false
-            registrationRefreshLock.unlock()
+            registrationMutationGate.completeUnregister()
             throw HelperError.registrationRefreshTimedOut
         }
-        let result = UnregisterResult()
-        let completion = DispatchSemaphore(value: 0)
-        let appService = service
-        let statusBefore = appService.status
-        appLog("helper unregister begin status=\(statusBefore.rawValue)")
-        appService.unregister { error in
-            result.record(error)
-            appLog("helper unregister completion statusBefore=\(statusBefore.rawValue)"
-                + " statusAfter=\(appService.status.rawValue) "
-                + ServiceManagementErrorDiagnostics.summary(error))
+        try waitForServiceUnregisterCompletion(
+            timeout: 15,
+            timeoutError: HelperError.registrationRefreshTimedOut
+        ) { error in
             if let error, !ServiceManagementErrorDiagnostics.matches(
                 error, domain: SMAppServiceErrorDomain, code: kSMErrorJobNotFound
             ) {
@@ -332,18 +337,46 @@ enum PrivilegeManager {
                 }
             }
             lease?.close()
-            registrationRefreshLock.lock()
-            registrationRefreshInFlight = false
-            registrationRefreshLock.unlock()
+            registrationMutationGate.completeUnregister()
+        }
+    }
+
+    /// Waits for ServiceManagement's completion instead of treating the
+    /// submission of unregister as a completed lifecycle transition. A nil
+    /// timeout is reserved for the replacement child: its parent keeps the
+    /// outgoing bundle at the canonical path and must not continue or relaunch
+    /// while an OS unregister may still complete later.
+    private static func waitForServiceUnregisterCompletion(
+        timeout: TimeInterval?,
+        timeoutError: Error,
+        acceptMissingJob: Bool = true,
+        onCompletion: @escaping (Error?) -> Void = { _ in }
+    ) throws {
+        let result = UnregisterResult()
+        let completion = DispatchSemaphore(value: 0)
+        let appService = service
+        let statusBefore = appService.status
+        appLog("helper unregister begin status=\(statusBefore.rawValue)")
+        appService.unregister { error in
+            result.record(error)
+            appLog("helper unregister completion statusBefore=\(statusBefore.rawValue)"
+                + " statusAfter=\(appService.status.rawValue) "
+                + ServiceManagementErrorDiagnostics.summary(error))
+            onCompletion(error)
             completion.signal()
         }
-        guard completion.wait(timeout: .now() + 15) == .success else {
-            throw HelperError.registrationRefreshTimedOut
+        if let timeout {
+            guard completion.wait(timeout: .now() + timeout) == .success else {
+                throw timeoutError
+            }
+        } else {
+            completion.wait()
         }
         if let error = result.error {
             if ServiceManagementErrorDiagnostics.matches(
                 error, domain: SMAppServiceErrorDomain, code: kSMErrorJobNotFound
-            ), status == .notRegistered || status == .notFound {
+            ), acceptMissingJob,
+               appService.status == .notRegistered || appService.status == .notFound {
                 return
             }
             throw error
@@ -451,9 +484,76 @@ enum PrivilegeManager {
         }
     }
 
+    /// Wait until the outgoing helper has fully left launchd and the process
+    /// table. Updaters can pass the installed bundle they are about to replace;
+    /// normal uninstall uses the currently running bundle.
+    static func teardownRegisteredHelper(outgoingBundleURL: URL? = nil) async throws {
+        var ownerBundles = [Bundle.main.bundleURL]
+        if let outgoingBundleURL,
+           !ownerBundles.contains(where: {
+               $0.standardizedFileURL.resolvingSymlinksInPath()
+                   == outgoingBundleURL.standardizedFileURL.resolvingSymlinksInPath()
+           }) {
+            ownerBundles.append(outgoingBundleURL)
+        }
+        let replacementTeardown = outgoingBundleURL != nil
+        let maintenanceToken = try HelperRegistrationMaintenanceIntent.read()?.token
+        let authenticatedPID = probeDaemonInfo().flatMap { Int32(exactly: $0.pid) }
+        let coordinator = HelperUninstallCoordinator(
+            authenticatedProcessIDs: Set([authenticatedPID].compactMap { $0 }),
+            requiresUnregister: replacementTeardown,
+            io: .init(
+                unregisterPending: { registrationMutationGate.hasPendingUnregister },
+                registrationStatus: {
+                    switch status {
+                    case .enabled, .requiresApproval:
+                        return .registered
+                    case .notRegistered, .notFound:
+                        return .removed
+                    @unknown default:
+                        return .unknown
+                    }
+                },
+                ownedProcesses: { retainedPIDs in
+                    HelperUninstallCoordinator.ownedDaemonProcesses(
+                        in: LocalProcessInventory.capture(), bundleURLs: ownerBundles,
+                        retaining: retainedPIDs
+                    )
+                },
+                unregister: {
+                    try await Task.detached {
+                        do {
+                            try registrationMutationGate.beginUnregister()
+                        } catch {
+                            throw HelperError.helperUnregisterPending
+                        }
+                        try waitForServiceUnregisterCompletion(
+                            timeout: replacementTeardown ? nil : 15,
+                            timeoutError: HelperError.helperUnregisterTimedOut,
+                            acceptMissingJob: !replacementTeardown
+                        ) { _ in
+                            registrationMutationGate.completeUnregister()
+                        }
+                    }.value
+                },
+                clearMaintenanceIntent: {
+                    if let maintenanceToken {
+                        try HelperRegistrationMaintenanceIntent.clear(token: maintenanceToken)
+                    }
+                },
+                now: { ProcessInfo.processInfo.systemUptime },
+                sleep: { interval in
+                    try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                }
+            )
+        )
+        try await coordinator.run()
+    }
+
     /// 卸载：注销 SMAppService（免密）+ 清运行数据。旧机制残留另走 cleanupLegacy。
-    static func uninstall(deleteData: Bool = false) throws {
-        try? unregister()
+    @MainActor
+    static func uninstall(deleteData: Bool = false) async throws {
+        try await teardownRegisteredHelper()
         if legacyInstalled {
             try cleanupLegacy()
         }
@@ -664,6 +764,8 @@ enum PrivilegeManager {
         case registrationIdentityUnavailable
         case registrationRefreshPending
         case registrationRefreshTimedOut
+        case helperUnregisterPending
+        case helperUnregisterTimedOut
 
         var errorDescription: String? {
             switch self {
@@ -677,6 +779,10 @@ enum PrivilegeManager {
                 "macOS 仍在完成上一笔后台服务注册更新"
             case .registrationRefreshTimedOut:
                 "macOS 未在 15 秒内确认后台服务注销，已停止后续注册操作"
+            case .helperUnregisterPending:
+                "macOS 仍在完成上一笔后台服务注销，已保留 XDial 应用"
+            case .helperUnregisterTimedOut:
+                "macOS 未在 15 秒内确认后台服务注销，已保留 XDial 应用"
             }
         }
     }

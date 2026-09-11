@@ -1,5 +1,25 @@
 import AppKit
 
+if CommandLine.arguments.contains(OutgoingApplicationCleanup.helperReplacementArgument) {
+    let application = NSApplication.shared
+    Task { @MainActor in
+        do {
+            let outgoingURL = try ApplicationRelocator.validateHelperReplacement()
+            appLog("installation outgoing helper teardown begin before bundle replacement")
+            try await PrivilegeManager.teardownRegisteredHelper(outgoingBundleURL: outgoingURL)
+            appLog("installation outgoing helper teardown completed before bundle replacement")
+            fputs("XDial outgoing helper teardown completed.\n", stdout)
+            exit(0)
+        } catch {
+            appLog("installation outgoing helper teardown failed: \(error)")
+            fputs("XDial outgoing helper teardown failed: " + error.localizedDescription + "\n", stderr)
+            exit(1)
+        }
+    }
+    application.run()
+    exit(0)
+}
+
 if CommandLine.arguments.contains(
     OutgoingApplicationCleanup.replacementArgument
 ) {
@@ -97,6 +117,13 @@ if CommandLine.arguments.contains("--uninstall") {
     let deleteData = CommandLine.arguments.contains(
         "--delete-data"
     )
+    do {
+        try ApplicationRelocator.prepareCommandLineUninstall()
+    } catch {
+        fputs("XDial uninstall could not stop the running app: "
+            + error.localizedDescription + "\n", stderr)
+        exit(1)
+    }
     let application = NSApplication.shared
     Task { @MainActor in
         ApplicationUninstaller.run(

@@ -367,32 +367,11 @@ enum XDialApplicationIdentifierPolicy {
         guard identifier == release else { return [] }
         return [legacyProbe, legacyRelease]
     }
-
-    static func shouldUnregisterApplicationRegistration(
-        installedIdentifier: String,
-        registeredIdentifier: String,
-        onDiskIdentifier: String,
-        isInstalledDestination: Bool
-    ) -> Bool {
-        guard installedIdentifier == release else { return false }
-        let obsoleteIdentifiers = Set([legacyProbe, legacyRelease])
-        if obsoleteIdentifiers.contains(registeredIdentifier) {
-            if onDiskIdentifier == registeredIdentifier {
-                return true
-            }
-            // Xcode can rewrite a build product in place while LaunchServices
-            // keeps its former identifier. Unregister that stale non-installed
-            // path without unregistering the canonical /Applications copy.
-            return onDiskIdentifier == release && !isInstalledDestination
-        }
-        return registeredIdentifier == release
-            && onDiskIdentifier == release
-            && !isInstalledDestination
-    }
 }
 
 enum OutgoingApplicationCleanup {
     static let timeout: TimeInterval = 5 * 60
+    static let helperReplacementArgument = "--prepare-helper-for-replacement"
     static let replacementArgument =
         "--prepare-owned-components-for-replacement"
 

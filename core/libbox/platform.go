@@ -61,6 +61,8 @@ type xdPlatformInterface struct {
 	ownInterfaceName   string
 	monitor            *platformInterfaceMonitor
 	bindUnderlaySocket bool
+	lineEpoch          string
+	lineRevision       uint64
 	tunInPackets       atomic.Uint64
 	tunInBytes         atomic.Uint64
 	tunOutPackets      atomic.Uint64
@@ -497,6 +499,7 @@ func (p *xdPlatformInterface) syncLineRuntimeUnderlayFrom(
 	p.networkInterfaces = updatedInterfaces
 	p.ownInterfaceName = updatedOwnInterface
 	p.bindUnderlaySocket = updatedBinding
+	p.lineRevision++
 	networkManager := p.networkManager
 	monitor := p.monitor
 	p.mu.Unlock()
@@ -513,6 +516,25 @@ func (p *xdPlatformInterface) syncLineRuntimeUnderlayFrom(
 	if monitor != nil {
 		monitor.notify(cloneInterface(updatedDefault))
 	}
+}
+
+func (p *xdPlatformInterface) lineNetworkRevision() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lineRevision
+}
+
+// A host network epoch is observed once by the process-owned endpoint, even
+// if several candidate generations are built for address-family convergence.
+func (p *xdPlatformInterface) observeLineNetwork(source *xdPlatformInterface, epoch string) {
+	p.mu.Lock()
+	if p.lineEpoch == epoch {
+		p.mu.Unlock()
+		return
+	}
+	p.lineEpoch = epoch
+	p.mu.Unlock()
+	p.syncLineRuntimeUnderlayFrom(source, true)
 }
 
 func cloneNetworkInterfaces(

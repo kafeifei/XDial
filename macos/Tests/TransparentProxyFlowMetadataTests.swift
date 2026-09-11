@@ -333,9 +333,11 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
 
     func testDatagramSOCKSHostUsesTrustedConnectByNameHostname() throws {
         let address = try XCTUnwrap(IPv6Address("2001:db8::10"))
+        let port = try XCTUnwrap(Network.NWEndpoint.Port(rawValue: 443))
         let selected = TransparentProxyFlowMetadata.datagramSOCKSHost(
             hostname: "connect-by-name.example",
-            endpointHost: .ipv6(address)
+            endpointHost: .ipv6(address),
+            endpointPort: port
         )
 
         guard case let .name(hostname, _) = selected else {
@@ -346,9 +348,11 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
 
     func testDatagramSOCKSHostKeepsLiteralWithoutHostname() throws {
         let address = try XCTUnwrap(IPv6Address("2001:db8::10"))
+        let port = try XCTUnwrap(Network.NWEndpoint.Port(rawValue: 443))
         let selected = TransparentProxyFlowMetadata.datagramSOCKSHost(
             hostname: nil,
-            endpointHost: .ipv6(address)
+            endpointHost: .ipv6(address),
+            endpointPort: port
         )
 
         guard case let .ipv6(selectedAddress) = selected else {
@@ -359,14 +363,46 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
 
     func testDatagramSOCKSHostRejectsInvalidHostname() throws {
         let address = try XCTUnwrap(IPv4Address("192.0.2.10"))
+        let port = try XCTUnwrap(Network.NWEndpoint.Port(rawValue: 443))
         let selected = TransparentProxyFlowMetadata.datagramSOCKSHost(
             hostname: " bad.example",
-            endpointHost: .ipv4(address)
+            endpointHost: .ipv4(address),
+            endpointPort: port
         )
 
         guard case let .ipv4(selectedAddress) = selected else {
             return XCTFail("expected literal IPv4 destination")
         }
         XCTAssertEqual(selectedAddress, address)
+    }
+
+    func testDatagramSOCKSHostKeepsIPv4DNSResolverEndpoint() throws {
+        let resolver = try XCTUnwrap(IPv4Address("172.20.10.1"))
+        let dnsPort = try XCTUnwrap(Network.NWEndpoint.Port(rawValue: 53))
+        let selected = TransparentProxyFlowMetadata.datagramSOCKSHost(
+            hostname: "chatgpt.com",
+            endpointHost: .ipv4(resolver),
+            endpointPort: dnsPort
+        )
+
+        guard case let .ipv4(selectedAddress) = selected else {
+            return XCTFail("expected literal IPv4 resolver destination")
+        }
+        XCTAssertEqual(selectedAddress, resolver)
+    }
+
+    func testDatagramSOCKSHostKeepsIPv6DNSResolverEndpoint() throws {
+        let resolver = try XCTUnwrap(IPv6Address("2001:db8::53"))
+        let dnsPort = try XCTUnwrap(Network.NWEndpoint.Port(rawValue: 53))
+        let selected = TransparentProxyFlowMetadata.datagramSOCKSHost(
+            hostname: "chatgpt.com",
+            endpointHost: .ipv6(resolver),
+            endpointPort: dnsPort
+        )
+
+        guard case let .ipv6(selectedAddress) = selected else {
+            return XCTFail("expected literal IPv6 resolver destination")
+        }
+        XCTAssertEqual(selectedAddress, resolver)
     }
 }

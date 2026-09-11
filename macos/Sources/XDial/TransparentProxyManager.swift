@@ -282,6 +282,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     func switchScenario(
         profileJSON: String,
         refreshLineRuntimes: Bool,
+        networkEpochID: String? = nil,
+        expectedUnderlayFingerprint: String? = nil,
         completion: @escaping (Result<ConnectionReport, Error>) -> Void
     ) {
         guard activeScenarioSwitch == nil else {
@@ -344,6 +346,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             profileJSON: profileJSON,
             targetReportJSON: targetReportJSON,
             refreshLineRuntimes: refreshLineRuntimes,
+            networkEpochID: networkEpochID,
+            expectedUnderlayFingerprint: expectedUnderlayFingerprint,
             candidateReport: targetReport,
             completionGate: HostCompletionGate(completion),
             cancellationRequested: false,
@@ -465,6 +469,22 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             }
             return
         }
+        if let expected = active.expectedUnderlayFingerprint,
+           expected != underlay.epochFingerprint {
+            // A settled epoch is inseparable from its captured network facts.
+            // A later capture cannot silently acquire that epoch's authority.
+            let failure = ProviderScenarioSwitchRejectedError(
+                code: "network-superseded",
+                message: "网络仍在变化，等待新的稳定网络后切换"
+            )
+            finishSourceScenarioSwitchFailure(
+                active,
+                error: failure,
+                code: failure.code,
+                message: failure.localizedDescription
+            )
+            return
+        }
         guard
             let liveSourceReport = ConnectionReportJournal.read(),
             liveSourceReport.transactionID == active.sourceTransactionID,
@@ -523,7 +543,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             underlayDefaultName: underlay.defaultInterface.name,
             underlayDefaultIndex: underlay.defaultInterface.index,
             systemDNSJSON: underlay.systemDNSJSON,
-            refreshLineRuntimes: active.refreshLineRuntimes
+            refreshLineRuntimes: active.refreshLineRuntimes,
+            networkEpochID: active.networkEpochID
         )
         sendScenarioSwitchMessage(request) { [weak self] switchResult in
             self?.finishScenarioSwitch(
@@ -3959,6 +3980,8 @@ private struct HostScenarioSwitch {
     let profileJSON: String
     let targetReportJSON: String
     let refreshLineRuntimes: Bool
+    let networkEpochID: String?
+    let expectedUnderlayFingerprint: String?
     var candidateReport: ConnectionReport
     let completionGate: HostCompletionGate<ConnectionReport>
     var cancellationRequested: Bool
@@ -3970,18 +3993,6 @@ private struct HostScenarioSwitch {
     var progressWorkItem: DispatchWorkItem?
     var underlay: HostUnderlaySnapshot?
     var timeoutWorkItem: DispatchWorkItem?
-}
-
-private struct ProviderScenarioSwitchRejectedError: LocalizedError {
-    let code: String
-    let message: String?
-
-    var errorDescription: String? {
-        if let message, !message.isEmpty {
-            return message
-        }
-        return "场景切换失败（\(code)）"
-    }
 }
 
 private enum ManagerError: LocalizedError {

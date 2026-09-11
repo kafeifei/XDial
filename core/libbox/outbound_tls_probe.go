@@ -65,6 +65,7 @@ type outboundTLSFamilyCapability struct {
 	TCPConnected     int            `json:"tcp_connected"`
 	TLSAuthenticated int            `json:"tls_authenticated"`
 	FailureCodes     map[string]int `json:"failure_codes"`
+	FailureClass     string         `json:"failure_class,omitempty"`
 }
 
 type outboundTLSCapabilities struct {
@@ -76,6 +77,7 @@ type outboundTLSAttemptResult struct {
 	tcpConnected     bool
 	tlsAuthenticated bool
 	failureCode      string
+	failureClass     string
 }
 
 type outboundTLSProbeJob struct {
@@ -124,6 +126,7 @@ func (l *Libbox) ProbeOutboundTLSCapabilities(
 		time.Duration(timeoutMS)*time.Millisecond,
 	)
 	generation := l.boxGeneration
+	networkReadiness := l.activeNetworkReadiness
 	probe := l.probeOutboundTLSCapabilitiesFunc
 	if probe == nil {
 		probe = probeOutboundTLSCapabilities
@@ -133,7 +136,10 @@ func (l *Libbox) ProbeOutboundTLSCapabilities(
 	defer l.runtimeUsers.Done()
 	defer cancel()
 
-	capabilities := probe(ctx, outbound)
+	capabilities, readinessErr := l.probeNetworkOutbound(ctx, networkReadiness, outboundTag, outbound, probe)
+	if readinessErr != nil {
+		return "", readinessErr
+	}
 	if !l.probeGenerationIsCurrent(generation) {
 		return "", fmt.Errorf(
 			"connection changed during outbound TLS probe",
@@ -174,7 +180,10 @@ func (l *Libbox) ProbePreparedSwitchOutboundTLSCapabilities(
 	defer l.switchCandidateUsers.Done()
 	defer cancel()
 
-	capabilities := probe(ctx, outbound)
+	capabilities, readinessErr := l.probeNetworkOutbound(ctx, candidate.networkReadiness, outboundTag, outbound, probe)
+	if readinessErr != nil {
+		return "", readinessErr
+	}
 	if !l.preparedSwitchIsCurrent(candidate) {
 		return "", fmt.Errorf(
 			"switch candidate changed during outbound TLS probe",
@@ -276,6 +285,9 @@ func addOutboundTLSAttemptResult(
 	}
 	if result.failureCode != "" {
 		capability.FailureCodes[result.failureCode]++
+		if readinessPriority(result.failureClass) > readinessPriority(capability.FailureClass) {
+			capability.FailureClass = result.failureClass
+		}
 	}
 }
 
@@ -288,7 +300,8 @@ func probeOutboundTLSAttempt(
 	conn, err := outbound.DialContext(ctx, "tcp", destination)
 	if err != nil {
 		return outboundTLSAttemptResult{
-			failureCode: classifyOutboundTLSDialFailure(ctx, err),
+			failureCode:  classifyOutboundTLSDialFailure(ctx, err),
+			failureClass: outboundTLSReadinessErrorClass(ctx, err),
 		}
 	}
 	defer conn.Close()
@@ -303,6 +316,7 @@ func probeOutboundTLSAttempt(
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return outboundTLSAttemptResult{
 			tcpConnected: true,
+			failureClass: outboundTLSReadinessErrorClass(ctx, err),
 			failureCode: classifyOutboundTLSHandshakeFailure(
 				ctx,
 				err,
@@ -314,6 +328,13 @@ func probeOutboundTLSAttempt(
 		tcpConnected:     true,
 		tlsAuthenticated: true,
 	}
+}
+
+func outboundTLSReadinessErrorClass(ctx context.Context, err error) string {
+	if ctx.Err() != nil {
+		return readinessErrorCode(ctx.Err())
+	}
+	return readinessErrorCode(err)
 }
 
 func classifyOutboundTLSDialFailure(ctx context.Context, err error) string {

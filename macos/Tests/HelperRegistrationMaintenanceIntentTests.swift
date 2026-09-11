@@ -107,7 +107,8 @@ final class HelperRegistrationMaintenanceIntentTests: XCTestCase {
             // The delayed operation must wait on the same lock as a root finalizer.
             XCTAssertEqual(finished.wait(timeout: .now() + 0.05), .timedOut)
             let successor = Intent.Record(version: 1, token: UUID().uuidString,
-                                          targetHash: "new", phase: "prepared", previousPID: nil)
+                                          targetHash: "new", phase: "prepared", previousPID: nil,
+                                          registrationFingerprint: nil)
             // Emulate the current lock owner publishing its successor token.
             let replacement = fixture.root.appendingPathComponent("replacement")
             try JSONEncoder().encode(successor).write(to: replacement)
@@ -200,6 +201,55 @@ final class HelperRegistrationMaintenanceIntentTests: XCTestCase {
             XCTAssertTrue(FileManager.default.fileExists(atPath: path))
         }
         XCTAssertEqual(try Intent.read(at: fixture.path), original)
+    }
+
+    func testRegisteredExecutableCannotProveDifferentRegistrationFingerprint() throws {
+        let record = Intent.Record(
+            version: 1, token: "transaction", targetHash: "same-helper",
+            phase: "registered", previousPID: nil,
+            registrationFingerprint: "old-plist-and-build"
+        )
+
+        XCTAssertNil(record.verifiedRegistrationFingerprint(
+            matching: "new-plist-and-build", executableHash: "same-helper"
+        ))
+    }
+
+    func testRegisteredRecordProvesExactRegistrationFingerprint() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let original = try Intent.establish(
+            targetHash: "current-helper", previousPID: 42, at: fixture.path
+        )
+        try Intent.update(
+            token: original.token, phase: "registered",
+            targetHash: "current-helper", registrationFingerprint: "current-registration",
+            at: fixture.path
+        )
+
+        let record = try XCTUnwrap(Intent.read(at: fixture.path))
+        XCTAssertEqual(record.registrationFingerprint, "current-registration")
+        XCTAssertEqual(record.verifiedRegistrationFingerprint(
+            matching: "current-registration", executableHash: "current-helper"
+        ), "current-registration")
+    }
+
+    func testLegacyRegisteredRecordWithoutFingerprintNeedsVerification() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let legacy = Data("""
+            {"version":1,"token":"legacy","target_hash":"same-helper","phase":"registered"}
+            """.utf8)
+        try legacy.write(to: URL(fileURLWithPath: fixture.path))
+        XCTAssertEqual(chmod(fixture.path, 0o600), 0)
+        try Data().write(to: URL(fileURLWithPath: fixture.path + ".lock"))
+        XCTAssertEqual(chmod(fixture.path + ".lock", 0o600), 0)
+
+        let record = try XCTUnwrap(Intent.read(at: fixture.path))
+        XCTAssertNil(record.registrationFingerprint)
+        XCTAssertNil(record.verifiedRegistrationFingerprint(
+            matching: "current-registration", executableHash: "same-helper"
+        ))
     }
 
     private enum TestFailure: Error { case incompleteRead }

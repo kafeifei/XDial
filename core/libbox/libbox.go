@@ -144,6 +144,11 @@ type Libbox struct {
 	activeLineRuntimeGeneration uint64
 	activeAnyConnectCapability  *anyConnectRuntimeCapability
 	activeTailscaleCapability   pooledTailscaleRuntime
+	activeNetworkReadiness      *lineNetworkGeneration
+	networkEpoch                string
+	networkContextJSON          string
+	networkEpochs               map[string]bool
+	lastNetworkReadiness        *lineNetworkGeneration
 	tailscaleRuntimeIdentity    string
 	tailscaleEndpointTag        string
 	preparedSwitch              *preparedBoxSwitch
@@ -213,6 +218,7 @@ type preparedBoxSwitch struct {
 	tailscaleEndpointTag      string
 	tailscaleCapability       pooledTailscaleRuntime
 	reusedLineIDs             []string
+	networkReadiness          *lineNetworkGeneration
 }
 
 // retiredBoxGeneration is the source generation retained after an atomic
@@ -1058,6 +1064,7 @@ func (l *Libbox) coldStart(
 	runtimeIdentity string,
 	tailscaleLineID string,
 	tailscaleRuntimeIdentity string,
+	networkGenerations ...*lineNetworkGeneration,
 ) error {
 	l.mu.Lock()
 	failLocked := func(code int, err error) error {
@@ -1293,6 +1300,10 @@ func (l *Libbox) coldStart(
 			l.activeLineRuntimeGeneration = runtimeGeneration
 			l.activeAnyConnectCapability = capability
 			l.activeTailscaleCapability = tailscaleCapability
+			l.activeNetworkReadiness = firstLineNetworkGeneration(networkGenerations)
+			if l.activeNetworkReadiness != nil {
+				l.activeNetworkReadiness.install(runtimeGeneration, capability, tailscaleCapability)
+			}
 			if tailscaleSpec != nil {
 				l.tailscaleRuntimeIdentity = tailscaleSpec.identity
 				l.tailscaleEndpointTag = tailscaleSpec.endpointTag
@@ -1433,14 +1444,17 @@ func (l *Libbox) createAnyConnectRuntimeCapability(
 		)
 	}
 	bridge.Start(cSess)
-	return &anyConnectRuntimeCapability{
-		vpn:     l.vpn,
-		line:    newAnyConnectLineRuntime(bridge, dnsServers),
-		bridge:  bridge,
-		session: cSess,
-		config:  config,
-		dnsJSON: string(dnsData),
-	}, nil
+	capability := &anyConnectRuntimeCapability{
+		vpn:      l.vpn,
+		line:     newAnyConnectLineRuntime(bridge, dnsServers),
+		bridge:   bridge,
+		session:  cSess,
+		config:   config,
+		dnsJSON:  string(dnsData),
+		revision: 1,
+	}
+	capability.attachOwner(l, false)
+	return capability, nil
 }
 
 func (l *Libbox) installRoutingProbe(instance *box.Box) *routingProbeTracker {
@@ -1678,6 +1692,7 @@ func (l *Libbox) prepareSwitch(
 	networkInterfacesJSON,
 	defaultInterfaceName string,
 	defaultInterfaceIndex int,
+	networkGenerations ...*lineNetworkGeneration,
 ) error {
 	l.mu.Lock()
 	if !l.running || l.box == nil || l.runtimeCtx == nil {
@@ -1779,10 +1794,11 @@ func (l *Libbox) prepareSwitch(
 				if runtimePlatform == nil {
 					err = fmt.Errorf("Tailscale capability platform is unavailable")
 				} else {
-					runtimePlatform.syncLineRuntimeUnderlayFrom(
-						candidatePlatform,
-						false,
-					)
+					if network := firstLineNetworkGeneration(networkGenerations); network != nil {
+						runtimePlatform.observeLineNetwork(candidatePlatform, network.epoch)
+					} else {
+						runtimePlatform.syncLineRuntimeUnderlayFrom(candidatePlatform, false)
+					}
 					configJSON = tailscaleSpec.consumerConfigJSON
 					if reusesTailscale && tailscaleSpec.lineID != "" {
 						reusedLineIDs = append(
@@ -1816,10 +1832,16 @@ func (l *Libbox) prepareSwitch(
 		if err == nil {
 			var ok bool
 			candidateAnyConnect, ok = pooled.(*anyConnectRuntimeCapability)
-			if !ok || !candidateAnyConnect.available() {
+			if !ok || (!candidateAnyConnect.available() && firstLineNetworkGeneration(networkGenerations) == nil) {
 				err = fmt.Errorf("AnyConnect capability is unavailable")
 			} else if reusesAnyConnect && anyConnectLineID != "" {
 				reusedLineIDs = append(reusedLineIDs, anyConnectLineID)
+			}
+			if err == nil {
+				if network := firstLineNetworkGeneration(networkGenerations); network != nil {
+					candidateAnyConnect.attachOwner(l, true)
+					candidateAnyConnect.observeNetwork(network.epoch, targetAnyConnectConfig)
+				}
 			}
 		}
 	}
@@ -1891,6 +1913,10 @@ func (l *Libbox) prepareSwitch(
 						tailscaleEndpointTag:      tailscaleSpecEndpointTag(tailscaleSpec),
 						tailscaleCapability:       candidateTailscale,
 						reusedLineIDs:             reusedLineIDs,
+						networkReadiness:          firstLineNetworkGeneration(networkGenerations),
+					}
+					if candidate.networkReadiness != nil {
+						candidate.networkReadiness.install(candidateLineRuntimeGeneration, candidateAnyConnect, candidateTailscale)
 					}
 				}
 			}
@@ -1925,7 +1951,7 @@ func (l *Libbox) prepareSwitch(
 			(!reusesAnyConnect ||
 				(l.activeAnyConnectCapability ==
 					candidateAnyConnect &&
-					candidateAnyConnect.available() &&
+					(candidateAnyConnect.available() || firstLineNetworkGeneration(networkGenerations) != nil) &&
 					l.anyConnectRuntimeIdentity ==
 						anyConnectRuntimeIdentity &&
 					l.lineRuntimes.committedIs(
@@ -2061,6 +2087,10 @@ func (l *Libbox) RefreshPreparedSwitchLineRuntimes() error {
 	}
 	capability := candidate.tailscaleCapability
 	platform := candidate.platform
+	if candidate.networkReadiness != nil {
+		l.mu.Unlock()
+		return nil
+	}
 	if capability == nil {
 		l.mu.Unlock()
 		return nil
@@ -2318,6 +2348,7 @@ func (l *Libbox) CommitPreparedSwitch() error {
 	l.routingProbe = candidate.routingProbe
 	l.stateLocks = candidate.stateLocks
 	l.activeLineRuntimeGeneration = candidate.lineRuntimeGeneration
+	l.activeNetworkReadiness = candidate.networkReadiness
 	l.boxGeneration++
 
 	var monitoredSession *session.ConnSession
@@ -2377,6 +2408,12 @@ func (l *Libbox) CommitPreparedSwitch() error {
 func (l *Libbox) validatePreparedSwitchCommitLocked(
 	candidate *preparedBoxSwitch,
 ) error {
+	if candidate != nil && candidate.networkReadiness != nil {
+		if err := candidate.networkReadiness.validate(l.networkEpoch); err != nil {
+			candidate.networkReadiness.recordError(err)
+			return err
+		}
+	}
 	if candidate == nil || candidate.box == nil ||
 		candidate.runtimeCtx == nil || candidate.runtimeCtx.Err() != nil {
 		return fmt.Errorf("switch candidate is unavailable before commit")
@@ -2643,6 +2680,17 @@ func (l *Libbox) monitorSession(generation uint64, cSess *session.ConnSession) {
 	}
 	if !l.running || l.cleaning || l.generation != generation || l.session != cSess {
 		l.mu.Unlock()
+		return
+	}
+	if capability := l.activeAnyConnectCapability; capability != nil {
+		ownerCtx := capability.attachOwner(l, l.activeNetworkReadiness != nil)
+		diagnostics := validAnyConnectDiagnostics(engine.AnyConnectSessionDiagnostics(cSess))
+		l.anyConnectDiagnostics = diagnostics
+		failureMessage := anyConnectFailureMessage(diagnostics)
+		l.lastError = failureMessage
+		l.mu.Unlock()
+		_ = capability.ensureTransport(ownerCtx, false)
+		capability.waitRecoverySettlement()
 		return
 	}
 	anyConnectDiagnostics := validAnyConnectDiagnostics(
@@ -2943,6 +2991,7 @@ func (l *Libbox) detachRunningLocked() (
 	l.tailscaleRuntimeIdentity = ""
 	l.tailscaleEndpointTag = ""
 	l.activeLineRuntimeGeneration = 0
+	l.activeNetworkReadiness = nil
 	l.stateLocks = nil
 	l.session = nil
 	if l.runtimeCancel != nil {

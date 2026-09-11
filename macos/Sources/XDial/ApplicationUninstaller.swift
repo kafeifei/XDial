@@ -19,42 +19,48 @@ enum ApplicationUninstaller {
                 completion(.failure(error))
                 return
             }
-            do {
-                if #available(macOS 13.0, *) {
-                    try? SMAppService.mainApp.unregister()
+            Task { @MainActor in
+                do {
+                    // Keep the bundle in place until unregister completion and
+                    // every XDial-owned helper PID have crossed the teardown barrier.
+                    try await PrivilegeManager.uninstall(deleteData: deleteData)
+                    if #available(macOS 13.0, *) {
+                        let mainAppService = SMAppService.mainApp
+                        if mainAppService.status == .enabled
+                            || mainAppService.status == .requiresApproval {
+                            try await mainAppService.unregister()
+                        }
+                    }
+                    if deleteData {
+                        xdialDefaults.removeObject(
+                            forKey: "xdial.profile"
+                        )
+                        xdialDefaults.removeObject(
+                            forKey: "xdial.language"
+                        )
+                        xdialDefaults.removeObject(
+                            forKey: "xdial.appearance"
+                        )
+                        xdialDefaults.removeObject(
+                            forKey: "xdial.launchAtLogin"
+                        )
+                        xdialDefaults.removeObject(
+                            forKey: "xdial.autoConnect"
+                        )
+                        KeychainStore.deleteVault()
+                        try? FileManager.default.removeItem(
+                            atPath: appLogPath()
+                        )
+                    }
+                    xdialDefaults.removeObject(
+                        forKey: "xdial.installation.ready"
+                    )
+                    try ApplicationRelocator
+                        .moveInstalledApplicationToTrash()
+                    completion(.success(()))
+                } catch {
+                    completion(.failure(error))
                 }
-                try PrivilegeManager.uninstall(
-                    deleteData: deleteData
-                )
-                if deleteData {
-                    xdialDefaults.removeObject(
-                        forKey: "xdial.profile"
-                    )
-                    xdialDefaults.removeObject(
-                        forKey: "xdial.language"
-                    )
-                    xdialDefaults.removeObject(
-                        forKey: "xdial.appearance"
-                    )
-                    xdialDefaults.removeObject(
-                        forKey: "xdial.launchAtLogin"
-                    )
-                    xdialDefaults.removeObject(
-                        forKey: "xdial.autoConnect"
-                    )
-                    KeychainStore.deleteVault()
-                    try? FileManager.default.removeItem(
-                        atPath: appLogPath()
-                    )
-                }
-                xdialDefaults.removeObject(
-                    forKey: "xdial.installation.ready"
-                )
-                try ApplicationRelocator
-                    .moveInstalledApplicationToTrash()
-                completion(.success(()))
-            } catch {
-                completion(.failure(error))
             }
         }
     }

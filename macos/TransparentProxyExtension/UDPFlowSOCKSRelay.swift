@@ -378,7 +378,8 @@ enum UDPFlowSOCKSRelay {
         }
         let socksHost = TransparentProxyFlowMetadata.datagramSOCKSHost(
             hostname: remoteHostname,
-            endpointHost: host
+            endpointHost: host,
+            endpointPort: port
         )
         var packet = Data([0x00, 0x00, 0x00])
         switch socksHost {

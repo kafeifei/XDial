@@ -1190,6 +1190,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     networkSnapshot: networkSnapshot,
                     refreshLineRuntimes:
                         request.refreshLineRuntimes == true,
+                    networkEpochID: request.networkEpochID,
                     sourceSession: sourceSession,
                     reporter: candidateReporter,
                     cancellation: operation.cancellation
@@ -1248,12 +1249,14 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             prepared = candidate
         case let .failure(error):
             abortScenarioSwitchCandidate(runtime)
-            candidateReporter.fail(
-                error,
-                code: EmbeddedSingBoxRuntime.switchFailureCode(
-                    for: error
+            if let failure = error as? ConnectionRuntimeFailure {
+                candidateReporter.fail(failure)
+            } else {
+                candidateReporter.fail(
+                    error,
+                    code: EmbeddedSingBoxRuntime.switchFailureCode(for: error)
                 )
-            )
+            }
             candidateReporter.discardStagedCandidate()
             finishScenarioSwitch(
                 operation,
@@ -1497,6 +1500,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 }
             )
         } catch {
+            let runtimeCode = EmbeddedSingBoxRuntime.switchFailureCode(for: error)
             restoreSourceSettingsAfterScenarioSwitchFailure(
                 operation: operation,
                 runtime: runtime,
@@ -1504,7 +1508,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 sourceSettings: sourceSettings,
                 candidateReporter: candidateReporter,
                 failure: error,
-                code: "switch-runtime-commit-failed",
+                code: runtimeCode == "scenario-switch-prepare-failed"
+                    ? "switch-runtime-commit-failed" : runtimeCode,
                 completionHandler: completionHandler
             )
             return
@@ -1611,7 +1616,11 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         completionHandler: @escaping (Data?) -> Void
     ) {
         abortScenarioSwitchCandidate(runtime)
-        candidateReporter.fail(failure, code: code)
+        if let attributedFailure = failure as? ConnectionRuntimeFailure {
+            candidateReporter.fail(attributedFailure)
+        } else {
+            candidateReporter.fail(failure, code: code)
+        }
         candidateReporter.discardStagedCandidate()
 
         let restoreID = UUID()
@@ -1889,7 +1898,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             ok: false,
             sourceTransactionID: request.expectedTransactionID,
             activeTransactionID: request.expectedTransactionID,
-            code: code,
+            code: AutomaticLineReadinessFailurePolicy.switchCode(for: code),
             message: error.localizedDescription,
             reportJSON: nil
         )

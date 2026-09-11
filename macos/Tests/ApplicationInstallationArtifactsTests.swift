@@ -126,10 +126,15 @@ final class ApplicationInstallationArtifactsTests: XCTestCase {
         let download = fixture.root.appendingPathComponent("My XDial.app")
         for url in [stale, live, download] { try fixture.makeApp(at: url, marker: "old") }
         try fixture.makeApp(at: untrusted, marker: "unrelated")
+        let expectedRegistrationPath = stale.resolvingSymlinksInPath().path
+        var unregistered: [String] = []
         let artifacts = fixture.artifacts(isInUse: {
             $0.resolvingSymlinksInPath().path == live.resolvingSymlinksInPath().path
+        }, unregister: {
+            unregistered.append($0.resolvingSymlinksInPath().path)
         })
         try artifacts.withExclusiveAccess { try artifacts.recoverAbandonedTransactions() }
+        XCTAssertEqual(unregistered, [expectedRegistrationPath])
         XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path))
         for url in [live, untrusted, download] {
             XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), url.path)

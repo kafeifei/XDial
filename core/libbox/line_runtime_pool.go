@@ -3,6 +3,7 @@
 package libbox
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -329,6 +330,9 @@ func (p *lineRuntimePool) detachAll() []lineRuntimeCapability {
 	stopped := make([]lineRuntimeCapability, 0, len(p.entries))
 	for _, entry := range p.entries {
 		if entry != nil && entry.capability != nil {
+			if capability, ok := entry.capability.(*anyConnectRuntimeCapability); ok {
+				capability.cancelOwner()
+			}
 			stopped = append(stopped, entry.capability)
 		}
 	}
@@ -418,27 +422,39 @@ func (p *lineRuntimePool) initializeLocked() {
 }
 
 type anyConnectRuntimeSnapshot struct {
-	line    *anyConnectLineRuntime
-	bridge  *engine.VPNBridge
-	session *session.ConnSession
-	config  engine.VPNConfig
-	dnsJSON string
-	stopped bool
-}
-
-// anyConnectRuntimeCapability is the concrete process-global sslcon capability
-// stored in lineRuntimePool. Its stable Line handle can be borrowed by two Box
-// generations while a switch drains the source generation.
-type anyConnectRuntimeCapability struct {
-	mu       sync.Mutex
-	vpn      vpnClient
 	line     *anyConnectLineRuntime
 	bridge   *engine.VPNBridge
 	session  *session.ConnSession
 	config   engine.VPNConfig
 	dnsJSON  string
 	stopped  bool
-	stopOnce sync.Once
+	revision uint64
+}
+
+// anyConnectRuntimeCapability is the concrete process-global sslcon capability
+// stored in lineRuntimePool. Its stable Line handle can be borrowed by two Box
+// generations while a switch drains the source generation.
+type anyConnectRuntimeCapability struct {
+	mu                   sync.Mutex
+	vpn                  vpnClient
+	line                 *anyConnectLineRuntime
+	bridge               *engine.VPNBridge
+	session              *session.ConnSession
+	config               engine.VPNConfig
+	dnsJSON              string
+	stopped              bool
+	stopOnce             sync.Once
+	ownerCtx             context.Context
+	ownerCancel          context.CancelFunc
+	owner                *Libbox
+	recovery             *anyConnectRecovery
+	revision             uint64
+	networkManaged       bool
+	networkEpoch         string
+	lastRecoveryEpoch    string
+	lastRecoveryRevision uint64
+	lastRecoveryError    error
+	lastRecoverySettled  chan struct{}
 }
 
 func (c *anyConnectRuntimeCapability) kind() lineRuntimeCapabilityKind {
@@ -449,12 +465,13 @@ func (c *anyConnectRuntimeCapability) snapshot() anyConnectRuntimeSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return anyConnectRuntimeSnapshot{
-		line:    c.line,
-		bridge:  c.bridge,
-		session: c.session,
-		config:  c.config,
-		dnsJSON: c.dnsJSON,
-		stopped: c.stopped,
+		line:     c.line,
+		bridge:   c.bridge,
+		session:  c.session,
+		config:   c.config,
+		dnsJSON:  c.dnsJSON,
+		stopped:  c.stopped,
+		revision: c.revision,
 	}
 }
 
@@ -480,6 +497,7 @@ func (c *anyConnectRuntimeCapability) deactivate(
 	c.bridge = nil
 	c.session = nil
 	c.dnsJSON = "[]"
+	c.revision++
 	return true
 }
 
@@ -498,6 +516,7 @@ func (c *anyConnectRuntimeCapability) activate(
 	c.bridge = bridge
 	c.session = cSess
 	c.dnsJSON = dnsServersJSON
+	c.revision++
 	return true
 }
 
@@ -505,6 +524,10 @@ func (c *anyConnectRuntimeCapability) stop() {
 	c.stopOnce.Do(func() {
 		c.mu.Lock()
 		c.stopped = true
+		if c.ownerCancel != nil {
+			c.ownerCancel()
+		}
+		recovery := c.recovery
 		bridge := c.bridge
 		cSess := c.session
 		if c.line != nil && bridge != nil {
@@ -514,6 +537,9 @@ func (c *anyConnectRuntimeCapability) stop() {
 		c.session = nil
 		c.dnsJSON = "[]"
 		c.mu.Unlock()
+		if recovery != nil {
+			<-recovery.done
+		}
 
 		if bridge != nil {
 			bridge.Close()

@@ -24,7 +24,9 @@ final class InstallationCoordinator: ObservableObject {
     @Published private(set) var report = InstallationReport.fresh(
         applicationAlreadyInstalled:
             ApplicationRelocator.isRunningFromApplications
-    )
+    ) {
+        didSet { recordReport() }
+    }
 
     var isReady: Bool { report.isReady }
     var blockingMessage: String {
@@ -33,6 +35,28 @@ final class InstallationCoordinator: ObservableObject {
 
     private var runTask: Task<Void, Never>?
     private let completionMarkerKey = "xdial.installation.ready"
+
+    /// The release build has no debug server. Retain the same credential-free
+    /// report shown by the UI so installation failures can be diagnosed without
+    /// inferring state from separate log messages. PID and build distinguish a
+    /// current run from a report left by a previous application process.
+    private func recordReport() {
+        let snapshot = InstallationReportSnapshot(
+            processIdentifier: ProcessInfo.processInfo.processIdentifier,
+            bundleIdentifier: Bundle.main.bundleIdentifier ?? "unknown",
+            bundleVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion")
+                as? String ?? "unknown",
+            recordedAt: Date(),
+            report: report
+        )
+        let url = URL(fileURLWithPath: appLogPath()).deletingLastPathComponent()
+            .appendingPathComponent("installation-report.json")
+        do {
+            try snapshot.write(to: url)
+        } catch {
+            appLog("installation report could not be saved: \(error.localizedDescription)")
+        }
+    }
 
     private init() {
         TransparentProxyManager.shared.activationStatusHandler = {

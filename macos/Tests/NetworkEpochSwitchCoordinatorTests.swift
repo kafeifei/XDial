@@ -305,6 +305,64 @@ final class NetworkEpochSwitchCoordinatorTests: XCTestCase {
         XCTAssertFalse(coordinator.hasPendingIntent)
     }
 
+    func testSettleDoesNotRecordSuccessBeforeCompletion() {
+        var coordinator = NetworkEpochSwitchCoordinator()
+        let token = coordinator.observeUnderlayChange(
+            currentDesiredScenarioID: "home",
+            underlayFingerprint: "underlay-2"
+        )!
+        let intent = coordinator.settle(token)!
+
+        XCTAssertTrue(coordinator.hasActiveIntent)
+        coordinator.complete(intent, outcome: .invalidated)
+        XCTAssertFalse(coordinator.hasActiveIntent)
+        XCTAssertNotNil(coordinator.observeUnderlayChange(
+            currentDesiredScenarioID: "home",
+            underlayFingerprint: "underlay-2"
+        ))
+    }
+
+    func testRetryableCompletionKeepsIntentAndSuppressesDuplicates() {
+        var coordinator = NetworkEpochSwitchCoordinator()
+        let token = coordinator.observeUnderlayChange(
+            currentDesiredScenarioID: "home",
+            underlayFingerprint: "underlay-2"
+        )!
+        let intent = coordinator.settle(token)!
+
+        XCTAssertTrue(coordinator.complete(
+            intent,
+            outcome: .retryableFailure
+        ))
+        XCTAssertTrue(coordinator.hasActiveIntent)
+        XCTAssertNil(coordinator.observeUnderlayChange(
+            currentDesiredScenarioID: "home",
+            underlayFingerprint: "underlay-2"
+        ))
+    }
+
+    func testTerminalCompletionRecordsTupleAndRejectsLateCompletion() {
+        var coordinator = NetworkEpochSwitchCoordinator()
+        let token = coordinator.observeUnderlayChange(
+            currentDesiredScenarioID: "home",
+            underlayFingerprint: "underlay-2"
+        )!
+        let intent = coordinator.settle(token)!
+
+        XCTAssertTrue(coordinator.complete(
+            intent,
+            outcome: .terminalFailure
+        ))
+        XCTAssertFalse(coordinator.complete(
+            intent,
+            outcome: .succeeded
+        ))
+        XCTAssertNil(coordinator.observeUnderlayChange(
+            currentDesiredScenarioID: "home",
+            underlayFingerprint: "underlay-2"
+        ))
+    }
+
     func testLatestUnmatchedSSIDCanSupersedeTransientMatch() {
         var coordinator = NetworkEpochSwitchCoordinator()
         let transient = coordinator.observeSSIDResolution(
@@ -386,6 +444,26 @@ final class NetworkEpochSwitchCoordinatorTests: XCTestCase {
                 underlayChanged: true
             )
         )
+    }
+
+    func testWakeCanResumeDesiredScenarioAfterSameTupleTerminalFailure() {
+        var coordinator = NetworkEpochSwitchCoordinator()
+        let first = coordinator.observeUnderlayChange(
+            currentDesiredScenarioID: "office",
+            underlayFingerprint: "same-underlay"
+        )!
+        let failed = coordinator.settle(first)!
+        coordinator.complete(failed, outcome: .terminalFailure)
+
+        _ = coordinator.observeSSIDSettling(
+            currentDesiredScenarioID: "office",
+            forceNewEpoch: true
+        )
+        let resumed = coordinator.refreshUnderlayFingerprint(
+            "same-underlay"
+        )!
+
+        XCTAssertNotNil(coordinator.settle(resumed))
     }
 
     func testPathRestorationRefreshesEquivalentSnapshot() {

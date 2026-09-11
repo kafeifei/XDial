@@ -61,6 +61,13 @@ struct SSIDScenarioSelectionState {
 /// window using the returned token and asks `settle` for the one final intent.
 /// A stale timer can never consume a newer epoch revision.
 struct NetworkEpochSwitchCoordinator {
+    enum CompletionOutcome: Equatable {
+        case succeeded
+        case retryableFailure
+        case terminalFailure
+        case invalidated
+    }
+
     struct QuietToken: Equatable {
         let epoch: UInt64
         let revision: UInt64
@@ -90,9 +97,12 @@ struct NetworkEpochSwitchCoordinator {
     private var nextEpoch: UInt64 = 0
     private var nextRevision: UInt64 = 0
     private var pending: Pending?
+    private var activeIntent: Intent?
     private var lastSettledTuple: SettledTuple?
 
     var hasPendingIntent: Bool { pending != nil }
+    var hasActiveIntent: Bool { activeIntent != nil }
+    var pendingDesiredScenarioID: String? { pending?.desiredScenarioID }
 
     func hasUnderlayFingerprint(_ fingerprint: String) -> Bool {
         pending?.underlayFingerprint == fingerprint
@@ -108,10 +118,13 @@ struct NetworkEpochSwitchCoordinator {
             return nil
         }
         if pending == nil {
-            if !forceNewEpoch, lastSettledTuple == SettledTuple(
+            let observedTuple = SettledTuple(
                 desiredScenarioID: currentDesiredScenarioID,
                 underlayFingerprint: underlayFingerprint
-            ) {
+            )
+            if !forceNewEpoch,
+               lastSettledTuple == observedTuple
+                || activeIntent.map({ tuple(for: $0) }) == observedTuple {
                 return nil
             }
             let created = makePending(
@@ -160,7 +173,8 @@ struct NetworkEpochSwitchCoordinator {
     /// physical epoch so an Underlay-only timer cannot settle just before the
     /// delayed SSID sample arrives.
     mutating func observeSSIDSettling(
-        currentDesiredScenarioID: String
+        currentDesiredScenarioID: String,
+        forceNewEpoch: Bool = false
     ) -> QuietToken? {
         guard !currentDesiredScenarioID.isEmpty else { return nil }
         if pending == nil {
@@ -168,9 +182,12 @@ struct NetworkEpochSwitchCoordinator {
                 desiredScenarioID: currentDesiredScenarioID,
                 underlayFingerprint: nil,
                 underlayChanged: false,
-                permitsRepeatedTuple: false
+                permitsRepeatedTuple: forceNewEpoch
             )
         } else {
+            if forceNewEpoch {
+                pending?.permitsRepeatedTuple = true
+            }
             bumpRevision()
         }
         return currentToken
@@ -198,6 +215,7 @@ struct NetworkEpochSwitchCoordinator {
         // It preserves the current Scenario but separates a later return to a
         // previously seen (Scenario, Underlay) tuple from a delayed duplicate.
         lastSettledTuple = nil
+        activeIntent = nil
     }
 
     func isCurrent(_ token: QuietToken) -> Bool {
@@ -220,17 +238,45 @@ struct NetworkEpochSwitchCoordinator {
         guard pending.permitsRepeatedTuple || tuple != lastSettledTuple else {
             return nil
         }
-        lastSettledTuple = tuple
-        return Intent(
+        guard pending.permitsRepeatedTuple
+                || activeIntent.map({ self.tuple(for: $0) }) != tuple else {
+            return nil
+        }
+        let intent = Intent(
             epoch: pending.epoch,
             desiredScenarioID: pending.desiredScenarioID,
             underlayFingerprint: underlayFingerprint,
             underlayChanged: pending.underlayChanged
         )
+        activeIntent = intent
+        return intent
+    }
+
+    /// Completes only the currently active settled intent. Retryable failures
+    /// keep that identity active so repeated notifications cannot create a
+    /// second budget. Terminal outcomes are remembered for tuple de-duplication;
+    /// explicit invalidation leaves the tuple eligible for a future epoch.
+    @discardableResult
+    mutating func complete(
+        _ intent: Intent,
+        outcome: CompletionOutcome
+    ) -> Bool {
+        guard activeIntent == intent else { return false }
+        switch outcome {
+        case .retryableFailure:
+            return true
+        case .succeeded, .terminalFailure:
+            lastSettledTuple = tuple(for: intent)
+            activeIntent = nil
+        case .invalidated:
+            activeIntent = nil
+        }
+        return true
     }
 
     mutating func cancel() {
         pending = nil
+        activeIntent = nil
         nextRevision &+= 1
     }
 
@@ -261,6 +307,13 @@ struct NetworkEpochSwitchCoordinator {
     private mutating func bumpRevision() {
         nextRevision &+= 1
         pending?.revision = nextRevision
+    }
+
+    private func tuple(for intent: Intent) -> SettledTuple {
+        SettledTuple(
+            desiredScenarioID: intent.desiredScenarioID,
+            underlayFingerprint: intent.underlayFingerprint
+        )
     }
 }
 

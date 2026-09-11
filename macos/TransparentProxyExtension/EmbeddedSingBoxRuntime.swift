@@ -27,6 +27,7 @@ final class EmbeddedSingBoxRuntime {
         "UVZM439VGU.com.kafeifei.xdial.network"
 
     struct Session {
+        let networkEpochID: String
         let port: UInt16
         let credentials: SOCKSCredentials
         /// Active Surge-style process selectors in Scenario binding order, each
@@ -55,6 +56,8 @@ final class EmbeddedSingBoxRuntime {
     }
 
     private struct SessionEnvelope: Decodable {
+        // Preserve the Go-generated envelope verbatim; Swift never rebuilds Line identities.
+        var rawJSON = ""
         struct ApplicationProcessCredential: Decodable {
             let kind: TransparentProxyProcessSelectorKind
             let value: String
@@ -325,6 +328,11 @@ final class EmbeddedSingBoxRuntime {
     private var backgroundRuleSetSessions:
         [RuleSetBootstrapEnvelope.BootstrapSession] = []
     private var backgroundNetworkSnapshot: InterfaceSnapshot?
+    // Physical network observation survives candidate failure. The committed
+    // Box can still belong to the previous network while its Lines recover on
+    // the newly observed one.
+    private var observedNetworkSnapshot: InterfaceSnapshot?
+    private var observedNetworkEpochID: String?
     private var backgroundCancellation: ConnectionCancellation?
     private var acquisitionEngine: LibboxLibbox?
     private struct PreparedSwitchState {
@@ -366,6 +374,9 @@ final class EmbeddedSingBoxRuntime {
             password: UUID().uuidString + UUID().uuidString
         )
         let basePath = try runtimeDirectory()
+        let networkEpochID = selectNetworkEpoch(
+            networkSnapshot, requested: nil, forceNew: true
+        )
 
         try checkCancellation(cancellation)
         reporter.setState(.preparing)
@@ -441,52 +452,14 @@ final class EmbeddedSingBoxRuntime {
         )
 
         do {
-            if let anyConnect = envelope.anyConnect {
-                guard let anyConnectRuntimeIdentity else {
-                    throw RuntimeError.invalidSessionEnvelope
-                }
-                try checkCancellation(cancellation)
-                var resolveError: NSError?
-                let dialAddress = LibboxResolveServerIPv4(
-                    anyConnect.server,
-                    &resolveError
+            try withLineReadinessFailure(instance) {
+                try instance.start(
+                    forNetwork: envelope.rawJSON,
+                    networkContextJSON: try networkContextJSON(
+                        networkSnapshot, epoch: networkEpochID
+                    ),
+                    anyConnectDialAddress: try resolveAnyConnectAddress(envelope)
                 )
-                if let resolveError {
-                    throw resolveError
-                }
-                if let tailscaleRuntime {
-                    try instance.startResolved(
-                        withLineRuntimes: anyConnect.server,
-                        dialAddress: dialAddress,
-                        username: anyConnect.username,
-                        password: anyConnect.password,
-                        allowInsecure: anyConnect.allowInsecure,
-                        anyConnectRuntimeIdentity:
-                            anyConnectRuntimeIdentity,
-                        tailscaleLineID: tailscaleRuntime.lineID,
-                        tailscaleRuntimeIdentity:
-                            tailscaleRuntime.identity,
-                        configJSON: envelope.configJSON
-                    )
-                } else {
-                    try instance.startResolved(
-                        withInsecureAndRuntimeIdentity: anyConnect.server,
-                        dialAddress: dialAddress,
-                        username: anyConnect.username,
-                        password: anyConnect.password,
-                        allowInsecure: anyConnect.allowInsecure,
-                        runtimeIdentity: anyConnectRuntimeIdentity,
-                        configJSON: envelope.configJSON
-                    )
-                }
-            } else if let tailscaleRuntime {
-                try instance.startStandalone(
-                    withTailscaleLineID: tailscaleRuntime.lineID,
-                    runtimeIdentity: tailscaleRuntime.identity,
-                    configJSON: envelope.configJSON
-                )
-            } else {
-                try instance.startStandalone(envelope.configJSON)
             }
             try checkCancellation(cancellation)
             let baselineReadiness = try prepareGenerationReadiness(
@@ -544,7 +517,7 @@ final class EmbeddedSingBoxRuntime {
                     sourceAnyConnectRuntimeIdentity:
                         anyConnectRuntimeIdentity,
                     networkSnapshot: networkSnapshot,
-                    refreshLineRuntimes: false,
+                    networkEpochID: networkEpochID,
                     cancellation: cancellation
                 )
                 let constrainedReadiness = try
@@ -620,6 +593,7 @@ final class EmbeddedSingBoxRuntime {
             )
             logger.notice("sing-box-started port=\(finalPort)")
             return Session(
+                networkEpochID: networkEpochID,
                 port: finalPort,
                 credentials: finalCredentials,
                 applicationProcessCredentials:
@@ -667,6 +641,7 @@ final class EmbeddedSingBoxRuntime {
         profileJSON: String,
         networkSnapshot: InterfaceSnapshot,
         refreshLineRuntimes: Bool,
+        networkEpochID requestedNetworkEpochID: String?,
         sourceSession: Session,
         reporter: ConnectionTransactionReporter,
         cancellation: ConnectionCancellation
@@ -681,6 +656,14 @@ final class EmbeddedSingBoxRuntime {
         guard !alreadyPrepared else {
             throw RuntimeError.switchAlreadyPreparing
         }
+        // A retry retains the host's settled epoch. Manual Scenario changes on
+        // the same Underlay borrow the current epoch, while an older host's
+        // refresh request still creates a fresh network boundary.
+        let networkEpochID = selectNetworkEpoch(
+            networkSnapshot,
+            requested: requestedNetworkEpochID,
+            forceNew: refreshLineRuntimes
+        )
 
         var port = UInt16.random(in: 20_000 ... 60_000)
         while port == sourceSession.port {
@@ -742,7 +725,7 @@ final class EmbeddedSingBoxRuntime {
                 sourceAnyConnectRuntimeIdentity:
                     sourceSession.anyConnectRuntimeIdentity,
                 networkSnapshot: networkSnapshot,
-                refreshLineRuntimes: refreshLineRuntimes,
+                networkEpochID: networkEpochID,
                 cancellation: cancellation
             )
             let baselineReadiness = try prepareGenerationReadiness(
@@ -791,7 +774,7 @@ final class EmbeddedSingBoxRuntime {
                         // This is configuration convergence inside the same
                         // network epoch. Shared Line runtimes already consumed
                         // the epoch refresh while preparing the baseline.
-                        refreshLineRuntimes: false,
+                        networkEpochID: networkEpochID,
                         cancellation: cancellation
                     )
                 let constrainedReadiness = try
@@ -826,7 +809,9 @@ final class EmbeddedSingBoxRuntime {
                 reporter.note(
                     code:
                         ConnectionReportRuntimeFacts.lineRuntimeReusedCode,
-                    message: "已复用现有线路运行能力，未重新认证",
+                    // The capability is shared; its owner may have recovered
+                    // the transport while this candidate waited for readiness.
+                    message: "已复用现有线路运行能力",
                     taskID: "line:\(lineID)",
                     facts: ["reused": true]
                 )
@@ -852,6 +837,7 @@ final class EmbeddedSingBoxRuntime {
                 }
             let preparedID = UUID()
             let candidateSession = Session(
+                networkEpochID: networkEpochID,
                 port: port,
                 credentials: credentials,
                 applicationProcessCredentials:
@@ -913,6 +899,7 @@ final class EmbeddedSingBoxRuntime {
                 session: candidateSession
             )
         } catch {
+            let failure = lineReadinessFailure(instance, underlying: error)
             try? instance.abortPreparedSwitch()
             engineLock.lock()
             preparedSwitchState = nil
@@ -920,7 +907,7 @@ final class EmbeddedSingBoxRuntime {
             if cancellation.isCancelled {
                 throw RuntimeError.cancelled
             }
-            throw error
+            throw failure
         }
     }
 
@@ -942,7 +929,9 @@ final class EmbeddedSingBoxRuntime {
         }
         engineLock.unlock()
 
-        try instance.commitPreparedSwitch()
+        try withLineReadinessFailure(instance) {
+            try instance.commitPreparedSwitch()
+        }
 
         engineLock.lock()
         let oldCancellation = backgroundCancellation
@@ -992,6 +981,121 @@ final class EmbeddedSingBoxRuntime {
         (error as? RuntimeError)?.reportCode ??
             (error as? ConnectionRuntimeFailure)?.code ??
             "scenario-switch-prepare-failed"
+    }
+
+    private struct LineReadinessFailureSnapshot: Decodable {
+        let state: String
+        let code: String
+    }
+
+    private func lineReadinessFailureCode(_ instance: LibboxLibbox) -> String? {
+        guard let data = instance.lineReadiness().data(using: .utf8),
+              let status = try? JSONDecoder().decode(
+                LineReadinessFailureSnapshot.self, from: data
+              ),
+              status.state == "failed",
+              ["line-readiness-transient", "line-readiness-terminal",
+               "line-readiness-cancelled", "network-superseded"].contains(status.code)
+        else { return nil }
+        return status.code
+    }
+
+    private func lineReadinessFailure(
+        _ instance: LibboxLibbox,
+        underlying error: Error
+    ) -> Error {
+        // Preserve existing protocol-specific terminal evidence. Go errors
+        // cross gomobile as NSError, so their retry class uses a separate,
+        // structured result instead of parsing a display message.
+        if error is ConnectionRuntimeFailure || error is RuntimeError {
+            return error
+        }
+        guard let code = lineReadinessFailureCode(instance)
+        else { return error }
+        return ConnectionRuntimeFailure(
+            code: code,
+            message: error.localizedDescription,
+            taskID: "data-plane:sing-box",
+            evidence: nil
+        )
+    }
+
+    private func withLineReadinessFailure<T>(
+        _ instance: LibboxLibbox,
+        operation: () throws -> T
+    ) throws -> T {
+        do { return try operation() }
+        catch { throw lineReadinessFailure(instance, underlying: error) }
+    }
+
+    private func resolveAnyConnectAddress(
+        _ envelope: SessionEnvelope
+    ) throws -> String {
+        guard let anyConnect = envelope.anyConnect else { return "" }
+        var resolveError: NSError?
+        let address = LibboxResolveServerIPv4(anyConnect.server, &resolveError)
+        if let resolveError { throw resolveError }
+        return address
+    }
+
+    private func networkContextJSON(
+        _ snapshot: InterfaceSnapshot,
+        epoch: String
+    ) throws -> String {
+        guard let interfacesData = snapshot.interfacesJSON.data(using: .utf8),
+              let interfaces = try JSONSerialization.jsonObject(
+                with: interfacesData
+              ) as? [[String: Any]],
+              let dnsData = snapshot.systemDNSJSON.data(using: .utf8),
+              let systemDNS = try JSONSerialization.jsonObject(
+                with: dnsData
+              ) as? [String] else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        let data = try JSONSerialization.data(withJSONObject: [
+            "epoch": epoch,
+            "network_interfaces": interfaces,
+            "default_interface_name": snapshot.defaultInterface.name,
+            "default_interface_index": snapshot.defaultInterface.index,
+            "system_dns": systemDNS,
+        ], options: [.sortedKeys])
+        guard let encoded = String(data: data, encoding: .utf8) else {
+            throw RuntimeError.invalidSessionEnvelope
+        }
+        return encoded
+    }
+
+    private func sameNetworkSnapshot(
+        _ source: InterfaceSnapshot?,
+        _ target: InterfaceSnapshot
+    ) -> Bool {
+        guard let source else { return false }
+        return source.defaultInterface.name == target.defaultInterface.name
+            && source.defaultInterface.index == target.defaultInterface.index
+            && source.interfacesJSON == target.interfacesJSON
+            && source.systemDNSJSON == target.systemDNSJSON
+    }
+
+    private func selectNetworkEpoch(
+        _ snapshot: InterfaceSnapshot,
+        requested: String?,
+        forceNew: Bool
+    ) -> String {
+        engineLock.lock()
+        defer { engineLock.unlock() }
+        let epoch: String
+        if let requested {
+            epoch = requested
+        } else if !forceNew,
+                  sameNetworkSnapshot(observedNetworkSnapshot, snapshot),
+                  let observedNetworkEpochID {
+            epoch = observedNetworkEpochID
+        } else {
+            epoch = UUID().uuidString
+        }
+        observedNetworkEpochID = epoch
+        observedNetworkSnapshot = snapshot
+        return epoch
     }
 
     private func anyConnectRuntimeIdentity(
@@ -1148,7 +1252,7 @@ final class EmbeddedSingBoxRuntime {
     ) throws -> SessionEnvelope {
         guard
             let envelopeData = envelopeJSON.data(using: .utf8),
-            let envelope = try? JSONDecoder().decode(
+            var envelope = try? JSONDecoder().decode(
                 SessionEnvelope.self,
                 from: envelopeData
             )
@@ -1207,6 +1311,7 @@ final class EmbeddedSingBoxRuntime {
         else {
             throw RuntimeError.invalidSessionEnvelope
         }
+        envelope.rawJSON = envelopeJSON
         return envelope
     }
 
@@ -1232,7 +1337,7 @@ final class EmbeddedSingBoxRuntime {
         envelope: SessionEnvelope,
         sourceAnyConnectRuntimeIdentity: String?,
         networkSnapshot: InterfaceSnapshot,
-        refreshLineRuntimes: Bool,
+        networkEpochID: String,
         cancellation: ConnectionCancellation
     ) throws -> PreparedBoxGeneration {
         try checkCancellation(cancellation)
@@ -1244,84 +1349,20 @@ final class EmbeddedSingBoxRuntime {
         )
         let targetTailscaleRuntime = try tailscaleRuntime(in: envelope)
 
-        if let anyConnect = envelope.anyConnect {
-            guard let targetAnyConnectIdentity else {
-                throw RuntimeError.invalidSessionEnvelope
-            }
-            if let sourceAnyConnectRuntimeIdentity {
-                guard
-                    sourceAnyConnectRuntimeIdentity ==
-                        targetAnyConnectIdentity
-                else {
-                    throw RuntimeError.switchRequiresAnyConnectRebuild
-                }
-                try instance.prepareSwitch(
-                    withLineRuntimeIDs: envelope.configJSON,
-                    anyConnectLineID: anyConnect.lineID,
-                    anyConnectRuntimeIdentity:
-                        targetAnyConnectIdentity,
-                    tailscaleLineID:
-                        targetTailscaleRuntime?.lineID ?? "",
-                    tailscaleRuntimeIdentity:
-                        targetTailscaleRuntime?.identity ?? "",
-                    networkInterfacesJSON:
-                        networkSnapshot.interfacesJSON,
-                    defaultInterfaceName:
-                        networkSnapshot.defaultInterface.name,
-                    defaultInterfaceIndex:
-                        networkSnapshot.defaultInterface.index
-                )
-            } else {
-                var resolveError: NSError?
-                let dialAddress = LibboxResolveServerIPv4(
-                    anyConnect.server,
-                    &resolveError
-                )
-                if let resolveError {
-                    throw resolveError
-                }
-                try instance.prepareSwitch(
-                    withAnyConnectAndLineRuntimeIDs:
-                        anyConnect.server,
-                    dialAddress: dialAddress,
-                    username: anyConnect.username,
-                    password: anyConnect.password,
-                    allowInsecure: anyConnect.allowInsecure,
-                    anyConnectLineID: anyConnect.lineID,
-                    anyConnectRuntimeIdentity:
-                        targetAnyConnectIdentity,
-                    tailscaleLineID:
-                        targetTailscaleRuntime?.lineID ?? "",
-                    tailscaleRuntimeIdentity:
-                        targetTailscaleRuntime?.identity ?? "",
-                    configJSON: envelope.configJSON,
-                    networkInterfacesJSON:
-                        networkSnapshot.interfacesJSON,
-                    defaultInterfaceName:
-                        networkSnapshot.defaultInterface.name,
-                    defaultInterfaceIndex:
-                        networkSnapshot.defaultInterface.index
-                )
-            }
-        } else {
-            try instance.prepareSwitch(
-                withLineRuntimeIDs: envelope.configJSON,
-                anyConnectLineID: "",
-                anyConnectRuntimeIdentity: "",
-                tailscaleLineID:
-                    targetTailscaleRuntime?.lineID ?? "",
-                tailscaleRuntimeIdentity:
-                    targetTailscaleRuntime?.identity ?? "",
-                networkInterfacesJSON:
-                    networkSnapshot.interfacesJSON,
-                defaultInterfaceName:
-                    networkSnapshot.defaultInterface.name,
-                defaultInterfaceIndex:
-                    networkSnapshot.defaultInterface.index
-            )
+        if let sourceAnyConnectRuntimeIdentity,
+           let targetAnyConnectIdentity,
+           sourceAnyConnectRuntimeIdentity != targetAnyConnectIdentity {
+            throw RuntimeError.switchRequiresAnyConnectRebuild
         }
-        if refreshLineRuntimes {
-            try instance.refreshPreparedSwitchLineRuntimes()
+        try withLineReadinessFailure(instance) {
+            try instance.prepareSwitch(
+                forNetwork: envelope.rawJSON,
+                networkContextJSON: try networkContextJSON(
+                    networkSnapshot, epoch: networkEpochID
+                ),
+                anyConnectDialAddress: sourceAnyConnectRuntimeIdentity == nil
+                    ? try resolveAnyConnectAddress(envelope) : ""
+            )
         }
         try checkCancellation(cancellation)
 
@@ -1464,7 +1505,8 @@ final class EmbeddedSingBoxRuntime {
                     guard capability.isUsable else {
                         probeState.recordFailure(
                             ConnectionRuntimeFailure(
-                                code: capability.reportCode,
+                                code: self.lineReadinessFailureCode(instance)
+                                    ?? capability.reportCode,
                                 message: capability.reportMessage,
                                 taskID: task.id,
                                 evidence: nil
@@ -1478,10 +1520,17 @@ final class EmbeddedSingBoxRuntime {
                         lineID: task.resourceID
                     )
                 } catch {
-                    if cancellation.isCancelled ||
-                        error is ConnectionRuntimeFailure
-                    {
+                    if cancellation.isCancelled {
                         probeState.recordFailure(error)
+                        return
+                    }
+                    if let failure = error as? ConnectionRuntimeFailure {
+                        probeState.recordFailure(ConnectionRuntimeFailure(
+                            code: failure.code,
+                            message: failure.message,
+                            taskID: task.id,
+                            evidence: failure.evidence
+                        ))
                         return
                     }
                     probeState.recordFailure(
@@ -1524,6 +1573,17 @@ final class EmbeddedSingBoxRuntime {
         guard capabilities.count == envelope.lineOutbounds.count else {
             throw RuntimeError.invalidSessionEnvelope
         }
+        try withLineReadinessFailure(instance) {
+            var readinessError: NSError?
+            switch generation {
+            case .active:
+                _ = instance.ensureActiveLinesReady(8_000, error: &readinessError)
+            case .preparedSwitch:
+                _ = instance.ensurePreparedSwitchLinesReady(8_000, error: &readinessError)
+            }
+            if let readinessError { throw readinessError }
+        }
+        try checkCancellation(cancellation)
         return GenerationReadiness(
             lineCapabilities: capabilities,
             preparedTailscaleDNS: preparedTailscaleDNS
@@ -1554,7 +1614,7 @@ final class EmbeddedSingBoxRuntime {
                 )
         }
         if let probeError {
-            throw probeError
+            throw lineReadinessFailure(instance, underlying: probeError)
         }
         return LineAddressFamilyCapabilityCodec.capability(
             from: try LineAddressFamilyCapabilityCodec.decodeProbe(
@@ -2987,6 +3047,8 @@ extension RuntimeError: LocalizedError {
             "tailscale-home-derp-not-ready"
         case .tailscalePeerHandshakeUnavailable:
             "tailscale-peer-handshake-failed"
+        case .tailscaleReadinessTimedOut:
+            "tailscale-readiness-timeout"
         case .anyConnectRecoveryTimedOut:
             "anyconnect-line-reconnect-timeout"
         case .switchRequiresAnyConnectRebuild:

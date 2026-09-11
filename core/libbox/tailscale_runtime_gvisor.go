@@ -4,8 +4,11 @@ package libbox
 
 import (
 	"context"
+	stdjson "encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
+	"sort"
 	"sync"
 
 	box "github.com/sagernet/sing-box"
@@ -54,6 +57,50 @@ func (c *tailscaleRuntimeCapability) platformInterface() *xdPlatformInterface {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.platform
+}
+
+// Only causally relevant lifecycle facts form the stamp. Traffic counters,
+// last-seen times and normal handshake refresh timestamps must not invalidate
+// an otherwise current proof every time the Provider asks for status.
+func (c *tailscaleRuntimeCapability) readinessRevision() uint64 {
+	c.mu.Lock()
+	endpoint, platform := c.endpoint, c.platform
+	valid := !c.stopped && endpoint != nil && platform != nil && c.runtimeCtx != nil && c.runtimeCtx.Err() == nil
+	c.mu.Unlock()
+	if !valid || endpoint.Server() == nil {
+		return 0
+	}
+	backend := endpoint.Server().ExportLocalBackend()
+	if backend == nil {
+		return 0
+	}
+	status := backend.Status()
+	type selectedPeer struct {
+		ID                                          string
+		Online, InNetworkMap, InMagicSock, InEngine bool
+	}
+	stamp := struct {
+		Platform   uint64
+		Backend    string
+		Runtime    tailscaleReadinessPayload
+		ExitID     string
+		ExitOnline bool
+		Peers      []selectedPeer
+	}{Platform: platform.lineNetworkRevision(), Backend: status.BackendState, Runtime: tailscaleRuntimeReadiness(endpoint)}
+	if status.ExitNodeStatus != nil {
+		stamp.ExitID = string(status.ExitNodeStatus.ID)
+		stamp.ExitOnline = status.ExitNodeStatus.Online
+	}
+	for _, peer := range status.Peer {
+		if peer.ExitNode {
+			stamp.Peers = append(stamp.Peers, selectedPeer{string(peer.ID), peer.Online, peer.InNetworkMap, peer.InMagicSock, peer.InEngine})
+		}
+	}
+	sort.Slice(stamp.Peers, func(i, j int) bool { return stamp.Peers[i].ID < stamp.Peers[j].ID })
+	data, _ := stdjson.Marshal(stamp)
+	digest := fnv.New64a()
+	_, _ = digest.Write(data)
+	return digest.Sum64()
 }
 
 func (c *tailscaleRuntimeCapability) runtimeEndpoint() (*boxTailscale.Endpoint, bool) {

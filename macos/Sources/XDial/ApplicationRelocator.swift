@@ -8,7 +8,8 @@ enum ApplicationLaunchPreparation {
     case failed(message: String, canRetry: Bool)
 }
 
-/// XDial 的平台安装入口。它只复制并验证 app bundle，不注册网络配置，也不启动数据面。
+/// XDial 的平台安装入口。替换前回收旧 helper，再复制并验证 app bundle；
+/// 不注册网络配置，也不启动数据面。
 enum ApplicationRelocator {
     private final class LaunchResult: @unchecked Sendable {
         private let lock = NSLock()
@@ -151,6 +152,31 @@ enum ApplicationRelocator {
         )
     }
 
+    /// A command-line uninstaller does not pass through the normal singleton
+    /// launch check. Finish the installed UI process before removing services
+    /// so it cannot recreate them while this process is uninstalling the app.
+    static func prepareCommandLineUninstall() throws {
+        guard isRunningFromApplications else {
+            throw InstallationError.applicationNotInstalled
+        }
+        let identity = try validateDistributionBundle(at: Bundle.main.bundleURL)
+        try terminateOtherCopies(bundleIdentifiers: [identity.identifier])
+    }
+
+    /// Run by the incoming installer's own child process, whose event loop can
+    /// await ServiceManagement without blocking the synchronous file transaction.
+    /// Keep the outgoing container at its registered path until teardown ends.
+    static func validateHelperReplacement() throws -> URL {
+        let incoming = try validateDistributionBundle(at: Bundle.main.bundleURL)
+        let outgoing = try existingApplicationIdentity(at: destinationURL)
+        guard incoming == outgoing,
+              platformComponentIdentifiers(at: destinationURL)
+                == platformComponentIdentifiers(at: Bundle.main.bundleURL) else {
+            throw InstallationError.existingApplicationNotReplaceable
+        }
+        return destinationURL
+    }
+
     /// A helper may have held the replaced bundle during launch. Installation
     /// retries receipt cleanup once platform preparation has released it.
     static func finishOwnedArtifactRecovery() {
@@ -226,9 +252,10 @@ enum ApplicationRelocator {
                     destinationIsRecognizedProduct
             ) {
             case .continueLaunch:
-                try unregisterConflictingApplications(
-                    forInstalledIdentifier: sourceIdentity.identifier
-                )
+                // A matching bundle identifier does not make a downloaded or
+                // running installer ours to unregister. Only receipt-owned
+                // artifacts and an explicitly replaced destination may have
+                // their LaunchServices registration removed.
                 return .continueLaunch
             case .rejectExisting:
                 return .failed(
@@ -256,10 +283,15 @@ enum ApplicationRelocator {
                     )
                     return .relaunching
                 } catch {
-                    relaunchInstalledApplicationAfterFailedReplacement(
-                        sourceIdentity: sourceIdentity,
-                        replacedIdentity: destinationIdentity
-                    )
+                    if case InstallationError.helperReplacementPreparationFailed = error {
+                        // An abnormal cleanup-child exit cannot establish the
+                        // OS completion barrier. Keep the old container closed.
+                    } else {
+                        relaunchInstalledApplicationAfterFailedReplacement(
+                            sourceIdentity: sourceIdentity,
+                            replacedIdentity: destinationIdentity
+                        )
+                    }
                     throw error
                 }
             }
@@ -356,6 +388,20 @@ enum ApplicationRelocator {
                     execute: runOutgoingCleanupProcess
                 )
                 try unregisterApplication(at: destinationURL)
+            } else {
+                // The currently registered helper still belongs to the old
+                // container. Unregister it before moving that container to a
+                // backup; a successor must not repair registration afterwards.
+                let cleanup = OutgoingApplicationCleanup.Plan(
+                    executableURL: sourceURL.appendingPathComponent("Contents/MacOS/XDial"),
+                    arguments: [OutgoingApplicationCleanup.helperReplacementArgument],
+                    timeout: .infinity
+                )
+                do {
+                    try OutgoingApplicationCleanup.run(cleanup, execute: runOutgoingCleanupProcess)
+                } catch {
+                    throw InstallationError.helperReplacementPreparationFailed
+                }
             }
             try ApplicationBundleReplacer.replace(
                 fileManager: fileManager,
@@ -416,9 +462,9 @@ enum ApplicationRelocator {
             completion.signal()
         }
         try process.run()
-        guard completion.wait(
-            timeout: .now() + max(0, timeout)
-        ) == .success else {
+        let deadline: DispatchTime = timeout.isInfinite
+            ? .distantFuture : .now() + max(0, timeout)
+        guard completion.wait(timeout: deadline) == .success else {
             process.terminate()
             _ = completion.wait(timeout: .now() + 1)
             return false
@@ -523,46 +569,6 @@ enum ApplicationRelocator {
         } else {
             try artifacts.withExclusiveAccess {
                 try artifacts.recoverAbandonedTransactions()
-            }
-        }
-    }
-
-    private static func unregisterConflictingApplications(
-        forInstalledIdentifier identifier: String
-    ) throws {
-        let candidateIdentifiers =
-            XDialApplicationIdentifierPolicy.obsoleteIdentifiers(
-                forInstalledIdentifier: identifier
-            )
-                .union([identifier])
-        for candidateIdentifier in candidateIdentifiers {
-            let registeredURLs = NSWorkspace.shared
-                .urlsForApplications(
-                    withBundleIdentifier: candidateIdentifier
-            )
-            var canonicalPaths = Set<String>()
-            for registeredURL in registeredURLs {
-                guard let onDiskIdentifier =
-                    ApplicationBundleInfo.identifier(at: registeredURL)
-                else { continue }
-                let canonicalURL = canonical(registeredURL)
-                guard canonicalPaths.insert(canonicalURL.path).inserted
-                else {
-                    continue
-                }
-                guard
-                    XDialApplicationIdentifierPolicy
-                        .shouldUnregisterApplicationRegistration(
-                            installedIdentifier: identifier,
-                            registeredIdentifier: candidateIdentifier,
-                            onDiskIdentifier: onDiskIdentifier,
-                            isInstalledDestination:
-                                canonicalURL == canonical(destinationURL)
-                        )
-                else {
-                    continue
-                }
-                try unregisterApplication(at: registeredURL)
             }
         }
     }
@@ -942,6 +948,7 @@ enum ApplicationRelocator {
         case installedSuccessorLocationMismatch
         case existingApplicationDidNotTerminate
         case existingApplicationNotReplaceable
+        case helperReplacementPreparationFailed
         case applicationNotInstalled
         case launchServicesRegistrarMissing
         case applicationUnregistrationFailed
@@ -1003,6 +1010,8 @@ enum ApplicationRelocator {
             case .existingApplicationNotReplaceable:
                 "“应用程序”中的 XDial 与当前构建签名或标识不一致，"
                     + "已拒绝覆盖"
+            case .helperReplacementPreparationFailed:
+                "旧版后台服务未能确认完成注销，已保留原应用并停止替换。"
             case .applicationNotInstalled:
                 "XDial 不在“应用程序”目录，无法完成卸载"
             case .launchServicesRegistrarMissing:

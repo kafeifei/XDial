@@ -647,6 +647,21 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   编译同源生成，可受 endpoint、协议参数和凭据影响，但不得记录或对外暴露投影材料。
   Scenario 名称、图标、SSID、顶层排序等展示字段不影响复用。能力池只允许当前 committed
   与唯一候选计划持有租约；未被二者引用的 Line 仍必须满足零会话、零探测、零请求。
+- **线路恢复归线路所有**：长连接、握手、迁移和重连由 Line 能力的唯一 owner 管理。
+  恢复上下文不能依附某个借用它的 Box；候选取消或旧 Box 退役只释放该借用者的租约，最后
+  一个租约释放才停止能力。Scenario 表达需要哪些 Line，并等待其就绪；遇到同身份 Line
+  正在恢复时加入同一任务，不重新登录，也不把暂时不可用当作配置错误。局部恢复仍使用
+  D35 的有界预算；用户显式断开取消所有租约和恢复任务。
+- **就绪证明属于当前网络**：宿主的稳定网络 epoch 以不含 SSID 的不透明标识随候选传入。
+  每条被引用 Line 记录期望 epoch、通过验证的 epoch 与运行能力 revision；session 失效、
+  新 epoch 或能力更换均使旧证明失效。普通代理与 Direct 的证明还必须绑定实际受测的
+  Box generation，不能借其他 Box 的成功跳过验证。协议支持迁移时先验证既有会话，只有
+  明确的瞬态失败才由 Line owner 恢复。检查范围必须符合 Line 的实际职责：Direct 验证
+  本代 Underlay 上下文与配置归属，不以固定外部 DNS 或展示服务可达作为提交前提；其他
+  Line 对实际依赖服务的验证须经自己的精确出口。全部所需 Line 完成当前 epoch 的相应
+  就绪检查及既有握手、DNS、订阅门禁后才可 Commit；迟到的旧网络结果不得恢复 ready。
+  同一 Line、同一当前 revision 的新成功可替换其旧失败，不能清除其他 Line 的失败或
+  generation 的结构错误；诊断请求的结果不得变成无关 Line 的连接门槛。
 - **完整配置原子提交**：复用 Line 不等于修改旧 Box。候选仍构造一份完整 sing-box Box，
   通过受租约保护的 Line 能力拨号。Provider 为候选启动独立的本地 relay endpoint；提交
   点只原子切换新 flow 的 relay generation 和同源 DNS/route 裁决。提交之后旧 flow 在
@@ -659,8 +674,9 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   `from`、`to`、候选 transaction、是否复用了 Line，以及失败后仍在承载流量的 committed
   transaction；不能用一份失败报告覆盖当前连接事实。
 - **AnyConnect 单例边界**：D30 仍然成立。配置身份相同的 AnyConnect Line 在 Switch 中
-  必须复用既有 sslcon session、VPNBridge 和恢复状态，不能重新登录或重建 CSTP；新旧
-  Box 可以短暂共享该能力。身份不同的 AnyConnect 不能与旧会话并发准备：这种 Switch
+  必须复用同一运行能力及其恢复状态。既有会话仍有效时复用 sslcon session 和 VPNBridge，
+  不能仅因切换 Scenario 而重新登录或重建 CSTP；会话失效则由该能力的唯一 owner 恢复，
+  候选等待恢复结果。新旧 Box 可以短暂共享该能力。身份不同的 AnyConnect 不能与旧会话并发准备：这种 Switch
   必须明确报告“需要重建线路”，并在得到用户动作或具备无断流交接能力前保留旧场景，
   不得伪装成已复用。相同要求适用于其他进程级单例能力。
 - **latest-wins 单飞**：任意时刻最多一个候选 Switch。新目标只更新 desired Scenario 并
@@ -673,6 +689,10 @@ sing-box TUN 约定，所有查询仍进入 sing-box 的 `hijack-dns`；适配�
   Scenario, Underlay fingerprint)` 启动一次 Switch；不得先因 Underlay 重建一次，再因
   SSID 变化重建第二次。快速 A→B→C 只允许 C 成为候选。自动触发的瞬态失败可以在同一
   epoch 和预算内重试；用户手动切换失败不自动循环，凭据/证书/配置等终止错误也不重试。
+  稳定采样仅表示意图已确定，不表示 Switch 已成功。自动意图在瞬态失败后保留 desired
+  Scenario，以 2 / 5 / 10 秒至多重试三次；相同 epoch 的重复事件不重置预算。成功、终止
+  错误、预算耗尽或用户取消才结束该意图，新 epoch 使旧候选与旧退避回调失效。Line 的
+  协议恢复与 Scenario 的事务重试不能并行创建同一身份的第二个握手任务。
 - **休眠不是网络切换**：`willSleep` 到完整 `didWake` 之间只允许积累变化事实，不允许
   Dark Wake 直接提交 Switch；唤醒后必须用一份新捕获的稳定 Underlay 与 SSID 样本合并为
   至多一笔 epoch。紧邻系统 `didWake` 的等价 Underlay 恢复不得仅凭

@@ -157,12 +157,16 @@ final class GoEngine: ObservableObject {
     func switchScenario(
         profileJSON: String,
         refreshLineRuntimes: Bool,
+        networkEpochID: String? = nil,
+        expectedUnderlayFingerprint: String? = nil,
         completion: @escaping (Result<ConnectionReport, Error>) -> Void
     ) {
         lastError = nil
         transparentProxy.switchScenario(
             profileJSON: profileJSON,
-            refreshLineRuntimes: refreshLineRuntimes
+            refreshLineRuntimes: refreshLineRuntimes,
+            networkEpochID: networkEpochID,
+            expectedUnderlayFingerprint: expectedUnderlayFingerprint
         ) { [weak self] result in
             Task { @MainActor [weak self] in
                 switch result {

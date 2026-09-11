@@ -849,7 +849,7 @@ func activeLineRuntimeIdentities(
 			return nil, fmt.Errorf("active Line identity is missing an ID")
 		}
 		line := profile.FindLine(lineID)
-		if task.ResourceType == string(config.LineTypeDirect) && line == nil {
+		if task.ResourceType == string(config.LineTypeDirect) && (line == nil || lineID == "direct") {
 			line = &config.Line{Type: config.LineTypeDirect, Enabled: true}
 		}
 		if line == nil || !line.Enabled {
@@ -981,6 +981,10 @@ func lineRuntimeIdentity(
 	default:
 		return "", fmt.Errorf("unsupported Line type %q", line.Type)
 	}
+	return opaqueLineRuntimeIdentity(material)
+}
+
+func opaqueLineRuntimeIdentity(material interface{}) (string, error) {
 	encoded, err := json.Marshal(material)
 	if err != nil {
 		return "", err

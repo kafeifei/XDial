@@ -6,6 +6,29 @@ import (
 	"testing"
 )
 
+func TestConnectionPlanBuiltinDirectCannotBeDisabledByStoredRow(t *testing.T) {
+	profile := Profile{
+		Lines:     []Line{{ID: "direct", Name: "My network", Type: LineTypeDirect, Enabled: false}, {ID: "unused", Type: LineTypeTrojan, Enabled: false}},
+		Scenarios: []Scenario{{ID: "home", Name: "Home", DefaultLineID: "direct"}}, ActiveScenarioID: "home",
+	}
+	plan, err := BuildConnectionPlan(&profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []ConnectionPlanTask
+	for _, task := range plan.Tasks {
+		if task.Kind == ConnectionTaskLine {
+			lines = append(lines, task)
+		}
+	}
+	if len(lines) != 1 || lines[0].ID != "line:direct" || lines[0].ResourceType != string(LineTypeDirect) {
+		t.Fatalf("built-in Direct requirement missing: %+v", lines)
+	}
+	if profile.Lines[0].Enabled || profile.Lines[1].Enabled {
+		t.Fatal("planning rewrote persisted disabled flags")
+	}
+}
+
 func TestBuildConnectionPlanUsesOnlyActiveScenarioDependenciesInBindingOrder(t *testing.T) {
 	profile := invBaseProfile()
 	profile.Lines = append(profile.Lines, invUnusedTrojanLine(), invTailscaleLine())

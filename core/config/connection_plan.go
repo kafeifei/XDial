@@ -158,6 +158,15 @@ func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
 				Type:    LineTypeDirect,
 				Enabled: true,
 			}
+		} else {
+			// The reserved Direct target is provided unconditionally by the
+			// generator. A persisted presentation row cannot disable or change
+			// that built-in capability; normalize a copy without rewriting the
+			// user's stored Line or reviving any other disabled Line.
+			builtin := *line
+			builtin.Type = LineTypeDirect
+			builtin.Enabled = true
+			line = &builtin
 		}
 		taskID, name, _, _ := addLine(line)
 		return taskID, name, directRuntimeConfigurationTarget()
