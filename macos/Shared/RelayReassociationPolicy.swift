@@ -90,3 +90,21 @@ struct RelayReassociationBudget {
         )
     }
 }
+
+/// Measures only the interval during which an association was ready to carry
+/// datagrams. Connection and SOCKS handshake time must not make a failed
+/// association appear healthy and reset the retry budget.
+struct RelayAssociationHealthClock {
+    private var readyAt: Date?
+
+    mutating func markReady(at now: Date = Date()) {
+        readyAt = now
+    }
+
+    func duration(endingAt now: Date = Date()) -> TimeInterval {
+        guard let readyAt else {
+            return 0
+        }
+        return max(0, now.timeIntervalSince(readyAt))
+    }
+}

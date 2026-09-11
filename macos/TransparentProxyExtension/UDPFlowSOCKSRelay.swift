@@ -140,9 +140,10 @@ enum UDPFlowSOCKSRelay {
 
     /// Reads the application's datagrams for the whole life of the flow.
     ///
-    /// Datagrams read while no association exists are dropped: UDP has no
-    /// delivery contract, and holding them would only reorder them behind the
-    /// re-association.
+    /// When no association is ready, this loop retains only the bounded batch
+    /// already returned by NetworkExtension. This prevents the first datagram
+    /// from being consumed during the initial SOCKS handshake without creating
+    /// an unbounded application-side queue.
     private static func uplink(
         channel: UDPFlowChannel,
         trialID: String,
@@ -158,10 +159,12 @@ enum UDPFlowSOCKSRelay {
                     return
                 }
                 for (payload, endpoint) in datagrams {
-                    guard
-                        let association = channel.current(),
-                        let datagramConnection = association.datagramConnection
+                    guard let association = try await channel.waitForCurrent()
+                    else { return }
+                    try Task.checkCancellation()
+                    guard let datagramConnection = association.datagramConnection
                     else {
+                        channel.release(association)
                         continue
                     }
                     let packet: Data
@@ -183,7 +186,7 @@ enum UDPFlowSOCKSRelay {
                         // An upstream send failure invalidates the association,
                         // not the flow. Retire it and let the supervisor
                         // re-associate.
-                        association.tearDown(with: error)
+                        channel.release(association, with: error)
                         continue
                     }
                     traffic.recordUpload(
@@ -314,7 +317,6 @@ enum UDPFlowSOCKSRelay {
             association.tearDown(with: error)
         }
         let box = UDPRelayOneShotBox<AssociationOutcome>()
-        let startedAt = Date()
         let handle = ProviderRelayHandle(
             shutdown: shutdown,
             operation: {
@@ -334,10 +336,7 @@ enum UDPFlowSOCKSRelay {
                 channel.release(association)
                 shutdown.finish(with: AppProxyFlowCloseError.aborted)
                 box.resolve(
-                    Self.stamp(
-                        outcome,
-                        duration: Date().timeIntervalSince(startedAt)
-                    )
+                    outcome
                 )
             }
         )
@@ -363,22 +362,6 @@ enum UDPFlowSOCKSRelay {
         return await box.wait()
     }
 
-    private static func stamp(
-        _ outcome: AssociationOutcome,
-        duration: TimeInterval
-    ) -> AssociationOutcome {
-        switch outcome {
-        case let .associationEnded(stage, error, _):
-            return .associationEnded(
-                stage: stage,
-                error: error,
-                duration: duration
-            )
-        case .flowEnded:
-            return outcome
-        }
-    }
-
     private static func establish(
         channel: UDPFlowChannel,
         association: UDPAssociation,
@@ -389,6 +372,7 @@ enum UDPFlowSOCKSRelay {
         logger: Logger
     ) async -> AssociationOutcome {
         var stage = "control-connect"
+        var healthClock = RelayAssociationHealthClock()
         do {
             try await start(control)
             stage = "udp-associate"
@@ -419,6 +403,7 @@ enum UDPFlowSOCKSRelay {
             guard channel.adopt(association) else {
                 throw RelayError.flowClosed
             }
+            healthClock.markReady()
             logger.debug(
                 "udp-relay-started trial=\(ticket.generation, privacy: .public) endpoint=\(String(describing: relayEndpoint), privacy: .public)"
             )
@@ -442,12 +427,16 @@ enum UDPFlowSOCKSRelay {
             return .associationEnded(
                 stage: stage,
                 error: RelayError.associationEnded,
-                duration: 0
+                duration: healthClock.duration()
             )
         } catch let failure as FlowFailure {
             return .flowEnded(stage: stage, error: failure.underlying)
         } catch {
-            return .associationEnded(stage: stage, error: error, duration: 0)
+            return .associationEnded(
+                stage: stage,
+                error: error,
+                duration: healthClock.duration()
+            )
         }
     }
 
@@ -897,66 +886,52 @@ private final class UDPFlowChannel: @unchecked Sendable {
     let flow: NEAppProxyUDPFlow
     let codec = UDPRelayDatagramCodec()
 
-    private let lock = NSLock()
-    private var association: UDPAssociation?
-    private var closed = false
+    private let associationSlot = RelayAssociationSlot<UDPAssociation>()
 
     init(flow: NEAppProxyUDPFlow) {
         self.flow = flow
     }
 
     var isClosed: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return closed
+        associationSlot.isClosed
     }
 
-    func current() -> UDPAssociation? {
-        lock.lock()
-        defer { lock.unlock() }
-        return association
+    func waitForCurrent() async throws -> UDPAssociation? {
+        try await associationSlot.waitForCurrent()
     }
 
     /// Publishes a ready association. Returns false once the flow has ended.
     func adopt(_ candidate: UDPAssociation) -> Bool {
-        lock.lock()
-        guard !closed else {
-            lock.unlock()
+        let result = associationSlot.adopt(candidate)
+        guard result.accepted else {
             return false
         }
-        let previous = association
-        association = candidate
-        lock.unlock()
-        if let previous, previous.id != candidate.id {
+        if let previous = result.replaced, previous.id != candidate.id {
             previous.tearDown(with: AppProxyFlowCloseError.aborted)
         }
         return true
     }
 
-    func release(_ candidate: UDPAssociation) {
-        lock.lock()
-        if association?.id == candidate.id {
-            association = nil
-        }
-        lock.unlock()
-        candidate.tearDown(with: AppProxyFlowCloseError.aborted)
+    func release(
+        _ candidate: UDPAssociation,
+        with error: Error? = AppProxyFlowCloseError.aborted
+    ) {
+        associationSlot.release(candidate)
+        candidate.tearDown(with: error)
     }
 
     /// Closes the application's flow exactly once. This is the only place a
     /// UDP flow dies, and it happens only when the flow itself failed or no
     /// engine generation can carry it any more.
     func close(with error: Error?) {
-        lock.lock()
-        guard !closed else {
-            lock.unlock()
+        let result = associationSlot.close()
+        guard result.didClose else {
             return
         }
-        closed = true
-        let current = association
-        association = nil
-        lock.unlock()
 
-        current?.tearDown(with: error ?? AppProxyFlowCloseError.aborted)
+        result.current?.tearDown(
+            with: error ?? AppProxyFlowCloseError.aborted
+        )
         let sourceError = AppProxyFlowCloseError.normalize(error)
         flow.closeReadWithError(sourceError)
         flow.closeWriteWithError(sourceError)
