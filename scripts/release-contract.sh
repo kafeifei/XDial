@@ -8,6 +8,8 @@ readonly RELEASE_SETTINGS_IDENTIFIER="com.kafeifei.xdial.app.settings-ui"
 readonly RELEASE_EXTENSION_IDENTIFIER="com.kafeifei.xdial.app.transparent-proxy"
 readonly RELEASE_HELPER_IDENTIFIER="com.kafeifei.xdial.app.helper"
 readonly RELEASE_TEAM_IDENTIFIER="UVZM439VGU"
+readonly RELEASE_CONTRACT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly DEPLOYMENT_TARGET_VERIFIER="$RELEASE_CONTRACT_DIRECTORY/verify-macos-deployment-target.py"
 
 cleanup_root=""
 cleanup() {
@@ -112,6 +114,12 @@ assert_plist_nonempty() {
     [[ -f "$plist" ]] || fail "missing Info.plist: $plist"
     actual="$(plist_value "$plist" "$key")"
     [[ -n "$actual" ]] || fail "$plist $key must not be empty"
+}
+
+assert_app_deployment_target() {
+    local app_path="$1"
+    python3 "$DEPLOYMENT_TARGET_VERIFIER" "$app_path" >/dev/null \
+        || fail "$app_path contains an executable newer than its declared macOS minimum"
 }
 
 assert_developer_id_signature() {
@@ -270,6 +278,8 @@ verify_app() {
         || fail "missing System Extension: $extension_path"
     [[ -x "$helper_path" && ! -L "$helper_path" ]] \
         || fail "missing bundled helper: $helper_path"
+
+    assert_app_deployment_target "$app_path"
 
     assert_plist_value "$app_path/Contents/Info.plist" CFBundleIdentifier \
         "$RELEASE_APPLICATION_IDENTIFIER"

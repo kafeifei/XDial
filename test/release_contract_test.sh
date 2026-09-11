@@ -43,6 +43,71 @@ check_debug_entitlement "$entitlement_plist_prefix$entitlement_plist_suffix"
 check_debug_entitlement ''
 expect_failure check_debug_entitlement 'invalid plist'
 
+check_deployment_target() (
+    source "$contract"
+    assert_app_deployment_target "$1"
+)
+
+deployment_fixture="$test_root/DeploymentFixture.app"
+mkdir -p "$deployment_fixture/Contents/MacOS"
+cat >"$deployment_fixture/Contents/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>DeploymentFixture</string>
+<key>CFBundleIdentifier</key><string>com.kafeifei.xdial.deployment-fixture</string>
+<key>LSMinimumSystemVersion</key><string>15.0</string>
+</dict></plist>
+EOF
+printf '%s\n' 'int main(void) { return 0; }' >"$test_root/deployment-fixture.c"
+/usr/bin/xcrun clang -mmacosx-version-min=15.0 \
+    "$test_root/deployment-fixture.c" \
+    -o "$deployment_fixture/Contents/MacOS/DeploymentFixture"
+/usr/bin/xcrun clang -mmacosx-version-min=15.0 \
+    "$test_root/deployment-fixture.c" \
+    -o "$deployment_fixture/Contents/MacOS/xdial-daemon"
+check_deployment_target "$deployment_fixture"
+
+# Older Mach-O files use LC_VERSION_MIN_MACOSX instead of LC_BUILD_VERSION.
+/usr/bin/vtool -set-version-min macos 15.0 26.5 -replace \
+    -output "$test_root/legacy-helper" \
+    "$deployment_fixture/Contents/MacOS/xdial-daemon"
+mv "$test_root/legacy-helper" \
+    "$deployment_fixture/Contents/MacOS/xdial-daemon"
+check_deployment_target "$deployment_fixture"
+
+# Every architecture in a universal executable must target macOS.
+/usr/bin/xcrun clang -arch arm64 -mmacosx-version-min=15.0 \
+    "$test_root/deployment-fixture.c" -o "$test_root/helper-arm64-15"
+/usr/bin/xcrun clang -arch x86_64 -mmacosx-version-min=26.0 \
+    "$test_root/deployment-fixture.c" -o "$test_root/helper-x86_64-26"
+/usr/bin/lipo -create "$test_root/helper-arm64-15" \
+    "$test_root/helper-x86_64-26" \
+    -output "$deployment_fixture/Contents/MacOS/xdial-daemon"
+expect_failure check_deployment_target "$deployment_fixture"
+
+/usr/bin/vtool -set-build-version iossim 26.0 26.5 -replace \
+    -output "$test_root/helper-x86_64-iossim" \
+    "$test_root/helper-x86_64-26"
+/usr/bin/lipo -create "$test_root/helper-arm64-15" \
+    "$test_root/helper-x86_64-iossim" \
+    -output "$deployment_fixture/Contents/MacOS/xdial-daemon"
+expect_failure check_deployment_target "$deployment_fixture"
+
+# A valid first slice must not hide a second slice with no deployment command.
+/usr/bin/vtool -remove-build-version macos \
+    -output "$test_root/helper-x86_64-no-deployment" \
+    "$test_root/helper-x86_64-26"
+/usr/bin/lipo -create "$test_root/helper-arm64-15" \
+    "$test_root/helper-x86_64-no-deployment" \
+    -output "$deployment_fixture/Contents/MacOS/xdial-daemon"
+expect_failure check_deployment_target "$deployment_fixture"
+
+/usr/bin/xcrun clang -mmacosx-version-min=26.0 \
+    "$test_root/deployment-fixture.c" \
+    -o "$deployment_fixture/Contents/MacOS/xdial-daemon"
+expect_failure check_deployment_target "$deployment_fixture"
+
 check_system_extension_authorization() (
     source "$contract"
     assert_system_extension_authorization_plists "$1" "$2" "$3" 1800000000

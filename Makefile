@@ -53,6 +53,21 @@ MACOS_APP_LAUNCHER_ABS := $(BUILD_DIR_ABS)/launch-macos-app
 SIGN_IDENTITY ?= Apple Development
 MACOS_DEBUG_XCODEBUILD_FLAGS ?=
 MACOS_TEST_XCODEBUILD_FLAGS ?=
+MACOS_MINIMUM_SYSTEM_VERSION := 15.0
+MACOS_CGO_CFLAGS ?= $(shell go env CGO_CFLAGS)
+MACOS_CGO_CXXFLAGS ?= $(shell go env CGO_CXXFLAGS)
+GO_TARGET_OS := $(if $(strip $(GOOS)),$(GOOS),$(shell go env GOOS))
+# MACOSX_DEPLOYMENT_TARGET controls the final external link. The explicit cgo
+# flags also compile every native object for the same target. Apply them only
+# when Go is targeting Darwin so the cli targets remain cross-platform.
+ifeq ($(GO_TARGET_OS),darwin)
+MACOS_GO_BUILD_ENV = MACOSX_DEPLOYMENT_TARGET='$(MACOS_MINIMUM_SYSTEM_VERSION)' \
+	CGO_CFLAGS='$(MACOS_CGO_CFLAGS) -mmacosx-version-min=$(MACOS_MINIMUM_SYSTEM_VERSION)' \
+	CGO_CXXFLAGS='$(MACOS_CGO_CXXFLAGS) -mmacosx-version-min=$(MACOS_MINIMUM_SYSTEM_VERSION)'
+else
+MACOS_GO_BUILD_ENV =
+endif
+MACOS_DEPLOYMENT_VERIFIER := scripts/verify-macos-deployment-target.py
 
 .PHONY: all cli cli-debug app ci-macos-build macos-identity-contract release-inputs release-app release publish test-release-contract restart inspector clean prepare-patched-go public-content-gate go-vet go-build test test-patched-tailscale test-patched-sing-box test-patched-sslcon test-macos-transaction test-smoke sing-box-test-validator check-mobile-libbox-deps libbox-xcframework libbox-ios-xcframework libbox-macos-xcframework appletv ios mobile-app-icons FORCE_PATCHED_GO
 
@@ -230,12 +245,12 @@ all: cli app
 
 cli: $(PATCHED_WORKFILE)
 	@mkdir -p $(BUILD_DIR)
-	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS)" -o $(BUILD_DIR)/xdial ./cmd/xdial/
+	$(MACOS_GO_BUILD_ENV) $(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS)" -o $(BUILD_DIR)/xdial ./cmd/xdial/
 
 # Debug helper has its own executable so release builds cannot overwrite it.
 cli-debug: $(PATCHED_WORKFILE)
 	@mkdir -p $(BUILD_DIR)
-	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS) -X main.buildFlavor=debug" -o $(BUILD_DIR)/xdial-debug ./cmd/xdial/
+	$(MACOS_GO_BUILD_ENV) $(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS) -X main.buildFlavor=debug" -o $(BUILD_DIR)/xdial-debug ./cmd/xdial/
 
 # debug 构建(含 DebugServer,仅本地开发用,不得分发)
 app: cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
@@ -273,6 +288,7 @@ ci-macos-build: cli cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/
 			-derivedDataPath $(BUILD_DIR)/macos-xcode-ci CODE_SIGNING_ALLOWED=NO build; \
 		product_name=XDial; if [ "$$configuration" = Debug ]; then product_name='Xdial debug'; fi; \
 		test "$$(plutil -extract LSUIElement raw "$(BUILD_DIR)/macos-xcode-ci/Build/Products/$$configuration/$$product_name.app/Contents/Info.plist")" = true; \
+		python3 $(MACOS_DEPLOYMENT_VERIFIER) "$(BUILD_DIR)/macos-xcode-ci/Build/Products/$$configuration/$$product_name.app" >/dev/null; \
 	done
 
 # Release 的 marketing version 只来自 RELEASE_TAG；build number 是独立、
@@ -285,7 +301,7 @@ release-inputs:
 
 release-app: release-inputs libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
 	@mkdir -p $(BUILD_DIR)
-	$(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -trimpath \
+	$(MACOS_GO_BUILD_ENV) $(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -trimpath \
 		-ldflags "-X main.version=$(RELEASE_TAG) -s -w" \
 		-o $(BUILD_DIR)/xdial ./cmd/xdial/
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Release \

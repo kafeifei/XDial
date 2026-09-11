@@ -24,6 +24,18 @@ def plist(path):
 def main():
     bundle = pathlib.Path(sys.argv[1]).resolve()
     require(bundle.name == "Xdial debug.app", "unexpected development app filename")
+    deployment_verifier = pathlib.Path(__file__).with_name(
+        "verify-macos-deployment-target.py"
+    )
+    deployment_result = subprocess.run(
+        [sys.executable, str(deployment_verifier), str(bundle)],
+        capture_output=True,
+        text=True,
+    )
+    require(
+        deployment_result.returncode == 0,
+        deployment_result.stderr.strip() or "invalid macOS deployment target",
+    )
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(bundle))
     group = "UVZM439VGU.com.kafeifei.xdial.debug.network"
     components = [
