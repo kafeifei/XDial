@@ -94,9 +94,15 @@ enum UDPFlowSOCKSRelay {
             // the flow while the fail-closed relay is prepared.
             try await open(channel.flow)
         } catch {
-            logger.error(
-                "udp-relay-error trial=\(trialID, privacy: .public) stage=flow-open code=\(diagnosticCode(error), privacy: .public)"
-            )
+            if isExpectedFlowClosure(error) {
+                logger.debug(
+                    "udp-relay-closed trial=\(trialID, privacy: .public) stage=flow-open code=\(diagnosticCode(error), privacy: .public)"
+                )
+            } else {
+                logger.error(
+                    "udp-relay-error trial=\(trialID, privacy: .public) stage=flow-open code=\(diagnosticCode(error), privacy: .public)"
+                )
+            }
             initialTicket.finish()
             channel.close(with: error)
             return

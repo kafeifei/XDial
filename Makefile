@@ -1,5 +1,10 @@
 BUILD_DIR := build
-APP_BUNDLE := $(BUILD_DIR)/Xdial debug.app
+# $(abspath) 按空格拆分参数，带空格的 bundle 路径必须由无空格的绝对
+# BUILD_DIR 拼出，不能整体交给 abspath/realpath。
+BUILD_DIR_ABS := $(abspath $(BUILD_DIR))
+APP_BUNDLE_NAME := Xdial debug.app
+APP_BUNDLE := $(BUILD_DIR)/$(APP_BUNDLE_NAME)
+APP_BUNDLE_ABS := $(BUILD_DIR_ABS)/$(APP_BUNDLE_NAME)
 RELEASE_BUNDLE := $(BUILD_DIR)/release/XDial.app
 RELEASE_TAG ?=
 RELEASE_BUILD_NUMBER ?=
@@ -39,6 +44,7 @@ MOBILE_ICON_GENERATOR_BINARY := $(BUILD_DIR)/generate-mobile-app-icons
 MACOS_APP_LAUNCH_POLICY_SOURCE := macos/Sources/XDial/ApplicationLaunchPolicy.swift
 MACOS_APP_LAUNCHER_SOURCE := tools/launch-macos-app.swift
 MACOS_APP_LAUNCHER := $(BUILD_DIR)/launch-macos-app
+MACOS_APP_LAUNCHER_ABS := $(BUILD_DIR_ABS)/launch-macos-app
 # SMAppService 要求签名身份跨构建稳定：ad-hoc 签名每次构建身份都变，
 # 系统会把重编后的 daemon 当新程序、要求重新批准。默认用开发者证书
 # （partial match，本机唯一），无证书环境可 SIGN_IDENTITY=- 回落 ad-hoc。
@@ -316,8 +322,8 @@ release: release-app
 # 构建失败不得影响正在运行的旧实例。
 restart:
 	@$(MAKE) app DEBUG_BUILD_VERSION=$(DEBUG_BUILD_VERSION)
-	@bash scripts/restart-macos-app.sh "$(abspath $(APP_BUNDLE))" \
-		"$(abspath $(MACOS_APP_LAUNCHER))"
+	@bash scripts/restart-macos-app.sh "$(APP_BUNDLE_ABS)" \
+		"$(MACOS_APP_LAUNCHER_ABS)"
 
 inspector:
 	@mkdir -p $(BUILD_DIR)
