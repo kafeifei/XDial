@@ -165,6 +165,13 @@ final class InstallationCoordinator: ObservableObject {
             appLog(
                 "installation ready transaction=\(report.transactionID)"
             )
+            // The previous application instance may have been replaced or
+            // killed while a DNS query was in flight: macOS never re-opens a
+            // flow for the socket whose flow died with that provider, and
+            // mDNSResponder retries that querier forever. Nothing in this
+            // process can observe that stop, so nudge once now that the daemon
+            // is registered and usable.
+            GoEngine.shared.nudgeResolverOnHostLaunch()
         } catch let failure as InstallationFailure {
             report.fail(
                 code: failure.code,

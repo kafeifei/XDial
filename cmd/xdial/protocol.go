@@ -18,6 +18,7 @@ type Request struct {
 	SubFormat  string `json:"sub_format,omitempty"`
 	LineID     string `json:"line_id,omitempty"`
 	AuthKey    string `json:"auth_key,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 // Response is a direct reply to a Request (carries the same ID).

@@ -114,6 +114,7 @@ func runDaemon(socketPath string) {
 		os.Exit(1)
 	}
 	tailscaleSetup := tailscalesetup.New(networkStatePath)
+	resolverRefresh := newResolverRefresher()
 	var networkRuntimeMu sync.Mutex
 	registrationGate := &daemonRegistrationGate{intentPresent: currentRegistrationIntentPresent}
 	// daemon 是唯一有资格接管系统 DNS 的宿主：它由 launchd KeepAlive 托管，被
@@ -163,7 +164,7 @@ func runDaemon(socketPath string) {
 				conn.Close()
 				continue
 			}
-			go handleClient(conn, eng, tailscaleSetup, &networkRuntimeMu, clients, registrationGate)
+			go handleClient(conn, eng, tailscaleSetup, resolverRefresh, &networkRuntimeMu, clients, registrationGate)
 		}
 	}()
 
@@ -202,6 +203,7 @@ func handleClient(
 	conn net.Conn,
 	eng *engine.Engine,
 	tailscaleSetup *tailscalesetup.Manager,
+	resolverRefresh *resolverRefresher,
 	networkRuntimeMu *sync.Mutex,
 	clients *ClientSet,
 	registrationGate *daemonRegistrationGate,
@@ -407,6 +409,13 @@ func handleClient(
 				} else {
 					client.SendResponse(Response{ID: req.ID, OK: true, Data: data})
 				}
+
+			case "resolver-refresh":
+				// 宿主在每次可能关闭 UDP flow 的切换之后调这里，让 mDNSResponder
+				// 重建 querier socket（详见 resolver_refresh.go 的说明）。纯补救
+				// 路径：失败只回报原因，不影响任何连接事务。
+				ok, message := resolverRefresh.refresh(req.Reason)
+				client.SendResponse(Response{ID: req.ID, OK: ok, Message: message})
 
 			case "tailscale-stop-setup":
 				networkRuntimeMu.Lock()

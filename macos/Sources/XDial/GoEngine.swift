@@ -49,6 +49,7 @@ final class GoEngine: ObservableObject {
     private var coldLaunchSettledTransactionID: String?
     private var explicitlyStoppedTransactionID: String?
     private var pendingStatusSyncCompletions: [() -> Void] = []
+    private var resolverRefreshTrigger = ResolverRefreshTrigger()
 
     var presentedConnectionReport: ConnectionReport? {
         ConnectionReportLiveProjection.presentedReport(
@@ -751,7 +752,51 @@ final class GoEngine: ObservableObject {
 
     private func applyConnectionReport(_ report: ConnectionReport) {
         connectionReport = report
+        nudgeResolver(
+            resolverRefreshTrigger.noteConnectionReport(
+                transactionID: report.transactionID,
+                state: report.state
+            )
+        )
         reconcileTransparentProxyStatus()
+    }
+
+    /// The provider closed this session's UDP flows; mDNSResponder would keep
+    /// retrying its stranded querier sockets forever unless it is told to
+    /// rebuild them. See `ResolverRefreshTrigger` for the full mechanism.
+    func nudgeResolverOnHostLaunch() {
+        nudgeResolver(resolverRefreshTrigger.noteHostLaunch())
+    }
+
+    private func nudgeResolver(_ reason: ResolverRefreshReason?) {
+        guard let reason else { return }
+        let trigger = reason.rawValue
+        guard ensureSocket() else {
+            appLog(
+                "resolver-refresh failed reason=\(trigger)"
+                    + " error=daemon socket unavailable"
+            )
+            return
+        }
+        let sent = sendRequest(
+            cmd: "resolver-refresh",
+            fields: ["reason": trigger]
+        ) { response in
+            if response.ok == true {
+                appLog("resolver-refresh ok reason=\(trigger)")
+            } else {
+                appLog(
+                    "resolver-refresh failed reason=\(trigger)"
+                        + " error=\(response.message ?? "unknown")"
+                )
+            }
+        }
+        if !sent {
+            appLog(
+                "resolver-refresh failed reason=\(trigger)"
+                    + " error=request could not be sent"
+            )
+        }
     }
 
     private func reconcileTransparentProxyStatus() {
@@ -763,6 +808,7 @@ final class GoEngine: ObservableObject {
             previousStatus: old
         )
         status = resolved
+        nudgeResolver(resolverRefreshTrigger.noteRuntimeStatus(resolved))
         if resolved == "connected" && old != "connected" {
             connectedAt = Date()
             lastError = nil

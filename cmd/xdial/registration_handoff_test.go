@@ -83,7 +83,7 @@ func TestRegistrationHandoffOnlyExemptsReadOnlyDiagnostics(t *testing.T) {
 			t.Errorf("diagnostic command %q should remain available", command)
 		}
 	}
-	for _, command := range []string{"start", "respawn", "parse-sub", "tailscale-status", "tailscale-login", "unknown"} {
+	for _, command := range []string{"start", "respawn", "parse-sub", "tailscale-status", "tailscale-login", "resolver-refresh", "unknown"} {
 		if registrationDiagnosticCommand(command) {
 			t.Errorf("command %q bypasses quiescence", command)
 		}
