@@ -16,6 +16,7 @@ enum AppUpdateReleaseSelectionError: Error, Equatable {
     case notNewer
     case archiveMissing
     case archiveURLRejected
+    case latestReleaseURLRejected
 }
 
 enum AppUpdateReleasePolicy {
@@ -76,6 +77,61 @@ enum AppUpdateReleasePolicy {
         )
     }
 
+    static func selectPublicFallbackCandidate(
+        fromLatestReleaseURL url: URL,
+        currentVersion: String
+    ) throws -> AppUpdateReleaseCandidate {
+        guard url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == "github.com",
+              url.port == nil,
+              url.user == nil,
+              url.password == nil,
+              url.query == nil,
+              url.fragment == nil,
+              url.pathComponents.count == 6,
+              url.pathComponents[0] == "/",
+              url.pathComponents[1] == owner,
+              url.pathComponents[2] == repository,
+              url.pathComponents[3] == "releases",
+              url.pathComponents[4] == "tag" else {
+            throw AppUpdateReleaseSelectionError.latestReleaseURLRejected
+        }
+        let tag = url.pathComponents[5]
+        guard url.absoluteString
+                == "https://github.com/\(owner)/\(repository)"
+                    + "/releases/tag/\(tag)",
+              let version = VersionUpdatePolicy.stableReleaseVersion(
+                  fromTag: tag
+              ) else {
+            throw AppUpdateReleaseSelectionError.latestReleaseURLRejected
+        }
+        guard VersionUpdatePolicy.isNewer(
+            latestTag: tag,
+            than: currentVersion
+        ) else {
+            throw AppUpdateReleaseSelectionError.notNewer
+        }
+
+        let archiveName = "XDial-\(tag).zip"
+        guard let archiveURL = URL(
+            string: "https://github.com/\(owner)/\(repository)"
+                + "/releases/download/\(tag)/\(archiveName)"
+        ), permitsArchiveURL(
+            archiveURL,
+            tag: tag,
+            archiveName: archiveName
+        ) else {
+            throw AppUpdateReleaseSelectionError.archiveURLRejected
+        }
+        return AppUpdateReleaseCandidate(
+            tag: tag,
+            version: version,
+            archiveName: archiveName,
+            archiveURL: archiveURL,
+            releaseNotes: nil
+        )
+    }
+
     static func releaseNotes(from body: String?) -> String? {
         guard let body else { return nil }
         let trimmedBody = body.trimmingCharacters(
@@ -105,7 +161,7 @@ enum AppUpdateReleasePolicy {
         return section.isEmpty ? trimmedBody : section
     }
 
-    private static func permitsArchiveURL(
+    static func permitsArchiveURL(
         _ url: URL,
         tag: String,
         archiveName: String

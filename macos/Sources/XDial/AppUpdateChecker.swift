@@ -68,15 +68,16 @@ final class AppUpdateChecker: ObservableObject {
     }
 
     private static let pollingInterval: UInt64 = 600_000_000_000
-    private static let latestReleaseURL = URL(
-        string: "https://api.github.com/repos/kafeifei/XDial/releases/latest"
-    )!
 
+    private let releaseLookup: AppUpdateReleaseLookup
     private var checkInFlight = false
     private var downloadTask: Task<Void, Never>?
     private var handoffTerminationObserver: NSObjectProtocol?
 
-    init() {
+    init(
+        releaseLookup: AppUpdateReleaseLookup = AppUpdateReleaseLookup()
+    ) {
+        self.releaseLookup = releaseLookup
         AppUpdateStager.pruneStaleRoots()
         #if DEBUG
         Self.current = self
@@ -176,36 +177,19 @@ final class AppUpdateChecker: ObservableObject {
         defer { checkInFlight = false }
 
         do {
-            var request = URLRequest(url: Self.latestReleaseURL)
-            request.timeoutInterval = 8
-            request.cachePolicy = .reloadRevalidatingCacheData
-            request.setValue(
-                "application/vnd.github+json",
-                forHTTPHeaderField: "Accept"
-            )
-            request.setValue(
-                "XDial/\(currentVersion)",
-                forHTTPHeaderField: "User-Agent"
-            )
-
-            let (data, response) = try await URLSession.shared.data(
-                for: request
-            )
-            guard let http = response as? HTTPURLResponse,
-                  http.statusCode == 200 else {
-                throw URLError(.badServerResponse)
-            }
-            do {
-                releaseCandidate = try AppUpdateReleasePolicy
-                    .selectCandidate(
-                        from: data,
-                        currentVersion: currentVersion
-                    )
+            switch try await releaseLookup.check(
+                currentVersion: currentVersion
+            ) {
+            case let .available(candidate):
+                releaseCandidate = candidate
                 phase = .available
-            } catch AppUpdateReleaseSelectionError.notNewer {
+            case .upToDate:
                 releaseCandidate = nil
                 phase = .upToDate
             }
+        } catch is CancellationError {
+            releaseCandidate = previousCandidate
+            phase = previousCandidate == nil ? .idle : .available
         } catch {
             releaseCandidate = previousCandidate
             if previousCandidate != nil {

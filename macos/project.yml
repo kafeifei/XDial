@@ -314,6 +314,7 @@ targets:
       - Sources/XDial/AppVersion.swift
       - Sources/XDial/AppUpdateStager.swift
       - Sources/XDial/AppUpdateDownloader.swift
+      - Sources/XDial/AppUpdateReleaseLookup.swift
       - Sources/XDial/AppUpdateTransaction.swift
       - Sources/XDial/ApplicationRelocator.swift
       - Sources/XDial/DebugStateRedactor.swift
