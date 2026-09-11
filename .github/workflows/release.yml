@@ -124,12 +124,13 @@ jobs:
             NOTARY_KEY_ID="$NOTARY_KEY_ID" \
             NOTARY_ISSUER="$NOTARY_ISSUER"
 
-      - name: Publish immutable release assets
+      - name: Stage immutable release assets for verification
         run: |
           gh release create "$RELEASE_TAG" \
             "build/release/XDial-${RELEASE_TAG}.zip" \
             "build/release/XDial-${RELEASE_TAG}.zip.sha256" \
             --verify-tag \
+            --draft \
             --title "XDial $RELEASE_TAG" \
             --notes-file RELEASE_NOTES.md
 
