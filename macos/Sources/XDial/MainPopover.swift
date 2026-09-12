@@ -737,10 +737,13 @@ struct MainPopover: View {
 
     private var needsSSIDAccess: Bool {
         state.requiresSSIDAccess && state.wifiSSIDAccessState != .ready
+            && state.wifiSSIDAccessState != .checking
     }
 
     private var ssidAccessActionTitle: String {
         switch state.wifiSSIDAccessState {
+        case .checking:
+            return state.tr("检查中", "Checking")
         case .permissionRequired:
             return state.tr(
                 "开启位置权限",

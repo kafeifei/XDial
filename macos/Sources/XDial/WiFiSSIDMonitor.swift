@@ -7,7 +7,7 @@ import Foundation
 final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     CWEventDelegate
 {
-    typealias UpdateHandler = (String?, WiFiSSIDAccessState) -> Void
+    typealias UpdateHandler = (String?, WiFiSSIDAccessState, UInt64) -> Void
     typealias SettlingHandler = () -> Void
 
     private let client = CWWiFiClient.shared()
@@ -18,6 +18,7 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     private var refreshWorkItem: DispatchWorkItem?
     private var lastSSID: String?
     private var lastAccessState: WiFiSSIDAccessState?
+    private var accessLifecycle = WiFiSSIDAccessLifecycle()
 
     init(
         onSettling: @escaping SettlingHandler,
@@ -29,13 +30,14 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
         locationManager.delegate = self
     }
 
-    /// Start observing and publish the current authorization state. This API
-    /// deliberately cannot request authorization: prompting belongs only to a
-    /// visible, foreground user action.
+    /// Publish checking until Core Location delivers its initial authorization
+    /// callback. Prompting belongs only to a visible, foreground user action.
     func start() {
-        switch WiFiSSIDAccessPolicy.accessState(
+        switch accessLifecycle.accessState(
             for: locationManager.authorizationStatus
         ) {
+        case .checking:
+            emit(ssid: nil, accessState: .checking)
         case .ready:
             guard startMonitoringIfNeeded() else {
                 emit(ssid: nil, accessState: .unavailable)
@@ -52,6 +54,8 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     }
 
     func stop() {
+        accessLifecycle.invalidatePendingUpdates()
+        lastAccessState = nil
         refreshWorkItem?.cancel()
         refreshWorkItem = nil
         guard monitoring else { return }
@@ -65,10 +69,13 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     func requestAuthorizationAndRefresh()
         -> WiFiSSIDAccessRequestDisposition
     {
+        guard accessLifecycle.hasReceivedAuthorization else { return .checking }
         let disposition = WiFiSSIDAccessPolicy.requestDisposition(
             for: locationManager.authorizationStatus
         )
         switch disposition {
+        case .checking:
+            return .checking
         case .refreshed:
             guard startMonitoringIfNeeded() else {
                 emit(ssid: nil, accessState: .unavailable)
@@ -93,7 +100,7 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
         ssid: String?,
         accessState: WiFiSSIDAccessState
     )? {
-        guard WiFiSSIDAccessPolicy.accessState(
+        guard accessLifecycle.accessState(
             for: locationManager.authorizationStatus
         ) == .ready else {
             return nil
@@ -103,13 +110,21 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
         }
         lastSSID = normalizedSSID
         lastAccessState = .ready
+        accessLifecycle.invalidatePendingUpdates()
         return (normalizedSSID, .ready)
     }
 
     func locationManagerDidChangeAuthorization(
         _ manager: CLLocationManager
     ) {
+        accessLifecycle.authorizationDidChange()
+        // A repeat callback must replace any observation it invalidated.
+        lastAccessState = nil
         start()
+    }
+
+    func isCurrentUpdate(_ revision: UInt64) -> Bool {
+        accessLifecycle.isCurrentUpdate(revision)
     }
 
     func ssidDidChangeForWiFiInterface(withName interfaceName: String) {
@@ -147,7 +162,7 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     }
 
     private func refresh() {
-        guard WiFiSSIDAccessPolicy.accessState(
+        guard accessLifecycle.accessState(
             for: locationManager.authorizationStatus
         ) == .ready else {
             return
@@ -182,8 +197,10 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
         if accessStateChanged {
             appLog("Wi-Fi SSID access state=\(accessState.logValue)")
         }
-        DispatchQueue.main.async { [onUpdate] in
-            onUpdate(normalizedSSID, accessState)
+        let revision = accessLifecycle.invalidatePendingUpdates()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isCurrentUpdate(revision) else { return }
+            self.onUpdate(normalizedSSID, accessState, revision)
         }
     }
 

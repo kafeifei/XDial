@@ -181,6 +181,7 @@ struct InstallationView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .disabled(state.wifiSSIDAccessState == .checking)
             }
         }
         .padding(.vertical, 10)
@@ -557,6 +558,8 @@ struct InstallationView: View {
 
     private var ssidAccessSymbol: String {
         switch state.wifiSSIDAccessState {
+        case .checking:
+            return "clock"
         case .permissionRequired:
             return "location.fill"
         case .denied, .unavailable:
@@ -574,6 +577,8 @@ struct InstallationView: View {
 
     private var ssidAccessDetail: String {
         switch state.wifiSSIDAccessState {
+        case .checking:
+            return state.tr("正在检查位置权限。", "Checking location access.")
         case .permissionRequired:
             return state.tr(
                 "macOS 需要位置权限才会提供当前 Wi-Fi 名称；XDial 只用它匹配场景。",
@@ -599,6 +604,8 @@ struct InstallationView: View {
 
     private var ssidAccessActionTitle: String {
         switch state.wifiSSIDAccessState {
+        case .checking:
+            return state.tr("检查中", "Checking")
         case .permissionRequired:
             return state.tr("继续", "Continue")
         case .denied:
