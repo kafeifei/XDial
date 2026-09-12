@@ -142,7 +142,7 @@ final class AppState: ObservableObject {
     @Published var profile: Profile
     @Published private(set) var currentSSID: String?
     @Published private(set) var wifiSSIDAccessState:
-        WiFiSSIDAccessState = .permissionRequired
+        WiFiSSIDAccessState = .checking
 
     var requiresSSIDAccess: Bool {
         profile.usesSSIDScenarioMatching
@@ -239,18 +239,20 @@ final class AppState: ObservableObject {
         ((AutomaticReconnectPreparation?) -> Void)?
     private var networkEpochPowerGate = SystemSleepNetworkEpochGate()
     private var networkEpochQuietWorkItem: DispatchWorkItem?
-    private var didEvaluateInitialSSIDAccess = false
+    private var initialSSIDAccessCheck = WiFiSSIDInitialAccessCheck()
     private var ssidAccessActivationObserver: NSObjectProtocol?
     private var ssidAccessActivationGeneration = 0
-    private lazy var wifiSSIDMonitor = WiFiSSIDMonitor(
+    private lazy var wifiSSIDMonitor: WiFiSSIDMonitor = WiFiSSIDMonitor(
         onSettling: { [weak self] in
             Task { @MainActor [weak self] in
                 self?.handleWiFiSSIDSettling()
             }
         },
-        onUpdate: { [weak self] ssid, accessState in
+        onUpdate: { [weak self] ssid, accessState, revision in
             Task { @MainActor [weak self] in
-                self?.handleWiFiSSIDUpdate(
+                guard let self,
+                      self.wifiSSIDMonitor.isCurrentUpdate(revision) else { return }
+                self.handleWiFiSSIDUpdate(
                     ssid: ssid,
                     accessState: accessState
                 )
@@ -2066,15 +2068,14 @@ final class AppState: ObservableObject {
     ) {
         currentSSID = ssid
         wifiSSIDAccessState = accessState
-        if !didEvaluateInitialSSIDAccess {
-            didEvaluateInitialSSIDAccess = true
-            if requiresSSIDAccess, accessState != .ready {
-                appLog(
-                    "Wi-Fi Scenario setup requires SSID access state="
-                        + accessState.logValue
-                )
-                installation.present()
-            }
+        if initialSSIDAccessCheck.shouldPresent(
+            accessState: accessState, requiresSSIDAccess: requiresSSIDAccess
+        ) {
+            appLog(
+                "Wi-Fi Scenario setup requires SSID access state="
+                    + accessState.logValue
+            )
+            installation.present()
         }
         activateScenarioForCurrentSSIDIfNeeded()
     }
