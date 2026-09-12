@@ -305,9 +305,10 @@ struct XDialApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var state = AppState()
     @StateObject private var updateChecker = AppUpdateChecker()
+    @StateObject private var menuBar = MenuBarRecoveryController.shared
 
     var body: some Scene {
-        MenuBarExtra {
+        MenuBarExtra(isInserted: menuBar.insertion) {
             MainPopover()
                 .environmentObject(state)
                 .environmentObject(updateChecker)
@@ -324,6 +325,14 @@ struct XDialApp: App {
             }
         }
         .menuBarExtraStyle(.window)
+        .commands {
+            CommandGroup(replacing: .appTermination) {
+                Button(state.tr("退出 \(XDialBuildIdentity.productTitle)", "Quit \(XDialBuildIdentity.productTitle)")) {
+                    MenuBarRecoveryController.shared.requestQuit()
+                }
+                .keyboardShortcut("q")
+            }
+        }
 
         Window("XDial 设置", id: "settings") {
             SettingsView()
@@ -551,6 +560,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         AppIcon.applyDockState(connected: GoEngine.shared.isConnected)
         ApplicationWindowLifecycleController.shared.start()
+        MenuBarRecoveryController.shared.start()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        MenuBarRecoveryController.shared.recoverOnReopen()
+        return false
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(
@@ -575,9 +590,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateCancel
         }
         if InstallationCoordinator.shared.isInstalling {
+            MenuBarRecoveryController.shared.cancelQuit()
             appLog(
                 "application termination: installation transaction active"
             )
+            return .terminateCancel
+        }
+        let recovery = MenuBarRecoveryController.shared
+        let event = NSAppleEventManager.shared().currentAppleEvent
+        let isSystemQuit = event?.eventClass == kCoreEventClass
+            && event?.eventID == kAEQuitApplication
+        if !recovery.explicitlyQuitting && !isSystemQuit {
+            recovery.suppressMenuRemovalTermination()
             return .terminateCancel
         }
         let engine = GoEngine.shared

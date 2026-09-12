@@ -90,7 +90,7 @@ struct MainPopover: View {
             }
             Divider()
             Button(state.tr("退出 XDial", "Quit XDial")) {
-                NSApp.terminate(nil)
+                MenuBarRecoveryController.shared.requestQuit()
             }
         }
         .onAppear { synchronizeTrafficSampling() }
