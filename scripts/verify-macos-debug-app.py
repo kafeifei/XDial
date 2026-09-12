@@ -23,7 +23,7 @@ def plist(path):
 
 def main():
     bundle = pathlib.Path(sys.argv[1]).resolve()
-    require(bundle.name == "Xdial debug.app", "unexpected development app filename")
+    require(bundle.name == "XDail Debug.app", "unexpected development app filename")
     deployment_verifier = pathlib.Path(__file__).with_name(
         "verify-macos-deployment-target.py"
     )
@@ -47,7 +47,7 @@ def main():
     ]
     host = plist(bundle / "Contents/Info.plist")
     require(host.get("CFBundleExecutable") == "XDial", "unexpected host executable")
-    require(host.get("CFBundleDisplayName") == "Xdial debug", "unexpected development display name")
+    require(host.get("CFBundleDisplayName") == "XDail Debug", "unexpected development display name")
     require(host.get("XDialBuildFlavor") == "debug", "bundle is not a development build")
     require(host.get("XDialTransparentProxyBundleIdentifier") == components[2][1],
             "host points to another channel's extension")

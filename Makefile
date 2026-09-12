@@ -2,7 +2,7 @@ BUILD_DIR := build
 # $(abspath) 按空格拆分参数，带空格的 bundle 路径必须由无空格的绝对
 # BUILD_DIR 拼出，不能整体交给 abspath/realpath。
 BUILD_DIR_ABS := $(abspath $(BUILD_DIR))
-APP_BUNDLE_NAME := Xdial debug.app
+APP_BUNDLE_NAME := XDail Debug.app
 APP_BUNDLE := $(BUILD_DIR)/$(APP_BUNDLE_NAME)
 APP_BUNDLE_ABS := $(BUILD_DIR_ABS)/$(APP_BUNDLE_NAME)
 RELEASE_BUNDLE := $(BUILD_DIR)/release/XDial.app
@@ -264,15 +264,15 @@ app: cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIco
 		-derivedDataPath $(BUILD_DIR)/macos-xcode \
 		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		$(MACOS_DEBUG_XCODEBUILD_FLAGS) build
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Info.plist')" = com.kafeifei.xdial.debug
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = com.kafeifei.xdial.debug.settings-ui
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Library/SystemExtensions/com.kafeifei.xdial.debug.transparent-proxy.systemextension/Contents/Info.plist')" = com.kafeifei.xdial.debug.transparent-proxy
-	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Info.plist')" = true
-	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = false
-	@test "$$(plutil -extract CFBundleDisplayName raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = 'Xdial debug'
-	@test -f '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Resources/SettingsDockIcon.icns'
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Info.plist')" = com.kafeifei.xdial.debug
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = com.kafeifei.xdial.debug.settings-ui
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Library/SystemExtensions/com.kafeifei.xdial.debug.transparent-proxy.systemextension/Contents/Info.plist')" = com.kafeifei.xdial.debug.transparent-proxy
+	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Info.plist')" = true
+	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = false
+	@test "$$(plutil -extract CFBundleDisplayName raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = 'XDail Debug'
+	@test -f '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Resources/SettingsDockIcon.icns'
 	rm -rf "$(APP_BUNDLE)"
-	ditto "$(BUILD_DIR)/macos-xcode/Build/Products/Debug/Xdial debug.app" "$(APP_BUNDLE)"
+	ditto "$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app" "$(APP_BUNDLE)"
 	@test "$$(plutil -extract LSUIElement raw '$(APP_BUNDLE)/Contents/Info.plist')" = true
 	python3 scripts/verify-macos-debug-app.py "$(APP_BUNDLE)"
 
@@ -286,7 +286,7 @@ ci-macos-build: cli cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/
 		xcodebuild -project macos/XDial.xcodeproj -scheme XDial \
 			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
 			-derivedDataPath $(BUILD_DIR)/macos-xcode-ci CODE_SIGNING_ALLOWED=NO build; \
-		product_name=XDial; if [ "$$configuration" = Debug ]; then product_name='Xdial debug'; fi; \
+		product_name=XDial; if [ "$$configuration" = Debug ]; then product_name='XDail Debug'; fi; \
 		test "$$(plutil -extract LSUIElement raw "$(BUILD_DIR)/macos-xcode-ci/Build/Products/$$configuration/$$product_name.app/Contents/Info.plist")" = true; \
 		python3 $(MACOS_DEPLOYMENT_VERIFIER) "$(BUILD_DIR)/macos-xcode-ci/Build/Products/$$configuration/$$product_name.app" >/dev/null; \
 	done

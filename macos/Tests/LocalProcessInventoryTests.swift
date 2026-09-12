@@ -5,7 +5,7 @@ final class LocalProcessInventoryTests: XCTestCase {
     func testKnownSiblingPathDoesNotMatchCurrentProductBundle() {
         let siblingURL = XDialBuildIdentity.isDevelopment
             ? URL(fileURLWithPath: "/Applications/XDial.app")
-            : URL(fileURLWithPath: "/Applications/Xdial debug.app")
+            : URL(fileURLWithPath: "/Applications/XDail Debug.app")
         let entry = LocalProcessInventory.Entry(
             pid: 42,
             name: "xdial-daemon",

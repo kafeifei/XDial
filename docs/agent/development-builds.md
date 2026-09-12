@@ -1,6 +1,6 @@
 # macOS 构建与安装
 
-日常 Debug 由 `make app` 生成 `build/Xdial debug.app`，使用 Apple Development 签名，
+日常 Debug 由 `make app` 生成 `build/XDail Debug.app`，使用 Apple Development 签名，
 不提交公证。`FormalDevelopment` 保留正式身份，仅用于该身份的专项验证。
 正式归档由 `make release` 生成，签名、公证与发布机制见 [updates.md](updates.md)。
 
@@ -8,7 +8,7 @@
 
 | 所有权 | Debug | 正式身份 |
 |---|---|---|
-| 安装路径 | `/Applications/Xdial debug.app` | `/Applications/XDial.app` |
+| 安装路径 | `/Applications/XDail Debug.app` | `/Applications/XDial.app` |
 | Host | `com.kafeifei.xdial.debug` | `com.kafeifei.xdial.app` |
 | Settings UI / Extension / Helper / Daemon | Host 加 `.settings-ui` / `.transparent-proxy` / `.helper` / `.daemon` | 同左 |
 | 偏好与钥匙串 service | `com.kafeifei.xdial.debug` | `com.kafeifei.xdial` |

@@ -66,7 +66,7 @@ source_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
     "${source_bundle}/Contents/Info.plist")"
 case "$source_identifier" in
     com.kafeifei.xdial.debug)
-        destination_bundle="/Applications/Xdial debug.app"
+        destination_bundle="/Applications/XDail Debug.app"
         debug_port=19877
         ;;
     com.kafeifei.xdial.app)

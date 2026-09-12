@@ -39,8 +39,8 @@ enum XDialBuildIdentity {
     static let settingsUIIdentifier = developmentSettingsUIIdentifier
     static let appGroupIdentifier =
         "UVZM439VGU.com.kafeifei.xdial.debug.network"
-    static let applicationBundleName = "Xdial debug.app"
-    static let applicationDisplayName = "Xdial debug"
+    static let applicationBundleName = "XDail Debug.app"
+    static let applicationDisplayName = "XDail Debug"
     static let productTitle = "XDial Debug"
     static let dataIdentifier = "com.kafeifei.xdial.debug"
     static let userDataDirectoryName = ".xdial-debug"
@@ -89,7 +89,7 @@ enum XDialBuildIdentity {
     )
     static let siblingApplicationDestinationURL = URL(
         fileURLWithPath: "/Applications/"
-            + (isDevelopment ? "XDial.app" : "Xdial debug.app"),
+            + (isDevelopment ? "XDial.app" : "XDail Debug.app"),
         isDirectory: true
     )
     static let settingsEntryTypeIdentifier =

@@ -34,9 +34,7 @@ struct LineAddressView: View {
                 Button { retry(family) } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "info.circle")
-                        Text(address.isEmpty ? text("missing") : address)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                        addressText(address.isEmpty ? text("missing") : address)
                     }
                     .font(.callout)
                     .frame(maxWidth: .infinity, alignment: .trailing)
@@ -58,14 +56,12 @@ struct LineAddressView: View {
         Menu {
             Section(text("display")) {
                 ForEach(LineAddressFamily.allCases, id: \.self) { value in
-                    Button { selection = value } label: {
-                        HStack {
-                            if family == value { Image(systemName: "checkmark") }
-                            Text(menuLabel(value))
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-                        }
-                    }
+                    // Use the native menu title and checkmark. A custom HStack
+                    // label can truncate the address before NSMenu sizes the item.
+                    Toggle(menuLabel(value), isOn: Binding(
+                        get: { family == value },
+                        set: { selected in if selected { selection = value } }
+                    ))
                     .disabled(!isAvailable(value))
                 }
             }
@@ -73,10 +69,7 @@ struct LineAddressView: View {
             HStack(spacing: 6) {
                 if !failed {
                     if !address.isEmpty {
-                        Text(address)
-                            .font(.system(.callout, design: .monospaced))
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                        addressText(address)
                     }
                     if pending {
                         ProgressView()
@@ -103,6 +96,24 @@ struct LineAddressView: View {
         .help(address.isEmpty ? text("display") : address)
         .accessibilityLabel(name + ", " + text("display"))
         .accessibilityValue((family == .ipv4 ? "IPv4" : "IPv6") + ", " + address)
+    }
+
+    /// Prefer a complete single line, then smaller type, then wrapping.
+    /// Every candidate preserves all digits, including stale observations.
+    private func addressText(_ value: String) -> some View {
+        ViewThatFits(in: .horizontal) {
+            Text(value)
+                .font(.system(.callout, design: .monospaced))
+                .fixedSize(horizontal: true, vertical: true)
+            Text(value)
+                .font(.system(size: 11, design: .monospaced))
+                .fixedSize(horizontal: true, vertical: true)
+            Text(value)
+                .font(.system(size: 11, design: .monospaced))
+                .lineLimit(nil)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.trailing)
+        }
     }
 
     private func menuLabel(_ value: LineAddressFamily) -> String {

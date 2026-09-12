@@ -30,11 +30,11 @@ final class XDialBuildIdentityTests: XCTestCase {
         )
         XCTAssertEqual(
             XDialBuildIdentity.applicationBundleName,
-            "Xdial debug.app"
+            "XDail Debug.app"
         )
         XCTAssertEqual(
             XDialBuildIdentity.applicationDisplayName,
-            "Xdial debug"
+            "XDail Debug"
         )
         XCTAssertEqual(XDialBuildIdentity.productTitle, "XDial Debug")
         XCTAssertEqual(XDialBuildIdentity.dataIdentifier, "com.kafeifei.xdial.debug")

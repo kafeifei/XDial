@@ -92,7 +92,7 @@ done
 assert_setting Debug XDial com.kafeifei.xdial.debug
 assert_setting Debug XDialSettingsUI com.kafeifei.xdial.debug.settings-ui
 assert_setting Debug XDialTransparentProxy com.kafeifei.xdial.debug.transparent-proxy
-assert_build_setting Debug XDial PRODUCT_NAME 'Xdial debug'
+assert_build_setting Debug XDial PRODUCT_NAME 'XDail Debug'
 assert_build_setting Debug XDial EXECUTABLE_NAME XDial
 assert_build_setting Debug XDial XDIAL_HELPER_IDENTIFIER com.kafeifei.xdial.debug.helper
 assert_build_setting Debug XDial XDIAL_DAEMON_PLIST com.kafeifei.xdial.debug.daemon.plist

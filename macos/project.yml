@@ -39,7 +39,7 @@ settings:
       XDIAL_DAEMON_PLIST: com.kafeifei.xdial.debug.daemon.plist
       XDIAL_DAEMON_ENTITLEMENTS: XDialDaemonDebug.entitlements
       XDIAL_HELPER_SOURCE: "$(SRCROOT)/../build/xdial-debug"
-      XDIAL_PRODUCT_DISPLAY_NAME: Xdial debug
+      XDIAL_PRODUCT_DISPLAY_NAME: XDail Debug
       XDIAL_SETTINGS_ENTRY_IDENTIFIER: com.kafeifei.xdial.debug.settings-entry
       XDIAL_BUILD_FLAVOR: debug
       SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG XDIAL_DEVELOPMENT_IDENTITY"
@@ -180,7 +180,7 @@ targets:
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
           CODE_SIGN_ENTITLEMENTS: XDialDebug.entitlements
-          PRODUCT_NAME: Xdial debug
+          PRODUCT_NAME: XDail Debug
           PRODUCT_MODULE_NAME: XDial
           EXECUTABLE_NAME: XDial
         FormalDevelopment:
