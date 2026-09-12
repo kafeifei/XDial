@@ -19,6 +19,10 @@ final class MenuBarRecoveryControllerTests: XCTestCase {
         XCTAssertEqual(publications, 1)
         for _ in 0..<100 { binding.wrappedValue = false }
         XCTAssertEqual(publications, 1)
+        controller.suppressMenuRemovalTermination()
+        controller.suppressMenuRemovalTermination()
+        XCTAssertEqual(publications, 1)
+        XCTAssertEqual(controller.suppressedTerminations, 2)
         binding.wrappedValue = true
         XCTAssertEqual(publications, 2)
         withExtendedLifetime(subscription) {}

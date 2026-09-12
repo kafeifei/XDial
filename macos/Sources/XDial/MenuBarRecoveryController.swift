@@ -32,12 +32,12 @@ final class MenuBarRecoveryController: ObservableObject {
     func start() {
         guard monitor == nil else { return }
         let center = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.willSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
+        for name in [NSWorkspace.sessionDidResignActiveNotification] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.setSessionAvailable(false) }
             })
         }
-        for name in [NSWorkspace.didWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+        for name in [NSWorkspace.sessionDidBecomeActiveNotification] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.setSessionAvailable(true) }
             })
@@ -50,7 +50,8 @@ final class MenuBarRecoveryController: ObservableObject {
         }
     }
 
-    private func setSessionAvailable(_ available: Bool) {
+    // AppState forwards system sleep/wake from the single host lifecycle owner.
+    func setSessionAvailable(_ available: Bool) {
         sessionAvailable = available
         _ = policy.observe(.deferred, at: ProcessInfo.processInfo.systemUptime)
     }
@@ -148,7 +149,7 @@ final class MenuBarRecoveryController: ObservableObject {
     /// user's Quit command. Keep the host alive so it can rebuild the entry.
     func suppressMenuRemovalTermination() {
         suppressedTerminations += 1
-        isInserted = false
+        if isInserted { isInserted = false }
         appLog("menu bar recovery: suppressed scene-removal termination")
     }
 
