@@ -1,33 +1,36 @@
-# Tailscale 验收边界
+# Tailscale 运行证据
 
-本文件只在实现或验收 Tailscale Line 时按需阅读。架构语义同时以 `ARCHITECTURE.md` 的
-D33–D35 为准；这里不授予登录、断连、重启本地或远端服务的权限。
+Line、setup session、Underlay 与 Commit 的语义见 [ARCHITECTURE.md](../../ARCHITECTURE.md)。
+桌面 setup 是 helper 中的配置会话，Provider 中的 active / prepared-switch runtime
+属于连接事务；它们共享持久身份，但状态和生命周期不同。
 
-- 桌面 Tailscale 的登录与节点发现只能由设置页 Line 卡片显式启动。Debug Server 可以用
-  AX 打开和检查这张卡片，但不得增加接收、回显或持久化 Auth Key 的接口。
-- 浏览器登录会改变用户的 Tailscale 账号状态；Agent 未经用户明确授权，只验收到登录入口
-  和结构化状态，不代替用户完成登录。Auth Key 同理不得从本机配置或日志中搜集。
-- setup session 前后都要确认 XDial 数据面处于断开状态，系统没有新增 XDial TUN、默认路由
-  与 DNS 未被 setup 改写。正式连接还必须确认 LocalAPI 登录态、所选 exit node 在线，
-  以及连接后的真实出口；仅看到下拉框或配置生成成功不算完成。
-- 官方 Tailscale exit node 等全流量 Network Extension 作为 Underlay 时，原生 TUN 存在
-  D34 平台边界。不得只凭 `route.default_interface`、一条 `route get` 或出口自测宣告叠加
-  成功；系统 DNS 必须进入 XDial，且普通 TCP/UDP 要分别证明命中真实 Scenario 出口。
-  DNS 接管路由被下层 link route 抢走时应让连接失败，不得追加产品特例或再尝试第二个
-  Packet Tunnel。
-- 旧原生 TUN 遇到 `RTF_GLOBAL` Underlay，必须在任何 Line 会话、规则预取和 sing-box
-  启动之前拒绝。Transparent Proxy 不靠这条路由判据，但同样必须先完成 sing-box 与 active
-  Tailscale 出口就绪，再提交系统网络设置；`Connecting` 不是允许半接管用户流量的状态。
-- 若结构化状态同时满足 exit node 在线且已选中、存在于 netmap / magicsock / engine、
-  `tx > 0`、`rx = 0`、无握手，应报告 peer handshake 失败，不能改写成登录、外部网络限制、
-  Underlay 或普通出口探测结论。需要定位 DERP 状态漂移时必须做同时间双端取证，分别比较
-  控制图与 magicsock 实时 Relay；旧日志和上一次成功不能替代本轮状态。远端 `tailscaled`
-  重启只会清除既有内存状态，未经用户明确授权不得执行，也不得把重启后成功当作产品修复
-  或验收。
-- 本地 NetInfo 发布调用返回、lite map HTTP 接受、远端 peer map 消费、fresh handshake
-  和真实出口是逐层独立的证据；只完成前一层不得宣称后一层。DERP client / ready 汇总只是
-  点时快照，不能排除两次采样之间发生 reconnect；缺少结构化 lifecycle 证据时必须报告
-  尚未确定。
-- 不得在连接启动事务中自动触发 Home DERP 重选。出现上述 peer handshake failure 时必须
-  在提交系统网络设置前失败并回滚；任何用户显式启动的重选也仍需 fresh handshake 与真实
-  出口验收，不能把本地提升或 control HTTP 接受当成恢复成功。
+## 结构化来源
+
+| 来源 | 表达的事实 |
+|---|---|
+| 设置页 Line 卡片 → `GoEngine.tailscaleStatus` → helper 的 `tailscale-status` | setup session 的 LocalAPI 登录态与可选 exit node；不是 Provider 已连接的证明 |
+| `Libbox.TailscaleStatus` / `PreparedSwitchTailscaleStatus` | 对应 runtime 的 LocalAPI 状态，以及 control、magicsock 的有限诊断 |
+| `exit_nodes` | `online`、`selected`、`in_network_map`、`in_magic_sock`、`in_engine`、收发计数和 `has_handshake` |
+| `readiness.control` / `readiness.derp`、节点的 `derp_path` | control generation、Home DERP 状态与连接 generation，以及收发、失效、关闭等 sequence |
+| `ProbeTailscalePeer` / `ProbePreparedSwitchTailscalePeer` | 对单个 peer 发起真实 Disco / TSMP 探测，返回路径类别、延迟和错误类别 |
+| 当前 `ConnectionReport` 与 Debug 路由探针 | 连接提交结果，以及具体流量的 Line 归因；HTTP 入口见 [debug-server.md](../agent/debug-server.md) |
+
+setup IPC 见 [GoEngine.swift](../../macos/Sources/XDial/GoEngine.swift) 与
+[daemon.go](../../cmd/xdial/daemon.go)。Provider 数据定义与读取见
+[tailscale_status_gvisor.go](../../core/libbox/tailscale_status_gvisor.go)；消费与证据投影见
+[EmbeddedSingBoxRuntime.swift](../../macos/TransparentProxyExtension/EmbeddedSingBoxRuntime.swift)
+和 [TailscaleReadiness.swift](../../macos/Shared/TailscaleReadiness.swift)。这些 Libbox 方法不是
+Debug Server HTTP 动作。
+
+## 结论范围
+
+`has_handshake` 仅表示 LocalAPI 的 `LastHandshake` 非零，不表示本轮 fresh handshake。
+exit node 在线、已选中且存在于三份运行结构中，仍可能出现 `tx > 0 / rx = 0` 的 peer
+handshake 失败；该组合本身不定位到登录、Underlay 或某个外部服务。
+
+NetInfo 本地调用返回、control HTTP 接受、远端消费 map、fresh handshake 与真实出口是
+不同证据。DERP ready/client 数是点时快照；相同汇总不能排除采样间的重连，sequence 与
+generation 才能表达期间变化。单端状态不证明远端已消费同一张 map。
+
+出口 IP、单次 HTTPS 和路由表分别只覆盖各自观察；TCP、系统 DNS 和普通 UDP 的实际
+Scenario 出口需要对应流量证据。远端进程重启后的成功属于新的运行现场。
