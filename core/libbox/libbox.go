@@ -49,6 +49,7 @@ import (
 	"golang.org/x/sys/unix"
 	"sslcon/session"
 
+	"github.com/kafeifei/xdial/core/config"
 	"github.com/kafeifei/xdial/core/engine"
 	"github.com/kafeifei/xdial/core/subscription"
 )
@@ -509,8 +510,8 @@ var outboundAddressProbeEndpointsByFamily = map[string][]outboundAddressProbeEnd
 			destination: M.ParseSocksaddrHostPortStr("1.1.1.1", "443"),
 		},
 		{
-			url:         "https://1.0.0.1/cdn-cgi/trace",
-			destination: M.ParseSocksaddrHostPortStr("1.0.0.1", "443"),
+			url:         "https://r.inews.qq.com/api/ip2city",
+			destination: M.ParseSocksaddrHostPortStr("r.inews.qq.com", "443"),
 		},
 	},
 	"ipv6": {
@@ -535,9 +536,9 @@ func (l *Libbox) ProbeOutboundIP(outboundTag string, timeoutMS int) (string, err
 }
 
 // ProbeOutboundIPForFamily fetches one public address of the requested family
-// through one exact running outbound. The fixed numeric endpoints make the
-// address family an input to routing while keeping the diagnostics surface from
-// becoming an arbitrary network fetch primitive.
+// through one exact running outbound. IPv4 races Cloudflare and Tencent; IPv6
+// retains numeric Cloudflare endpoints until Tencent IPv6 support is verified.
+// The endpoint allowlist cannot be supplied by diagnostics callers.
 func (l *Libbox) ProbeOutboundIPForFamily(
 	outboundTag string,
 	addressFamily string,
@@ -589,33 +590,29 @@ func (l *Libbox) probeOutboundIP(
 	defer l.runtimeUsers.Done()
 	defer cancel()
 
+	if addressFamily != "" {
+		key := outboundTag + "/" + addressFamily
+		address, winner, err := raceOutboundAddresses(ctx, outbound, endpoints,
+			addressFamily, addressProbePolicy.preference(key), probe, addressProbePolicy)
+		if !l.probeGenerationIsCurrent(generation) {
+			return "", fmt.Errorf("connection changed during outbound address probe")
+		}
+		if err == nil {
+			addressProbePolicy.remember(key, winner)
+		}
+		return address, err
+	}
+
 	var probeErrors []string
 	for index, endpoint := range endpoints {
-		address, err := probe(
-			ctx,
-			outbound,
-			endpoint,
-			len(endpoints)-index,
-		)
+		address, err := probe(ctx, outbound, endpoint, len(endpoints)-index)
 		if err == nil {
-			if addressFamily != "" && !addressMatchesFamily(address, addressFamily) {
-				probeErrors = append(probeErrors, familyProbeFailureCode(
-					addressFamily, index, "wrong-family",
-				))
-				continue
-			}
 			if !l.probeGenerationIsCurrent(generation) {
 				return "", fmt.Errorf("connection changed during outbound address probe")
 			}
 			return address, nil
 		}
-		if addressFamily == "" {
-			probeErrors = append(probeErrors, err.Error())
-		} else {
-			probeErrors = append(probeErrors, familyProbeFailureCode(
-				addressFamily, index, outboundAddressProbeSafeCode(err),
-			))
-		}
+		probeErrors = append(probeErrors, err.Error())
 	}
 	if !l.probeGenerationIsCurrent(generation) {
 		return "", fmt.Errorf("connection changed during outbound address probe")
@@ -772,7 +769,35 @@ func probeOutboundAddress(
 	ctx, cancel := context.WithTimeout(parentCtx, attemptTimeout)
 	defer cancel()
 
-	conn, err := outbound.DialContext(ctx, "tcp", endpoint.destination)
+	destination := endpoint.destination
+	if destination.Fqdn == "r.inews.qq.com" {
+		// Resolve through the selected Line's compiled resolver, never the
+		// Scenario default or a host-side HTTP client. Force an IPv4 target.
+		router := service.FromContext[adapter.DNSRouter](ctx)
+		transports := service.FromContext[adapter.DNSTransportManager](ctx)
+		if router == nil || transports == nil {
+			return "", newOutboundAddressProbeError("dns-unavailable", fmt.Errorf("line resolver unavailable"))
+		}
+		resolverTag := "proxy-dns-" + outbound.Tag()
+		if outbound.Tag() == "direct" {
+			resolverTag = config.TransparentNativeDNSTag
+		}
+		transport, loaded := transports.Transport(resolverTag)
+		if !loaded {
+			return "", newOutboundAddressProbeError("dns-unavailable", fmt.Errorf("line resolver unavailable"))
+		}
+		addresses, lookupErr := router.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{
+			Transport: transport, Strategy: C.DomainStrategyIPv4Only,
+		})
+		if lookupErr != nil || len(addresses) == 0 {
+			return "", newOutboundAddressProbeError("dns-failed", fmt.Errorf("address probe resolution failed"))
+		}
+		destination = M.SocksaddrFrom(addresses[0].Unmap(), destination.Port)
+		if !destination.Addr.Is4() {
+			return "", newOutboundAddressProbeError("dns-wrong-family", fmt.Errorf("resolver returned wrong family"))
+		}
+	}
+	conn, err := outbound.DialContext(ctx, "tcp", destination)
 	if err != nil {
 		return "", newOutboundAddressProbeError(
 			"dial-failed",
@@ -787,6 +812,12 @@ func probeOutboundAddress(
 			"request-failed",
 			fmt.Errorf("create address probe request: %w", err),
 		)
+	}
+	request.Header.Set("Cache-Control", "no-cache")
+	if endpoint.destination.Fqdn == "r.inews.qq.com" {
+		query := request.URL.Query()
+		query.Set("_t", strconv.FormatInt(time.Now().UnixNano(), 10))
+		request.URL.RawQuery = query.Encode()
 	}
 	client := http.Client{
 		Transport: &http.Transport{
@@ -828,7 +859,12 @@ func probeOutboundAddress(
 			fmt.Errorf("read address probe response: %w", err),
 		)
 	}
-	address, err := parsePublicProbeAddress(string(body))
+	var address string
+	if endpoint.destination.Fqdn == "r.inews.qq.com" {
+		address, err = parseTencentProbeAddress(body)
+	} else {
+		address, err = parsePublicProbeAddress(string(body))
+	}
 	if err != nil {
 		return "", newOutboundAddressProbeError("invalid-address", err)
 	}
@@ -853,6 +889,17 @@ func deadlineFromContext(ctx context.Context) time.Time {
 		return deadline
 	}
 	return time.Now()
+}
+
+func parseTencentProbeAddress(body []byte) (string, error) {
+	var response struct {
+		Ret *int   `json:"ret"`
+		IP  string `json:"ip"`
+	}
+	if err := stdjson.Unmarshal(body, &response); err != nil || response.Ret == nil || *response.Ret != 0 {
+		return "", fmt.Errorf("address service returned an invalid response")
+	}
+	return validatePublicProbeAddress(response.IP)
 }
 
 func parsePublicProbeAddress(body string) (string, error) {
