@@ -227,6 +227,7 @@ final class DebugServer {
         ] as [String: Any]
         dict["applicationLifecycle"] =
             ApplicationWindowLifecycleController.shared.diagnostics
+        dict["menuBarRecovery"] = MenuBarRecoveryController.shared.diagnostics
         if let updater = AppUpdateChecker.current {
             dict["appUpdate"] = [
                 "phase": updater.phase.rawValue,
@@ -434,7 +435,7 @@ final class DebugServer {
             appLog("DebugServer: graceful quit requested")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 appLog("DebugServer: invoking NSApplication terminate")
-                NSApp.terminate(nil)
+                MenuBarRecoveryController.shared.requestQuit()
             }
             return ok(["ok": true])
         case "prepare-system-extension":

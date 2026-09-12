@@ -483,7 +483,7 @@ struct InstallationView: View {
             isUninstalling = false
             if ok {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    NSApp.terminate(nil)
+                    MenuBarRecoveryController.shared.requestQuit()
                 }
             } else {
                 uninstallError = error

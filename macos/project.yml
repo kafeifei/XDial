@@ -325,6 +325,9 @@ targets:
       - Sources/XDial/ProfileVaultProjection.swift
       - Sources/XDial/Localization.swift
       - Sources/XDial/MenuBarStatusIcon.swift
+      - Sources/XDial/MenuBarRecoveryPolicy.swift
+      - Sources/XDial/MenuBarRecoveryController.swift
+      - Sources/XDial/MenuBarTrackingRepair.swift
       - Sources/XDial/NetworkInfo.swift
       - Sources/XDial/RotaryDial.swift
       - Sources/XDial/ScenarioIconCatalog.swift

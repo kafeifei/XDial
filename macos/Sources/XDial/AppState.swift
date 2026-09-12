@@ -1078,6 +1078,7 @@ final class AppState: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
+                MenuBarRecoveryController.shared.setSessionAvailable(false)
                 self?.handleSystemWillSleep()
             }
         }
@@ -1087,6 +1088,7 @@ final class AppState: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
+                MenuBarRecoveryController.shared.setSessionAvailable(true)
                 self?.handleWakeSignal(trigger: "workspace_did_wake")
             }
         }
