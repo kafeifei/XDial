@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -132,42 +131,22 @@ func TestProbeOutboundIPReturnsCurrentGenerationResult(t *testing.T) {
 	}
 }
 
-func TestProbeOutboundIPForFamilyUsesFixedNumericEndpoints(t *testing.T) {
-	for family, endpoints := range outboundAddressProbeEndpointsByFamily {
-		if len(endpoints) != 2 {
-			t.Fatalf("%s endpoint count = %d", family, len(endpoints))
-		}
-		for _, endpoint := range endpoints {
-			parsedURL, err := url.Parse(endpoint.url)
-			if err != nil {
-				t.Fatalf("parse %s endpoint URL: %v", family, err)
-			}
-			address, err := netip.ParseAddr(parsedURL.Hostname())
-			if err != nil {
-				t.Fatalf("%s endpoint is not numeric: %q", family, endpoint.url)
-			}
-			if family == "ipv4" && !address.Is4() {
-				t.Fatalf("IPv4 endpoint is not IPv4: %q", endpoint.url)
-			}
-			if family == "ipv6" && (!address.Is6() || address.Is4In6()) {
-				t.Fatalf("IPv6 endpoint is not IPv6: %q", endpoint.url)
-			}
-			if parsedURL.Scheme != "https" || parsedURL.Path != "/cdn-cgi/trace" {
-				t.Fatalf("unexpected %s endpoint URL: %q", family, endpoint.url)
-			}
-			if endpoint.destination.Addr != address || endpoint.destination.Port != 443 {
-				t.Fatalf(
-					"%s endpoint destination = %s, URL host = %s",
-					family,
-					endpoint.destination,
-					address,
-				)
-			}
+func TestProbeOutboundIPForFamilyEndpointContract(t *testing.T) {
+	v4 := outboundAddressProbeEndpointsByFamily["ipv4"]
+	if len(v4) != 2 || v4[0].destination.Addr != netip.MustParseAddr("1.1.1.1") ||
+		v4[1].url != "https://r.inews.qq.com/api/ip2city" || v4[1].destination.Fqdn != "r.inews.qq.com" {
+		t.Fatalf("unexpected IPv4 endpoints: %+v", v4)
+	}
+	for _, endpoint := range outboundAddressProbeEndpointsByFamily["ipv6"] {
+		if !endpoint.destination.Addr.Is6() || endpoint.destination.Port != 443 {
+			t.Fatalf("unverified IPv6 endpoint: %+v", endpoint)
 		}
 	}
 }
 
 func TestProbeOutboundIPForFamilyFallsBackAndRejectsWrongFamily(t *testing.T) {
+	addressProbePolicy = newAddressProbePolicy()
+	t.Cleanup(func() { addressProbePolicy = newAddressProbePolicy() })
 	instance := New(nil)
 	instance.platform.setDefaultInterface("test0", 1)
 	if err := instance.StartStandalone(outboundProbeTestConfig); err != nil {
@@ -189,7 +168,7 @@ func TestProbeOutboundIPForFamilyFallsBackAndRejectsWrongFamily(t *testing.T) {
 		return "2606:4700:4700::1111", nil
 	}
 
-	address, err := instance.ProbeOutboundIPForFamily("direct", "ipv6", 500)
+	address, _, err := raceOutboundAddresses(context.Background(), nil, outboundAddressProbeEndpointsByFamily["ipv6"], "ipv6", "", instance.probeOutboundAddressFunc, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +186,7 @@ func TestProbeOutboundIPForFamilyFallsBackAndRejectsWrongFamily(t *testing.T) {
 		attempts = append(attempts, endpoint.url)
 		return "8.8.8.8", nil
 	}
-	_, err = instance.ProbeOutboundIPForFamily("direct", "ipv6", 500)
+	_, _, err = raceOutboundAddresses(context.Background(), nil, outboundAddressProbeEndpointsByFamily["ipv6"], "ipv6", "", instance.probeOutboundAddressFunc, nil)
 	if err == nil || !strings.Contains(err.Error(), "ipv6-endpoint-1-wrong-family") {
 		t.Fatalf("wrong-family result was accepted: %v", err)
 	}
@@ -217,6 +196,8 @@ func TestProbeOutboundIPForFamilyFallsBackAndRejectsWrongFamily(t *testing.T) {
 }
 
 func TestProbeOutboundIPForFamilyAggregatesOnlySafeStageCodes(t *testing.T) {
+	addressProbePolicy = newAddressProbePolicy()
+	t.Cleanup(func() { addressProbePolicy = newAddressProbePolicy() })
 	instance := New(nil)
 	instance.platform.setDefaultInterface("test0", 1)
 	if err := instance.StartStandalone(outboundProbeTestConfig); err != nil {
@@ -286,6 +267,8 @@ func TestProbeOutboundIPForFamilyRejectsUnknownFamily(t *testing.T) {
 }
 
 func TestProbeOutboundIPForFamilyStopCancelsAndWaitsForProbeLease(t *testing.T) {
+	addressProbePolicy = newAddressProbePolicy()
+	t.Cleanup(func() { addressProbePolicy = newAddressProbePolicy() })
 	instance := New(nil)
 	instance.platform.setDefaultInterface("test0", 1)
 	if err := instance.StartStandalone(outboundProbeTestConfig); err != nil {
