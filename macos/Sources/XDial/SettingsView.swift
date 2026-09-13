@@ -173,108 +173,48 @@ private func reorder<Item>(
 
 struct SettingsView: View {
     @EnvironmentObject var state: AppState
-    @State private var tab = 0
+    private var tab: Int { state.editorPosition.tab }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                Spacer(minLength: 0)
-                    .frame(width: 56)
-
-                HStack {
-                    Spacer(minLength: 0)
-                    HStack(spacing: 4) {
-                        settingsTab(
-                            0,
-                            title: state.tr("线路", "Lines"),
-                            symbol: "point.3.connected.trianglepath.dotted"
-                        )
-                        settingsTab(
-                            1,
-                            title: state.tr("规则", "Rules"),
-                            symbol: "list.bullet.rectangle"
-                        )
-                        settingsTab(
-                            2,
-                            title: state.tr("场景", "Scenarios"),
-                            symbol: "square.grid.2x2"
-                        )
-                    }
-                    .padding(4)
-                    .frame(width: 260)
-                    .background(Color.primary.opacity(0.04), in: Capsule())
-                    .overlay {
-                        Capsule().stroke(
-                            XDialPalette.divider.opacity(0.65),
-                            lineWidth: 0.5
-                        )
-                    }
-                    Spacer(minLength: 0)
-                }
-                .frame(maxWidth: .infinity)
-
-                HStack(spacing: 0) {
-                    settingsTab(
-                        3,
-                        title: state.tr("通用", "General"),
-                        symbol: "gearshape"
-                    )
-                }
-                .padding(4)
-                .frame(width: 84)
-                .background(Color.primary.opacity(0.04), in: Capsule())
-                .overlay {
-                    Capsule().stroke(
-                        XDialPalette.divider.opacity(0.65),
-                        lineWidth: 0.5
-                    )
-                }
+            HStack {
+                ProfileNavigation()
             }
-            .padding(.horizontal, 16)
-            .frame(height: 48)
-            .background {
-                LinearGradient(
-                    colors: [
-                        titleAccent.opacity(0.10),
-                        titleAccent.opacity(0.035),
-                        XDialPalette.accent.opacity(0.025),
-                    ],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                )
-            }
-            // fullSizeContentView 仍保留 32pt 的系统标题安全区。只让顶栏
-            // 覆盖这块区域，而不是把整个 520pt 内容上移；否则底部会空出
-            // 同样的 32pt。
-            .padding(.top, -32)
+            .padding(.horizontal, 16).frame(height: 48)
+            .background(titleAccent.opacity(0.07))
 
-            if !state.installation.isReady {
-                installationBanner
-            } else if state.configDirty {
-                dirtyBanner
+            if state.settingsArea == .configuration {
+                HStack(spacing: 4) {
+                    settingsTab(0, title: state.tr("线路", "Lines"), symbol: "point.3.connected.trianglepath.dotted")
+                    settingsTab(1, title: state.tr("规则", "Rules"), symbol: "list.bullet.rectangle")
+                    settingsTab(2, title: state.tr("场景", "Scenarios"), symbol: "square.grid.2x2")
+                    Spacer(minLength: 8)
+                    Text(state.editingRecord.source == nil ? state.tr("本地配置", "Local") : state.tr("订阅配置", "Subscription"))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 8)
+                if let error = state.profilePersistenceError ?? state.profileOperationError {
+                    Text(error).font(.caption).foregroundStyle(XDialPalette.danger)
+                        .textSelection(.enabled).padding(12)
+                }
+                if state.editingActiveProfile && state.configDirty { dirtyBanner }
             }
-
             Divider()
-
             ZStack {
-                if tab == 0 { LinesTab() }
-                else if tab == 1 { RulesTab() }
-                else if tab == 2 { ScenariosTab() }
-                else { GeneralTab() }
+                if state.settingsArea == .general { GeneralTab() }
+                else if tab == 0 { LinesTab().id(state.editingRecord.id) }
+                else if tab == 1 { RulesTab().id(state.editingRecord.id) }
+                else { ScenariosTab().id(state.editingRecord.id) }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(XDialPalette.canvas)
         }
-        .frame(width: 540, height: 520)
+        .frame(width: 620, height: 580)
         .background(XDialPalette.canvas)
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: .xdialSettingsSelectTab
-            )
-        ) { notification in
-            guard let index = notification.userInfo?["index"] as? Int,
-                  (0 ... 3).contains(index) else { return }
-            tab = index
+        .onReceive(NotificationCenter.default.publisher(for: .xdialSettingsSelectTab)) { notification in
+            guard let index = notification.userInfo?["index"] as? Int, (0 ... 3).contains(index) else { return }
+            state.settingsArea = index == 3 ? .general : .configuration
+            if index != 3 { state.editorPosition.tab = index }
         }
     }
 
@@ -292,7 +232,7 @@ struct SettingsView: View {
     ) -> some View {
         let selected = tab == index
         return Button {
-            tab = index
+            state.editorPosition.tab = index
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: symbol)
@@ -303,8 +243,7 @@ struct SettingsView: View {
             .foregroundStyle(
                 selected ? XDialPalette.selection : Color.secondary
             )
-            .frame(maxWidth: .infinity)
-            .frame(height: 28)
+            .frame(width: 76, height: 28)
             .background(
                 selected
                     ? XDialPalette.selection.opacity(0.18)
@@ -449,6 +388,38 @@ struct GeneralTab: View {
             VStack(alignment: .leading, spacing: 8) {
                 SettingsPanel {
                     VStack(alignment: .leading, spacing: 8) {
+                        Text(state.tr("启动与连接", "Startup & Connection")).font(.system(size: 12, weight: .semibold))
+                        Toggle(isOn: $state.launchAtLogin) {
+                            Text(state.tr("开机自动启动", "Launch at login"))
+                                .font(.system(size: 12))
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Toggle(isOn: $state.autoConnect) {
+                                Text(state.tr(
+                                    "启动时自动连接",
+                                    "Connect automatically on launch"
+                                ))
+                                .font(.system(size: 12))
+                            }
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                            .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                            Text(state.tr(
+                                "此选项控制 XDial 启动后连接当前场景。运行中断线时，XDial 会尝试自动恢复连接。",
+                                "This controls connecting the active Scenario when XDial launches. If the connection drops while running, XDial attempts to restore it automatically."
+                            ))
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                SettingsPanel {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(state.tr("界面", "Interface")).font(.system(size: 12, weight: .semibold))
                         HStack(spacing: 8) {
                             Text(state.tr("外观", "Appearance"))
                                 .font(.system(size: 12))
@@ -502,32 +473,6 @@ struct GeneralTab: View {
                         }
                         .frame(minHeight: 28)
 
-                        Toggle(isOn: $state.launchAtLogin) {
-                            Text(state.tr("开机自动启动", "Launch at login"))
-                                .font(.system(size: 12))
-                        }
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-
-                        VStack(alignment: .leading, spacing: 3) {
-                            Toggle(isOn: $state.autoConnect) {
-                                Text(state.tr(
-                                    "启动时自动连接",
-                                    "Connect automatically on launch"
-                                ))
-                                .font(.system(size: 12))
-                            }
-                            .toggleStyle(.switch)
-                            .controlSize(.mini)
-                            .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-                            Text(state.tr(
-                                "此选项控制 XDial 启动后连接当前场景。运行中断线时，XDial 会尝试自动恢复连接。",
-                                "This controls connecting the active Scenario when XDial launches. If the connection drops while running, XDial attempts to restore it automatically."
-                            ))
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                        }
                     }
                 }
 
@@ -592,16 +537,13 @@ struct GeneralTab: View {
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
-                        Button {
-                            presentUpdateWindow()
-                        } label: {
-                            Label(
-                                state.tr("检查更新", "Check for Updates"),
-                                systemImage: "arrow.triangle.2.circlepath"
-                            )
-                            .font(.system(size: 11.5))
+                        if XDialBuildIdentity.allowsAutomaticUpdates {
+                            Button(state.tr("检查更新", "Check for Updates")) { presentUpdateWindow() }
+                                .controlSize(.small)
+                        } else {
+                            Text(state.tr("独立开发版 · 手动更新", "Independent build · Manual updates"))
+                                .font(.caption).foregroundStyle(.secondary)
                         }
-                        .controlSize(.small)
                     }
                 }
             }
@@ -683,8 +625,11 @@ struct LinesTab: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 8) {
-                    ForEach($state.profile.lines) { $line in
-                        LineRow(line: $line, onDelete: { delete(line) })
+                    ForEach($state.editingProfile.lines) { $line in
+                        Group {
+                            if line.isGroup { LineGroupRow(line: $line, onDelete: { delete(line) }) }
+                            else { LineRow(line: $line, onDelete: { delete(line) }) }
+                        }
                             .settingsReorderable(
                                 SettingsReorderItem(
                                     kind: "line",
@@ -695,18 +640,6 @@ struct LinesTab: View {
                                 moveLine(item, to: targetID)
                             }
                     }
-                    ForEach($state.profile.subscriptions) { $sub in
-                        SubscriptionRow(sub: $sub, onDelete: { deleteSub(sub) })
-                            .settingsReorderable(
-                                SettingsReorderItem(
-                                    kind: "subscription",
-                                    id: sub.id
-                                ),
-                                draggedItem: $draggedItem
-                            ) { item, targetID in
-                                moveSubscription(item, to: targetID)
-                            }
-                    }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
@@ -715,6 +648,9 @@ struct LinesTab: View {
             Divider()
             AddBar {
                 Menu {
+                    lineTypeButton("手动选择组", type: "selector", icon: "square.stack.3d.up")
+                    lineTypeButton("自动测速组", type: "urltest", icon: "speedometer")
+                    Divider()
                     lineTypeButton("VPN", type: "vpn", icon: "lock.shield")
                     lineTypeButton(
                         "Trojan",
@@ -741,25 +677,10 @@ struct LinesTab: View {
                         type: "tailscale",
                         icon: "circle.grid.3x3.fill"
                     )
-                    Divider()
-                    Button {
-                        showAddSub = true
-                    } label: {
-                        Label(
-                            state.tr(
-                                "从订阅导入…",
-                                "Import from subscription…"
-                            ),
-                            systemImage: "tray.and.arrow.down"
-                        )
-                    }
                 } label: {
                     Label(state.tr("添加线路", "Add Line"), systemImage: "plus")
                 }
             }
-        }
-        .sheet(isPresented: $showAddSub) {
-            AddSubscriptionSheet(isPresented: $showAddSub)
         }
     }
 
@@ -787,22 +708,28 @@ struct LinesTab: View {
         case "tailscale": name = "Tailscale"
         default: name = "节点"
         }
-        state.profile.lines.append(Line(id: id, name: name, type: type))
-        state.save()
+        var line = Line(id: id, name: name, type: type)
+        if line.isGroup {
+            line.name = type == "selector" ? "手动选择组" : "自动测速组"
+            line.groupMembers = state.editingProfile.lines.filter { $0.enabled && $0.type != "vpn" && $0.type != "tailscale" && !$0.isGroup && (type != "urltest" || $0.type != "direct") }.map(\.id)
+        }
+        state.editingProfile.lines.append(line)
+        state.saveEditingProfile()
     }
 
     private func delete(_ line: Line) {
         if line.type == "direct" { return }
+        if state.editingProfile.scenarios.contains(where: { $0.defaultLineID == line.id || $0.bindings.contains(where: { $0.lineID == line.id }) }) || state.editingProfile.lines.contains(where: { $0.groupMembers.contains(line.id) }) {
+            state.profileOperationError = "此线路仍被场景或线路组使用，请先修改引用"
+            return
+        }
         if line.type == "tailscale" {
             state.engine.stopTailscaleSetup(lineID: line.id)
         }
-        state.profile.lines.removeAll { $0.id == line.id }
-        state.save()
+        state.editingProfile.lines.removeAll { $0.id == line.id }
+        state.saveEditingProfile()
     }
 
-    private func deleteSub(_ sub: Subscription) {
-        state.deleteSubscription(sub.id)
-    }
 
     private func moveLine(
         _ item: SettingsReorderItem?,
@@ -810,12 +737,12 @@ struct LinesTab: View {
     ) -> Bool {
         guard let item, item.kind == "line",
               reorder(
-                &state.profile.lines,
+                &state.editingProfile.lines,
                 draggedID: item.id,
                 targetID: targetID,
                 id: { $0.id }
               ) else { return false }
-        state.saveVisualOrderAsync()
+        state.saveEditingVisualOrder()
         return true
     }
 
@@ -825,12 +752,12 @@ struct LinesTab: View {
     ) -> Bool {
         guard let item, item.kind == "subscription",
               reorder(
-                &state.profile.subscriptions,
+                &state.editingProfile.subscriptions,
                 draggedID: item.id,
                 targetID: targetID,
                 id: { $0.id }
               ) else { return false }
-        state.saveVisualOrderAsync()
+        state.saveEditingVisualOrder()
         return true
     }
 }
@@ -974,7 +901,13 @@ private struct RuntimeResourceBadge: View {
 struct LineRow: View {
     @SwiftUI.Binding var line: Line
     var onDelete: () -> Void
-    @State private var expanded = false
+    private var expanded: Bool {
+        get { state.editorPosition.expandedLineIDs.contains(line.id) }
+        nonmutating set {
+            if newValue { state.editorPosition.expandedLineIDs.insert(line.id) }
+            else { state.editorPosition.expandedLineIDs.remove(line.id) }
+        }
+    }
     @State private var showAuthKey = false
     @State private var authKey = ""
     @State private var anyTLSALPNInput: String
@@ -994,6 +927,7 @@ struct LineRow: View {
         )
     }
 
+    private var sourceOwned: Bool { state.editingRecord.baseline?.lines.contains(where: { $0.id == line.id }) == true }
     private var isLocked: Bool { line.type == "direct" }
     private var tailscaleStatus: TailscaleRuntimeStatus? {
         state.tailscaleConfigurationStatus(for: line.id)
@@ -1016,8 +950,8 @@ struct LineRow: View {
             isExpanded: expanded,
             locked: isLocked,
             onToggle: { expanded.toggle() },
-            onDelete: isLocked ? nil : onDelete,
-            enabled: Binding(get: { line.enabled }, set: { if !isLocked { line.enabled = $0; state.save() } }),
+            onDelete: (isLocked || sourceOwned) ? nil : onDelete,
+            enabled: Binding(get: { line.enabled }, set: { if !isLocked && !sourceOwned { line.enabled = $0; state.saveEditingProfile() } }),
             header: {
                 RuntimeResourceBadge(
                     kind: "line",
@@ -1038,6 +972,7 @@ struct LineRow: View {
                 }
                 Spacer()
                 Text(typeLabel).font(.caption).foregroundStyle(.secondary)
+                Text(sourceOwned ? "订阅" : "自建").font(.caption).foregroundStyle(.secondary)
             },
             detail: {
                 VStack(alignment: .leading, spacing: 4) {
@@ -1046,10 +981,16 @@ struct LineRow: View {
                         Text("名称").font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
                         TextField("名称", text: $line.name)
                             .textFieldStyle(.roundedBorder).font(.caption)
-                            .onChange(of: line.name) { _, _ in state.save() }
+                            .onChange(of: line.name) { _, _ in state.saveEditingProfile() }
                     }
                     detailFields
+                    if ["trojan", "shadowsocks", "vmess", "anytls"].contains(line.type) {
+                        DisclosureGroup("高级选项（sing-box）") {
+                            NativeLineOptionsEditor(line: $line)
+                        }
+                    }
                 }
+                .disabled(sourceOwned)
             }
         )
         .opacity(line.enabled ? 1.0 : 0.65)
@@ -1286,7 +1227,7 @@ struct LineRow: View {
                     get: { line.tailscaleMagicDNS },
                     set: {
                         line.tailscaleMagicDNS = $0
-                        state.save()
+                        state.saveEditingProfile()
                     }
                 )
             )
@@ -1384,7 +1325,7 @@ struct LineRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(width: 70, alignment: .leading)
-            Text(state.profile.tailscale.hostname)
+            Text(state.editingProfile.tailscale.hostname)
                 .font(.caption.monospaced())
                 .textSelection(.enabled)
             Spacer()
@@ -1399,7 +1340,7 @@ struct LineRow: View {
                 get: { line.tailscaleExitNode },
                 set: {
                     line.tailscaleExitNode = $0
-                    state.save()
+                    state.saveEditingProfile()
                 }
             )) {
                 Text(state.tr("不使用", "None")).tag("")
@@ -1464,7 +1405,7 @@ struct LineRow: View {
         state.setTailscaleConfigurationBusy(true, for: line.id)
         state.setTailscaleConfigurationError(nil, for: line.id)
         state.engine.prepareTailscale(
-            profileJSON: state.buildProfileJSON(),
+            profileJSON: state.buildEditingProfileJSON(),
             lineID: line.id,
             authKey: authKey
         ) { result in
@@ -1487,7 +1428,7 @@ struct LineRow: View {
         // 设置窗口或 helper 重启后，旧卡片可能还在但 setup session 已经结束。
         // 登录按钮先重建会话，不能假设 onAppear 曾成功执行。
         state.engine.prepareTailscale(
-            profileJSON: state.buildProfileJSON(),
+            profileJSON: state.buildEditingProfileJSON(),
             lineID: line.id
         ) { result in
             switch result {
@@ -1808,7 +1749,7 @@ struct LineRow: View {
 
     private func markLineChanged() {
         line.verified = false
-        state.save()
+        state.saveEditingProfile()
     }
 
     private func field(_ label: String, _ binding: SwiftUI.Binding<String>, placeholder: String = "") -> some View {
@@ -1905,7 +1846,7 @@ struct RulesTab: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 8) {
-                    ForEach($state.profile.ruleSets) { $rule in
+                    ForEach($state.editingProfile.ruleSets) { $rule in
                         RuleSetRow(rule: $rule, onDelete: { delete(rule) })
                             .settingsReorderable(
                                 SettingsReorderItem(
@@ -1942,6 +1883,13 @@ struct RulesTab: View {
                     Button(state.tr("应用程序", "Application")) {
                         addApplication()
                     }
+                    Button("sing-box 匹配规则") {
+                        var rule = RuleSet(id: UUID().uuidString, name: "匹配规则", type: "native")
+                        rule.nativeRule = .object([:])
+                        state.editingProfile.ruleSets.append(rule)
+                        state.editorPosition.expandedRuleIDs.insert(rule.id)
+                        state.saveEditingProfile()
+                    }
                 } label: {
                     Label(
                         state.tr("添加规则", "Add Rule"),
@@ -1968,7 +1916,7 @@ struct RulesTab: View {
 
     private func add(preset: RuleSetPreset) {
         let id = "rule-" + String(UUID().uuidString.prefix(6))
-        state.profile.ruleSets.append(RuleSet(
+        state.editingProfile.ruleSets.append(RuleSet(
             id: id,
             name: state.language == .zh
                 ? preset.nameZH
@@ -1978,17 +1926,17 @@ struct RulesTab: View {
             format: preset.format,
             invert: preset.invert
         ))
-        state.save()
+        state.saveEditingProfile()
     }
 
     private func addManual() {
         let id = "rule-" + String(UUID().uuidString.prefix(6))
-        state.profile.ruleSets.append(RuleSet(
+        state.editingProfile.ruleSets.append(RuleSet(
             id: id,
             name: state.tr("新手动规则", "New Manual Rule"),
             type: "manual"
         ))
-        state.save()
+        state.saveEditingProfile()
     }
 
     private func addApplication() {
@@ -1996,7 +1944,7 @@ struct RulesTab: View {
             let applications = try ApplicationRulePicker.chooseApplications()
             guard !applications.isEmpty else { return }
             let id = "rule-" + String(UUID().uuidString.prefix(6))
-            state.profile.ruleSets.append(RuleSet(
+            state.editingProfile.ruleSets.append(RuleSet(
                 id: id,
                 name: applications.count == 1
                     ? applications[0].name
@@ -2004,18 +1952,19 @@ struct RulesTab: View {
                 type: "application",
                 applications: applications
             ))
-            state.save()
+            state.saveEditingProfile()
         } catch {
             applicationSelectionError = error.localizedDescription
         }
     }
 
     private func delete(_ rule: RuleSet) {
-        state.profile.ruleSets.removeAll { $0.id == rule.id }
-        for i in state.profile.scenarios.indices {
-            state.profile.scenarios[i].bindings.removeAll { $0.ruleSetID == rule.id }
+        guard !state.editingProfile.scenarios.contains(where: { $0.bindings.contains(where: { $0.ruleSetID == rule.id }) }) else {
+            state.profileOperationError = "此规则仍被场景使用，请先修改引用"
+            return
         }
-        state.save()
+        state.editingProfile.ruleSets.removeAll { $0.id == rule.id }
+        state.saveEditingProfile()
     }
 
     private func moveRule(
@@ -2024,12 +1973,12 @@ struct RulesTab: View {
     ) -> Bool {
         guard let item, item.kind == "rule",
               reorder(
-                &state.profile.ruleSets,
+                &state.editingProfile.ruleSets,
                 draggedID: item.id,
                 targetID: targetID,
                 id: { $0.id }
               ) else { return false }
-        state.saveVisualOrderAsync()
+        state.saveEditingVisualOrder()
         return true
     }
 }
@@ -2037,7 +1986,13 @@ struct RulesTab: View {
 struct RuleSetRow: View {
     @SwiftUI.Binding var rule: RuleSet
     var onDelete: () -> Void
-    @State private var expanded = false
+    private var expanded: Bool {
+        get { state.editorPosition.expandedRuleIDs.contains(rule.id) }
+        nonmutating set {
+            if newValue { state.editorPosition.expandedRuleIDs.insert(rule.id) }
+            else { state.editorPosition.expandedRuleIDs.remove(rule.id) }
+        }
+    }
     @State private var domainsText = ""
     @State private var cidrsText = ""
     @State private var processesText = ""
@@ -2046,6 +2001,8 @@ struct RuleSetRow: View {
     @State private var applicationSelectionError: String?
     @EnvironmentObject var state: AppState
 
+    private var sourceOwned: Bool { state.editingRecord.baseline?.ruleSets.contains(where: { $0.id == rule.id }) == true }
+
     private func saveDomainsAndCIDRs() {
         rule.domains = domainsText.split(whereSeparator: \.isNewline)
             .map { RuleSet.sanitizeEntry(String($0)) }
@@ -2053,30 +2010,31 @@ struct RuleSetRow: View {
         rule.cidrs = cidrsText.split(whereSeparator: \.isNewline)
             .map { RuleSet.sanitizeEntry(String($0)) }
             .filter { !$0.isEmpty }
-        state.save()
+        state.saveEditingProfile()
     }
 
     private func saveProcesses() {
         rule.processes = RuleSet.sanitizeProcesses(
             processesText.split(whereSeparator: \.isNewline).map(String.init)
         )
-        state.save()
+        state.saveEditingProfile()
     }
 
     var body: some View {
         CollapsibleCard(
             isExpanded: expanded,
             onToggle: { expanded.toggle() },
-            onDelete: onDelete,
-            enabled: Binding(get: { rule.enabled }, set: { rule.enabled = $0; state.save() }),
+            onDelete: sourceOwned ? nil : onDelete,
+            enabled: Binding(get: { rule.enabled }, set: { guard !sourceOwned else { return }; rule.enabled = $0; state.saveEditingProfile() }),
             header: {
                 Text(rule.name).font(.system(size: 13, weight: .medium))
                 Spacer()
                 Text(ruleTypeLabel)
                     .font(.caption).foregroundStyle(.secondary)
                 Button {
+                    guard !sourceOwned else { return }
                     rule.invert.toggle()
-                    state.save()
+                    state.saveEditingProfile()
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: rule.invert
@@ -2128,9 +2086,11 @@ struct RuleSetRow: View {
                         Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
                         TextField("", text: $rule.name)
                             .textFieldStyle(.roundedBorder).font(.caption)
-                            .onChange(of: rule.name) { _, _ in state.save() }
+                            .onChange(of: rule.name) { _, _ in state.saveEditingProfile() }
                     }
-                    if rule.type == "url" {
+                    if rule.type == "native" {
+                        NativeRuleEditor(rule: $rule)
+                    } else if rule.type == "url" {
                         urlFields
                     } else if rule.type == "application" {
                         applicationFields
@@ -2138,6 +2098,7 @@ struct RuleSetRow: View {
                         manualFields
                     }
                 }
+                .disabled(sourceOwned)
             }
         )
         .alert(
@@ -2171,10 +2132,10 @@ struct RuleSetRow: View {
                 ASCIITextField(placeholder: "https://...", text: $rule.url)
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
-                    .onChange(of: rule.url) { _, _ in state.save() }
+                    .onChange(of: rule.url) { _, _ in state.saveEditingProfile() }
                 Picker("", selection: $rule.fetchLineID) {
                     Text(state.tr("直连", "Direct")).tag("direct")
-                    ForEach(state.profile.lines.filter {
+                    ForEach(state.editingProfile.lines.filter {
                         $0.enabled && $0.id != "direct"
                     }) { line in
                         Text(line.name).tag(line.id)
@@ -2184,7 +2145,7 @@ struct RuleSetRow: View {
                 .labelsHidden()
                 .frame(width: 120)
                 .help(state.tr("选择获取线路", "Select fetch line"))
-                .onChange(of: rule.fetchLineID) { _, _ in state.save() }
+                .onChange(of: rule.fetchLineID) { _, _ in state.saveEditingProfile() }
             }
             HStack {
                 Text("格式").font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
@@ -2196,7 +2157,7 @@ struct RuleSetRow: View {
                 }
                 .pickerStyle(.menu)
                 .labelsHidden()
-                .onChange(of: rule.format) { _, _ in state.save() }
+                .onChange(of: rule.format) { _, _ in state.saveEditingProfile() }
             }
         }
         .padding(.leading, 18)
@@ -2267,7 +2228,7 @@ struct RuleSetRow: View {
                             rule.applications.removeAll {
                                 $0.path == application.path
                             }
-                            state.save()
+                            state.saveEditingProfile()
                         } label: {
                             Image(systemName: "minus.circle")
                         }
@@ -2326,7 +2287,7 @@ struct RuleSetRow: View {
             rule.applications = RuleSet.sanitizeApplications(
                 replacing ? selected : rule.applications + selected
             )
-            state.save()
+            state.saveEditingProfile()
         } catch {
             applicationSelectionError = error.localizedDescription
         }
@@ -2359,18 +2320,21 @@ struct ScenariosTab: View {
     @EnvironmentObject var state: AppState
     @State private var showTemplate = false
     @State private var newName = ""
-    @State private var expandedID: String? = nil
+    private var expandedID: String? {
+        get { state.editorPosition.expandedScenarioID }
+        nonmutating set { state.editorPosition.expandedScenarioID = newValue }
+    }
     @State private var draggedItem: SettingsReorderItem?
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 8) {
-                    ForEach($state.profile.scenarios) { $scenario in
+                    ForEach($state.editingProfile.scenarios) { $scenario in
                         let scenarioID = scenario.id
                         ScenarioRow(
                             scenario: $scenario,
-                            isActive: scenarioID == state.profile.activeScenarioID,
+                            isActive: state.editingActiveProfile && scenarioID == state.engine.connectionReport?.scenario.id && state.isConnected,
                             isExpanded: expandedID == scenarioID,
                             onToggle: {
                                 expandedID = expandedID == scenarioID
@@ -2379,7 +2343,7 @@ struct ScenariosTab: View {
                             },
                             // 和主 popover 的 Picker、DebugServer 的 select-scenario
                             // 走同一个 intent，门禁与 dirty 置位只有一处实现
-                            onActivate: { state.activateScenario(scenarioID) },
+                            onActivate: { state.copyEditingScenario(scenarioID) },
                             onDelete: {
                                 if expandedID == scenarioID {
                                     expandedID = nil
@@ -2424,12 +2388,12 @@ struct ScenariosTab: View {
     ) -> Bool {
         guard let item, item.kind == "scenario",
               reorder(
-                &state.profile.scenarios,
+                &state.editingProfile.scenarios,
                 draggedID: item.id,
                 targetID: targetID,
                 id: { $0.id }
               ) else { return false }
-        state.saveVisualOrderAsync()
+        state.saveEditingVisualOrder()
         return true
     }
 
@@ -2447,6 +2411,8 @@ struct ScenarioRow: View {
     @State private var ssidError: String?
     @State private var showsIconPicker = false
 
+    private var sourceOwned: Bool { state.editingRecord.baseline?.scenarios.contains(where: { $0.id == scenario.id }) == true }
+
     private var bindingSummary: String {
         let n = scenario.bindings.count
         return n == 0 ? state.tr("无规则", "No rules") : "\(n) \(state.tr("条规则", "rules"))"
@@ -2456,18 +2422,13 @@ struct ScenarioRow: View {
         CollapsibleCard(
             isExpanded: isExpanded,
             onToggle: onToggle,
-            onDelete: onDelete,
+            onDelete: sourceOwned ? nil : onDelete,
             accentBar: isActive,
             header: {
-                if isActive {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.caption)
-                        .foregroundStyle(XDialPalette.selection)
-                } else {
-                    Image(systemName: "circle")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .onTapGesture { onActivate() }
+                Button(action: onActivate) {
+                    Image(systemName: "doc.on.doc").font(.caption).foregroundStyle(.secondary)
                 }
+                .buttonStyle(.plain).help(state.tr("复制场景", "Copy Scenario"))
                 Image(systemName: iconPreset.symbol)
                     .font(.system(size: 15, weight: .regular))
                     .foregroundStyle(.secondary)
@@ -2518,7 +2479,7 @@ struct ScenarioRow: View {
                         Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
                         TextField("", text: $scenario.name)
                             .textFieldStyle(.roundedBorder).font(.caption)
-                            .onChange(of: scenario.name) { _, _ in state.save() }
+                            .onChange(of: scenario.name) { _, _ in state.saveEditingProfile() }
                         Button {
                             showsIconPicker.toggle()
                         } label: {
@@ -2671,7 +2632,7 @@ struct ScenarioRow: View {
                         bindings: $scenario.bindings,
                         scenarioID: scenario.id,
                         state: state,
-                        onSave: { state.save() }
+                        onSave: { state.saveEditingProfile() }
                     )
 
                     Divider()
@@ -2682,7 +2643,7 @@ struct ScenarioRow: View {
                             .frame(width: 200, alignment: .leading)
                         exitPicker(selectedID: SwiftUI.Binding(
                             get: { scenario.defaultTargetID },
-                            set: { scenario.defaultTargetID = $0; state.save() }
+                            set: { scenario.defaultTargetID = $0; state.saveEditingProfile() }
                         ))
                     }
 
@@ -2691,15 +2652,15 @@ struct ScenarioRow: View {
                         Spacer()
                         Menu {
                             let usedIDs = Set(scenario.bindings.map { $0.ruleSetID })
-                            let available = state.profile.ruleSets.filter { !usedIDs.contains($0.id) }
+                            let available = state.editingProfile.ruleSets.filter { !usedIDs.contains($0.id) }
                             if available.isEmpty {
                                 Button(state.tr("（无可用规则）", "(No rule available)")) {}.disabled(true)
                             } else {
                                 ForEach(available) { rule in
                                     Button(rule.name) {
-                                        let firstExit = state.profile.lines.first?.id ?? ""
+                                        let firstExit = state.editingProfile.lines.first?.id ?? ""
                                         scenario.bindings.append(RuleBinding(ruleSetID: rule.id, lineID: firstExit))
-                                        state.save()
+                                        state.saveEditingProfile()
                                     }
                                 }
                             }
@@ -2710,6 +2671,7 @@ struct ScenarioRow: View {
                         .controlSize(.small)
                     }
                 }
+                .disabled(sourceOwned)
             }
         )
     }
@@ -2766,12 +2728,12 @@ struct ScenarioRow: View {
 
     private func exitPicker(selectedID: SwiftUI.Binding<String>) -> some View {
         Picker("", selection: selectedID) {
-            ForEach(state.profile.lines.filter { $0.enabled }) { e in
+            ForEach(state.editingProfile.lines.filter { $0.enabled }) { e in
                 Text(e.name).tag("port:\(e.id)")
             }
-            if !state.profile.subscriptions.filter({ $0.enabled }).isEmpty {
+            if !state.editingProfile.subscriptions.filter({ $0.enabled }).isEmpty {
                 Divider()
-                ForEach(state.profile.subscriptions.filter { $0.enabled }) { sub in
+                ForEach(state.editingProfile.subscriptions.filter { $0.enabled }) { sub in
                     Label("\(sub.name) (\(sub.lines.count))", systemImage: "antenna.radiowaves.left.and.right")
                         .tag("sub:\(sub.id)")
                 }
@@ -2779,7 +2741,7 @@ struct ScenarioRow: View {
         }
         .pickerStyle(.menu)
         .labelsHidden()
-        .onChange(of: selectedID.wrappedValue) { _, _ in state.save() }
+        .onChange(of: selectedID.wrappedValue) { _, _ in state.saveEditingProfile() }
     }
 
 }
@@ -3061,7 +3023,7 @@ private struct ScenarioIconPicker: View {
 
     private func select(_ key: String?) {
         scenario.iconOverride = key
-        state.save()
+        state.saveEditingProfile()
         dismiss()
     }
 
@@ -3091,323 +3053,5 @@ private struct ScenarioIconPicker: View {
         }
         focusedKey = keys[nextIndex]
         hoveredKey = keys[nextIndex]
-    }
-}
-
-// MARK: - 订阅行
-
-struct SubscriptionRow: View {
-    @SwiftUI.Binding var sub: Subscription
-    var onDelete: () -> Void
-    @State private var expanded = false
-    @State private var refreshing = false
-    @EnvironmentObject var state: AppState
-
-    private var groupCount: Int { sub.proxyGroups.count }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // 折叠头
-            HStack {
-                Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .foregroundStyle(.secondary)
-                    .frame(width: 12)
-
-                RuntimeResourceBadge(
-                    kind: "subscription",
-                    resourceID: sub.id,
-                    enabled: sub.enabled
-                )
-
-                Text(sub.name)
-                    .font(.system(size: 13, weight: .medium))
-
-                if groupCount > 0 {
-                    Text("\(groupCount)\(state.tr("组", "g"))")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Text("\(sub.lines.count)\(state.tr("节点", "n"))")
-                    .font(.caption).foregroundStyle(.secondary)
-
-                if sub.updatedAt > 0 {
-                    Text(formatDate(sub.updatedAt))
-                        .font(.caption2).foregroundStyle(.tertiary)
-                }
-
-                Spacer()
-
-                if refreshing {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Button { refreshSub() } label: {
-                        Image(systemName: "arrow.clockwise").foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help(state.tr("刷新", "Refresh"))
-                }
-
-                Toggle("", isOn: $sub.enabled)
-                    .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-                    .onChange(of: sub.enabled) { _, _ in state.save() }
-
-                Button(action: onDelete) {
-                    Image(systemName: "trash").foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() } }
-
-            // 展开内容
-            if expanded {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
-                        TextField("", text: $sub.name)
-                            .textFieldStyle(.roundedBorder).font(.caption)
-                            .onChange(of: sub.name) { _, _ in state.save() }
-                    }
-                    HStack {
-                        Text("URL").font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
-                        TextField("", text: $sub.url)
-                            .textFieldStyle(.roundedBorder).font(.caption)
-                            .onChange(of: sub.url) { _, _ in state.save() }
-                    }
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(state.tr("GEOIP 模板", "GEOIP template"))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .frame(width: 78, alignment: .leading)
-                        TextField(
-                            state.tr(
-                                "https://…/{code}.srs 或 file:///…/{code}.srs",
-                                "https://…/{code}.srs or file:///…/{code}.srs"
-                            ),
-                            text: $sub.geoIPRuleSetURLTemplate
-                        )
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption)
-                        .onChange(of: sub.geoIPRuleSetURLTemplate) { _, _ in
-                            state.save()
-                        }
-                        .help(state.tr(
-                            "用于订阅中的 GEOIP 条目。仅接受 HTTPS 或绝对 file:// 模板，必须包含 {code}，且不得包含用户名或密码；订阅含非 LAN/private GEOIP 时，缺失或无效会拒绝连接。",
-                            "Used by GEOIP entries in the subscription. Use an HTTPS or absolute file:// template containing {code}, without a username or password. If the subscription contains GEOIP entries other than LAN/private, a missing or invalid template blocks the connection."
-                        ))
-                    }
-
-                    // === 策略组 ===
-                    if !sub.proxyGroups.isEmpty {
-                        Divider()
-                        Text(state.tr("策略组", "Groups"))
-                            .font(.caption2).foregroundStyle(.tertiary).textCase(.uppercase)
-                        // id 用 offset 而不是 name，订阅原始 YAML 里允许重名策略组，
-                        // 用 name 当 id 会导致 SwiftUI ForEach 重复 key 渲染错乱
-                        ForEach(Array(sub.proxyGroups.enumerated()), id: \.offset) { _, group in
-                            groupRow(group: group)
-                        }
-                    }
-
-                }
-                .padding(.leading, 18)
-            }
-        }
-        .padding(8)
-        .background(
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.06))
-                HStack(spacing: 0) {
-                    XDialPalette.divider.opacity(0.72)
-                        .frame(width: 3)
-                        .clipShape(RoundedRectangle(cornerRadius: 1.5))
-                    Spacer()
-                }
-                .padding(.vertical, 2)
-            }
-        )
-    }
-
-    @ViewBuilder
-    private func groupRow(group: SubProxyGroup) -> some View {
-        HStack {
-            Text(group.name)
-                .font(.system(size: 12, weight: .medium))
-                .lineLimit(1)
-
-            Spacer()
-
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(groupTypeLabel(group.type))
-                    .font(.caption)
-                Text("\(group.proxies.count)\(state.tr("节点", " nodes"))")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-            .frame(maxWidth: 180, alignment: .trailing)
-        }
-    }
-
-    private func groupTypeLabel(_ type: String) -> String {
-        switch type {
-        case "select", "selector": return "select"
-        case "url-test", "urltest": return "auto"
-        case "fallback": return "fallback"
-        case "load-balance": return "balance"
-        default: return type
-        }
-    }
-
-    private func refreshSub() {
-        refreshing = true
-        state.engine.parseSubscription(url: sub.url, format: sub.format) { result in
-            refreshing = false
-            switch result {
-            case .success(let r):
-                state.updateSubscription(sub.id, with: r)
-            case .failure(let err):
-                state.engine.lastError = err.localizedDescription
-            }
-        }
-    }
-
-    private func formatDate(_ ts: Int) -> String {
-        let date = Date(timeIntervalSince1970: TimeInterval(ts))
-        let fmt = RelativeDateTimeFormatter()
-        fmt.unitsStyle = .abbreviated
-        return fmt.localizedString(for: date, relativeTo: Date())
-    }
-}
-
-struct AddSubscriptionSheet: View {
-    @SwiftUI.Binding var isPresented: Bool
-    @EnvironmentObject var state: AppState
-    @State private var name = ""
-    @State private var url = ""
-    @State private var fileContent = ""
-    @State private var format = "auto"
-    @State private var strategy = "urltest"
-    @State private var parsing = false
-    @State private var parsedResult: GoEngine.ParseResult?
-    @State private var parseError: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(state.tr("添加订阅", "Add Subscription")).font(.headline)
-                Spacer()
-                Button(state.tr("取消", "Cancel")) { isPresented = false }
-            }
-
-            TextField(state.tr("名称", "Name"), text: $name)
-                .textFieldStyle(.roundedBorder)
-            HStack {
-                TextField(state.tr("订阅 URL 或本地文件", "URL or local file"), text: $url)
-                    .textFieldStyle(.roundedBorder)
-                Button(state.tr("选择文件", "File")) {
-                    pickFile()
-                }
-                .controlSize(.small)
-            }
-
-            HStack {
-                Text(state.tr("格式", "Format")).font(.caption)
-                Picker("", selection: $format) {
-                    Text(state.tr("自动", "Auto")).tag("auto")
-                    Text("Clash").tag("clash")
-                    Text("Surge").tag("surge")
-                    Text("Base64").tag("base64")
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-
-                Text(state.tr("策略", "Strategy")).font(.caption)
-                Picker("", selection: $strategy) {
-                    Text(state.tr("自动选优", "Auto Best")).tag("urltest")
-                    Text(state.tr("手动选择", "Manual")).tag("selector")
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-            }
-
-            if parsing {
-                HStack {
-                    ProgressView().controlSize(.small)
-                    Text(state.tr("正在解析…", "Parsing…")).font(.caption)
-                }
-            }
-
-            if let error = parseError {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(XDialPalette.danger)
-            }
-
-            if let r = parsedResult {
-                let summary = state.tr(
-                    "解析到 \(r.lines.count) 个节点、\(r.proxyGroups?.count ?? 0) 个策略组、\(r.rules?.count ?? 0) 条规则",
-                    "Found \(r.lines.count) nodes, \(r.proxyGroups?.count ?? 0) groups, \(r.rules?.count ?? 0) rules"
-                )
-                Text(summary)
-                    .font(.caption)
-                    .foregroundStyle(XDialPalette.success)
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(r.lines) { line in
-                            HStack {
-                                Text(line.name).font(.caption)
-                                Spacer()
-                                Text(line.type).font(.caption2).foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-                .frame(maxHeight: 150)
-
-                Button(state.tr("确认添加", "Add")) {
-                    let n = name.isEmpty ? (URL(string: url)?.host ?? "Subscription") : name
-                    state.addSubscription(name: n, url: url, format: format, strategy: strategy,
-                                          lines: r.lines, proxyGroups: r.proxyGroups ?? [], rules: r.rules ?? [])
-                    isPresented = false
-                }
-                .buttonStyle(.borderedProminent)
-            } else {
-                Button(state.tr("解析", "Parse")) {
-                    doParse()
-                }
-                .disabled((url.isEmpty && fileContent.isEmpty) || parsing)
-                .buttonStyle(.borderedProminent)
-            }
-        }
-        .padding(16)
-        .frame(width: 420)
-    }
-
-    private func pickFile() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.plainText, .yaml, .data]
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let fileURL = panel.url {
-            if let content = try? String(contentsOf: fileURL, encoding: .utf8) {
-                fileContent = content
-                url = fileURL.lastPathComponent
-            }
-        }
-    }
-
-    private func doParse() {
-        parsing = true
-        parseError = nil
-        parsedResult = nil
-
-        state.engine.parseSubscription(url: url, content: fileContent, format: format) { result in
-            parsing = false
-            switch result {
-            case .success(let r):
-                parsedResult = r
-            case .failure(let err):
-                parseError = err.localizedDescription
-            }
-        }
     }
 }

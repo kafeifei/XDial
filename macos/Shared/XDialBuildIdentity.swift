@@ -29,7 +29,33 @@ enum XDialBuildIdentity {
     static let legacyTransparentProxyIdentifier =
         "com.kafeifei.xdial.transparent-proxy"
 
-    #if XDIAL_DEVELOPMENT_IDENTITY
+    #if XDIAL_NEXT_IDENTITY
+    static let isDevelopment = true
+    static let applicationIdentifier = "com.kafeifei.xdial.next"
+    static let helperIdentifier = "com.kafeifei.xdial.next.helper"
+    static let daemonIdentifier = "com.kafeifei.xdial.next.daemon"
+    static let transparentProxyIdentifier =
+        "com.kafeifei.xdial.next.transparent-proxy"
+    static let settingsUIIdentifier = "com.kafeifei.xdial.next.settings-ui"
+    static let appGroupIdentifier =
+        "UVZM439VGU.com.kafeifei.xdial.next.network"
+    static let applicationBundleName = "XDial Next.app"
+    static let applicationDisplayName = "XDial Next"
+    static let productTitle = "XDial Next"
+    static let dataIdentifier = "com.kafeifei.xdial.next"
+    static let userDataDirectoryName = ".xdial-next"
+    static let applicationSupportDirectoryName = "XDial Next"
+    static let logDirectoryName = "XDial Next"
+    static let daemonSocketPath = "/tmp/xdial-next.sock"
+    static let engineRuntimePath = "/tmp/xdial-next-engine"
+    static let daemonLogPath = "/tmp/xdial-next.log"
+    static let registrationMaintenancePath =
+        "/tmp/xdial-next-registration-maintenance"
+    static let debugServerPort: UInt16 = 19878
+    static let allowsAutomaticUpdates = false
+    static let allowsFormalDataMigration = false
+    static let allowsLegacyCleanup = false
+    #elseif XDIAL_DEVELOPMENT_IDENTITY
     static let isDevelopment = true
     static let applicationIdentifier = developmentApplicationIdentifier
     static let helperIdentifier = "com.kafeifei.xdial.debug.helper"
@@ -101,8 +127,10 @@ enum XDialBuildIdentity {
     static let providerConfigurationName =
         applicationDisplayName + " Transparent Proxy"
     static let queueLabelPrefix = applicationIdentifier
-    static let updateStagingDirectoryName = isDevelopment
+    static let updateStagingDirectoryName = applicationIdentifier == "com.kafeifei.xdial.next"
+        ? "XDialNextUpdates" : isDevelopment
         ? "XDialDebugUpdates" : "XDialUpdates"
-    static let installationArtifactPrefix = isDevelopment
+    static let installationArtifactPrefix = applicationIdentifier == "com.kafeifei.xdial.next"
+        ? ".XDial-next" : isDevelopment
         ? ".Xdial-debug" : ".XDial"
 }

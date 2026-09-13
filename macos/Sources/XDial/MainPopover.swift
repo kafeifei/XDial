@@ -39,6 +39,7 @@ struct MainPopover: View {
         VStack(spacing: 0) {
             header
             Divider()
+            profilePicker
             scenarioCarousel
             if needsSSIDAccess {
                 Divider()
@@ -66,7 +67,7 @@ struct MainPopover: View {
         .frame(width: popoverWidth)
         .animation(
             .easeInOut(duration: 0.2),
-            value: state.profile.scenarios.count
+            value: state.browsingRecord.profile.scenarios.count
         )
         .background(XDialPalette.elevated)
         .contextMenu {
@@ -79,7 +80,7 @@ struct MainPopover: View {
                 ) {
                     presentUpdateWindow()
                 }
-            } else {
+            } else if XDialBuildIdentity.allowsAutomaticUpdates {
                 Button(state.tr("检查更新…", "Check for Updates…")) {
                     presentUpdateWindow()
                     Task { await updater.checkNow() }
@@ -180,6 +181,7 @@ struct MainPopover: View {
             Button {
                 ApplicationWindowLifecycleController.shared
                     .prepareToPresentSettingsWindow()
+                state.selectEditingProfile(state.browsingRecord.id)
                 openWindow(id: "settings")
                 NSApp.activate(ignoringOtherApps: true)
             } label: {
@@ -250,9 +252,35 @@ struct MainPopover: View {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    private var profilePicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Menu {
+                    ForEach(state.profileLibrary.profiles) { record in
+                        Button {
+                            state.browsedProfileID = record.id
+                        } label: {
+                            Label(record.name, systemImage: record.id == state.browsingRecord.id ? "checkmark" : "folder")
+                        }
+                    }
+                } label: { Text(state.browsingRecord.name) }
+                .menuStyle(.borderlessButton).fixedSize()
+                Spacer()
+                Text(state.browsingRecord.source == nil ? state.tr("本地", "Local") : state.tr("订阅", "Subscription"))
+                    .foregroundStyle(.secondary)
+            }
+            if state.isConnected, state.browsingRecord.id != state.profileLibrary.activeProfileID,
+               let active = state.profileLibrary.profiles.first(where: { $0.id == state.profileLibrary.activeProfileID }) {
+                Text(state.tr("正在使用：", "In use: ") + active.name + " · " + (state.engine.connectionReport?.scenario.name ?? ""))
+                    .foregroundStyle(XDialPalette.success)
+            }
+        }
+        .font(.caption).padding(.horizontal, 20).padding(.top, 12)
+    }
+
     @ViewBuilder
     private var scenarioCarousel: some View {
-        if state.profile.scenarios.isEmpty {
+        if state.browsingRecord.profile.scenarios.isEmpty {
             VStack(spacing: 7) {
                 Circle()
                     .strokeBorder(
@@ -272,7 +300,7 @@ struct MainPopover: View {
             .frame(maxWidth: .infinity)
             .frame(height: 142)
         } else {
-            let indexedScenarios = Array(state.profile.scenarios.enumerated())
+            let indexedScenarios = Array(state.browsingRecord.profile.scenarios.enumerated())
             let columnCount = scenarioColumnCount
             let rowCount = Int(
                 ceil(
@@ -304,7 +332,7 @@ struct MainPopover: View {
     }
 
     private var popoverWidth: CGFloat {
-        let scenarioCount = state.profile.scenarios.count
+        let scenarioCount = state.browsingRecord.profile.scenarios.count
         guard scenarioCount > 0 else { return minimumPopoverWidth }
         let columnCount = scenarioColumnCount
         let contentWidth = CGFloat(columnCount) * scenarioItemWidth
@@ -317,7 +345,7 @@ struct MainPopover: View {
     /// 这样 5 个是 3+2，6 个是 3+3，不会因为新增一行仍保持四列宽。
     private var scenarioColumnCount: Int {
         ScenarioGridLayout.columnCount(
-            itemCount: state.profile.scenarios.count,
+            itemCount: state.browsingRecord.profile.scenarios.count,
             maximumPerRow: maximumScenariosPerRow
         )
     }
@@ -1097,7 +1125,8 @@ struct MainPopover: View {
     }
 
     private var currentRuntimeScenarioID: String? {
-        state.presentedConnectionReport?.scenario.id
+        guard state.browsingRecord.id == state.profileLibrary.activeProfileID else { return nil }
+        return state.presentedConnectionReport?.scenario.id
     }
 
     private var expandableReport: ConnectionReport? {
@@ -1232,7 +1261,7 @@ struct MainPopover: View {
 
     private func visualState(for scenario: Scenario) -> ScenarioVisualState {
         if let targetScenarioID = state.scenarioSwitchTargetID {
-            if scenario.id == targetScenarioID { return .connecting }
+            if scenario.id == targetScenarioID && state.browsingRecord.id == state.scenarioSwitchTargetProfileID { return .connecting }
             if scenario.id == currentRuntimeScenarioID,
                state.isConnected {
                 return .connected
@@ -1240,7 +1269,7 @@ struct MainPopover: View {
             return .idle
         }
         guard scenario.id == currentRuntimeScenarioID else {
-            return scenario.id == state.profile.activeScenarioID
+            return scenario.id == state.browsingRecord.profile.activeScenarioID
                 ? .idleSelected
                 : .idle
         }
@@ -1258,24 +1287,24 @@ struct MainPopover: View {
         visualState: ScenarioVisualState
     ) {
         if let targetScenarioID = state.scenarioSwitchTargetID {
-            if scenario.id == targetScenarioID {
+            if scenario.id == targetScenarioID && state.browsingRecord.id == state.scenarioSwitchTargetProfileID {
                 state.cancelPendingScenarioSwitch()
             } else if scenario.id == currentRuntimeScenarioID,
                       state.isConnected {
-                state.disconnect()
+                state.cancelPendingScenarioSwitch()
             } else {
-                state.switchScenario(to: scenario.id)
+                state.connectScenario(scenario.id, profileID: state.browsingRecord.id)
             }
             return
         }
 
         if !state.isConnected && !state.isBusy {
-            state.connectScenario(scenario.id)
+            state.connectScenario(scenario.id, profileID: state.browsingRecord.id)
             return
         }
 
         if scenario.id != currentRuntimeScenarioID {
-            state.switchScenario(to: scenario.id)
+            state.connectScenario(scenario.id, profileID: state.browsingRecord.id)
             return
         }
 
@@ -1285,7 +1314,7 @@ struct MainPopover: View {
         case .connected:
             state.disconnect()
         case .failed, .idle, .idleSelected:
-            state.switchScenario(to: scenario.id)
+            state.connectScenario(scenario.id, profileID: state.browsingRecord.id)
         }
     }
 

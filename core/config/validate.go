@@ -91,6 +91,21 @@ func CollectProfileWarnings(profile *Profile) ([]ProfileWarning, error) {
 // CollectProfileWarnings 都走它，保证"能不能生成"和"为什么某条没生效"的判定一致。
 func inspectScenarioReferences(profile *Profile, scenario *Scenario) ([]ProfileWarning, error) {
 	var warnings []ProfileWarning
+	active, _ := effectiveActiveTargetIDs(profile, scenario)
+	for id := range active {
+		if line := profile.FindLine(id); line.IsGroup() {
+			if err := validateGroupDependencies(profile, line); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, binding := range scenario.Bindings {
+		if rule := profile.FindRuleSet(binding.RuleSetID); rule != nil && rule.Type == RuleSetTypeNative {
+			if err := validateNativeRule(rule.NativeRule); err != nil {
+				return nil, err
+			}
+		}
+	}
 	warn := func(w ProfileWarning) {
 		w.ScenarioID = scenario.ID
 		warnings = append(warnings, w)
@@ -133,7 +148,7 @@ func inspectScenarioReferences(profile *Profile, scenario *Scenario) ([]ProfileW
 		}
 
 		switch ruleSet.Type {
-		case RuleSetTypeURL, RuleSetTypeManual, RuleSetTypeApplication:
+		case RuleSetTypeURL, RuleSetTypeManual, RuleSetTypeApplication, RuleSetTypeNative:
 		default:
 			return nil, fmt.Errorf(
 				"scenario %q references rule set %q with unsupported type %q",
@@ -154,6 +169,9 @@ func inspectScenarioReferences(profile *Profile, scenario *Scenario) ([]ProfileW
 					ruleSetLabel(ruleSet), scenarioLabel(scenario)),
 			})
 			continue
+		}
+		if ruleSet.Type == RuleSetTypeURL && strings.TrimSpace(ruleSet.URL) == "" {
+			return nil, fmt.Errorf("enabled rule set %q requires a URL before connection", ruleSet.ID)
 		}
 		if ruleSet.Type == RuleSetTypeURL && ruleSet.FetchLineID != "" {
 			if ruleSet.FetchLineID != builtinDirectLineID {

@@ -1,5 +1,7 @@
 # macOS 构建与安装
 
+> 本独立分支默认构建 XDial Next；当前入口与隔离约束见 [profile-next.md](profile-next.md)。以下 Debug / 正式说明用于既有通道参考。
+
 日常 Debug 由 `make app` 生成 `build/XDail Debug.app`，使用 Apple Development 签名，
 不提交公证。`FormalDevelopment` 保留正式身份，仅用于该身份的专项验证。
 正式归档由 `make release` 生成，签名、公证与发布机制见 [updates.md](updates.md)。

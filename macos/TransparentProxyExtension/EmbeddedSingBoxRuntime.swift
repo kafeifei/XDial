@@ -373,7 +373,7 @@ final class EmbeddedSingBoxRuntime {
             username: UUID().uuidString,
             password: UUID().uuidString + UUID().uuidString
         )
-        let basePath = try runtimeDirectory()
+        let basePath = try runtimeDirectory(profileJSON: profileJSON)
         let networkEpochID = selectNetworkEpoch(
             networkSnapshot, requested: nil, forceNew: true
         )
@@ -673,7 +673,7 @@ final class EmbeddedSingBoxRuntime {
             username: UUID().uuidString,
             password: UUID().uuidString + UUID().uuidString
         )
-        let basePath = try runtimeDirectory()
+        let basePath = try runtimeDirectory(profileJSON: profileJSON)
 
         reporter.setState(.preparing)
         reporter.markUnderlaySnapshotReady()
@@ -2063,17 +2063,22 @@ final class EmbeddedSingBoxRuntime {
         return current
     }
 
-    private func runtimeDirectory() throws -> URL {
+    private func runtimeDirectory(profileJSON: String) throws -> URL {
         guard let groupContainer = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier:
                 Self.networkStateGroup
         ) else {
             throw RuntimeError.storageUnavailable
         }
-        let directory = groupContainer.appendingPathComponent(
+        let baseDirectory = groupContainer.appendingPathComponent(
             "NetworkExtension",
             isDirectory: true
         )
+        var error: NSError?
+        let path = LibboxProfileStoragePath(profileJSON, baseDirectory.path, &error)
+        if let error { throw error }
+        guard !path.isEmpty else { throw RuntimeError.storageUnavailable }
+        let directory = URL(fileURLWithPath: path, isDirectory: true)
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true,

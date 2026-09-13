@@ -2,7 +2,7 @@ BUILD_DIR := build
 # $(abspath) 按空格拆分参数，带空格的 bundle 路径必须由无空格的绝对
 # BUILD_DIR 拼出，不能整体交给 abspath/realpath。
 BUILD_DIR_ABS := $(abspath $(BUILD_DIR))
-APP_BUNDLE_NAME := XDail Debug.app
+APP_BUNDLE_NAME := XDial Next.app
 APP_BUNDLE := $(BUILD_DIR)/$(APP_BUNDLE_NAME)
 APP_BUNDLE_ABS := $(BUILD_DIR_ABS)/$(APP_BUNDLE_NAME)
 RELEASE_BUNDLE := $(BUILD_DIR)/release/XDial.app
@@ -252,29 +252,33 @@ cli-debug: $(PATCHED_WORKFILE)
 	@mkdir -p $(BUILD_DIR)
 	$(MACOS_GO_BUILD_ENV) $(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS) -X main.buildFlavor=debug" -o $(BUILD_DIR)/xdial-debug ./cmd/xdial/
 
+cli-next: $(PATCHED_WORKFILE)
+	@mkdir -p $(BUILD_DIR)
+	$(MACOS_GO_BUILD_ENV) $(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS) -X main.buildFlavor=next" -o $(BUILD_DIR)/xdial-next ./cmd/xdial/
+
 # debug 构建(含 DebugServer,仅本地开发用,不得分发)
-app: cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
-	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Debug \
+app: cli-next libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
+	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Next \
 		-destination 'platform=macOS,arch=arm64' \
-		-derivedDataPath $(BUILD_DIR)/macos-xcode \
+		-derivedDataPath $(BUILD_DIR)/macos-next-xcode \
 		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		$(MACOS_DEBUG_XCODEBUILD_FLAGS) build
-	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration Debug \
+	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration Next \
 		-destination 'platform=macOS,arch=arm64' \
-		-derivedDataPath $(BUILD_DIR)/macos-xcode \
+		-derivedDataPath $(BUILD_DIR)/macos-next-xcode \
 		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		$(MACOS_DEBUG_XCODEBUILD_FLAGS) build
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Info.plist')" = com.kafeifei.xdial.debug
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = com.kafeifei.xdial.debug.settings-ui
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Library/SystemExtensions/com.kafeifei.xdial.debug.transparent-proxy.systemextension/Contents/Info.plist')" = com.kafeifei.xdial.debug.transparent-proxy
-	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Info.plist')" = true
-	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = false
-	@test "$$(plutil -extract CFBundleDisplayName raw '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = 'XDail Debug'
-	@test -f '$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app/Contents/Helpers/XDial Settings UI.app/Contents/Resources/SettingsDockIcon.icns'
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Info.plist')" = com.kafeifei.xdial.next
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = com.kafeifei.xdial.next.settings-ui
+	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Library/SystemExtensions/com.kafeifei.xdial.next.transparent-proxy.systemextension/Contents/Info.plist')" = com.kafeifei.xdial.next.transparent-proxy
+	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Info.plist')" = true
+	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = false
+	@test "$$(plutil -extract CFBundleDisplayName raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = 'XDial Next'
+	@test -f '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Helpers/XDial Settings UI.app/Contents/Resources/SettingsDockIcon.icns'
 	rm -rf "$(APP_BUNDLE)"
-	ditto "$(BUILD_DIR)/macos-xcode/Build/Products/Debug/XDail Debug.app" "$(APP_BUNDLE)"
+	ditto "$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app" "$(APP_BUNDLE)"
 	@test "$$(plutil -extract LSUIElement raw '$(APP_BUNDLE)/Contents/Info.plist')" = true
-	python3 scripts/verify-macos-debug-app.py "$(APP_BUNDLE)"
+	python3 scripts/verify-macos-debug-app.py "$(APP_BUNDLE)" next
 
 # GitHub 托管 runner 不持有 System Extension 的签名证书和 provisioning profile。
 # 这里分别编译 Debug / Release 的扩展与宿主，只验证源码和链接；产物没有签名、不可分发。
@@ -295,6 +299,7 @@ ci-macos-build: cli cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/
 # 单调递增的安装身份。release-app 只产生待公证的签名 app，不能分发；
 # 分发一律使用 make release 在所有门禁后产生的 zip。
 release-inputs:
+	@echo "XDial Next is maintained independently; stable release is disabled on this branch." >&2; exit 1
 	@$(RELEASE_CONTRACT) validate-inputs "$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
 	@$(RELEASE_CONTRACT) validate-notes "$(RELEASE_TAG)" "$(RELEASE_NOTES_FILE)"
 	@python3 -c 'import re,sys; sys.exit(0 if not sys.argv[1] or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,79}", sys.argv[1]) else "invalid update acceptance ID")' "$(RELEASE_UPDATE_ACCEPTANCE_ID)"
@@ -347,6 +352,7 @@ release: release-app
 # 显式公开已验收的 Release，再触发 saymiao/xdial-updates 的 Pages 部署。
 # 使用操作者现有 gh 登录；不把跨仓库凭据嵌入 App 或 Actions。
 publish:
+	@echo "XDial Next cannot publish to the stable channel." >&2; exit 1
 	@test -z "$(RELEASE_UPDATE_ACCEPTANCE_ID)" || { \
 		echo "error: an acceptance build cannot be published to stable" >&2; \
 		exit 1; \
@@ -359,9 +365,8 @@ publish:
 # 不得在旧实例退出与新实例启动之间扩大断网窗口。
 # 构建失败不得影响正在运行的旧实例。
 restart:
-	@$(MAKE) app DEBUG_BUILD_VERSION=$(DEBUG_BUILD_VERSION)
-	@bash scripts/restart-macos-app.sh "$(APP_BUNDLE_ABS)" \
-		"$(MACOS_APP_LAUNCHER_ABS)"
+	@echo "XDial Next is independent. Build with make app and open it explicitly when ready."
+	@exit 1
 
 inspector:
 	@mkdir -p $(BUILD_DIR)

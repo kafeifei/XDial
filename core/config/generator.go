@@ -401,6 +401,7 @@ func generateSingBox(
 		return nil, fmt.Errorf("transparent proxy session username is too long for application rules")
 	}
 	activeLineIDs, activeSubscriptionIDs := effectiveActiveTargetIDs(profile, scenario)
+	expandGroupLineIDs(profile, activeLineIDs)
 	activeVPNIDs := effectiveActiveVPNLineIDs(profile, scenario)
 	activeTailscaleIDs := effectiveActiveTailscaleLineIDs(profile, scenario)
 	activeMagicDNSTags := effectiveActiveMagicDNSEndpointTags(profile, scenario)
@@ -1341,6 +1342,12 @@ func buildTransparentProxyDNS(
 			return
 		}
 		seenResolver[resolverTag] = true
+		if selectedGroupUsesDirect(profile, outTag) {
+			servers = append(servers, map[string]interface{}{
+				"type": "local", "tag": resolverTag, "xdial_use_system_resolver": true,
+			})
+			return
+		}
 		switch resolverTag {
 		case transparentEnterpriseDNSTag:
 			servers = append(servers, map[string]interface{}{
@@ -1386,6 +1393,17 @@ func buildTransparentProxyDNS(
 		}
 		resolverTag := transparentProxyResolverTag(ruleSet, outTag)
 		switch ruleSet.Type {
+		case RuleSetTypeNative:
+			if !nativeRuleDomainOnly(ruleSet.NativeRule) {
+				continue
+			}
+			ensureResolver(resolverTag, outTag, strategy)
+			rule := map[string]interface{}{"rule_set": sbRuleSetTag(ruleSet), "server": resolverTag}
+			applyRuleSetInvert(rule, ruleSet)
+			if strategy != "" {
+				rule["strategy"] = strategy
+			}
+			rules = append(rules, rule)
 		case RuleSetTypeApplication:
 			selectors := applicationRuleSetSelectors(ruleSet)
 			if len(selectors) == 0 {
@@ -1725,6 +1743,18 @@ func compileTransparentProxyRuleSet(
 	addressFamilyStrategy string,
 ) []map[string]interface{} {
 	switch ruleSet.Type {
+	case RuleSetTypeNative:
+		route := map[string]interface{}{"rule_set": sbRuleSetTag(ruleSet), "outbound": outTag}
+		applyRuleSetInvert(route, ruleSet)
+		if nativeRuleDomainOnly(ruleSet.NativeRule) {
+			resolve := map[string]interface{}{"rule_set": sbRuleSetTag(ruleSet), "action": "resolve", "server": transparentProxyResolverTag(ruleSet, outTag)}
+			applyRuleSetInvert(resolve, ruleSet)
+			if addressFamilyStrategy != "" {
+				resolve["strategy"] = addressFamilyStrategy
+			}
+			return []map[string]interface{}{resolve, route}
+		}
+		return []map[string]interface{}{transparentProxySystemResolveRule(), route}
 	case RuleSetTypeApplication:
 		selectors := applicationRuleSetSelectors(ruleSet)
 		if len(selectors) == 0 {
@@ -1940,6 +1970,10 @@ func isConnectivityAcceptanceRuleSetID(id string) bool {
 
 func buildRouteRule(c *RuleSet, outTag string) map[string]interface{} {
 	switch c.Type {
+	case RuleSetTypeNative:
+		rule := map[string]interface{}{"rule_set": sbRuleSetTag(c), "outbound": outTag}
+		applyRuleSetInvert(rule, c)
+		return rule
 	case RuleSetTypeURL:
 		if c.URL == "" {
 			return nil
@@ -2094,7 +2128,7 @@ func sbCollectRuleSets(
 
 	for _, binding := range scenario.Bindings {
 		c := profile.FindRuleSet(binding.RuleSetID)
-		if c == nil || !c.Enabled || c.Type != RuleSetTypeURL || c.URL == "" {
+		if c == nil || !c.Enabled || (c.Type != RuleSetTypeURL && c.Type != RuleSetTypeNative) || (c.Type == RuleSetTypeURL && c.URL == "") {
 			continue
 		}
 		tag := sbRuleSetTag(c)
@@ -2103,6 +2137,10 @@ func sbCollectRuleSets(
 		}
 		seen[tag] = true
 
+		if c.Type == RuleSetTypeNative {
+			sets = append(sets, map[string]interface{}{"type": "inline", "tag": tag, "rules": []json.RawMessage{c.NativeRule}})
+			continue
+		}
 		format := sbResolveRuleSetFormat(c)
 		if strings.HasPrefix(c.URL, "file://") {
 			sets = append(sets, map[string]interface{}{
@@ -2889,7 +2927,13 @@ func configureTransparentProxyEndpointBootstrap(outbounds []map[string]interface
 }
 
 func buildProxyOutbound(line *Line) map[string]interface{} {
+	return nativeOutboundWithEdits(line, buildEditableProxyOutbound(line))
+}
+
+func buildEditableProxyOutbound(line *Line) map[string]interface{} {
 	switch line.Type {
+	case LineTypeSelector, LineTypeURLTest:
+		return groupOutbound(line)
 	case LineTypeTrojan:
 		if line.TrojanServer == "" || line.TrojanPort <= 0 || line.TrojanPort > 65535 || line.TrojanPassword == "" {
 			return nil

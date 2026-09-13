@@ -9,6 +9,8 @@ type LineType string
 
 const (
 	LineTypeDirect      LineType = "direct"
+	LineTypeSelector    LineType = "selector"
+	LineTypeURLTest     LineType = "urltest"
 	LineTypeVPN         LineType = "vpn"
 	LineTypeTrojan      LineType = "trojan"
 	LineTypeShadowsocks LineType = "shadowsocks"
@@ -19,10 +21,15 @@ const (
 
 // Line 线路：流量从哪个通道出去
 type Line struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Type    LineType `json:"type"`
-	Enabled bool     `json:"enabled"`
+	GroupMembers  []string        `json:"group_members,omitempty"`
+	GroupDefault  string          `json:"group_default,omitempty"`
+	GroupURL      string          `json:"group_url,omitempty"`
+	GroupInterval string          `json:"group_interval,omitempty"`
+	NativeOptions json.RawMessage `json:"native_options,omitempty"`
+	ID            string          `json:"id"`
+	Name          string          `json:"name"`
+	Type          LineType        `json:"type"`
+	Enabled       bool            `json:"enabled"`
 
 	// VPN (AnyConnect via sslcon)
 	VPNServer   string `json:"vpn_server,omitempty"`
@@ -93,6 +100,7 @@ type RuleSetType string
 
 const (
 	RuleSetTypeURL         RuleSetType = "url"
+	RuleSetTypeNative      RuleSetType = "native"
 	RuleSetTypeManual      RuleSetType = "manual"
 	RuleSetTypeApplication RuleSetType = "application"
 )
@@ -120,10 +128,11 @@ type ApplicationMatch struct {
 
 // RuleSet 规则：匹配哪些流量
 type RuleSet struct {
-	ID      string      `json:"id"`
-	Name    string      `json:"name"`
-	Type    RuleSetType `json:"type"`
-	Enabled bool        `json:"enabled"`
+	NativeRule json.RawMessage `json:"native_rule,omitempty"`
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	Type       RuleSetType     `json:"type"`
+	Enabled    bool            `json:"enabled"`
 
 	// URL 规则（远程规则集）
 	URL         string `json:"url,omitempty"`
@@ -223,6 +232,7 @@ type TailscaleIdentity struct {
 
 // Profile 完整配置
 type Profile struct {
+	ID               string            `json:"profile_id,omitempty"`
 	Lines            []Line            `json:"lines"`
 	RuleSets         []RuleSet         `json:"rule_sets"`
 	Scenarios        []Scenario        `json:"scenarios"`

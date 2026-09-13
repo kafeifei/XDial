@@ -4,135 +4,6 @@ import Foundation
 import ServiceManagement
 import SwiftUI
 
-private struct ProfilePersistenceProjection {
-    var profile: Profile
-    var vault: [String: String]
-}
-
-private func makeProfilePersistenceProjection(
-    _ source: Profile
-) -> ProfilePersistenceProjection {
-    var vault = [String: String]()
-    var sanitized = source
-
-    for i in sanitized.lines.indices {
-        let id = sanitized.lines[i].id
-        if !sanitized.lines[i].vpnPassword.isEmpty {
-            vault[id + "-vpn"] = sanitized.lines[i].vpnPassword
-            sanitized.lines[i].vpnPassword = ""
-        }
-        if !sanitized.lines[i].trojanPassword.isEmpty {
-            vault[id + "-trojan"] = sanitized.lines[i].trojanPassword
-            sanitized.lines[i].trojanPassword = ""
-        }
-        if !sanitized.lines[i].ssPassword.isEmpty {
-            vault[id + "-ss"] = sanitized.lines[i].ssPassword
-            sanitized.lines[i].ssPassword = ""
-        }
-        if !sanitized.lines[i].vmessUUID.isEmpty {
-            vault[id + "-vmess"] = sanitized.lines[i].vmessUUID
-            sanitized.lines[i].vmessUUID = ""
-        }
-        if !sanitized.lines[i].anytlsPassword.isEmpty {
-            vault[id + "-anytls"] = sanitized.lines[i].anytlsPassword
-            sanitized.lines[i].anytlsPassword = ""
-        }
-    }
-    for si in sanitized.subscriptions.indices {
-        let subID = sanitized.subscriptions[si].id
-        for pi in sanitized.subscriptions[si].lines.indices {
-            let lineID = sanitized.subscriptions[si].lines[pi].id
-            let key = subID + "-" + lineID
-            let line = sanitized.subscriptions[si].lines[pi]
-            if !line.trojanPassword.isEmpty {
-                vault[key + "-trojan"] = line.trojanPassword
-                sanitized.subscriptions[si].lines[pi].trojanPassword = ""
-            }
-            if !line.ssPassword.isEmpty {
-                vault[key + "-ss"] = line.ssPassword
-                sanitized.subscriptions[si].lines[pi].ssPassword = ""
-            }
-            if !line.vmessUUID.isEmpty {
-                vault[key + "-vmess"] = line.vmessUUID
-                sanitized.subscriptions[si].lines[pi].vmessUUID = ""
-            }
-            if !line.anytlsPassword.isEmpty {
-                vault[key + "-anytls"] = line.anytlsPassword
-                sanitized.subscriptions[si].lines[pi].anytlsPassword = ""
-            }
-        }
-    }
-    ProfileVaultProjection.splitSubscriptionGeoIPRuleSetURLTemplates(
-        from: &sanitized,
-        into: &vault
-    )
-    return ProfilePersistenceProjection(
-        profile: sanitized,
-        vault: vault
-    )
-}
-
-private final class ProfilePersistenceWriter: @unchecked Sendable {
-    private let defaults: UserDefaults
-    private let profileKey: String
-    private let queue = DispatchQueue(
-        label: XDialBuildIdentity.queueLabelPrefix
-            + ".profile-persistence",
-        qos: .utility
-    )
-    private let generationLock = NSLock()
-    private var latestRequestedGeneration: UInt64 = 0
-
-    init(defaults: UserDefaults, profileKey: String) {
-        self.defaults = defaults
-        self.profileKey = profileKey
-    }
-
-    func persistVisualOrderAsync(
-        profile: Profile,
-        generation: UInt64
-    ) {
-        announce(generation)
-        // 拖动跨过多张卡片时会产生连续的实时排序快照。短暂合并这些请求，
-        // 只编码并写入最后一个落点；UI 的内存排序完全不等待这里。
-        queue.asyncAfter(
-            deadline: .now() + .milliseconds(180)
-        ) { [self] in
-            guard isLatest(generation) else { return }
-            let projection = makeProfilePersistenceProjection(profile)
-            guard let data = try? JSONEncoder().encode(projection.profile),
-                  isLatest(generation) else { return }
-            defaults.set(data, forKey: profileKey)
-        }
-    }
-
-    func persistSynchronously(
-        data: Data,
-        generation: UInt64
-    ) {
-        announce(generation)
-        queue.sync { [self] in
-            guard isLatest(generation) else { return }
-            defaults.set(data, forKey: profileKey)
-        }
-    }
-
-    private func announce(_ generation: UInt64) {
-        generationLock.lock()
-        latestRequestedGeneration = max(
-            latestRequestedGeneration,
-            generation
-        )
-        generationLock.unlock()
-    }
-
-    private func isLatest(_ generation: UInt64) -> Bool {
-        generationLock.lock()
-        defer { generationLock.unlock() }
-        return generation == latestRequestedGeneration
-    }
-}
-
 @MainActor
 final class AppState: ObservableObject {
     #if DEBUG
@@ -140,6 +11,18 @@ final class AppState: ObservableObject {
     #endif
 
     @Published var profile: Profile
+    @Published var profileLibrary = ProfileLibrary()
+    @Published var browsedProfileID = ""
+    @Published var settingsArea: ProfileSettingsArea = .configuration
+    @Published var editorPositions: [String: ProfileEditorPosition] = [:]
+    @Published var profilePersistenceError: String?
+    @Published var profileOperationError: String?
+    @Published var refreshingProfileIDs: Set<String> = []
+    var profileRefreshRetryAfter: [String: Date] = [:]
+    @Published private(set) var scenarioSwitchTargetProfileID: String?
+    let profileLibraryStore = ProfileLibraryStore()
+    private var profileRefreshTimer: AnyCancellable?
+    var profileLibraryLoaded = false
     @Published private(set) var currentSSID: String?
     @Published private(set) var wifiSSIDAccessState:
         WiFiSSIDAccessState = .checking
@@ -260,15 +143,7 @@ final class AppState: ObservableObject {
         }
     )
 
-    private let profileKey = "xdial.profile"
-    private let profilePersistenceWriter = ProfilePersistenceWriter(
-        defaults: xdialDefaults,
-        profileKey: "xdial.profile"
-    )
-    private var profilePersistenceGeneration: UInt64 = 0
-    private let keychainPrefix = "xdial-line-"
-    private let subKeychainPrefix = "xdial-sub-"
-    private var cachedVault: [String: String] = [:]
+
 
     /// Tailscale 的登录/节点发现属于配置态，不是 LineRow 的视图状态。
     ///
@@ -522,6 +397,7 @@ final class AppState: ObservableObject {
     }
 
     var canConnect: Bool {
+        guard profileLibraryLoaded, profilePersistenceError == nil else { return false }
         // 宿主的唤醒恢复态会让 UI 显示忙碌，但它最终仍要进入这里发起连接。
         // 真正阻止新事务的只能是引擎自身的连接/断开状态。
         guard !engine.isBusy else { return false }
@@ -530,7 +406,8 @@ final class AppState: ObservableObject {
         return hasRequiredCredentials(for: scenario)
     }
 
-    private func hasRequiredCredentials(for scenario: Scenario) -> Bool {
+    private func hasRequiredCredentials(for scenario: Scenario, in candidate: Profile? = nil) -> Bool {
+        let profile = candidate ?? self.profile
         // Empty Scenarios are valid drafts, but connecting them would make the
         // Go planner invent Direct as an undeclared default policy.
         guard !scenario.defaultLineID.isEmpty
@@ -673,7 +550,7 @@ final class AppState: ObservableObject {
         ) as? Bool {
             self.autoConnect = savedAutoConnect
         } else {
-            self.autoConnect = AutomaticConnectionPolicy.defaultEnabled
+            self.autoConnect = false // A new independent installation starts without network takeover.
             xdialDefaults.set(
                 self.autoConnect,
                 forKey: "xdial.autoConnect"
@@ -756,6 +633,8 @@ final class AppState: ObservableObject {
             }
             .store(in: &engineSubs)
         loadSaved()
+        profileRefreshTimer = Timer.publish(every: 60, on: .main, in: .common)
+            .autoconnect().sink { [weak self] _ in self?.refreshDueProfiles() }
         updateRelaunchDecision =
             AppUpdateRelaunchIntentStore.loadDecision(
                 currentVersion: Bundle.main.object(
@@ -770,7 +649,9 @@ final class AppState: ObservableObject {
             runtimeConfigurationSignature()
         )
         checkHelper()
-        installation.start()
+        // A fresh Next installation can manage Profiles before registering
+        // system components. Install/connect remains an explicit user action.
+        if PrivilegeManager.isInstalled { installation.start() }
         switch updateRelaunchDecision {
         case .reconnect:
             launchAutoConnectPending = true
@@ -977,6 +858,10 @@ final class AppState: ObservableObject {
 
     var desiredConnectionOwnershipForDiagnostics: String {
         connectionDesired.runtimeOwnership?.rawValue ?? ""
+    }
+
+    var hasPendingScenarioSwitch: Bool {
+        scenarioSwitchInFlight != nil || scenarioSwitchTargetID != nil
     }
 
     var scenarioSwitchInFlightForDiagnostics: Bool {
@@ -1537,12 +1422,13 @@ final class AppState: ObservableObject {
     /// 用户从断开态点击场景球时表达的是“用这个场景连接”，不是只选择场景。
     /// SSID / 设置页的激活仍走 `switchScenario`，因此 D39 的显式断开门禁不变。
     @discardableResult
-    func connectScenario(_ id: String) -> Bool {
+    func connectScenario(_ id: String, profileID: String? = nil) -> Bool {
         ssidScenarioSelection.noteManualSelection()
         cancelNetworkEpochQuietWindow()
         return enqueueScenarioSwitch(
             to: id,
-            requiresUnderlayRefresh: false
+            requiresUnderlayRefresh: false,
+            profileID: profileID
         )
     }
 
@@ -1572,21 +1458,27 @@ final class AppState: ObservableObject {
     private func enqueueScenarioSwitch(
         to id: String,
         requiresUnderlayRefresh: Bool,
-        automaticIntent: NetworkEpochSwitchCoordinator.Intent? = nil
+        automaticIntent: NetworkEpochSwitchCoordinator.Intent? = nil,
+        profileID: String? = nil
     ) -> Bool {
-        guard let scenario = profile.scenarios.first(where: { $0.id == id }) else {
+        guard profileLibraryLoaded, profilePersistenceError == nil else { return false }
+        let targetProfileID = profileID ?? profileLibrary.activeProfileID
+        guard let targetProfile = profileLibrary.profiles.first(where: { $0.id == targetProfileID })?.profile else { return false }
+        guard let scenario = targetProfile.scenarios.first(where: { $0.id == id }) else {
             return false
         }
-        guard hasRequiredCredentials(for: scenario) else { return false }
+        guard hasRequiredCredentials(for: scenario, in: targetProfile) else { return false }
 
         if let inFlight = scenarioSwitchInFlight,
            inFlight.targetScenarioID == id,
+           inFlight.targetProfileID == targetProfileID,
            !scenarioSwitchCancellationRequested,
            !requiresUnderlayRefresh {
             return true
         }
         if scenarioSwitchInFlight == nil,
            scenarioSwitchTargetID == id,
+           scenarioSwitchTargetProfileID == targetProfileID,
            !requiresUnderlayRefresh {
             return true
         }
@@ -1611,12 +1503,14 @@ final class AppState: ObservableObject {
             invalidateAutomaticScenarioSwitchRetry()
         }
         scenarioSwitchTargetID = id
+        scenarioSwitchTargetProfileID = targetProfileID
         scenarioSwitchRequiresUnderlayRefresh =
             scenarioSwitchRequiresUnderlayRefresh
             || requiresUnderlayRefresh
 
         if let inFlight = scenarioSwitchInFlight,
            (inFlight.targetScenarioID != id
+                || inFlight.targetProfileID != targetProfileID
                 || requiresUnderlayRefresh),
            !scenarioSwitchCancellationRequested {
             scenarioSwitchCancellationRequested = true
@@ -1634,15 +1528,21 @@ final class AppState: ObservableObject {
             return
         }
 
+        let targetProfileID = scenarioSwitchTargetProfileID ?? profileLibrary.activeProfileID
+        guard let targetRecord = profileLibrary.profiles.first(where: { $0.id == targetProfileID }) else { return }
         if engine.status == "disconnected" {
             let generation = scenarioSwitchGeneration
+            profileLibrary.activeProfileID = targetProfileID
+            profile = targetRecord.profile
             guard persistActiveScenario(targetScenarioID) else {
                 scenarioSwitchTargetID = nil
+                scenarioSwitchTargetProfileID = nil
                 scenarioSwitchRequiresUnderlayRefresh = false
                 return
             }
             if scenarioSwitchGeneration == generation {
                 scenarioSwitchTargetID = nil
+                scenarioSwitchTargetProfileID = nil
                 scenarioSwitchRequiresUnderlayRefresh = false
             }
             connect()
@@ -1665,7 +1565,9 @@ final class AppState: ObservableObject {
         let requiresUnderlayRefresh =
             scenarioSwitchRequiresUnderlayRefresh
         let profileJSON = buildProfileJSON(
-            activeScenarioID: targetScenarioID
+            activeScenarioID: targetScenarioID,
+            sourceProfile: targetRecord.profile,
+            profileID: targetProfileID
         )
         let automaticIntent = activeNetworkEpochScenarioSwitchIntent.flatMap {
             intent -> NetworkEpochSwitchCoordinator.Intent? in
@@ -1678,6 +1580,8 @@ final class AppState: ObservableObject {
             return intent
         }
         scenarioSwitchInFlight = ScenarioSwitchAttempt(
+            targetProfileID: targetProfileID,
+            sourceProfileID: profileLibrary.activeProfileID,
             generation: generation,
             targetScenarioID: targetScenarioID,
             sourceTransactionID: sourceReport.transactionID,
@@ -1737,7 +1641,7 @@ final class AppState: ObservableObject {
         let cancellationNeedsSourceRestore =
             cancellationWasRequested
             && scenarioSwitchTargetID == nil
-            && targetScenarioID != inFlight.sourceScenarioID
+            && (targetScenarioID != inFlight.sourceScenarioID || inFlight.targetProfileID != inFlight.sourceProfileID)
         scenarioSwitchInFlight = nil
         scenarioSwitchCancellationRequested = false
 
@@ -1749,14 +1653,16 @@ final class AppState: ObservableObject {
                 report.state == .committed,
                 !report.systemTakeoverRemoved
             {
-                var updated = profile
+                guard let targetRecord = profileLibrary.profiles.first(where: { $0.id == inFlight.targetProfileID }) else { return }
+                profileLibrary.activeProfileID = inFlight.targetProfileID
+                var updated = targetRecord.profile
                 updated.activeScenarioID = targetScenarioID
                 profile = updated
                 save(markDirty: false)
-                configurationChanges.markApplied(
+                configurationChanges.adoptApplied(
                     .valid(report.configurationFingerprint)
                 )
-                configDirtyFlag = false
+                configDirtyFlag = configurationChanges.isDirty
                 if let automaticIntent = inFlight.automaticIntent {
                     finishAutomaticScenarioSwitchIntent(
                         automaticIntent,
@@ -1770,6 +1676,7 @@ final class AppState: ObservableObject {
                     // so restore the user's source intent with a second staged
                     // Switch instead of tearing down the live session.
                     scenarioSwitchTargetID = inFlight.sourceScenarioID
+                    scenarioSwitchTargetProfileID = inFlight.sourceProfileID
                     scenarioSwitchRequiresUnderlayRefresh = false
                 }
             } else {
@@ -1846,6 +1753,7 @@ final class AppState: ObservableObject {
 
         if scenarioSwitchGeneration == generation {
             scenarioSwitchTargetID = nil
+            scenarioSwitchTargetProfileID = nil
             scenarioSwitchRequiresUnderlayRefresh = false
             return
         }
@@ -1920,6 +1828,7 @@ final class AppState: ObservableObject {
         }
         scenarioSwitchGeneration += 1
         scenarioSwitchTargetID = nil
+        scenarioSwitchTargetProfileID = nil
         scenarioSwitchRequiresUnderlayRefresh = false
         if let sourceScenarioID = scenarioSwitchInFlight?.sourceScenarioID
                 ?? engine.connectionReport?.scenario.id,
@@ -1944,6 +1853,7 @@ final class AppState: ObservableObject {
         scenarioSwitchInFlight = nil
         scenarioSwitchCancellationRequested = false
         scenarioSwitchTargetID = nil
+        scenarioSwitchTargetProfileID = nil
         scenarioSwitchRequiresUnderlayRefresh = false
     }
 
@@ -2025,12 +1935,12 @@ final class AppState: ObservableObject {
         guard !ssid.isEmpty else {
             return tr("SSID 不能为空", "SSID cannot be empty")
         }
-        guard let index = profile.scenarios.firstIndex(where: {
+        guard let index = editingProfile.scenarios.firstIndex(where: {
             $0.id == scenarioID
         }) else {
             return tr("场景不存在", "Scenario does not exist")
         }
-        if let owner = profile.scenarios.first(where: {
+        if let owner = editingProfile.scenarios.first(where: {
             $0.id != scenarioID && $0.matchSSIDs.contains(ssid)
         }) {
             return tr(
@@ -2038,30 +1948,27 @@ final class AppState: ObservableObject {
                 "This SSID is already used by “\(owner.name)”"
             )
         }
-        guard !profile.scenarios[index].matchSSIDs.contains(ssid) else {
+        guard !editingProfile.scenarios[index].matchSSIDs.contains(ssid) else {
             return nil
         }
-        profile.scenarios[index].matchSSIDs.append(ssid)
-        save()
+        editingProfile.scenarios[index].matchSSIDs.append(ssid)
+        saveEditingProfile()
         if wifiSSIDAccessState == .ready {
             wifiSSIDMonitor.start()
         } else {
             requestSSIDAccess()
         }
-        activateScenarioForCurrentSSIDIfNeeded(
-            forceMatching: ssid == currentSSID
-        )
         return nil
     }
 
     func removeSSID(_ ssid: String, from scenarioID: String) {
-        guard let index = profile.scenarios.firstIndex(where: {
+        guard let index = editingProfile.scenarios.firstIndex(where: {
             $0.id == scenarioID
         }) else {
             return
         }
-        profile.scenarios[index].matchSSIDs.removeAll { $0 == ssid }
-        save()
+        editingProfile.scenarios[index].matchSSIDs.removeAll { $0 == ssid }
+        saveEditingProfile()
     }
 
     private func handleWiFiSSIDUpdate(
@@ -2341,6 +2248,7 @@ final class AppState: ObservableObject {
                 scenarioID: intent.desiredScenarioID
             )
             scenarioSwitchTargetID = nil
+            scenarioSwitchTargetProfileID = nil
             scenarioSwitchRequiresUnderlayRefresh = false
             _ = persistActiveScenario(intent.desiredScenarioID)
             let preparation = AutomaticReconnectPreparation(
@@ -2476,6 +2384,7 @@ final class AppState: ObservableObject {
         )
         scenarioSwitchGeneration += 1
         scenarioSwitchTargetID = nil
+        scenarioSwitchTargetProfileID = nil
         scenarioSwitchRequiresUnderlayRefresh = false
         if scenarioSwitchInFlight?.automaticIntent == intent,
            !scenarioSwitchCancellationRequested {
@@ -2524,6 +2433,7 @@ final class AppState: ObservableObject {
         )
         scenarioSwitchGeneration += 1
         scenarioSwitchTargetID = nil
+        scenarioSwitchTargetProfileID = nil
         scenarioSwitchRequiresUnderlayRefresh = false
         if !sourceScenarioID.isEmpty {
             connectionDesired.userRequestedConnection(
@@ -2573,10 +2483,9 @@ final class AppState: ObservableObject {
         guard profile.scenarios.contains(where: { $0.id == id }) else {
             return false
         }
-        guard profile.activeScenarioID != id else { return true }
         profile.activeScenarioID = id
         save()
-        return true
+        return profilePersistenceError == nil
     }
 
     /// 兼容既有 UI / Debug intent；实际执行统一进入完整安装事务。
@@ -2617,7 +2526,6 @@ final class AppState: ObservableObject {
     ///   内部写入传 false：连接前的落盘（马上就下发了），以及 verified 这类纯展示
     ///   标记的回写（不影响数据面行为）。
     func save(markDirty: Bool = true) {
-        let persistenceGeneration = nextProfilePersistenceGeneration()
         if profile.lines.contains(where: { $0.type == "tailscale" }),
            profile.tailscale.hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             profile.tailscale.hostname = Self.newTailscaleHostname()
@@ -2647,21 +2555,9 @@ final class AppState: ObservableObject {
             profile.lines[i].verified = true
         }
 
-        // 所有密码收集到一个 vault dict，一次性存入 Keychain（只弹一次授权）
-        let projection = makeProfilePersistenceProjection(profile)
-        let sanitized = projection.profile
-        let vault = projection.vault
-
-        if vault != cachedVault {
-            KeychainStore.saveVault(vault)
-            cachedVault = vault
-        }
-
-        guard let data = try? JSONEncoder().encode(sanitized) else { return }
-        profilePersistenceWriter.persistSynchronously(
-            data: data,
-            generation: persistenceGeneration
-        )
+        guard let index = profileLibrary.profiles.firstIndex(where: { $0.id == profileLibrary.activeProfileID }) else { return }
+        profileLibrary.profiles[index].profile = profile
+        guard persistProfileLibrary() else { return }
 
         configurationChanges.recordSave(
             runtimeConfigurationSignature(),
@@ -2675,152 +2571,11 @@ final class AppState: ObservableObject {
         )
     }
 
-    /// 视觉排序先更新内存，再在后台持久化完整的脱敏快照。
-    ///
-    /// 所有 profile 写入共用 generation 与串行 writer：更晚的普通编辑会使尚未
-    /// 落盘的排序快照失效，排序写入不会反过来覆盖字段编辑或凭据更新。
-    func saveVisualOrderAsync() {
-        let generation = nextProfilePersistenceGeneration()
-        profilePersistenceWriter.persistVisualOrderAsync(
-            profile: profile,
-            generation: generation
-        )
-    }
-
-    private func nextProfilePersistenceGeneration() -> UInt64 {
-        profilePersistenceGeneration &+= 1
-        return profilePersistenceGeneration
-    }
+    /// Visual order shares the encrypted library's atomic writer.
+    func saveVisualOrderAsync() { save(markDirty: false) }
 
     private func loadSaved() {
-        guard let data = xdialDefaults.data(forKey: profileKey) else {
-            appLog("loadSaved: no saved data, using bootstrap")
-            return  // 第一次启动，保留 bootstrap
-        }
-        appLog("loadSaved: found \(data.count) bytes")
-
-        // 先把原始 JSON 解成字典，做「旧命名 → 新命名」的精确 key 重写：
-        // 比喻命名时代（ports/cargoes/cruises/active_cruise_id/cargo_id/port_id/
-        // default_port_id）持久化的 profile，key 与新 CodingKeys 不一致。由于 Profile
-        // 的所有 key 都是 decodeIfPresent，直接解码旧数据不会抛错、而是静默得到空 profile，
-        // 因此必须在解码前把旧 key 改写成新 key（严格精确匹配，绝不子串替换，避免误伤
-        // trojan_port / default_subscription_id 等含 "port" 子串的字段）。
-        var rewrittenData = data
-        var didKeyRewrite = false
-        if let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           Self.hasLegacyMetaphorKeys(raw) {
-            let migrated = Self.rewriteLegacyMetaphorKeys(raw)
-            if let d = try? JSONSerialization.data(withJSONObject: migrated) {
-                rewrittenData = d
-                didKeyRewrite = true
-                appLog("loadSaved: rewrote legacy metaphor keys → new schema")
-            }
-        }
-
-        // 优先按新格式解析；失败再按更旧格式（v0.2 exits/rules/strategies）迁移
-        var loaded: Profile
-        do {
-            loaded = try JSONDecoder().decode(Profile.self, from: rewrittenData)
-            appLog("loadSaved: decoded OK, \(loaded.lines.count) lines, \(loaded.scenarios.count) scenarios, \(loaded.subscriptions.count) subs")
-        } catch {
-            appLog("loadSaved: decode failed: \(error)")
-            if let old = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let migrated = Self.migrate(oldProfile: old) {
-                loaded = migrated
-                appLog("Profile: migrated from old schema")
-            } else {
-                appLog("loadSaved: migration also failed, using bootstrap")
-                return
-            }
-        }
-
-        // 从 vault（单条目）恢复密码，回退到旧的逐条方式（迁移）
-        let containedPlaintextGeoIPRuleSetURLTemplate =
-            loaded.subscriptions.contains {
-                !$0.geoIPRuleSetURLTemplate.isEmpty
-            }
-        var vault = KeychainStore.loadVault()
-        cachedVault = vault
-        var didMigrate = didKeyRewrite
-            || containedPlaintextGeoIPRuleSetURLTemplate
-        if vault.isEmpty {
-            didMigrate = true
-            // 迁移：从旧的逐条 Keychain 读取（含旧的 "xdial-port-" 前缀）
-            let oldPrefixes = [keychainPrefix, "xdial-port-", "xdial-exit-"]
-            for line in loaded.lines {
-                for pfx in oldPrefixes {
-                    for suffix in ["vpn", "trojan", "ss", "vmess", "anytls"] {
-                        if let v = KeychainStore.load(account: pfx + line.id + "-" + suffix), !v.isEmpty {
-                            vault[line.id + "-" + suffix] = v
-                        }
-                    }
-                }
-            }
-            appLog("loadSaved: migrated \(vault.count) passwords to vault")
-        }
-
-        for i in loaded.lines.indices {
-            let id = loaded.lines[i].id
-            if let v = vault[id + "-vpn"] { loaded.lines[i].vpnPassword = v }
-            if let v = vault[id + "-trojan"] { loaded.lines[i].trojanPassword = v }
-            if let v = vault[id + "-ss"] { loaded.lines[i].ssPassword = v }
-            if let v = vault[id + "-vmess"] { loaded.lines[i].vmessUUID = v }
-            if let v = vault[id + "-anytls"] { loaded.lines[i].anytlsPassword = v }
-        }
-        for si in loaded.subscriptions.indices {
-            let subID = loaded.subscriptions[si].id
-            for pi in loaded.subscriptions[si].lines.indices {
-                let lineID = loaded.subscriptions[si].lines[pi].id
-                let k = subID + "-" + lineID
-                if let v = vault[k + "-trojan"] { loaded.subscriptions[si].lines[pi].trojanPassword = v }
-                if let v = vault[k + "-ss"] { loaded.subscriptions[si].lines[pi].ssPassword = v }
-                if let v = vault[k + "-vmess"] { loaded.subscriptions[si].lines[pi].vmessUUID = v }
-                if let v = vault[k + "-anytls"] { loaded.subscriptions[si].lines[pi].anytlsPassword = v }
-            }
-        }
-        ProfileVaultProjection.restoreSubscriptionGeoIPRuleSetURLTemplates(
-            from: vault,
-            into: &loaded
-        )
-
-        // 自愈：清洗存量数据里混入的控制/格式字符。老输入层只 trim 空白，
-        // 粘贴带入的 \u{03} 等会存进 profile 并写进 domain_suffix（永远匹配
-        // 不中，UI 又看不见）。清洗后走 didMigrate 回写持久化。
-        for i in loaded.ruleSets.indices {
-            let cleanedDomains = loaded.ruleSets[i].domains
-                .map(RuleSet.sanitizeEntry).filter { !$0.isEmpty }
-            let cleanedCIDRs = loaded.ruleSets[i].cidrs
-                .map(RuleSet.sanitizeEntry).filter { !$0.isEmpty }
-            let cleanedApplications = RuleSet.sanitizeApplications(
-                loaded.ruleSets[i].applications
-            )
-            let cleanedProcesses = RuleSet.sanitizeProcesses(
-                loaded.ruleSets[i].processes
-            )
-            if cleanedDomains != loaded.ruleSets[i].domains
-                || cleanedCIDRs != loaded.ruleSets[i].cidrs
-                || cleanedApplications != loaded.ruleSets[i].applications
-                || cleanedProcesses != loaded.ruleSets[i].processes {
-                loaded.ruleSets[i].domains = cleanedDomains
-                loaded.ruleSets[i].cidrs = cleanedCIDRs
-                loaded.ruleSets[i].applications = cleanedApplications
-                loaded.ruleSets[i].processes = cleanedProcesses
-                didMigrate = true
-                appLog("loadSaved: sanitized control chars in rule set \(loaded.ruleSets[i].id)")
-            }
-        }
-
-        // D33 恢复桌面内置 Tailscale。旧版本已经留下 Line 但尚未有全局设备名时，
-        // 只补一份稳定身份；不迁移、删除或重写任何 Scenario 引用。
-        if loaded.lines.contains(where: { $0.type == "tailscale" }),
-           loaded.tailscale.hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            loaded.tailscale.hostname = Self.newTailscaleHostname()
-            didMigrate = true
-            appLog("loadSaved: created persistent Tailscale identity")
-        }
-
-        self.profile = loaded
-        if didMigrate { save() }
+        loadProfileLibrary()
     }
 
     private static func newTailscaleHostname() -> String {
@@ -2934,19 +2689,6 @@ final class AppState: ObservableObject {
         return m
     }
 
-    private func loadKeychain(id: String, suffix: String, oldPrefixes: [String]) -> String {
-        if let v = KeychainStore.load(account: keychainPrefix + id + "-" + suffix), !v.isEmpty {
-            return v
-        }
-        // 回退到旧 prefix
-        for old in oldPrefixes {
-            if let v = KeychainStore.load(account: old + id + "-" + suffix), !v.isEmpty {
-                return v
-            }
-        }
-        return ""
-    }
-
     /// 把旧格式 profile (v0.2: exits/rules/strategies) 迁移到新格式 (lines/rule_sets/scenarios)
     static func migrate(oldProfile: [String: Any]) -> Profile? {
         var p = Profile()
@@ -3046,14 +2788,14 @@ final class AppState: ObservableObject {
     // MARK: - Scenario Management
 
     func createScenario(from template: ScenarioTemplate, named name: String) {
-        let direct = profile.lines.first(where: { $0.type == "direct" })?.id ?? "direct"
-        let vpn = profile.lines.first(where: { $0.type == "vpn" })?.id ?? "vpn"
-        let ss = profile.lines.first(where: { $0.type != "direct" && $0.type != "vpn" })?.id ?? "ss"
+        let direct = editingProfile.lines.first(where: { $0.type == "direct" })?.id ?? "direct"
+        let vpn = editingProfile.lines.first(where: { $0.type == "vpn" })?.id ?? direct
+        let ss = editingProfile.lines.first(where: { $0.type != "direct" && $0.type != "vpn" })?.id ?? direct
 
-        let manualRules = profile.ruleSets
+        let manualRules = editingProfile.ruleSets
             .filter { $0.type == "manual" && $0.enabled }
             .map { $0.id }
-        let remoteRuleSet = profile.ruleSets
+        let remoteRuleSet = editingProfile.ruleSets
             .first(where: { $0.type == "url" && $0.enabled })?.id ?? ""
 
         var s: Scenario
@@ -3082,39 +2824,45 @@ final class AppState: ObservableObject {
         case .blank:
             // 空白模板只创建领域对象，不替用户作任何流量裁决。
             // 默认 Line、RuleSet binding 与 SSID 都必须由用户显式配置。
-            s = Scenario(id: UUID().uuidString, name: name)
+            s = Scenario(id: UUID().uuidString, name: name, defaultLineID: direct)
         }
         s.name = name
-        profile.scenarios.append(s)
-        if profile.activeScenarioID.isEmpty {
-            profile.activeScenarioID = s.id
+        editingProfile.scenarios.append(s)
+        if editingProfile.activeScenarioID.isEmpty {
+            editingProfile.activeScenarioID = s.id
         }
-        save()
+        saveEditingProfile()
     }
 
     func deleteScenario(id: String) {
-        guard profile.scenarios.contains(where: { $0.id == id }) else {
+        guard editingProfile.scenarios.count > 1, !hasPendingScenarioSwitch,
+              !(editingActiveProfile && engine.status != "disconnected" && engine.connectionReport?.scenario.id == id),
+              !(scenarioSwitchTargetProfileID == editingRecord.id && scenarioSwitchTargetID == id),
+              editingProfile.scenarios.contains(where: { $0.id == id }) else {
             return
         }
 
         // ForEach($collection) 删除后会立刻重建行 Binding。先在值副本中完成
         // 整次变更、再整体赋回 @Published，确保设置窗口、Popover 与 Debug
         // 同时收到同一份场景清单，不能只依赖嵌套数组的 writeback 通知。
-        var updated = profile
+        var updated = editingProfile
         updated.scenarios.removeAll { $0.id == id }
         if updated.activeScenarioID == id {
             updated.activeScenarioID = updated.scenarios.first?.id ?? ""
         }
-        profile = updated
-        save()
+        editingProfile = updated
+        saveEditingProfile()
     }
 
     // MARK: - Build profile JSON
 
     func buildProfileJSON(
-        activeScenarioID: String? = nil
+        activeScenarioID: String? = nil,
+        sourceProfile: Profile? = nil,
+        profileID: String? = nil
     ) -> String {
-        var snapshot = profile
+        var snapshot = sourceProfile ?? profile
+        snapshot.profileID = profileID ?? profileLibrary.activeProfileID
         if let activeScenarioID {
             snapshot.activeScenarioID = activeScenarioID
         }
@@ -3124,6 +2872,8 @@ final class AppState: ObservableObject {
 }
 
 private struct ScenarioSwitchAttempt {
+    let targetProfileID: String
+    let sourceProfileID: String
     let generation: Int
     let targetScenarioID: String
     let sourceTransactionID: String

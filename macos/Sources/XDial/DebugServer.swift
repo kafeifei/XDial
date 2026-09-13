@@ -186,6 +186,16 @@ final class DebugServer {
             ] as [String: Any]
         }
         dict["activeScenarioID"] = s.profile.activeScenarioID
+        dict["profiles"] = s.profileLibrary.profiles.map { record in
+            ["id": record.id, "name": record.name, "subscribed": record.source != nil,
+             "lineCount": record.profile.lines.count, "ruleCount": record.profile.ruleSets.count,
+             "scenarioCount": record.profile.scenarios.count] as [String: Any]
+        }
+        dict["activeProfileID"] = s.profileLibrary.activeProfileID
+        dict["editingProfileID"] = s.profileLibrary.editingProfileID
+        dict["browsedProfileID"] = s.browsedProfileID
+        dict["settingsArea"] = s.settingsArea.rawValue
+        dict["profileLibraryReady"] = s.profileLibraryLoaded && s.profilePersistenceError == nil
         // 配置改了但引擎还在跑旧快照 —— 验收改动是否真正生效必须看这个
         dict["configDirty"] = s.configDirty
         if let report = s.engine.connectionReport,
@@ -273,6 +283,10 @@ final class DebugServer {
         subrole: String?
     ) -> CFTypeRef? {
         guard subrole != secureTextFieldSubrole else { return nil }
+        var role: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+        // The advanced JSON editor may contain native TLS credentials.
+        guard role as? String != kAXTextAreaRole else { return nil }
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success else {
             return nil

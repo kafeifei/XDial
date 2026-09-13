@@ -48,6 +48,7 @@ enum ApplicationUninstaller {
                             forKey: "xdial.autoConnect"
                         )
                         KeychainStore.deleteVault()
+                        ProfileLibraryStore.removeKeyOnExplicitDataDeletion()
                         try? FileManager.default.removeItem(
                             atPath: appLogPath()
                         )

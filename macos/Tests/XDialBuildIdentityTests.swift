@@ -2,7 +2,56 @@ import XCTest
 
 final class XDialBuildIdentityTests: XCTestCase {
     func testDevelopmentAndFormalIdentityAreCompleteAndDisjoint() {
-        #if XDIAL_DEVELOPMENT_IDENTITY
+        #if XDIAL_NEXT_IDENTITY
+        XCTAssertTrue(XDialBuildIdentity.isDevelopment)
+        XCTAssertEqual(
+            XDialBuildIdentity.applicationIdentifier,
+            "com.kafeifei.xdial.next"
+        )
+        XCTAssertEqual(
+            XDialBuildIdentity.helperIdentifier,
+            "com.kafeifei.xdial.next.helper"
+        )
+        XCTAssertEqual(
+            XDialBuildIdentity.daemonIdentifier,
+            "com.kafeifei.xdial.next.daemon"
+        )
+        XCTAssertEqual(
+            XDialBuildIdentity.transparentProxyIdentifier,
+            "com.kafeifei.xdial.next.transparent-proxy"
+        )
+        XCTAssertEqual(
+            XDialBuildIdentity.settingsUIIdentifier,
+            "com.kafeifei.xdial.next.settings-ui"
+        )
+        XCTAssertEqual(
+            XDialBuildIdentity.appGroupIdentifier,
+            "UVZM439VGU.com.kafeifei.xdial.next.network"
+        )
+        XCTAssertEqual(
+            XDialBuildIdentity.applicationBundleName,
+            "XDial Next.app"
+        )
+        XCTAssertEqual(
+            XDialBuildIdentity.applicationDisplayName,
+            "XDial Next"
+        )
+        XCTAssertEqual(XDialBuildIdentity.productTitle, "XDial Next")
+        XCTAssertEqual(XDialBuildIdentity.dataIdentifier, "com.kafeifei.xdial.next")
+        XCTAssertEqual(XDialBuildIdentity.userDataDirectoryName, ".xdial-next")
+        XCTAssertEqual(XDialBuildIdentity.applicationSupportDirectoryName, "XDial Next")
+        XCTAssertEqual(XDialBuildIdentity.logDirectoryName, "XDial Next")
+        XCTAssertEqual(XDialBuildIdentity.daemonSocketPath, "/tmp/xdial-next.sock")
+        XCTAssertEqual(XDialBuildIdentity.engineRuntimePath, "/tmp/xdial-next-engine")
+        XCTAssertEqual(
+            XDialBuildIdentity.registrationMaintenancePath,
+            "/tmp/xdial-next-registration-maintenance"
+        )
+        XCTAssertEqual(XDialBuildIdentity.debugServerPort, 19878)
+        XCTAssertFalse(XDialBuildIdentity.allowsAutomaticUpdates)
+        XCTAssertFalse(XDialBuildIdentity.allowsFormalDataMigration)
+        XCTAssertFalse(XDialBuildIdentity.allowsLegacyCleanup)
+        #elseif XDIAL_DEVELOPMENT_IDENTITY
         XCTAssertTrue(XDialBuildIdentity.isDevelopment)
         XCTAssertEqual(
             XDialBuildIdentity.applicationIdentifier,

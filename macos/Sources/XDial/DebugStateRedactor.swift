@@ -17,7 +17,11 @@ enum DebugStateRedactor {
             // Subscription 对象（有 lines + url）的 url 是带 token 的机场地址
             let isSubscription = dict["lines"] != nil && dict["url"] != nil
             for (key, child) in dict {
-                if secretKeys.contains(key),
+                if key == "native_options" {
+                    // Native TLS and transport objects can contain private keys
+                    // or authorization headers. Diagnostics never expose them.
+                    dict[key] = "***"
+                } else if secretKeys.contains(key),
                    let string = child as? String,
                    !string.isEmpty {
                     dict[key] = "***"

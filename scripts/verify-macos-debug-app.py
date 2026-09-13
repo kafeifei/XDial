@@ -23,7 +23,11 @@ def plist(path):
 
 def main():
     bundle = pathlib.Path(sys.argv[1]).resolve()
-    require(bundle.name == "XDail Debug.app", "unexpected development app filename")
+    flavor = sys.argv[2] if len(sys.argv) > 2 else "debug"
+    require(flavor in ("debug", "next"), "unknown development channel")
+    product = "XDial Next" if flavor == "next" else "XDail Debug"
+    prefix = "com.kafeifei.xdial." + flavor
+    require(bundle.name == product + ".app", "unexpected development app filename")
     deployment_verifier = pathlib.Path(__file__).with_name(
         "verify-macos-deployment-target.py"
     )
@@ -37,18 +41,18 @@ def main():
         deployment_result.stderr.strip() or "invalid macOS deployment target",
     )
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(bundle))
-    group = "UVZM439VGU.com.kafeifei.xdial.debug.network"
+    group = "UVZM439VGU." + prefix + ".network"
     components = [
-        (bundle, "com.kafeifei.xdial.debug", True),
+        (bundle, prefix, True),
         (bundle / "Contents/Helpers/XDial Settings UI.app",
-         "com.kafeifei.xdial.debug.settings-ui", False),
-        (bundle / "Contents/Library/SystemExtensions/com.kafeifei.xdial.debug.transparent-proxy.systemextension",
-         "com.kafeifei.xdial.debug.transparent-proxy", True),
+         prefix + ".settings-ui", False),
+        (bundle / f"Contents/Library/SystemExtensions/{prefix}.transparent-proxy.systemextension",
+         prefix + ".transparent-proxy", True),
     ]
     host = plist(bundle / "Contents/Info.plist")
     require(host.get("CFBundleExecutable") == "XDial", "unexpected host executable")
-    require(host.get("CFBundleDisplayName") == "XDail Debug", "unexpected development display name")
-    require(host.get("XDialBuildFlavor") == "debug", "bundle is not a development build")
+    require(host.get("CFBundleDisplayName") == product, "unexpected development display name")
+    require(host.get("XDialBuildFlavor") == flavor, "bundle is not a development build")
     require(host.get("XDialTransparentProxyBundleIdentifier") == components[2][1],
             "host points to another channel's extension")
     for path, identifier, has_group in components:
@@ -75,23 +79,23 @@ def main():
         ["/usr/bin/codesign", "-d", "--verbose=4", str(helper)],
         check=True, capture_output=True, text=True,
     ).stderr
-    require("Identifier=com.kafeifei.xdial.debug.helper\n" in helper_signature,
+    require(f"Identifier={prefix}.helper\n" in helper_signature,
             "helper uses another channel's signing identity")
     require("Authority=Apple Development:" in helper_signature, "helper is not development signed")
     helper_entitlements = plistlib.loads(run("/usr/bin/codesign", "-d", "--entitlements", ":-", str(helper)))
     require(helper_entitlements.get("com.apple.security.application-groups") == [group],
             "helper uses another channel's data group")
     build_info = run("go", "version", "-m", str(helper)).decode()
-    require("main.buildFlavor=debug" in build_info, "helper was compiled for the wrong channel")
+    require(f"main.buildFlavor={flavor}" in build_info, "helper was compiled for the wrong channel")
     daemon_directory = bundle / "Contents/Library/LaunchDaemons"
-    require(sorted(p.name for p in daemon_directory.iterdir()) == ["com.kafeifei.xdial.debug.daemon.plist"],
+    require(sorted(p.name for p in daemon_directory.iterdir()) == [prefix + ".daemon.plist"],
             "bundle contains unexpected launch daemons")
-    daemon = plist(daemon_directory / "com.kafeifei.xdial.debug.daemon.plist")
-    require(daemon["Label"] == "com.kafeifei.xdial.debug.daemon", "wrong daemon label")
-    require(daemon["AssociatedBundleIdentifiers"] == ["com.kafeifei.xdial.debug"], "wrong daemon owner")
-    require(daemon["ProgramArguments"] == ["xdial-daemon", "daemon", "--socket", "/tmp/xdial-debug.sock"],
+    daemon = plist(daemon_directory / (prefix + ".daemon.plist"))
+    require(daemon["Label"] == prefix + ".daemon", "wrong daemon label")
+    require(daemon["AssociatedBundleIdentifiers"] == [prefix], "wrong daemon owner")
+    require(daemon["ProgramArguments"] == ["xdial-daemon", "daemon", "--socket", f"/tmp/xdial-{flavor}.sock"],
             "wrong daemon socket or arguments")
-    require(daemon["StandardOutPath"] == daemon["StandardErrorPath"] == "/tmp/xdial-debug.log",
+    require(daemon["StandardOutPath"] == daemon["StandardErrorPath"] == f"/tmp/xdial-{flavor}.log",
             "wrong daemon logs")
     print(json.dumps({"bundle": str(bundle), "version": host["CFBundleShortVersionString"],
                       "build": host["CFBundleVersion"], "identity": host["CFBundleIdentifier"],

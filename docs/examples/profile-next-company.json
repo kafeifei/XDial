@@ -1,0 +1,17 @@
+{
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {
+    "rule_set": [{"type": "inline", "tag": "company-domains", "rules": [{"domain_suffix": ["corp.example"]}]}]
+  },
+  "xdial": {
+    "schema_version": 1,
+    "requires_input": true,
+    "lines": {"direct": {"name": "直连"}},
+    "rules": {"company-domains": {"name": "公司域名", "kind": "native"}},
+    "adapter_lines": [{"id": "company-vpn", "name": "公司 VPN（示例，需填写）", "type": "vpn", "enabled": true, "vpn_server": "https://vpn.corp.example", "vpn_username": "", "vpn_password": ""}],
+    "scenarios": [
+      {"id": "office", "name": "办公", "route": {"rules": [{"rule_set": "company-domains", "action": "route", "outbound": "company-vpn"}], "final": "direct"}},
+      {"id": "home", "name": "日常", "route": {"final": "direct"}}
+    ]
+  }
+}

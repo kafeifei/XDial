@@ -30,6 +30,28 @@ func TestRuntimeIdentityForDebug(t *testing.T) {
 	}
 }
 
+func TestRuntimeIdentityForNext(t *testing.T) {
+	got := runtimeIdentityForFlavor("next")
+	want := runtimeIdentity{
+		hostBundleIdentifier:   "com.kafeifei.xdial.next",
+		helperBundleIdentifier: "com.kafeifei.xdial.next.helper",
+		daemonLabel:            "com.kafeifei.xdial.next.daemon",
+		socketPath:             "/tmp/xdial-next.sock",
+		engineBasePath:         "/tmp/xdial-next-engine",
+		rootStatePath:          "/Library/Application Support/XDial Next",
+		userStateDirectoryName: ".xdial-next",
+		sharedAppGroup:         "UVZM439VGU.com.kafeifei.xdial.next.network",
+		registrationIntentPath: "/tmp/xdial-next-registration-maintenance",
+		logPath:                "/tmp/xdial-next.log",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Next runtime identity = %#v, want %#v", got, want)
+	}
+	if got.userStatePath("/Users/test") != "/Users/test/.xdial-next" {
+		t.Fatalf("Next user state path = %q", got.userStatePath("/Users/test"))
+	}
+}
+
 func TestRuntimeIdentityDefaultsToExistingProductionIdentity(t *testing.T) {
 	want := runtimeIdentity{
 		hostBundleIdentifier:   "com.kafeifei.xdial.app",

@@ -2,7 +2,9 @@
 
 macOS 菜单栏网络分流工具；iOS / tvOS 共用 Go 核心。
 
-修复后合入最新 main，验证并覆盖安装 Debug；未经要求不重启。
+本分支 `codex/profile-next` 长期独立维护 XDial Next，基线为 `2eab57f`。
+按用户要求不合入 main、不发布稳定版、不覆盖 XDial / XDail Debug。
+`make app` 构建独立的 XDial Next；未经要求不重启应用或网络。
 
 ## 核心边界
 

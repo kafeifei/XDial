@@ -103,6 +103,20 @@ for target in XDial XDialSettingsUI XDialTransparentProxy XDialTests; do
     [[ " $(build_setting Debug "$target" SWIFT_ACTIVE_COMPILATION_CONDITIONS) " == *' XDIAL_DEVELOPMENT_IDENTITY '* ]] \
         || fail "Debug/$target missing development identity condition"
 done
+assert_setting Next XDial com.kafeifei.xdial.next
+assert_setting Next XDialSettingsUI com.kafeifei.xdial.next.settings-ui
+assert_setting Next XDialTransparentProxy com.kafeifei.xdial.next.transparent-proxy
+assert_build_setting Next XDial PRODUCT_NAME 'XDial Next'
+assert_build_setting Next XDial EXECUTABLE_NAME XDial
+assert_build_setting Next XDial XDIAL_HELPER_IDENTIFIER com.kafeifei.xdial.next.helper
+assert_build_setting Next XDial XDIAL_DAEMON_PLIST com.kafeifei.xdial.next.daemon.plist
+assert_build_setting Next XDial XDIAL_DAEMON_ENTITLEMENTS XDialDaemonNext.entitlements
+assert_build_setting Next XDial CODE_SIGN_ENTITLEMENTS XDialNext.entitlements
+assert_build_setting Next XDialTransparentProxy CODE_SIGN_ENTITLEMENTS TransparentProxyExtension/XDialTransparentProxyNext.entitlements
+for target in XDial XDialSettingsUI XDialTransparentProxy XDialTests; do
+    [[ " $(build_setting Next "$target" SWIFT_ACTIVE_COMPILATION_CONDITIONS) " == *' XDIAL_NEXT_IDENTITY '* ]] \
+        || fail "Next/$target missing development identity condition"
+done
 for configuration in FormalDevelopment Release; do
     for target in XDial XDialSettingsUI XDialTransparentProxy; do
         [[ " $(build_setting "$configuration" "$target" SWIFT_ACTIVE_COMPILATION_CONDITIONS) " != *' XDIAL_DEVELOPMENT_IDENTITY '* ]] \
@@ -145,4 +159,16 @@ assert value["AssociatedBundleIdentifiers"] == ["com.kafeifei.xdial.debug"]
 assert value["StandardOutPath"] == value["StandardErrorPath"] == "/tmp/xdial-debug.log"
 PYTHON
 
-echo "macOS development isolation, formal identity, and location-access contracts verified"
+python3 - <<'PYTHON'
+import pathlib, plistlib
+for path in ["XDialNext.entitlements", "XDialDaemonNext.entitlements", "TransparentProxyExtension/XDialTransparentProxyNext.entitlements"]:
+    value = plistlib.loads((pathlib.Path("macos") / path).read_bytes())
+    assert value["com.apple.security.application-groups"] == ["UVZM439VGU.com.kafeifei.xdial.next.network"], path
+value = plistlib.loads(pathlib.Path("macos/com.kafeifei.xdial.next.daemon.plist").read_bytes())
+assert value["Label"] == "com.kafeifei.xdial.next.daemon"
+assert "/tmp/xdial-next.sock" in value["ProgramArguments"]
+assert value["AssociatedBundleIdentifiers"] == ["com.kafeifei.xdial.next"]
+assert value["StandardOutPath"] == value["StandardErrorPath"] == "/tmp/xdial-next.log"
+PYTHON
+
+echo "macOS Next and development isolation, formal identity, and location-access contracts verified"

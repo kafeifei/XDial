@@ -1,6 +1,13 @@
 import Foundation
 
 struct Line: Codable, Identifiable, Hashable {
+    var groupMembers: [String] = []
+    var groupDefault: String = ""
+    var groupURL: String = ""
+    var groupInterval: String = ""
+    var nativeOptions: JSONValue?
+    var isGroup: Bool { type == "selector" || type == "urltest" }
+
     var id: String
     var name: String
     var type: String  // direct / vpn / trojan / shadowsocks / vmess / anytls / tailscale
@@ -50,6 +57,11 @@ struct Line: Codable, Identifiable, Hashable {
     var allowInsecure: Bool = false
 
     enum CodingKeys: String, CodingKey {
+        case groupMembers = "group_members"
+        case groupDefault = "group_default"
+        case groupURL = "group_url"
+        case groupInterval = "group_interval"
+        case nativeOptions = "native_options"
         case id, name, type, enabled, verified
         case udp, tfo
         case allowInsecure = "allow_insecure"
@@ -117,6 +129,11 @@ struct Line: Codable, Identifiable, Hashable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        groupMembers = try c.decodeIfPresent([String].self, forKey: .groupMembers) ?? []
+        groupDefault = try c.decodeIfPresent(String.self, forKey: .groupDefault) ?? ""
+        groupURL = try c.decodeIfPresent(String.self, forKey: .groupURL) ?? ""
+        groupInterval = try c.decodeIfPresent(String.self, forKey: .groupInterval) ?? ""
+        nativeOptions = try c.decodeIfPresent(JSONValue.self, forKey: .nativeOptions)
         id = try c.decode(String.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
         type = try c.decode(String.self, forKey: .type)
@@ -330,6 +347,7 @@ struct ApplicationRuleApplication: Codable, Identifiable, Hashable {
 }
 
 struct RuleSet: Codable, Identifiable, Hashable {
+    var nativeRule: JSONValue?
     var id: String
     var name: String
     var type: String  // url / manual / application
@@ -377,6 +395,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case nativeRule = "native_rule"
         case id
         case name
         case type
@@ -393,6 +412,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        nativeRule = try values.decodeIfPresent(JSONValue.self, forKey: .nativeRule)
         id = try values.decode(String.self, forKey: .id)
         name = try values.decode(String.self, forKey: .name)
         type = try values.decode(String.self, forKey: .type)
@@ -753,6 +773,7 @@ struct Scenario: Codable, Identifiable, Hashable {
 }
 
 struct Profile: Codable, Hashable {
+    var profileID: String = ""
     var lines: [Line] = []
     var ruleSets: [RuleSet] = []
     var scenarios: [Scenario] = []
@@ -761,6 +782,7 @@ struct Profile: Codable, Hashable {
     var tailscale = TailscaleIdentity()
 
     enum CodingKeys: String, CodingKey {
+        case profileID = "profile_id"
         case lines = "lines"
         case ruleSets = "rule_sets"
         case scenarios = "scenarios"
@@ -773,6 +795,7 @@ struct Profile: Codable, Hashable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        profileID = try c.decodeIfPresent(String.self, forKey: .profileID) ?? ""
         lines = try c.decodeIfPresent([Line].self, forKey: .lines) ?? []
         ruleSets = try c.decodeIfPresent([RuleSet].self, forKey: .ruleSets) ?? []
         scenarios = try c.decodeIfPresent(
@@ -789,6 +812,7 @@ struct Profile: Codable, Hashable {
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(profileID, forKey: .profileID)
         try c.encode(lines, forKey: .lines)
         try c.encode(ruleSets, forKey: .ruleSets)
         try c.encode(scenarios, forKey: .scenarios)

@@ -36,4 +36,10 @@ final class DebugServerRedactionTests: XCTestCase {
             ""
         )
     }
+
+    func testNativeOptionsNeverExposeTransportOrTLSCredentials() throws {
+        let input: [String: Any] = ["native_options": ["transport": ["headers": ["Authorization": "private-example"]]]]
+        let result = try XCTUnwrap(DebugStateRedactor.redactSecrets(input) as? [String: Any])
+        XCTAssertEqual(result["native_options"] as? String, "***")
+    }
 }

@@ -822,6 +822,8 @@ var (
 )
 
 type lineRuntimeIdentityMaterial struct {
+	ProfileID     string          `json:"profile_id,omitempty"`
+	NativeOptions json.RawMessage `json:"native_options,omitempty"`
 	Type          config.LineType `json:"type"`
 	Configuration interface{}     `json:"configuration,omitempty"`
 }
@@ -878,8 +880,10 @@ func lineRuntimeIdentity(
 	if profile == nil || line == nil {
 		return "", fmt.Errorf("Line is unavailable")
 	}
-	material := lineRuntimeIdentityMaterial{Type: line.Type}
+	material := lineRuntimeIdentityMaterial{Type: line.Type, ProfileID: profile.ID, NativeOptions: line.NativeOptions}
 	switch line.Type {
+	case config.LineTypeSelector, config.LineTypeURLTest:
+		material.Configuration = config.GroupLineOutbounds(profile, line.ID)
 	case config.LineTypeDirect:
 		material.Configuration = struct{}{}
 	case config.LineTypeVPN:
@@ -1162,6 +1166,10 @@ func GenerateTailscaleSetupConfigWithAuthKey(profileJSON string, lineID string, 
 	lineID = strings.TrimSpace(lineID)
 	if lineID == "" {
 		return "", fmt.Errorf("Tailscale line is missing")
+	}
+	basePath, err = config.ProfileDataPath(profile, basePath)
+	if err != nil {
+		return "", err
 	}
 	line := profile.FindLine(lineID)
 	if line == nil {

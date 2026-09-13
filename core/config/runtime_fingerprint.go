@@ -22,6 +22,7 @@ type runtimeConfigurationBuilder struct {
 }
 
 type runtimeConfigurationProjection struct {
+	ProfileID     string                             `json:"profile_id,omitempty"`
 	Scenario      runtimeConfigurationScenario       `json:"scenario"`
 	RuleSets      []runtimeConfigurationRuleSet      `json:"rule_sets,omitempty"`
 	Lines         []runtimeConfigurationLine         `json:"lines,omitempty"`
@@ -46,6 +47,7 @@ type runtimeConfigurationTarget struct {
 }
 
 type runtimeConfigurationRuleSet struct {
+	NativeRule     json.RawMessage              `json:"native_rule,omitempty"`
 	ID             string                       `json:"id"`
 	Type           RuleSetType                  `json:"type"`
 	Invert         bool                         `json:"invert,omitempty"`
@@ -153,6 +155,8 @@ func (builder *runtimeConfigurationBuilder) includeRuleSet(ruleSet *RuleSet) {
 		Invert: ruleSet.Invert,
 	}
 	switch ruleSet.Type {
+	case RuleSetTypeNative:
+		entry.NativeRule = ruleSet.NativeRule
 	case RuleSetTypeURL:
 		entry.URL = ruleSet.URL
 		entry.Format = ruleSet.Format
@@ -204,6 +208,11 @@ func (builder *runtimeConfigurationBuilder) includeLine(line *Line) {
 		Type:          line.Type,
 		Configuration: configuration,
 	}
+	if line.IsGroup() {
+		for _, id := range line.GroupMembers {
+			builder.includeLine(builder.profile.FindLine(id))
+		}
+	}
 }
 
 func (builder *runtimeConfigurationBuilder) includeSubscription(
@@ -239,6 +248,7 @@ func (builder *runtimeConfigurationBuilder) includeSubscription(
 
 func (builder *runtimeConfigurationBuilder) fingerprint() (string, error) {
 	projection := runtimeConfigurationProjection{
+		ProfileID:     builder.profile.ID,
 		Scenario:      builder.scenario,
 		RuleSets:      sortedRuntimeConfigurationRuleSets(builder.ruleSets),
 		Lines:         sortedRuntimeConfigurationLines(builder.lines),

@@ -24,6 +24,20 @@ type runtimeIdentity struct {
 }
 
 func runtimeIdentityForFlavor(flavor string) runtimeIdentity {
+	if flavor == "next" {
+		return runtimeIdentity{
+			hostBundleIdentifier:   "com.kafeifei.xdial.next",
+			helperBundleIdentifier: "com.kafeifei.xdial.next.helper",
+			daemonLabel:            "com.kafeifei.xdial.next.daemon",
+			socketPath:             "/tmp/xdial-next.sock",
+			engineBasePath:         "/tmp/xdial-next-engine",
+			rootStatePath:          "/Library/Application Support/XDial Next",
+			userStateDirectoryName: ".xdial-next",
+			sharedAppGroup:         "UVZM439VGU.com.kafeifei.xdial.next.network",
+			registrationIntentPath: "/tmp/xdial-next-registration-maintenance",
+			logPath:                "/tmp/xdial-next.log",
+		}
+	}
 	if flavor == "debug" {
 		return runtimeIdentity{
 			hostBundleIdentifier:   "com.kafeifei.xdial.debug",
