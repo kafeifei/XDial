@@ -350,6 +350,7 @@ targets:
       - Sources/XDial/ApplicationRelocator.swift
       - Sources/XDial/DebugStateRedactor.swift
       - Sources/XDial/Models.swift
+      - Sources/XDial/ExistingXDialProfileReader.swift
       - Sources/XDial/ProfileVaultProjection.swift
       - Sources/XDial/ProfileLibrary.swift
       - Sources/XDial/ProfileLibraryStore.swift

@@ -1,5 +1,46 @@
 import AppKit
 
+#if XDIAL_NEXT_IDENTITY
+// This entry point precedes all App/engine/installation initialization. The
+// read-only check works while Debug and Next run; the writer refuses a live
+// Next process so its in-memory library cannot overwrite an imported record.
+if CommandLine.arguments.contains("--import-xdial-debug") ||
+    CommandLine.arguments.contains("--check-xdial-debug-import") {
+    do {
+        let checkOnly = CommandLine.arguments.contains("--check-xdial-debug-import")
+        guard checkOnly || NSRunningApplication.runningApplications(
+            withBundleIdentifier: XDialBuildIdentity.applicationIdentifier
+        ).filter({ $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }).isEmpty else {
+            throw ProfileLibraryError.invalid("Next 正在运行，请使用配置菜单导入，或关闭 Next 后执行；XDail Debug 可以继续运行")
+        }
+        let id = UUID().uuidString.lowercased()
+        let profile = try ProfileDocumentService.importExistingDebug(id: id)
+        guard try JSONDecoder().decode(Profile.self, from: JSONEncoder().encode(profile)) == profile else {
+            throw ProfileLibraryError.invalid("导入配置往返验证失败")
+        }
+        if !checkOnly {
+            let store = ProfileLibraryStore()
+            var library = try store.load() ?? ProfileLibrary()
+            library.profiles.append(ProfileRecord(id: id, name: "XDail Debug 导入", profile: profile))
+            library.editingProfileID = id
+            try store.save(library)
+            guard try store.load() == library else { throw ProfileLibraryError.invalid("导入后的加密配置校验失败") }
+        }
+        let credentials = profile.lines.filter {
+            !$0.vpnPassword.isEmpty || !$0.trojanPassword.isEmpty || !$0.ssPassword.isEmpty ||
+            !$0.vmessUUID.isEmpty || !$0.anytlsPassword.isEmpty
+        }.count
+        fputs("\(checkOnly ? "Validated" : "Imported") XDail Debug: \(profile.lines.count) lines, \(profile.ruleSets.count) rule sets, \(profile.scenarios.count) scenarios, \(credentials) credential-bearing lines. No connection or activation.\n", stdout)
+        exit(0)
+    } catch {
+        // Decoder/validator errors can contain source fields; never emit them.
+        let message = (error as? ProfileLibraryError)?.localizedDescription ?? "读取或验证配置失败；未输出配置正文"
+        fputs("Import failed: " + message + "\n", stderr)
+        exit(1)
+    }
+}
+#endif
+
 if CommandLine.arguments.contains(OutgoingApplicationCleanup.helperReplacementArgument) {
     let application = NSApplication.shared
     Task { @MainActor in

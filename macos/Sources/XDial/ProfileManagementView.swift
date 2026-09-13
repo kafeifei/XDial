@@ -3,7 +3,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum ProfileManagementAction: String, Identifiable {
-    case rename, source, copy, export, delete, empty, file, subscription
+    case rename, source, copy, export, delete, empty, file, subscription, existingDebug
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -15,6 +15,7 @@ enum ProfileManagementAction: String, Identifiable {
         case .empty: return "新建空白配置"
         case .file: return "从文件导入"
         case .subscription: return "从链接订阅"
+        case .existingDebug: return "从 XDail Debug 导入"
         }
     }
 }
@@ -71,6 +72,7 @@ struct ProfileNavigation: View {
                             Button("新建空白配置…") { action = .empty }
                             Button("从文件导入…") { action = .file }
                             Button("从链接订阅…") { action = .subscription }
+                            Button("从 XDail Debug 导入…") { action = .existingDebug }
                         }
                     } label: {
                         Image(systemName: "chevron.down").frame(width: 24, height: 30)
@@ -117,7 +119,7 @@ struct ProfileManagementSheet: View {
     @State private var task: Task<Void, Never>?
     @State private var newID = UUID().uuidString.lowercased()
 
-    private var imports: Bool { action == .file || action == .subscription }
+    private var imports: Bool { action == .file || action == .subscription || action == .existingDebug }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -154,7 +156,10 @@ struct ProfileManagementSheet: View {
                     }
                 }
                 if action == .empty { Text("创建直连线路和默认场景，随后可以自行添加。\n保存配置后，在菜单栏点击场景即可连接。").font(.caption).foregroundStyle(.secondary) }
-                if imports { Toggle("仅导入线路，另建默认场景", isOn: $nodesOnly).font(.caption) }
+                if action == .existingDebug {
+                    Text("将本机 XDail Debug 的线路、规则、场景和已保存密码复制到独立配置。\n原应用继续运行。Tailscale 需要在 Next 中单独登录。").font(.caption).foregroundStyle(.secondary)
+                }
+                if action == .file || action == .subscription { Toggle("仅导入线路，另建默认场景", isOn: $nodesOnly).font(.caption) }
                 if let preview {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("\(preview.lines.count) 条线路 · \(preview.ruleSets.count) 个规则集 · \(preview.scenarios.count) 个场景")
@@ -175,6 +180,7 @@ struct ProfileManagementSheet: View {
         .padding(24).frame(width: 440)
         .onAppear {
             name = [.empty, .file, .subscription].contains(action) ? "新配置" : record.name + (action == .copy ? " 副本" : "")
+            if action == .existingDebug { name = "XDail Debug 导入" }
             url = record.source?.url ?? ""
             interval = record.source?.refreshInterval ?? 86400
         }
@@ -219,8 +225,13 @@ struct ProfileManagementSheet: View {
             task = Task {
                 defer { busy = false }
                 do {
-                    let parsed = try await ProfileDocumentService.read(content: fileContents,
-                        url: action == .subscription ? url : "", profileID: newID, nodesOnly: nodesOnly)
+                    let parsed: Profile
+                    if action == .existingDebug {
+                        parsed = try ProfileDocumentService.importExistingDebug(id: newID)
+                    } else {
+                        parsed = try await ProfileDocumentService.read(content: fileContents,
+                            url: action == .subscription ? url : "", profileID: newID, nodesOnly: nodesOnly)
+                    }
                     try Task.checkCancellation()
                     preview = parsed
                 } catch is CancellationError { } catch { self.error = error.localizedDescription }
@@ -238,7 +249,7 @@ struct ProfileManagementSheet: View {
             do { copied.profile = try ProfileDocumentService.copy(record.profile, id: newID) }
             catch { self.error = error.localizedDescription; return }
             if !state.insertProfile(copied) { error = state.profilePersistenceError; return }
-        case .file, .subscription:
+        case .file, .subscription, .existingDebug:
             guard let preview else { return }
             let source = action == .subscription ? ProfileSource(url: url, nodesOnly: nodesOnly, refreshInterval: interval, updatedAt: Date()) : nil
             let imported = ProfileRecord(id: newID, name: name, profile: preview, source: source, baseline: source == nil ? nil : preview)

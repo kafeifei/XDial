@@ -2,6 +2,16 @@ import Foundation
 import Libbox
 
 enum ProfileDocumentService {
+    static func importExistingDebug(id: String) throws -> Profile {
+        let original = try ExistingXDialProfileReader.readDebug()
+        var imported = try copy(original, id: id)
+        if imported.lines.contains(where: { $0.type == "tailscale" }) {
+            imported.tailscale.hostname = "xdial-next-" + String(id.prefix(8))
+        }
+        try validate(imported)
+        return imported
+    }
+
     static func copy(_ profile: Profile, id: String) throws -> Profile {
         let data = try JSONEncoder().encode(profile)
         var error: NSError?
