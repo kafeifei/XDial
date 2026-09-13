@@ -275,6 +275,16 @@ struct Line: Codable, Identifiable, Hashable {
 
 struct TailscaleIdentity: Codable, Hashable {
     var hostname: String = ""
+
+    init(hostname: String = "") { self.hostname = hostname }
+
+    enum CodingKeys: String, CodingKey { case hostname }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        // Go omits an unset hostname and emits an empty identity object.
+        hostname = try values.decodeIfPresent(String.self, forKey: .hostname) ?? ""
+    }
 }
 
 struct TailscaleRuntimeExitNode: Decodable, Identifiable, Hashable {

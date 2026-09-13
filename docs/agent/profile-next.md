@@ -67,6 +67,8 @@ REJECT / GEOIP 等完整订阅转换、旧嵌套 Subscription 的无损迁移、
 - Go：`core/config`、`core/libbox`、`core/subscription`、`cmd/xdial` 全包测试；配置用同版本
   sing-box validator 检查；涵盖原生规则/组、脱敏往返、严格拒绝、稳定 ID、DNS 归属及身份隔离。
 - Swift：XDialTests 的 Next 配置；覆盖加密、篡改、钥匙串不可用、刷新引用与选择器选择等。
+- `make test-profile-document-bridge` 使用实际 Libbox framework 解析公司示例，再用实际
+  Swift Profile 解码、复制和脱敏往返。覆盖 Go 省略空字段时 Swift 解码的兼容边界。
 - `scripts/verify-macos-identity-contract.sh` 同时检查 Next、Debug、正式配置；
   `scripts/verify-macos-debug-app.py '<Next app>' next` 检查实际签名产物。
 - 真正的跨 Profile 网络切换、企业 VPN 登录、在线订阅刷新仍需要运行验收。

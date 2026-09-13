@@ -372,6 +372,17 @@ inspector:
 	@mkdir -p $(BUILD_DIR)
 	swiftc -O tools/inspector.swift -o $(BUILD_DIR)/xdial-inspector
 
+.PHONY: test-profile-document-bridge
+test-profile-document-bridge: libbox-macos-xcframework
+	swiftc -target arm64-apple-macos15.0 \
+		-F $(BUILD_DIR)/frameworks/macos/Libbox.xcframework/macos-arm64_x86_64 \
+		-framework Libbox -framework Foundation -framework Security \
+		-framework SystemConfiguration -framework IOKit -framework Network \
+		-lresolv -lz -lc++ macos/Shared/JSONValue.swift \
+		macos/Sources/XDial/Models.swift tools/profile-document-check.swift \
+		-o $(BUILD_DIR)/profile-document-check
+	$(BUILD_DIR)/profile-document-check docs/examples/profile-next-company.json
+
 # 把 core/libbox(sslcon + gVisor + sing-box,进程内 tvOS 引擎)编译成
 # Swift 可直接 import 的 xcframework。需要 SagerNet fork 的 gomobile/gobind:
 #   go install github.com/sagernet/gomobile/cmd/gomobile@latest

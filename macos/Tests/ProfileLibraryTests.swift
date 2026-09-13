@@ -3,6 +3,15 @@ import Foundation
 import XCTest
 
 final class ProfileLibraryTests: XCTestCase {
+    func testImportedCoreProfileAllowsEmptyTailscaleIdentity() throws {
+        let coreJSON = #"{"profile_id":"company","lines":[{"id":"direct","name":"Direct","type":"direct","enabled":true}],"rule_sets":null,"scenarios":[{"id":"scene","name":"Default","bindings":null,"default_line_id":"direct"}],"active_scenario_id":"scene","tailscale":{}}"#
+        let profile = try JSONDecoder().decode(Profile.self, from: Data(coreJSON.utf8))
+        XCTAssertEqual(profile.tailscale.hostname, "")
+        XCTAssertEqual(profile.scenarios.first?.defaultLineID, "direct")
+        XCTAssertEqual(profile.ruleSets, [])
+        XCTAssertEqual(try JSONDecoder().decode(Profile.self, from: JSONEncoder().encode(profile)), profile)
+    }
+
     func testEncryptedRoundTripAndTamperRejection() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

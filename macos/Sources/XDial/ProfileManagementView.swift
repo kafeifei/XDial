@@ -203,8 +203,11 @@ struct ProfileManagementSheet: View {
             guard data.count <= 4 * 1024 * 1024, let text = String(data: data, encoding: .utf8) else {
                 throw ProfileLibraryError.invalid("配置文件必须为 UTF-8 文本，且不能超过 4 MiB")
             }
+            let previousFileName = URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
             fileContents = text; fileName = selected.lastPathComponent; preview = nil
-            name = selected.deletingPathExtension().lastPathComponent
+            if name == "新配置" || name == previousFileName || name.trimmingCharacters(in: .whitespaces).isEmpty {
+                name = selected.deletingPathExtension().lastPathComponent
+            }
             error = nil
         } catch { self.error = error.localizedDescription }
     }
