@@ -7,11 +7,15 @@ struct ScenarioBindingList: View {
     @ObservedObject var state: AppState
     let onSave: () -> Void
 
+    private var preservesSourceOrder: Bool {
+        state.editingProfile.scenarios.first(where: { $0.id == scenarioID })?.matchOrder.isEmpty == false
+    }
+
     @State private var draggedItem: SettingsReorderItem?
     @State private var hasMoved = false
 
     var body: some View {
-        VStack(spacing: 6) {
+        LazyVStack(spacing: 6) {
             ForEach($bindings) { $binding in
                 let item = SettingsReorderItem(
                     kind: "scenario-binding:\(scenarioID)",
@@ -24,6 +28,7 @@ struct ScenarioBindingList: View {
                 .settingsReorderable(
                     item,
                     draggedItem: $draggedItem,
+                    allowsDragging: !preservesSourceOrder,
                     onDrop: commitReorder
                 ) { dragged, targetID in
                     moveBinding(dragged, to: targetID)
@@ -40,7 +45,7 @@ struct ScenarioBindingList: View {
         _ item: SettingsReorderItem,
         to targetID: String
     ) -> Bool {
-        guard item.kind == "scenario-binding:\(scenarioID)",
+        guard !preservesSourceOrder, item.kind == "scenario-binding:\(scenarioID)",
               item.id != targetID,
               let source = bindings.firstIndex(where: {
                   $0.ruleSetID == item.id
@@ -65,7 +70,7 @@ struct ScenarioBindingList: View {
     }
 
     private func ruleName(for ruleSetID: String) -> String {
-        state.profile.ruleSets.first(where: { $0.id == ruleSetID })?.name
+        state.editingProfile.ruleSets.first(where: { $0.id == ruleSetID })?.name
             ?? state.tr("（已删除）", "(Deleted)")
     }
 
@@ -92,50 +97,38 @@ struct ScenarioBindingList: View {
                             .font(.caption2)
                             .foregroundStyle(XDialPalette.warning)
                     }
+                    VStack(alignment: .leading, spacing: 2) {
                     Text(ruleName)
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .help(ruleName)
+                    if !binding.wrappedValue.conditionIDs.isEmpty {
+                        Menu {
+                            Button(state.tr("使用完整规则", "Use Entire Rule")) {
+                                binding.wrappedValue.conditionIDs = []
+                                onSave()
+                            }
+                        } label: {
+                            Text(state.tr("部分匹配 · \(binding.wrappedValue.conditionIDs.count) 项", "Partial · \(binding.wrappedValue.conditionIDs.count) items"))
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }.menuStyle(.borderlessButton)
+                            .help(state.tr("为保留原场景，只使用此规则中的部分匹配内容", "Uses a subset to preserve this Scenario's matching scope"))
+                    }
+                    }
                 }
                 .frame(width: 166, alignment: .leading)
             }
             .frame(width: 200, alignment: .leading)
 
-            Picker(
-                "",
-                selection: SwiftUI.Binding(
-                    get: { binding.wrappedValue.targetID },
-                    set: { targetID in
-                        guard binding.wrappedValue.targetID != targetID else {
-                            return
-                        }
-                        binding.wrappedValue.targetID = targetID
-                        onSave()
-                    }
-                )
-            ) {
-                ForEach(state.profile.lines.filter(\.enabled)) { line in
-                    Text(line.name).tag("port:\(line.id)")
+            LineTargetPicker(state: state, selection: SwiftUI.Binding(
+                get: { binding.wrappedValue.targetID },
+                set: { targetID in
+                    guard binding.wrappedValue.targetID != targetID else { return }
+                    binding.wrappedValue.targetID = targetID
+                    onSave()
                 }
-                if !state.profile.subscriptions.filter(\.enabled).isEmpty {
-                    Divider()
-                    ForEach(state.profile.subscriptions.filter(\.enabled)) {
-                        subscription in
-                        Label(
-                            "\(subscription.name) (\(subscription.lines.count))",
-                            systemImage: "antenna.radiowaves.left.and.right"
-                        )
-                        .tag("sub:\(subscription.id)")
-                    }
-                }
-            }
-            .pickerStyle(.menu)
-            .labelsHidden()
+            ), label: state.tr("\(ruleName) 的线路或组", "Exit for \(ruleName)"))
             .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityLabel(state.tr(
-                "\(ruleName) 的线路",
-                "Line for \(ruleName)"
-            ))
 
             Button {
                 bindings.removeAll { $0.ruleSetID == ruleSetID }
@@ -162,7 +155,7 @@ struct ScenarioBindingList: View {
         ruleName: String,
         position: Int
     ) -> some View {
-        let enabled = bindings.count > 1
+        let enabled = bindings.count > 1 && !preservesSourceOrder
         let image = Image(systemName: "line.3.horizontal")
             .font(.system(size: 9.5, weight: .semibold))
             .foregroundStyle(

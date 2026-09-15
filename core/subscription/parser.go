@@ -32,6 +32,13 @@ func Parse(url, content, format string) (*ParseResult, error) {
 	if content == "" {
 		return nil, fmt.Errorf("empty subscription content")
 	}
+	// Some providers return HTTP 200 with an access-window notice instead of
+	// configuration. Report the required user action without echoing arbitrary
+	// server content (which may include a subscription token).
+	if strings.HasPrefix(strings.TrimSpace(content), "请登录系统网站后台") &&
+		strings.Contains(content, "开启订阅获取") {
+		return nil, fmt.Errorf("订阅下载权限未开启或已过期，请在服务商后台重新开启订阅获取后重试")
+	}
 
 	if format == "" || format == "auto" {
 		format = detect(content)

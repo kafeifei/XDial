@@ -410,3 +410,10 @@ func assertLine(t *testing.T, line config.Line, name string, typ config.LineType
 		t.Errorf("line %s port = %d, want %d", name, gotPort, portNum)
 	}
 }
+
+func TestProviderDownloadWindowNoticeIsNotReportedAsMissingNodes(t *testing.T) {
+	_, err := Parse("", "请登录系统网站后台，或开启订阅获取。每次有效 10 分钟。token=must-not-leak", "auto")
+	if err == nil || !strings.Contains(err.Error(), "订阅下载权限") || strings.Contains(err.Error(), "must-not-leak") {
+		t.Fatalf("unexpected provider notice handling: %v", err)
+	}
+}

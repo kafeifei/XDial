@@ -208,7 +208,7 @@ type transparentProxyTailscale struct {
 // credential-free connection checklist. The host calls it before starting the
 // Network Extension so planning failures cannot leave session resources behind.
 func GenerateConnectionPlan(profileJSON string) (string, error) {
-	profile, err := config.ParseProfile([]byte(profileJSON))
+	profile, err := config.ParseRuntimeProfile([]byte(profileJSON))
 	if err != nil {
 		return "", err
 	}
@@ -428,7 +428,7 @@ func GenerateTransparentProxyRuleSetBootstrapWithCapabilities(
 	systemDNSJSON string,
 	directIPv6Available bool,
 ) (string, error) {
-	profile, err := config.ParseProfile([]byte(profileJSON))
+	profile, err := config.ParseRuntimeProfile([]byte(profileJSON))
 	if err != nil {
 		return "", err
 	}
@@ -648,7 +648,7 @@ func generateTransparentProxySession(
 	capabilities transparentProxyCapabilityInput,
 	progress connectionPreparationSink,
 ) (string, error) {
-	profile, err := config.ParseProfile([]byte(profileJSON))
+	profile, err := config.ParseRuntimeProfile([]byte(profileJSON))
 	if err != nil {
 		return "", err
 	}
@@ -1123,7 +1123,7 @@ func activeRouteRuleSetTags(configJSON []byte) ([]string, error) {
 }
 
 func generateNEConfig(profileJSON string, vpnServerIP string, basePath string, platform config.Platform) (string, error) {
-	profile, err := config.ParseProfile([]byte(profileJSON))
+	profile, err := config.ParseRuntimeProfile([]byte(profileJSON))
 	if err != nil {
 		return "", err
 	}
@@ -1159,7 +1159,7 @@ func GenerateTailscaleSetupConfig(profileJSON string, lineID string, basePath st
 // GenerateTailscaleSetupConfigWithAuthKey 只为一次显式注册请求加入瞬时 Auth Key。
 // 调用方不得把 key 写回 Profile；返回配置也只能存在于限时 setup session 的内存中。
 func GenerateTailscaleSetupConfigWithAuthKey(profileJSON string, lineID string, basePath string, authKey string) (string, error) {
-	profile, err := config.ParseProfile([]byte(profileJSON))
+	profile, err := config.ParseRuntimeProfile([]byte(profileJSON))
 	if err != nil {
 		return "", err
 	}

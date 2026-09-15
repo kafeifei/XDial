@@ -212,12 +212,18 @@ func CloneProfile(profile *Profile, namespace string) *Profile {
 		}
 		line.GroupDefault = lines[line.GroupDefault]
 	}
-	for i := range result.RuleSets {
-		rule := &result.RuleSets[i]
-		rule.ID = rules[rule.ID]
+	var remapRule func(*RuleSet)
+	remapRule = func(rule *RuleSet) {
+		rule.ID = documentID(namespace, "rule", rule.ID)
 		if rule.FetchLineID != "" {
 			rule.FetchLineID = lines[rule.FetchLineID]
 		}
+		for i := range rule.Conditions {
+			remapRule(&rule.Conditions[i])
+		}
+	}
+	for i := range result.RuleSets {
+		remapRule(&result.RuleSets[i])
 	}
 	for i := range result.Scenarios {
 		scenario := &result.Scenarios[i]
@@ -227,7 +233,13 @@ func CloneProfile(profile *Profile, namespace string) *Profile {
 			result.ActiveScenarioID = scenario.ID
 		}
 		scenario.DefaultLineID = lines[scenario.DefaultLineID]
+		for j, id := range scenario.MatchOrder {
+			scenario.MatchOrder[j] = documentID(namespace, "rule", id)
+		}
 		for j := range scenario.Bindings {
+			for k, id := range scenario.Bindings[j].ConditionIDs {
+				scenario.Bindings[j].ConditionIDs[k] = documentID(namespace, "rule", id)
+			}
 			scenario.Bindings[j].LineID = lines[scenario.Bindings[j].LineID]
 			scenario.Bindings[j].RuleSetID = rules[scenario.Bindings[j].RuleSetID]
 		}

@@ -2,6 +2,70 @@ import Foundation
 import Libbox
 
 enum ProfileDocumentService {
+    static func reimportSavedScenario(_ profile: Profile, scenarioID: String, newProfileID: String) async throws -> Profile {
+        let data = try JSONEncoder().encode(profile)
+        return try await Task.detached(priority: .userInitiated) {
+            var error: NSError?
+            let result = LibboxReimportProfileScenario(String(decoding: data, as: UTF8.self), scenarioID, newProfileID, &error)
+            if let error { throw error }
+            guard !result.isEmpty else { throw ProfileLibraryError.invalid("无法重新导入已保存配置") }
+            return try JSONDecoder().decode(Profile.self, from: Data(result.utf8))
+        }.value
+    }
+
+    static func validateMatchingContent(_ content: RuleSet) throws {
+        var draft = Profile()
+        draft.lines = [Line(id: "direct", name: "Direct", type: "direct")]
+        draft.ruleSets = [content]
+        draft.scenarios = [Scenario(id: "validation", name: "Validation", defaultLineID: "direct")]
+        try validate(draft)
+    }
+
+    static func groupRulesByDestination(_ profile: Profile, referenceScenarioID: String) throws -> Profile {
+        let data = try JSONEncoder().encode(profile)
+        var error: NSError?
+        let result = LibboxGroupProfileRulesByDestination(String(decoding: data, as: UTF8.self), referenceScenarioID, &error)
+        if let error { throw error }
+        let candidate = try JSONDecoder().decode(Profile.self, from: Data(result.utf8))
+        guard candidate.scenarios.map(\.id) == profile.scenarios.map(\.id) else {
+            throw ProfileLibraryError.invalid("场景身份发生变化，已取消迁移")
+        }
+        var updated = profile
+        updated.ruleSets = candidate.ruleSets
+        for index in updated.scenarios.indices {
+            updated.scenarios[index].bindings = candidate.scenarios[index].bindings
+            updated.scenarios[index].matchOrder = candidate.scenarios[index].matchOrder
+        }
+        return updated
+    }
+
+    static func separateImportedRuleResources(_ profile: Profile) throws -> Profile {
+        let data = try JSONEncoder().encode(profile)
+        var error: NSError?
+        // The bridge verifies the compiled fingerprint of every Scenario.
+        let result = LibboxSeparateImportedRuleResources(String(decoding: data, as: UTF8.self), &error)
+        if let error { throw error }
+        let candidate = try JSONDecoder().decode(Profile.self, from: Data(result.utf8))
+        guard candidate.scenarios.map(\.id) == profile.scenarios.map(\.id) else {
+            throw ProfileLibraryError.invalid("场景身份发生变化，已取消迁移")
+        }
+        // Go does not own Swift-only defaults or local line/UI state.
+        var updated = profile
+        updated.ruleSets = candidate.ruleSets
+        for index in updated.scenarios.indices {
+            updated.scenarios[index].bindings = candidate.scenarios[index].bindings
+        }
+        return updated
+    }
+
+    static func compactRuleSets(_ profile: Profile) throws -> Profile {
+        let data = try JSONEncoder().encode(profile)
+        var error: NSError?
+        let result = LibboxCompactProfileRuleSets(String(decoding: data, as: UTF8.self), &error)
+        if let error { throw error }
+        return try JSONDecoder().decode(Profile.self, from: Data(result.utf8))
+    }
+
     static func importExistingDebug(id: String) throws -> Profile {
         let original = try ExistingXDialProfileReader.readDebug()
         var imported = try copy(original, id: id)

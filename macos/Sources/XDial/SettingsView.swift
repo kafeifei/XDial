@@ -173,6 +173,7 @@ private func reorder<Item>(
 
 struct SettingsView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.openWindow) private var openWindow
     private var tab: Int { state.editorPosition.tab }
 
     var body: some View {
@@ -183,26 +184,25 @@ struct SettingsView: View {
             .padding(.horizontal, 16).frame(height: 48)
             .background(titleAccent.opacity(0.07))
 
-            if state.settingsArea == .configuration {
-                HStack(spacing: 4) {
-                    settingsTab(0, title: state.tr("线路", "Lines"), symbol: "point.3.connected.trianglepath.dotted")
-                    settingsTab(1, title: state.tr("规则", "Rules"), symbol: "list.bullet.rectangle")
-                    settingsTab(2, title: state.tr("场景", "Scenarios"), symbol: "square.grid.2x2")
-                    Spacer(minLength: 8)
-                    Text(state.editingRecord.source == nil ? state.tr("本地配置", "Local") : state.tr("订阅配置", "Subscription"))
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 16).padding(.vertical, 8)
-                if let error = state.profilePersistenceError ?? state.profileOperationError {
-                    Text(error).font(.caption).foregroundStyle(XDialPalette.danger)
-                        .textSelection(.enabled).padding(12)
-                }
-                if state.editingActiveProfile && state.configDirty { dirtyBanner }
+            HStack(spacing: 4) {
+                settingsTab(0, title: state.tr("线路", "Lines"), symbol: "point.3.connected.trianglepath.dotted")
+                settingsTab(3, title: state.tr("线路组", "Line Groups"), symbol: "square.stack.3d.up")
+                settingsTab(1, title: state.tr("规则", "Rules"), symbol: "list.bullet.rectangle")
+                settingsTab(2, title: state.tr("场景", "Scenarios"), symbol: "square.grid.2x2")
+                Spacer(minLength: 8)
+                Text(state.editingRecord.source == nil ? state.tr("本地配置", "Local") : state.tr("订阅配置", "Subscription"))
+                    .font(.caption).foregroundStyle(.secondary)
             }
+            .padding(.horizontal, 16).padding(.vertical, 8)
+            if let error = state.profilePersistenceError ?? state.profileOperationError {
+                Text(error).font(.caption).foregroundStyle(XDialPalette.danger)
+                    .textSelection(.enabled).padding(12)
+            }
+            if state.editingActiveProfile && state.configDirty { dirtyBanner }
             Divider()
             ZStack {
-                if state.settingsArea == .general { GeneralTab() }
-                else if tab == 0 { LinesTab().id(state.editingRecord.id) }
+                if tab == 0 { LinesTab().id(state.editingRecord.id) }
+                else if tab == 3 { LinesTab(groupsOnly: true).id(state.editingRecord.id + "-groups") }
                 else if tab == 1 { RulesTab().id(state.editingRecord.id) }
                 else { ScenariosTab().id(state.editingRecord.id) }
             }
@@ -212,9 +212,14 @@ struct SettingsView: View {
         .frame(width: 620, height: 580)
         .background(XDialPalette.canvas)
         .onReceive(NotificationCenter.default.publisher(for: .xdialSettingsSelectTab)) { notification in
-            guard let index = notification.userInfo?["index"] as? Int, (0 ... 3).contains(index) else { return }
-            state.settingsArea = index == 3 ? .general : .configuration
-            if index != 3 { state.editorPosition.tab = index }
+            guard let index = notification.userInfo?["index"] as? Int, (0 ... 4).contains(index) else { return }
+            if index == 4 {
+                ApplicationWindowLifecycleController.shared.prepareToPresentSettingsWindow()
+                openWindow(id: "general")
+                NSApp.activate(ignoringOtherApps: true)
+            } else {
+                state.editorPosition.tab = index
+            }
         }
     }
 
@@ -263,7 +268,7 @@ struct SettingsView: View {
         .buttonStyle(.plain)
     }
 
-    /// 当前事务依赖的已保存配置发生变化时，四个 Tab 共用这一条状态轨。
+    /// 当前事务依赖的已保存配置发生变化时，三个配置 Tab 共用这一条状态轨。
     /// 它是“运行快照待应用”，不是错误，因此不使用危险色或独立警告卡片。
     private var dirtyBanner: some View {
         HStack(spacing: 8) {
@@ -377,255 +382,27 @@ struct SettingsView: View {
     }
 }
 
-// MARK: - 通用 Tab
-
-struct GeneralTab: View {
-    @EnvironmentObject var state: AppState
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                SettingsPanel {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(state.tr("启动与连接", "Startup & Connection")).font(.system(size: 12, weight: .semibold))
-                        Toggle(isOn: $state.launchAtLogin) {
-                            Text(state.tr("开机自动启动", "Launch at login"))
-                                .font(.system(size: 12))
-                        }
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-
-                        VStack(alignment: .leading, spacing: 3) {
-                            Toggle(isOn: $state.autoConnect) {
-                                Text(state.tr(
-                                    "启动时自动连接",
-                                    "Connect automatically on launch"
-                                ))
-                                .font(.system(size: 12))
-                            }
-                            .toggleStyle(.switch)
-                            .controlSize(.mini)
-                            .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-                            Text(state.tr(
-                                "此选项控制 XDial 启动后连接当前场景。运行中断线时，XDial 会尝试自动恢复连接。",
-                                "This controls connecting the active Scenario when XDial launches. If the connection drops while running, XDial attempts to restore it automatically."
-                            ))
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                SettingsPanel {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(state.tr("界面", "Interface")).font(.system(size: 12, weight: .semibold))
-                        HStack(spacing: 8) {
-                            Text(state.tr("外观", "Appearance"))
-                                .font(.system(size: 12))
-                            Spacer()
-                            Picker(
-                                state.tr("外观", "Appearance"),
-                                selection: $state.appearance
-                            ) {
-                                appearanceOption(
-                                    .system,
-                                    title: state.tr(
-                                        "跟随系统",
-                                        "Follow System"
-                                    ),
-                                    symbol: "circle.lefthalf.filled"
-                                )
-                                appearanceOption(
-                                    .light,
-                                    title: state.tr("白天", "Light"),
-                                    symbol: "sun.max.fill"
-                                )
-                                appearanceOption(
-                                    .dark,
-                                    title: state.tr("黑夜", "Dark"),
-                                    symbol: "moon.fill"
-                                )
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.segmented)
-                            .controlSize(.small)
-                            .frame(width: 132)
-                            .accessibilityLabel(
-                                state.tr("外观", "Appearance")
-                            )
-                        }
-                        .frame(minHeight: 28)
-
-                        HStack(spacing: 8) {
-                            Text(state.tr("语言", "Language"))
-                                .font(.system(size: 12))
-                            Spacer()
-                            Picker("", selection: $state.language) {
-                                ForEach(Lang.allCases, id: \.self) { l in
-                                    Text(l.displayName).tag(l)
-                                }
-                            }
-                            .font(.system(size: 12))
-                            .pickerStyle(.menu)
-                            .controlSize(.small)
-                            .frame(width: 136)
-                        }
-                        .frame(minHeight: 28)
-
-                    }
-                }
-
-                SettingsPanel {
-                    HStack(spacing: 8) {
-                        Image(systemName: installationStatusSymbol)
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(installationStatusColor)
-                            .frame(width: 18, height: 18)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(state.tr(
-                                "安装与卸载",
-                                "Install & Uninstall"
-                            ))
-                            .font(.system(size: 12, weight: .semibold))
-                            Text(installationStatusText)
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                        Button {
-                            state.installation.present(
-                                operation: .install
-                            )
-                        } label: {
-                            Label(
-                                state.tr("安装", "Install"),
-                                systemImage: "square.and.arrow.down"
-                            )
-                            .font(.system(size: 11.5))
-                        }
-                        .controlSize(.small)
-
-                        Button(role: .destructive) {
-                            state.installation.present(
-                                operation: .uninstall
-                            )
-                        } label: {
-                            Label(
-                                state.tr("卸载", "Uninstall"),
-                                systemImage: "trash"
-                            )
-                            .font(.system(size: 11.5))
-                        }
-                        .controlSize(.small)
-                    }
-                }
-
-                SettingsPanel {
-                    HStack(spacing: 8) {
-                        Image(systemName: "info.circle.fill")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(Color.secondary.opacity(0.82))
-                            .frame(width: 18, height: 18)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(state.tr("版本", "Version"))
-                                .font(.system(size: 12, weight: .semibold))
-                            Text(appVersionText)
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                        if XDialBuildIdentity.allowsAutomaticUpdates {
-                            Button(state.tr("检查更新", "Check for Updates")) { presentUpdateWindow() }
-                                .controlSize(.small)
-                        } else {
-                            Text(state.tr("独立开发版 · 手动更新", "Independent build · Manual updates"))
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-        }
-    }
-
-    private func appearanceOption(
-        _ appearance: AppAppearance,
-        title: String,
-        symbol: String
-    ) -> some View {
-        Label(title, systemImage: symbol)
-            .labelStyle(.iconOnly)
-            .accessibilityLabel(title)
-            .tag(appearance)
-            .help(title)
-    }
-
-    private var installationStatusText: String {
-        if state.installation.isReady {
-            return state.tr(
-                "后台服务与网络扩展均已安装",
-                "Background service and network extension are installed"
-            )
-        }
-        return state.installation.report.error?.message
-            ?? state.tr(
-                "安装尚未完成",
-                "Installation is not complete"
-            )
-    }
-
-    private var installationStatusSymbol: String {
-        if state.installation.isReady { return "checkmark.shield.fill" }
-        if state.installation.report.state == .failed {
-            return "exclamationmark.shield.fill"
-        }
-        return "shield.lefthalf.filled"
-    }
-
-    private var installationStatusColor: Color {
-        if state.installation.isReady { return XDialPalette.success }
-        if state.installation.report.state == .failed {
-            return XDialPalette.danger
-        }
-        return XDialPalette.progress
-    }
-
-    /// 只读展示当前安装的版本，不参与更新状态机；候选版本与更新进度
-    /// 仍然只由更新窗口和菜单栏消费同一份 update candidate。
-    private var appVersionText: String {
-        let version = Bundle.main.object(
-            forInfoDictionaryKey: "CFBundleShortVersionString"
-        ) as? String ?? "?"
-        let build = Bundle.main.object(
-            forInfoDictionaryKey: "CFBundleVersion"
-        ) as? String ?? "?"
-        return "v\(version) (build \(build))"
-    }
-
-    private func presentUpdateWindow() {
-        ApplicationWindowLifecycleController.shared
-            .prepareToPresentUpdateWindow()
-        openWindow(id: "update")
-        NSApp.activate(ignoringOtherApps: true)
-    }
-}
-
 // MARK: - 线路 Tab
 
 struct LinesTab: View {
+    var groupsOnly = false
     @EnvironmentObject var state: AppState
     @State private var showAddSub = false
     @State private var draggedItem: SettingsReorderItem?
+    @State private var searchText = ""
 
     var body: some View {
         VStack(spacing: 0) {
+            HStack {
+                TextField(groupsOnly ? state.tr("搜索线路组", "Search line groups") : state.tr("搜索线路", "Search lines"), text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                Text("\(state.editingProfile.lines.filter { $0.isGroup == groupsOnly }.count)")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.padding(.horizontal, 14).padding(.top, 10)
             ScrollView {
-                VStack(spacing: 8) {
+                LazyVStack(spacing: 8) {
                     ForEach($state.editingProfile.lines) { $line in
+                        if line.isGroup == groupsOnly && (searchText.isEmpty || line.name.localizedCaseInsensitiveContains(searchText)) {
                         Group {
                             if line.isGroup { LineGroupRow(line: $line, onDelete: { delete(line) }) }
                             else { LineRow(line: $line, onDelete: { delete(line) }) }
@@ -635,10 +412,12 @@ struct LinesTab: View {
                                     kind: "line",
                                     id: line.id
                                 ),
-                                draggedItem: $draggedItem
+                                draggedItem: $draggedItem,
+                                allowsDragging: searchText.isEmpty
                             ) { item, targetID in
                                 moveLine(item, to: targetID)
                             }
+                        }
                     }
                 }
                 .padding(.horizontal, 14)
@@ -648,9 +427,10 @@ struct LinesTab: View {
             Divider()
             AddBar {
                 Menu {
+                    if groupsOnly {
                     lineTypeButton("手动选择组", type: "selector", icon: "square.stack.3d.up")
                     lineTypeButton("自动测速组", type: "urltest", icon: "speedometer")
-                    Divider()
+                    } else {
                     lineTypeButton("VPN", type: "vpn", icon: "lock.shield")
                     lineTypeButton(
                         "Trojan",
@@ -677,8 +457,9 @@ struct LinesTab: View {
                         type: "tailscale",
                         icon: "circle.grid.3x3.fill"
                     )
+                    }
                 } label: {
-                    Label(state.tr("添加线路", "Add Line"), systemImage: "plus")
+                    Label(groupsOnly ? state.tr("添加线路组", "Add Line Group") : state.tr("添加线路", "Add Line"), systemImage: "plus")
                 }
             }
         }
@@ -711,9 +492,9 @@ struct LinesTab: View {
         var line = Line(id: id, name: name, type: type)
         if line.isGroup {
             line.name = type == "selector" ? "手动选择组" : "自动测速组"
-            line.groupMembers = state.editingProfile.lines.filter { $0.enabled && $0.type != "vpn" && $0.type != "tailscale" && !$0.isGroup && (type != "urltest" || $0.type != "direct") }.map(\.id)
         }
         state.editingProfile.lines.append(line)
+        state.editorPosition.expandedLineIDs.insert(line.id)
         state.saveEditingProfile()
     }
 
@@ -1838,25 +1619,41 @@ struct LineRow: View {
 
 struct RulesTab: View {
     @EnvironmentObject var state: AppState
-    private let presetCatalog = RuleSetPresetCatalog.load()
-    @State private var applicationSelectionError: String?
     @State private var draggedItem: SettingsReorderItem?
+    @State private var searchText = ""
+
+    private var query: String { searchText.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    private var visibleRuleIDs: Set<String> {
+        Set(state.editingProfile.ruleSets.filter { $0.matchesSearch(query) }.map(\.id))
+    }
 
     var body: some View {
+        let visible = visibleRuleIDs
         VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                TextField(state.tr("搜索名称、域名、IP 或应用", "Search name, domain, IP or app"), text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                Text(state.tr("\(visible.count) / \(state.editingProfile.ruleSets.count) 个规则", "\(visible.count) / \(state.editingProfile.ruleSets.count) rules"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 14).padding(.top, 10)
             ScrollView {
-                VStack(spacing: 8) {
+                LazyVStack(spacing: 8) {
                     ForEach($state.editingProfile.ruleSets) { $rule in
-                        RuleSetRow(rule: $rule, onDelete: { delete(rule) })
+                        if visible.contains(rule.id) {
+                        RuleSetRow(rule: $rule, onDelete: { delete(rule) }, searchQuery: query)
                             .settingsReorderable(
                                 SettingsReorderItem(
                                     kind: "rule",
                                     id: rule.id
                                 ),
-                                draggedItem: $draggedItem
+                                draggedItem: $draggedItem,
+                                allowsDragging: query.isEmpty
                             ) { item, targetID in
                                 moveRule(item, to: targetID)
                             }
+                        }
                     }
                 }
                 .padding(.horizontal, 14)
@@ -1865,31 +1662,12 @@ struct RulesTab: View {
             }
             Divider()
             AddBar {
-                Menu {
-                    Menu(state.tr("URL 规则", "URL Rule")) {
-                        ForEach(presetCatalog.presets) { preset in
-                            Button(
-                                state.language == .zh
-                                    ? preset.nameZH
-                                    : preset.nameEN
-                            ) {
-                                add(preset: preset)
-                            }
-                        }
-                    }
-                    Button(state.tr("手动域名/IP", "Manual Domain/IP")) {
-                        addManual()
-                    }
-                    Button(state.tr("应用程序", "Application")) {
-                        addApplication()
-                    }
-                    Button("sing-box 匹配规则") {
-                        var rule = RuleSet(id: UUID().uuidString, name: "匹配规则", type: "native")
-                        rule.nativeRule = .object([:])
-                        state.editingProfile.ruleSets.append(rule)
-                        state.editorPosition.expandedRuleIDs.insert(rule.id)
-                        state.saveEditingProfile()
-                    }
+                Button {
+                    let rule = RuleSet(id: UUID().uuidString, name: state.tr("新规则", "New Rule"), type: "group")
+                    state.editingProfile.ruleSets.append(rule)
+                    state.editorPosition.expandedRuleIDs.insert(rule.id)
+                    searchText = ""
+                    state.saveEditingProfile()
                 } label: {
                     Label(
                         state.tr("添加规则", "Add Rule"),
@@ -1897,64 +1675,6 @@ struct RulesTab: View {
                     )
                 }
             }
-        }
-        .alert(
-            state.tr(
-                "无法添加应用程序规则",
-                "Could not add application rule"
-            ),
-            isPresented: Binding(
-                get: { applicationSelectionError != nil },
-                set: { if !$0 { applicationSelectionError = nil } }
-            )
-        ) {
-            Button(state.tr("好", "OK"), role: .cancel) {}
-        } message: {
-            Text(applicationSelectionError ?? "")
-        }
-    }
-
-    private func add(preset: RuleSetPreset) {
-        let id = "rule-" + String(UUID().uuidString.prefix(6))
-        state.editingProfile.ruleSets.append(RuleSet(
-            id: id,
-            name: state.language == .zh
-                ? preset.nameZH
-                : preset.nameEN,
-            type: "url",
-            url: preset.url,
-            format: preset.format,
-            invert: preset.invert
-        ))
-        state.saveEditingProfile()
-    }
-
-    private func addManual() {
-        let id = "rule-" + String(UUID().uuidString.prefix(6))
-        state.editingProfile.ruleSets.append(RuleSet(
-            id: id,
-            name: state.tr("新手动规则", "New Manual Rule"),
-            type: "manual"
-        ))
-        state.saveEditingProfile()
-    }
-
-    private func addApplication() {
-        do {
-            let applications = try ApplicationRulePicker.chooseApplications()
-            guard !applications.isEmpty else { return }
-            let id = "rule-" + String(UUID().uuidString.prefix(6))
-            state.editingProfile.ruleSets.append(RuleSet(
-                id: id,
-                name: applications.count == 1
-                    ? applications[0].name
-                    : state.tr("应用程序规则", "Application Rule"),
-                type: "application",
-                applications: applications
-            ))
-            state.saveEditingProfile()
-        } catch {
-            applicationSelectionError = error.localizedDescription
         }
     }
 
@@ -1985,7 +1705,10 @@ struct RulesTab: View {
 
 struct RuleSetRow: View {
     @SwiftUI.Binding var rule: RuleSet
-    var onDelete: () -> Void
+    var onDelete: (() -> Void)?
+    var isCondition = false
+    var searchQuery = ""
+    private static let presetCatalog = RuleSetPresetCatalog.load()
     private var expanded: Bool {
         get { state.editorPosition.expandedRuleIDs.contains(rule.id) }
         nonmutating set {
@@ -2001,7 +1724,10 @@ struct RuleSetRow: View {
     @State private var applicationSelectionError: String?
     @EnvironmentObject var state: AppState
 
-    private var sourceOwned: Bool { state.editingRecord.baseline?.ruleSets.contains(where: { $0.id == rule.id }) == true }
+    private var sourceOwned: Bool {
+        state.editingRecord.baseline?.ruleSets.contains(where: { $0.id == rule.id }) == true ||
+        state.editingRecord.baseline?.matchingResources.contains(where: { $0.id == rule.id }) == true
+    }
 
     private func saveDomainsAndCIDRs() {
         rule.domains = domainsText.split(whereSeparator: \.isNewline)
@@ -2031,54 +1757,56 @@ struct RuleSetRow: View {
                 Spacer()
                 Text(ruleTypeLabel)
                     .font(.caption).foregroundStyle(.secondary)
-                Button {
-                    guard !sourceOwned else { return }
-                    rule.invert.toggle()
-                    state.saveEditingProfile()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: rule.invert
-                            ? "checkmark"
-                            : "arrow.left.arrow.right")
-                            .font(.system(
-                                size: 9,
-                                weight: rule.invert ? .bold : .semibold
-                            ))
-                            .frame(width: 12)
-                        Text(state.tr("反向", "Invert"))
-                    }
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(
-                        rule.invert
-                            ? XDialPalette.selection
-                            : XDialPalette.textSecondary
-                    )
-                    .padding(.horizontal, 7)
-                    .frame(height: 22)
-                    .background(
-                        rule.invert
-                            ? XDialPalette.selection.opacity(0.20)
-                            : XDialPalette.surface,
-                        in: Capsule()
-                    )
-                    .overlay {
-                        Capsule().stroke(
+                if rule.type != "group" {
+                    Button {
+                        guard !sourceOwned else { return }
+                        rule.invert.toggle()
+                        state.saveEditingProfile()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: rule.invert
+                                ? "checkmark"
+                                : "arrow.left.arrow.right")
+                                .font(.system(
+                                    size: 9,
+                                    weight: rule.invert ? .bold : .semibold
+                                ))
+                                .frame(width: 12)
+                            Text(state.tr("反向", "Invert"))
+                        }
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(
                             rule.invert
-                                ? XDialPalette.selection.opacity(0.72)
-                                : XDialPalette.divider,
-                            lineWidth: 0.8
+                                ? XDialPalette.selection
+                                : XDialPalette.textSecondary
                         )
+                        .padding(.horizontal, 7)
+                        .frame(height: 22)
+                        .background(
+                            rule.invert
+                                ? XDialPalette.selection.opacity(0.20)
+                                : XDialPalette.surface,
+                            in: Capsule()
+                        )
+                        .overlay {
+                            Capsule().stroke(
+                                rule.invert
+                                    ? XDialPalette.selection.opacity(0.72)
+                                    : XDialPalette.divider,
+                                lineWidth: 0.8
+                            )
+                        }
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(state.tr("反向", "Invert"))
+                    .help(state.tr(
+                        "反向匹配：匹配该规则之外的流量",
+                        "Invert: match traffic outside this rule"
+                    ))
+                    .accessibilityValue(rule.invert
+                        ? state.tr("已开启", "On")
+                        : state.tr("已关闭", "Off"))
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel(state.tr("反向", "Invert"))
-                .help(state.tr(
-                    "反向匹配：匹配该规则之外的流量",
-                    "Invert: match traffic outside this rule"
-                ))
-                .accessibilityValue(rule.invert
-                    ? state.tr("已开启", "On")
-                    : state.tr("已关闭", "Off"))
             },
             detail: {
                 VStack(alignment: .leading, spacing: 4) {
@@ -2086,9 +1814,23 @@ struct RuleSetRow: View {
                         Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
                         TextField("", text: $rule.name)
                             .textFieldStyle(.roundedBorder).font(.caption)
+                            .disabled(sourceOwned)
                             .onChange(of: rule.name) { _, _ in state.saveEditingProfile() }
                     }
-                    if rule.type == "native" {
+                    if rule.type == "group" {
+                        Text(state.tr("以下内容任一匹配即命中", "Match any of the following"))
+                            .font(.caption).foregroundStyle(.secondary).padding(.vertical, 5)
+                        LazyVStack(spacing: 6) {
+                            ForEach($rule.conditions) { $condition in
+                                if searchQuery.isEmpty || rule.name.localizedCaseInsensitiveContains(searchQuery) || condition.matchesSearch(searchQuery) {
+                                AnyView(RuleSetRow(rule: $condition, onDelete: {
+                                    rule.conditions.removeAll { $0.id == condition.id }
+                                    state.saveEditingProfile()
+                                }, isCondition: true))
+                                }
+                            }
+                        }
+                    } else if rule.type == "native" {
                         NativeRuleEditor(rule: $rule)
                     } else if rule.type == "url" {
                         urlFields
@@ -2097,8 +1839,9 @@ struct RuleSetRow: View {
                     } else {
                         manualFields
                     }
+                    if !isCondition && !sourceOwned { addContentMenu.padding(.top, 8) }
                 }
-                .disabled(sourceOwned)
+                .disabled(sourceOwned && rule.type != "group")
             }
         )
         .alert(
@@ -2115,14 +1858,53 @@ struct RuleSetRow: View {
     }
 
     private var ruleTypeLabel: String {
+        if !isCondition { return rule.contentSummary(chinese: state.language == .zh) }
         switch rule.type {
+        case "group":
+            return state.tr("\(rule.conditions.count) 组条件", "\(rule.conditions.count) condition groups")
         case "url":
             return "URL"
         case "application":
-            return state.tr("应用程序", "Application")
+            return state.tr("应用 · \(rule.matchItemCount ?? 0) 项", "App · \(rule.matchItemCount ?? 0) items")
+        case "native":
+            return state.tr("sing-box · \(rule.matchItemCount ?? 0) 项", "sing-box · \(rule.matchItemCount ?? 0) items")
         default:
-            return state.tr("手动", "Manual")
+            return state.tr("域名 / IP · \(rule.matchItemCount ?? 0) 项", "Domain / IP · \(rule.matchItemCount ?? 0) items")
         }
+    }
+
+    private var addContentMenu: some View {
+        Menu {
+            Button(state.tr("域名", "Domain")) { addContent(name: "域名", type: "native", field: "domain_suffix") }
+            Button(state.tr("IP / 网段", "IP / CIDR")) { addContent(name: "IP / 网段", type: "native", field: "ip_cidr") }
+            Button(state.tr("应用 / 进程", "App / Process")) { addContent(name: "应用 / 进程", type: "application") }
+            Menu(state.tr("远程规则集", "Remote Rule Set")) {
+                Button(state.tr("填写 URL…", "Enter URL…")) { addContent(name: "远程规则集", type: "url") }
+                Divider()
+                ForEach(Self.presetCatalog.presets) { preset in
+                    Button(state.language == .zh ? preset.nameZH : preset.nameEN) {
+                        appendContent(RuleSet(id: UUID().uuidString, name: state.language == .zh ? preset.nameZH : preset.nameEN,
+                                              type: "url", url: preset.url, format: preset.format, invert: preset.invert))
+                    }
+                }
+            }
+            Divider()
+            Button(state.tr("高级组合条件", "Advanced Match")) { addContent(name: "组合条件", type: "native") }
+        } label: {
+            Label(state.tr("添加匹配内容", "Add Matching Content"), systemImage: "plus")
+        }.menuStyle(.borderlessButton).fixedSize()
+    }
+
+    private func addContent(name: String, type: String, field: String? = nil) {
+        var content = RuleSet(id: UUID().uuidString, name: name, type: type)
+        if type == "native" { content.nativeRule = .object(field.map { [$0: .array([])] } ?? [:]) }
+        appendContent(content)
+    }
+
+    private func appendContent(_ content: RuleSet) {
+        state.editingProfile.appendMatchingContent(content, to: rule.id)
+        state.editorPosition.expandedRuleIDs.insert(content.id)
+        state.saveEditingProfile()
     }
 
     private var urlFields: some View {
@@ -2329,7 +2111,7 @@ struct ScenariosTab: View {
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(spacing: 8) {
+                LazyVStack(spacing: 8) {
                     ForEach($state.editingProfile.scenarios) { $scenario in
                         let scenarioID = scenario.id
                         ScenarioRow(
@@ -2619,13 +2401,29 @@ struct ScenarioRow: View {
                             Color.clear
                                 .frame(width: 28, height: 1)
                                 .accessibilityHidden(true)
-                            Text(state.tr("规则", "Rule"))
+                            Text(state.tr("匹配条件", "Match"))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .frame(width: 166, alignment: .leading)
                         }
                         .frame(width: 200, alignment: .leading)
-                        Text(state.tr("线路", "Line")).font(.caption).foregroundStyle(.secondary)
+                        Text(state.tr("线路或组", "Line or group")).font(.caption).foregroundStyle(.secondary)
+                    }
+
+                    if !scenario.matchOrder.isEmpty {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(state.tr("沿用原配置的匹配顺序", "Preserve Source Match Order"))
+                                    .font(.caption)
+                                Spacer()
+                                Button(state.tr("改用下方规则顺序", "Use Rule Order Below")) {
+                                    scenario.matchOrder = []
+                                    state.saveEditingProfile()
+                                }.controlSize(.small)
+                            }
+                            Text(state.tr("同名规则已归类，交错的匹配顺序仍保留。改用下方顺序后可拖动排序，重叠流量的出口可能改变。", "Conditions are grouped by name while their original priority is retained. Using the order below enables reordering and may change overlapping matches."))
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }.padding(.vertical, 5)
                     }
 
                     ScenarioBindingList(
@@ -2727,21 +2525,8 @@ struct ScenarioRow: View {
     }
 
     private func exitPicker(selectedID: SwiftUI.Binding<String>) -> some View {
-        Picker("", selection: selectedID) {
-            ForEach(state.editingProfile.lines.filter { $0.enabled }) { e in
-                Text(e.name).tag("port:\(e.id)")
-            }
-            if !state.editingProfile.subscriptions.filter({ $0.enabled }).isEmpty {
-                Divider()
-                ForEach(state.editingProfile.subscriptions.filter { $0.enabled }) { sub in
-                    Label("\(sub.name) (\(sub.lines.count))", systemImage: "antenna.radiowaves.left.and.right")
-                        .tag("sub:\(sub.id)")
-                }
-            }
-        }
-        .pickerStyle(.menu)
-        .labelsHidden()
-        .onChange(of: selectedID.wrappedValue) { _, _ in state.saveEditingProfile() }
+        LineTargetPicker(state: state, selection: selectedID, label: state.tr("默认出口", "Default Exit"))
+            .onChange(of: selectedID.wrappedValue) { _, _ in state.saveEditingProfile() }
     }
 
 }

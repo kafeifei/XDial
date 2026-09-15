@@ -4,6 +4,7 @@ package libbox
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -81,6 +82,65 @@ rules:
 		t.Fatal("Clash resources were not promoted into the Profile")
 	}
 	if _, err := config.BuildConnectionPlan(profile); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGroupedProfileCompactionAndRemoteBootstrap(t *testing.T) {
+	profile := config.Profile{
+		ID: "grouped", Lines: []config.Line{{ID: "direct", Name: "Direct", Type: config.LineTypeDirect, Enabled: true}},
+		RuleSets: []config.RuleSet{
+			{ID: "domain", Name: "Domain", Type: config.RuleSetTypeNative, Enabled: true, NativeRule: json.RawMessage(`{"domain":["example.test"]}`)},
+			{ID: "remote", Name: "Remote", Type: config.RuleSetTypeURL, Enabled: true, URL: "https://rules.example/list.srs", Format: "srs", NoResolve: true},
+			{ID: "app", Name: "Application", Type: config.RuleSetTypeApplication, Enabled: true, Processes: []string{"Example*"}},
+		},
+		Scenarios: []config.Scenario{{ID: "scene", Name: "Default", DefaultLineID: "direct", Bindings: []config.RuleBinding{{RuleSetID: "domain", LineID: "direct"}, {RuleSetID: "remote", LineID: "direct"}, {RuleSetID: "app", LineID: "direct"}}}}, ActiveScenarioID: "scene",
+	}
+	raw, _ := json.Marshal(profile)
+	compacted, err := CompactProfileRuleSets(string(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	grouped, err := config.ParseProfile([]byte(compacted))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grouped.RuleSets) != 1 || len(grouped.RuleSets[0].Conditions) != 3 {
+		t.Fatal("compaction lost conditions")
+	}
+	again, err := CompactProfileRuleSets(compacted)
+	if err != nil || again != compacted {
+		t.Fatal("compaction is not idempotent")
+	}
+	bootstrapRaw, err := GenerateTransparentProxyRuleSetBootstrap(compacted, t.TempDir(), 29877, "user", "password", "utun-underlay", `["192.0.2.53"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bootstrap transparentProxyRuleSetBootstrap
+	if err := json.Unmarshal([]byte(bootstrapRaw), &bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	if len(bootstrap.PreflightSessions) != 1 || len(bootstrap.PreflightSessions[0].Refreshes) != 1 {
+		t.Fatal("grouped remote resource skipped acquisition")
+	}
+	runtime, err := config.ParseRuntimeProfile([]byte(compacted))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := materializeNERuleSets(runtime, t.TempDir(), func(string, int64) ([]byte, error) { return nil, fmt.Errorf("unavailable") }); err == nil {
+		t.Fatal("remote acquisition failure silently ignored")
+	}
+	if grouped.RuleSets[0].Conditions[1].URL != "https://rules.example/list.srs" {
+		t.Fatal("resource preparation mutated source group")
+	}
+	exported, err := ExportProfile(compacted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(exported, "https://rules.example/list.srs") {
+		t.Fatal("nested source URL leaked in redacted export")
+	}
+	if _, err := ImportProfile(exported, "auto", "copy", false); err != nil {
 		t.Fatal(err)
 	}
 }

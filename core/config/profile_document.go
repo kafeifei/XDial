@@ -23,13 +23,16 @@ type documentRoute struct {
 	Final    string            `json:"final,omitempty"`
 }
 type documentScenario struct {
-	ID    string        `json:"id"`
-	Name  string        `json:"name"`
-	Icon  string        `json:"icon,omitempty"`
-	SSIDs []string      `json:"match_ssids,omitempty"`
-	Route documentRoute `json:"route"`
+	MatchOrder        []string            `json:"match_order,omitempty"`
+	BindingConditions map[string][]string `json:"binding_conditions,omitempty"`
+	ID                string              `json:"id"`
+	Name              string              `json:"name"`
+	Icon              string              `json:"icon,omitempty"`
+	SSIDs             []string            `json:"match_ssids,omitempty"`
+	Route             documentRoute       `json:"route"`
 }
 type documentObject struct {
+	NoResolve    bool               `json:"no_resolve,omitempty"`
 	Kind         RuleSetType        `json:"kind,omitempty"`
 	Domains      []string           `json:"domains,omitempty"`
 	CIDRs        []string           `json:"cidrs,omitempty"`
@@ -40,12 +43,21 @@ type documentObject struct {
 	Processes    []string           `json:"processes,omitempty"`
 }
 type documentMetadata struct {
-	RequiresInput bool                      `json:"requires_input,omitempty"`
-	SchemaVersion int                       `json:"schema_version"`
-	Lines         map[string]documentObject `json:"lines,omitempty"`
-	Rules         map[string]documentObject `json:"rules,omitempty"`
-	AdapterLines  []Line                    `json:"adapter_lines,omitempty"`
-	Scenarios     []documentScenario        `json:"scenarios"`
+	RuleGroups     []documentRuleGroup       `json:"rule_groups,omitempty"`
+	ImportWarnings []SubscriptionRule        `json:"import_warnings,omitempty"`
+	RequiresInput  bool                      `json:"requires_input,omitempty"`
+	SchemaVersion  int                       `json:"schema_version"`
+	Lines          map[string]documentObject `json:"lines,omitempty"`
+	Rules          map[string]documentObject `json:"rules,omitempty"`
+	AdapterLines   []Line                    `json:"adapter_lines,omitempty"`
+	Scenarios      []documentScenario        `json:"scenarios"`
+}
+
+// Matching resources remain native route.rule_set entries. This metadata only
+// records their ordered membership as one resource in XDial's Scenario editor.
+type documentRuleGroup struct {
+	Tag        string   `json:"tag"`
+	Conditions []string `json:"conditions"`
 }
 
 func documentID(namespace, kind, identity string) string {
@@ -116,7 +128,7 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 	if document.XDial.SchemaVersion != 0 && document.XDial.SchemaVersion != 1 {
 		return nil, fmt.Errorf("unsupported XDial schema version")
 	}
-	profile := &Profile{ID: namespace, Lines: []Line{{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true}}}
+	profile := &Profile{ImportWarnings: document.XDial.ImportWarnings, ID: namespace, Lines: []Line{{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true}}}
 	tags := map[string]string{"direct": "direct"}
 	seen := map[string]bool{}
 	for _, raw := range document.Outbounds {
@@ -227,6 +239,7 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 			rule.Name = metadata.Name
 			rule.Enabled = !metadata.Disabled
 			rule.Invert = metadata.Invert
+			rule.NoResolve = metadata.NoResolve
 			if metadata.Kind == RuleSetTypeManual {
 				rule.Type = RuleSetTypeManual
 				rule.NativeRule = nil
@@ -241,6 +254,9 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 			}
 		}
 		profile.RuleSets = append(profile.RuleSets, rule)
+	}
+	if err := restoreDocumentRuleGroups(profile, document.XDial, ruleTags, namespace); err != nil {
+		return nil, err
 	}
 	scenarios := document.XDial.Scenarios
 	if len(scenarios) == 0 {
@@ -266,7 +282,7 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 		if scenario.DefaultLineID == "" {
 			return nil, fmt.Errorf("unknown final outbound")
 		}
-		for index, raw := range entry.Route.Rules {
+		for _, raw := range entry.Route.Rules {
 			var fields map[string]json.RawMessage
 			if json.Unmarshal(raw, &fields) != nil {
 				return nil, fmt.Errorf("invalid route rule")
@@ -300,14 +316,41 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 				}
 				ruleID = documentID(namespace, "rule", "match/"+string(encoded))
 				if profile.FindRuleSet(ruleID) == nil {
-					profile.RuleSets = append(profile.RuleSets, RuleSet{ID: ruleID, Name: fmt.Sprintf("分流规则 %d", index+1), Type: RuleSetTypeNative, Enabled: true, NativeRule: encoded})
+					rule := RuleSet{ID: ruleID, Type: RuleSetTypeNative, Enabled: true, NativeRule: encoded}
+					rule.Name = MatchingRuleName(rule)
+					profile.RuleSets = append(profile.RuleSets, rule)
 				}
 			}
 			scenario.Bindings = append(scenario.Bindings, RuleBinding{RuleSetID: ruleID, LineID: lineID})
 		}
+		for tag, ids := range entry.BindingConditions {
+			found := false
+			for i := range scenario.Bindings {
+				if scenario.Bindings[i].RuleSetID != ruleTags[tag] {
+					continue
+				}
+				found = true
+				for _, id := range ids {
+					scenario.Bindings[i].ConditionIDs = append(scenario.Bindings[i].ConditionIDs, documentID(namespace, "rule", id))
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("matching scope references an unbound rule")
+			}
+		}
+		for _, id := range entry.MatchOrder {
+			scenario.MatchOrder = append(scenario.MatchOrder, documentID(namespace, "rule", id))
+		}
 		profile.Scenarios = append(profile.Scenarios, scenario)
 	}
 	profile.ActiveScenarioID = profile.Scenarios[0].ID
+	if document.XDial.SchemaVersion == 0 && len(document.XDial.Scenarios) == 0 {
+		grouped, err := GroupProfileRulesByDestination(profile, profile.ActiveScenarioID)
+		if err != nil {
+			return nil, err
+		}
+		return NormalizeImportedPolicySelectors(grouped)
+	}
 	return profile, validateDocumentProfile(profile)
 }
 
@@ -432,6 +475,11 @@ func importDocumentOutbound(raw json.RawMessage, tags map[string]string, allowIn
 // Documents may contain unfinished forms or redacted credentials. Reference
 // validation is separate from runtime preparation, which still fails closed.
 func validateDocumentProfile(profile *Profile) error {
+	var groupErr error
+	profile, groupErr = ExpandRuleSetGroups(profile)
+	if groupErr != nil {
+		return groupErr
+	}
 	if len(profile.Lines) == 0 || len(profile.Scenarios) == 0 {
 		return fmt.Errorf("configuration requires a Line and Scenario")
 	}
@@ -495,7 +543,10 @@ func validateDocumentProfile(profile *Profile) error {
 }
 
 func ExportProfileDocument(profile *Profile) ([]byte, error) {
-	document := ProfileDocument{XDial: documentMetadata{SchemaVersion: 1, Lines: map[string]documentObject{}, Rules: map[string]documentObject{}}}
+	if err := validateDocumentProfile(profile); err != nil {
+		return nil, err
+	}
+	document := ProfileDocument{XDial: documentMetadata{ImportWarnings: profile.ImportWarnings, SchemaVersion: 1, Lines: map[string]documentObject{}, Rules: map[string]documentObject{}}}
 	if len(profile.Subscriptions) > 0 {
 		return nil, fmt.Errorf("legacy nested subscriptions must be migrated before export")
 	}
@@ -522,8 +573,22 @@ func ExportProfileDocument(profile *Profile) ([]byte, error) {
 		raw, _ := json.Marshal(outbound)
 		document.Outbounds = append(document.Outbounds, raw)
 	}
+	var resources []RuleSet
 	for _, rule := range profile.RuleSets {
-		document.XDial.Rules[rule.ID] = documentObject{Kind: rule.Type, Domains: rule.Domains, CIDRs: rule.CIDRs, Name: rule.Name, Disabled: !rule.Enabled, Invert: rule.Invert, Applications: rule.Applications, Processes: rule.Processes}
+		if rule.Type != RuleSetTypeGroup {
+			resources = append(resources, rule)
+			continue
+		}
+		group := documentRuleGroup{Tag: rule.ID}
+		for _, condition := range rule.Conditions {
+			group.Conditions = append(group.Conditions, condition.ID)
+			resources = append(resources, condition)
+		}
+		document.XDial.RuleGroups = append(document.XDial.RuleGroups, group)
+		document.XDial.Rules[rule.ID] = documentObject{Kind: rule.Type, Name: rule.Name, Disabled: !rule.Enabled}
+	}
+	for _, rule := range resources {
+		document.XDial.Rules[rule.ID] = documentObject{NoResolve: rule.NoResolve, Kind: rule.Type, Domains: rule.Domains, CIDRs: rule.CIDRs, Name: rule.Name, Disabled: !rule.Enabled, Invert: rule.Invert, Applications: rule.Applications, Processes: rule.Processes}
 		resource := map[string]interface{}{"tag": rule.ID}
 		switch rule.Type {
 		case RuleSetTypeURL:
@@ -555,8 +620,11 @@ func ExportProfileDocument(profile *Profile) ([]byte, error) {
 		document.Route.RuleSets = append(document.Route.RuleSets, raw)
 	}
 	for _, scenario := range profile.Scenarios {
-		entry := documentScenario{ID: scenario.ID, Name: scenario.Name, Icon: scenario.Icon, SSIDs: scenario.MatchSSIDs, Route: documentRoute{Final: scenario.DefaultLineID}}
+		entry := documentScenario{ID: scenario.ID, Name: scenario.Name, Icon: scenario.Icon, SSIDs: scenario.MatchSSIDs, MatchOrder: scenario.MatchOrder, BindingConditions: map[string][]string{}, Route: documentRoute{Final: scenario.DefaultLineID}}
 		for _, binding := range scenario.Bindings {
+			if len(binding.ConditionIDs) > 0 {
+				entry.BindingConditions[binding.RuleSetID] = binding.ConditionIDs
+			}
 			if binding.SubscriptionID != "" {
 				return nil, fmt.Errorf("nested subscription binding cannot be exported")
 			}

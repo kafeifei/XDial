@@ -103,6 +103,7 @@ const (
 	RuleSetTypeNative      RuleSetType = "native"
 	RuleSetTypeManual      RuleSetType = "manual"
 	RuleSetTypeApplication RuleSetType = "application"
+	RuleSetTypeGroup       RuleSetType = "group"
 )
 
 // RuleSetMatchKind 是 NetworkExtension 在严格下载并解析远程规则集后写入的
@@ -128,6 +129,11 @@ type ApplicationMatch struct {
 
 // RuleSet 规则：匹配哪些流量
 type RuleSet struct {
+	// Conditions are ordered, private matching resources of one user RuleSet.
+	// Each retains its DNS behavior; only the Scenario supplies an outbound.
+	Conditions []RuleSet `json:"conditions,omitempty"`
+	// NoResolve keeps imported IP rules from initiating a DNS lookup to match.
+	NoResolve  bool            `json:"no_resolve,omitempty"`
 	NativeRule json.RawMessage `json:"native_rule,omitempty"`
 	ID         string          `json:"id"`
 	Name       string          `json:"name"`
@@ -167,13 +173,17 @@ func (r RuleSet) EffectiveFetchLineID() string {
 
 // RuleBinding 场景中的一条绑定：规则→线路（或订阅）
 type RuleBinding struct {
-	RuleSetID      string `json:"rule_set_id"`
-	LineID         string `json:"line_id,omitempty"`
-	SubscriptionID string `json:"subscription_id,omitempty"`
+	ConditionIDs   []string `json:"condition_ids,omitempty"`
+	RuleSetID      string   `json:"rule_set_id"`
+	LineID         string   `json:"line_id,omitempty"`
+	SubscriptionID string   `json:"subscription_id,omitempty"`
 }
 
 // Scenario 场景：一组规则→线路的绑定
 type Scenario struct {
+	// MatchOrder preserves imported interleaving while the editor groups by destination.
+	// Empty means execute complete rules in Bindings order.
+	MatchOrder            []string      `json:"match_order,omitempty"`
 	ID                    string        `json:"id"`
 	Name                  string        `json:"name"`
 	Icon                  string        `json:"icon,omitempty"`
@@ -195,9 +205,13 @@ type ProxyGroup struct {
 
 // SubscriptionRule 订阅内的规则
 type SubscriptionRule struct {
-	Type  string `json:"type"`  // RULE-SET / DOMAIN-SUFFIX / DOMAIN / IP-CIDR / GEOIP / FINAL
-	Value string `json:"value"` // URL 或匹配值
-	Group string `json:"group"` // 策略组名
+	// SourceID is a parse-time boundary for an expanded remote rule set.
+	SourceID   string `json:"-"`
+	SourceName string `json:"-"`
+	Options    string `json:"options,omitempty"`
+	Type       string `json:"type"`  // RULE-SET / DOMAIN-SUFFIX / DOMAIN / IP-CIDR / GEOIP / FINAL
+	Value      string `json:"value"` // URL 或匹配值
+	Group      string `json:"group"` // 策略组名
 }
 
 // Subscription 订阅：通过 URL 批量导入的完整配置
@@ -232,13 +246,16 @@ type TailscaleIdentity struct {
 
 // Profile 完整配置
 type Profile struct {
-	ID               string            `json:"profile_id,omitempty"`
-	Lines            []Line            `json:"lines"`
-	RuleSets         []RuleSet         `json:"rule_sets"`
-	Scenarios        []Scenario        `json:"scenarios"`
-	Subscriptions    []Subscription    `json:"subscriptions,omitempty"`
-	ActiveScenarioID string            `json:"active_scenario_id"`
-	Tailscale        TailscaleIdentity `json:"tailscale,omitempty"`
+	// ImportWarnings retains source rules with no equivalent in sing-box. They
+	// are shown for review, never compiled as if they were supported matches.
+	ImportWarnings   []SubscriptionRule `json:"import_warnings,omitempty"`
+	ID               string             `json:"profile_id,omitempty"`
+	Lines            []Line             `json:"lines"`
+	RuleSets         []RuleSet          `json:"rule_sets"`
+	Scenarios        []Scenario         `json:"scenarios"`
+	Subscriptions    []Subscription     `json:"subscriptions,omitempty"`
+	ActiveScenarioID string             `json:"active_scenario_id"`
+	Tailscale        TailscaleIdentity  `json:"tailscale,omitempty"`
 }
 
 // ParseProfile 从 JSON 解码当前正式 Profile 契约。

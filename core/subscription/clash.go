@@ -87,10 +87,15 @@ func clashRule(line string) (config.SubscriptionRule, bool) {
 	if len(parts) < 3 {
 		return config.SubscriptionRule{}, false
 	}
+	options := ""
+	if len(parts) == 4 {
+		options = strings.TrimSpace(parts[3])
+	}
 	return config.SubscriptionRule{
-		Type:  typ,
-		Value: strings.TrimSpace(parts[1]),
-		Group: strings.TrimSpace(parts[2]),
+		Options: options,
+		Type:    typ,
+		Value:   strings.TrimSpace(parts[1]),
+		Group:   strings.TrimSpace(parts[2]),
 	}, true
 }
 

@@ -3,12 +3,13 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum ProfileManagementAction: String, Identifiable {
-    case rename, source, copy, export, delete, empty, file, subscription, existingDebug
+    case rename, source, compatibility, copy, export, delete, empty, file, subscription, existingDebug
     var id: String { rawValue }
     var title: String {
         switch self {
         case .rename: return "重命名配置"
         case .source: return "订阅设置"
+        case .compatibility: return "导入兼容提示"
         case .copy: return "创建本地副本"
         case .export: return "导出配置"
         case .delete: return "删除配置"
@@ -24,76 +25,72 @@ struct ProfileNavigation: View {
     @EnvironmentObject var state: AppState
     @State private var action: ProfileManagementAction?
 
+    @Environment(\.openWindow) private var openWindow
+
     var body: some View {
         HStack(spacing: 12) {
-            HStack(spacing: 0) {
-                Button {
-                    state.settingsArea = .configuration
-                } label: {
-                    HStack(spacing: 7) {
-                        Image(systemName: "folder")
-                        Text(state.tr("配置", "Configuration"))
-                        if state.settingsArea == .configuration {
-                            Divider().frame(height: 14)
-                            Text(state.editingRecord.name).lineLimit(1).frame(maxWidth: 156, alignment: .leading)
+            Menu {
+                Section(state.tr("选择配置", "Choose Configuration")) {
+                    ForEach(state.profileLibrary.profiles) { record in
+                        Button {
+                            state.selectEditingProfile(record.id)
+                        } label: {
+                            Label(record.name, systemImage: record.id == state.editingRecord.id ? "checkmark" : "folder")
                         }
                     }
-                    .padding(.horizontal, 9).frame(height: 30)
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel(state.tr("配置", "Configuration"))
-                if state.settingsArea == .configuration {
-                    Menu {
-                        Section("切换配置") {
-                            ForEach(state.profileLibrary.profiles) { record in
-                                Button {
-                                    state.selectEditingProfile(record.id)
-                                } label: {
-                                    Label(record.name, systemImage: record.id == state.editingRecord.id ? "checkmark" : "folder")
-                                }
-                            }
+                Section("当前配置 · \(state.editingRecord.name)") {
+                    Button("重命名…") { action = .rename }
+                    if state.editingRecord.source != nil {
+                        Button("订阅设置…") { action = .source }
+                        Button(state.refreshingProfileIDs.contains(state.editingRecord.id) ? "正在更新订阅…" : "立即更新订阅") {
+                            state.refreshProfile(state.editingRecord.id)
                         }
-                        Section("当前配置 · \(state.editingRecord.name)") {
-                            Button("重命名…") { action = .rename }
-                            if state.editingRecord.source != nil {
-                                Button("订阅设置…") { action = .source }
-                                Button(state.refreshingProfileIDs.contains(state.editingRecord.id) ? "正在更新订阅…" : "立即更新订阅") {
-                                    state.refreshProfile(state.editingRecord.id)
-                                }
-                                .disabled(state.refreshingProfileIDs.contains(state.editingRecord.id))
-                            }
-                            Button("创建本地副本…") { action = .copy }
-                            Button("导出配置…") { action = .export }
-                            Button("删除配置…", role: .destructive) { action = .delete }
-                                .disabled(!state.canDeleteEditingProfile)
-                        }
-                        Section("添加配置") {
-                            Button("新建空白配置…") { action = .empty }
-                            Button("从文件导入…") { action = .file }
-                            Button("从链接订阅…") { action = .subscription }
-                            Button("从 XDail Debug 导入…") { action = .existingDebug }
-                        }
-                    } label: {
-                        Image(systemName: "chevron.down").frame(width: 24, height: 30)
+                        .disabled(state.refreshingProfileIDs.contains(state.editingRecord.id))
                     }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                    .accessibilityLabel("切换与管理配置")
+                    if !state.editingRecord.profile.importWarnings.isEmpty {
+                        Button("导入兼容提示…") { action = .compatibility }
+                    }
+                    Button("创建本地副本…") { action = .copy }
+                    Button("导出配置…") { action = .export }
+                    Button("删除配置…", role: .destructive) { action = .delete }
+                        .disabled(!state.canDeleteEditingProfile)
                 }
+                Section("添加配置") {
+                    Button("新建空白配置…") { action = .empty }
+                    Button("从文件导入…") { action = .file }
+                    Button("从链接订阅…") { action = .subscription }
+                    Button("从 XDail Debug 导入…") { action = .existingDebug }
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "folder")
+                    Text(state.editingRecord.name)
+                        .lineLimit(1)
+                        .frame(maxWidth: 190, alignment: .leading)
+                }
+                .padding(.horizontal, 9)
+                .frame(height: 30)
+                .contentShape(Rectangle())
             }
-            .background(state.settingsArea == .configuration ? XDialPalette.selection.opacity(0.14) : .clear,
-                        in: RoundedRectangle(cornerRadius: 7))
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.visible)
+            .fixedSize()
+            .accessibilityLabel(state.tr("选择与管理配置", "Choose and Manage Configuration"))
+
+            Spacer(minLength: 12)
+
             Button {
-                state.settingsArea = .general
+                ApplicationWindowLifecycleController.shared.prepareToPresentSettingsWindow()
+                openWindow(id: "general")
+                NSApp.activate(ignoringOtherApps: true)
             } label: {
                 Label(state.tr("通用", "General"), systemImage: "slider.horizontal.3")
-                    .padding(.horizontal, 10).frame(height: 30)
-                    .background(state.settingsArea == .general ? XDialPalette.selection.opacity(0.14) : .clear,
-                                in: RoundedRectangle(cornerRadius: 7))
+                    .padding(.horizontal, 10)
+                    .frame(height: 30)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            Spacer(minLength: 0)
         }
         .font(.system(size: 12, weight: .medium))
         .sheet(item: $action) { action in
@@ -116,6 +113,7 @@ struct ProfileManagementSheet: View {
     @State private var error: String?
     @State private var busy = false
     @State private var nodesOnly = false
+    @State private var acknowledgedWarnings = false
     @State private var task: Task<Void, Never>?
     @State private var newID = UUID().uuidString.lowercased()
 
@@ -124,7 +122,9 @@ struct ProfileManagementSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(action.title).font(.headline)
-            if action == .delete {
+            if action == .compatibility {
+                importDetails(record.profile)
+            } else if action == .delete {
                 Text("删除「\(record.name)」及其中的线路、规则和场景？")
                 Text("订阅服务和服务器上的内容不会被删除。")
                     .font(.caption).foregroundStyle(.secondary)
@@ -145,6 +145,7 @@ struct ProfileManagementSheet: View {
                         Text("每天").tag(86400.0)
                         Text("每周").tag(604800.0)
                     }
+                    if action == .source { importDetails(record.profile) }
                     if let updated = record.source?.updatedAt, action == .source {
                         Text("上次更新：\(updated.formatted())").font(.caption).foregroundStyle(.secondary)
                     }
@@ -164,6 +165,11 @@ struct ProfileManagementSheet: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("\(preview.lines.count) 条线路 · \(preview.ruleSets.count) 个规则集 · \(preview.scenarios.count) 个场景")
                         Text(preview.scenarios.map(\.name).joined(separator: "、")).font(.caption).foregroundStyle(.secondary)
+                        importDetails(preview)
+                        if !preview.importWarnings.isEmpty {
+                            Toggle("确认以上规则不生效，导入其余配置", isOn: $acknowledgedWarnings)
+                                .font(.caption)
+                        }
                     }
                 }
             }
@@ -174,7 +180,7 @@ struct ProfileManagementSheet: View {
                 Button("取消") { task?.cancel(); dismiss() }.keyboardShortcut(.cancelAction)
                 Button(primaryTitle, role: action == .delete ? .destructive : nil, action: perform)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(busy || (name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && action != .delete && action != .export))
+                    .disabled(busy || (preview?.importWarnings.isEmpty == false && !acknowledgedWarnings) || (name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && action != .delete && action != .export))
             }
         }
         .padding(24).frame(width: 440)
@@ -191,11 +197,38 @@ struct ProfileManagementSheet: View {
 
     private var primaryTitle: String {
         if imports { return preview == nil ? "解析并预览" : "保存配置" }
+        if action == .compatibility { return "完成" }
         switch action {
         case .empty, .copy: return "创建"
         case .delete: return "删除"
         case .export: return "导出…"
         default: return "保存"
+        }
+    }
+
+    @ViewBuilder
+    private func importDetails(_ profile: Profile) -> some View {
+        if profile.matchingResources.contains(where: { $0.url.hasPrefix("https://raw.githubusercontent.com/SagerNet/sing-geoip/") }) {
+            Text("GEOIP 使用 SagerNet 国家 IP 规则集，可在规则中查看和修改来源。")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        if profile.matchingResources.contains(where: { $0.url.hasPrefix("https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/asn/") }) {
+            Text("ASN 使用 MetaCubeX IP 规则集，可在规则中查看和修改来源。")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        if !profile.importWarnings.isEmpty {
+            Text("以下 \(profile.importWarnings.count) 条 USER-AGENT 规则无法执行。原始条目会保留；其他域名、IP 和进程规则照常导入。")
+                .font(.caption).foregroundStyle(XDialPalette.danger)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(profile.importWarnings.enumerated()), id: \.offset) { _, rule in
+                        Text("\(rule.type), \(rule.value) → \(rule.group)")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .font(.caption).textSelection(.enabled)
+            }
+            .frame(maxHeight: 110)
         }
     }
 
@@ -233,12 +266,14 @@ struct ProfileManagementSheet: View {
                             url: action == .subscription ? url : "", profileID: newID, nodesOnly: nodesOnly)
                     }
                     try Task.checkCancellation()
+                    acknowledgedWarnings = false
                     preview = parsed
                 } catch is CancellationError { } catch { self.error = error.localizedDescription }
             }
             return
         }
         switch action {
+        case .compatibility: break
         case .rename: state.renameEditingProfile(name)
         case .delete: state.deleteEditingProfile()
         case .empty:

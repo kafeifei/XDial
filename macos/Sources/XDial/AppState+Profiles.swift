@@ -27,12 +27,12 @@ extension AppState {
     func selectEditingProfile(_ id: String) {
         guard profileLibrary.profiles.contains(where: { $0.id == id }) else { return }
         profileLibrary.editingProfileID = id
-        settingsArea = .configuration
         persistProfileLibrary()
     }
 
     func saveEditingProfile() {
         profileOperationError = nil
+        editingProfile.reconcileMatchingReferences()
         if editingActiveProfile {
             profile = editingProfile
             save()
@@ -78,7 +78,6 @@ extension AppState {
         profileLibrary.profiles.append(record)
         profileLibrary.editingProfileID = record.id
         guard persistProfileLibrary() else { profileLibrary = original; return false }
-        settingsArea = .configuration
         return true
     }
 

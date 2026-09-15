@@ -13,7 +13,6 @@ final class AppState: ObservableObject {
     @Published var profile: Profile
     @Published var profileLibrary = ProfileLibrary()
     @Published var browsedProfileID = ""
-    @Published var settingsArea: ProfileSettingsArea = .configuration
     @Published var editorPositions: [String: ProfileEditorPosition] = [:]
     @Published var profilePersistenceError: String?
     @Published var profileOperationError: String?

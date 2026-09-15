@@ -2,7 +2,10 @@ package subscription
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -10,7 +13,7 @@ import (
 )
 
 const (
-	maxStrictRemoteRuleSets = 32
+	maxStrictRemoteRuleSets = 64
 	maxStrictRuleSetBytes   = 1 * 1024 * 1024
 	maxStrictRuleSetLines   = 20_000
 	maxStrictExpandedRules  = 20_000
@@ -95,7 +98,21 @@ func expandRulesetsWithFetcher(ctx context.Context, result *ParseResult, strict 
 		}
 		lines := strings.Split(content, "\n")
 		for _, line := range lines {
-			if r, ok := ruleSetLineToRule(line, rule.Group); ok {
+			r, ok := ruleSetLineToRule(line, rule.Group)
+			if strict && !ok {
+				trimmed := strings.TrimSpace(line)
+				if trimmed != "" && !strings.HasPrefix(trimmed, "#") && !strings.HasPrefix(trimmed, "//") {
+					return fmt.Errorf("remote rule set contains an unsupported or invalid rule")
+				}
+			}
+			if ok {
+				r.SourceID = fmt.Sprintf("%x", sha256.Sum256([]byte(rule.Value)))
+				if source, err := url.Parse(rule.Value); err == nil {
+					name := path.Base(source.Path)
+					if name != "." && name != "/" {
+						r.SourceName = strings.TrimSuffix(name, path.Ext(name))
+					}
+				}
 				if strict && len(out) >= maxStrictExpandedRules {
 					return fmt.Errorf("subscription contains too many expanded rules")
 				}
@@ -121,8 +138,8 @@ func ruleSetLineToRule(line, group string) (config.SubscriptionRule, bool) {
 	if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
 		return config.SubscriptionRule{}, false
 	}
-	parts := strings.SplitN(line, ",", 2)
-	if len(parts) != 2 {
+	parts := strings.SplitN(line, ",", 3)
+	if len(parts) < 2 {
 		return config.SubscriptionRule{}, false
 	}
 	typ := strings.TrimSpace(parts[0])
@@ -130,9 +147,13 @@ func ruleSetLineToRule(line, group string) (config.SubscriptionRule, bool) {
 	if typ == "" || value == "" {
 		return config.SubscriptionRule{}, false
 	}
+	options := ""
+	if len(parts) == 3 {
+		options = strings.TrimSpace(parts[2])
+	}
 	switch typ {
-	case "DOMAIN-SUFFIX", "DOMAIN", "DOMAIN-KEYWORD", "IP-CIDR", "IP-CIDR6", "GEOIP":
-		return config.SubscriptionRule{Type: typ, Value: value, Group: group}, true
+	case "DOMAIN-SUFFIX", "DOMAIN", "DOMAIN-KEYWORD", "IP-CIDR", "IP-CIDR6", "GEOIP", "PROCESS-NAME", "IP-ASN", "USER-AGENT":
+		return config.SubscriptionRule{Type: typ, Value: value, Group: group, Options: options}, true
 	}
 	return config.SubscriptionRule{}, false
 }

@@ -202,6 +202,16 @@ struct XDialApp: App {
         .windowResizability(.contentSize)
         .windowStyle(.titleBar)
 
+        Window("\(XDialBuildIdentity.productTitle) 通用设置", id: "general") {
+            GeneralSettingsView()
+                .environmentObject(state)
+                .tint(XDialPalette.accent)
+                .background(SettingsWindowChrome())
+        }
+        .defaultSize(width: 620, height: 380)
+        .windowResizability(.contentSize)
+        .windowStyle(.titleBar)
+
         Window("XDial 安装与卸载", id: "installation") {
             InstallationView(
                 coordinator: InstallationCoordinator.shared
@@ -230,6 +240,7 @@ final class ApplicationWindowLifecycleController {
 
     private enum ManagedWindowKind: String {
         case settings
+        case general
         case installation
         case update
     }
@@ -281,14 +292,14 @@ final class ApplicationWindowLifecycleController {
     }
 
     func prepareToPresentInstallationWindow() {
-        guard !hasOpenWindow(.settings) else { return }
+        guard !hasOpenSettingsWindow else { return }
         _ = NSApp.setActivationPolicy(.accessory)
         lastPolicyTransitionSucceeded =
             NSApp.activationPolicy() == .accessory
     }
 
     func prepareToPresentUpdateWindow() {
-        guard !hasOpenWindow(.settings) else { return }
+        guard !hasOpenSettingsWindow else { return }
         _ = NSApp.setActivationPolicy(.accessory)
         lastPolicyTransitionSucceeded =
             NSApp.activationPolicy() == .accessory
@@ -299,7 +310,7 @@ final class ApplicationWindowLifecycleController {
               let kind = kind(of: window) else { return }
         window.hidesOnDeactivate = false
         switch kind {
-        case .settings:
+        case .settings, .general:
             prepareToPresentSettingsWindow()
         case .installation:
             window.level = .floating
@@ -324,7 +335,7 @@ final class ApplicationWindowLifecycleController {
     }
 
     private func reconcileAfterWindowClose() {
-        if hasOpenWindow(.settings) {
+        if hasOpenSettingsWindow {
             prepareToPresentSettingsWindow()
             return
         }
@@ -338,8 +349,8 @@ final class ApplicationWindowLifecycleController {
     }
 
     private func bringSettingsWindowForward() {
-        guard let settingsWindow = NSApp.windows.first(where: { window in
-            kind(of: window) == .settings
+        guard let settingsWindow = (NSApp.orderedWindows + NSApp.windows).first(where: { window in
+            (kind(of: window) == .settings || kind(of: window) == .general)
                 && (window.isVisible || window.isMiniaturized)
         }) else { return }
         if settingsWindow.isMiniaturized {
@@ -351,7 +362,7 @@ final class ApplicationWindowLifecycleController {
 
     var diagnostics: [String: Any] {
         [
-            "desiredDockPresentation": hasOpenWindow(.settings)
+            "desiredDockPresentation": hasOpenSettingsWindow
                 ? "settings" : "hidden",
             "activationPolicy": Self.activationPolicyName(
                 NSApp.activationPolicy()
@@ -391,6 +402,10 @@ final class ApplicationWindowLifecycleController {
             self.kind(of: window) == kind
                 && (window.isVisible || window.isMiniaturized)
         }
+    }
+
+    private var hasOpenSettingsWindow: Bool {
+        hasOpenWindow(.settings) || hasOpenWindow(.general)
     }
 
     private func kind(of window: NSWindow) -> ManagedWindowKind? {

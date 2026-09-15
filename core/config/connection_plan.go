@@ -46,6 +46,11 @@ const (
 // It must remain side-effect free: cache inspection and network preparation belong
 // to the platform transaction's Prepare phase.
 func BuildConnectionPlan(profile *Profile) (*ConnectionPlan, error) {
+	var groupErr error
+	profile, groupErr = ExpandRuleSetGroups(profile)
+	if groupErr != nil {
+		return nil, groupErr
+	}
 	if profile == nil {
 		return nil, fmt.Errorf("profile is nil")
 	}

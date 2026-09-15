@@ -191,12 +191,41 @@ func TestRuleSetLineToRule_EdgeCases(t *testing.T) {
 	if ok {
 		t.Error("empty type should not be ok")
 	}
-	// 多余逗号会被 SplitN(x, \",\", 2) 归入 value
-	r, ok := ruleSetLineToRule("DOMAIN-SUFFIX,google.com,extra", "G")
-	if !ok {
-		t.Error("SplitN with limit=2 puts extra commas in value, should be ok")
+	r, ok := ruleSetLineToRule("IP-CIDR,192.0.2.0/24,no-resolve", "G")
+	if !ok || r.Value != "192.0.2.0/24" || r.Options != "no-resolve" {
+		t.Fatal("rule-set options became part of the CIDR")
 	}
-	if r.Value != "google.com,extra" {
-		t.Errorf("value=%q, want google.com,extra (commas in value)", r.Value)
+}
+
+func TestExpandRulesetsStrictSupportsAirportSourcesWithoutDroppingRules(t *testing.T) {
+	var rules []config.SubscriptionRule
+	for range 33 {
+		rules = append(rules, config.SubscriptionRule{Type: "RULE-SET", Value: "https://rules.example/list", Group: "Proxy"})
+	}
+	result := &ParseResult{Rules: rules}
+	err := expandRulesetsWithFetcher(context.Background(), result, true,
+		func(context.Context, string, bool, int64) (string, error) {
+			return "PROCESS-NAME,Claude Helper\nIP-ASN,32934,no-resolve\nUSER-AGENT,Example*", nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rules) != 99 || result.Rules[0].Type != "PROCESS-NAME" || result.Rules[1].Options != "no-resolve" || result.Rules[2].Type != "USER-AGENT" {
+		t.Fatal("expanded rules/options silently disappeared")
+	}
+}
+
+func TestExpandRulesetsStrictRejectsUnknownEntryAtomically(t *testing.T) {
+	original := config.SubscriptionRule{Type: "RULE-SET", Value: "https://rules.example/list", Group: "Proxy"}
+	result := &ParseResult{Rules: []config.SubscriptionRule{original}}
+	err := expandRulesetsWithFetcher(context.Background(), result, true,
+		func(context.Context, string, bool, int64) (string, error) {
+			return "DOMAIN,example.com\nUNKNOWN,private-value", nil
+		})
+	if err == nil || strings.Contains(err.Error(), "private-value") {
+		t.Fatal("unknown rule was lost or included in error")
+	}
+	if len(result.Rules) != 1 || result.Rules[0] != original {
+		t.Fatal("failed expansion changed the original")
 	}
 }

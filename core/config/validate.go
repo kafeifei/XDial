@@ -77,6 +77,11 @@ func (w ProfileWarning) String() string {
 // 这是一个独立的只读入口，刻意不改 GenerateSingBox / GenerateSingBoxFor /
 // GenerateSingBoxDesktop 的签名，现有调用方（core/engine、core/libbox）零改动。
 func CollectProfileWarnings(profile *Profile) ([]ProfileWarning, error) {
+	var groupErr error
+	profile, groupErr = ExpandRuleSetGroups(profile)
+	if groupErr != nil {
+		return nil, groupErr
+	}
 	if profile == nil {
 		return nil, fmt.Errorf("profile is nil")
 	}

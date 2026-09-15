@@ -357,7 +357,74 @@ struct ApplicationRuleApplication: Codable, Identifiable, Hashable {
 }
 
 struct RuleSet: Codable, Identifiable, Hashable {
+    var conditions: [RuleSet] = []
+    var matchingResources: [RuleSet] { type == "group" ? conditions : [self] }
+    func contentSummary(chinese: Bool) -> String {
+        var domains = 0, ips = 0, apps = 0, remote = 0
+        func countNative(_ value: JSONValue) {
+            guard case let .object(fields) = value else { return }
+            for (key, value) in fields {
+                if key == "rules", case let .array(children) = value { children.forEach(countNative); continue }
+                let count: Int
+                if case let .array(items) = value { count = items.count }
+                else if case .string = value { count = 1 }
+                else { count = 0 }
+                if key.hasPrefix("domain") { domains += count }
+                if key == "ip_cidr" { ips += count }
+            }
+        }
+        for item in matchingResources {
+            domains += item.domains.count; ips += item.cidrs.count
+            apps += item.applications.count + item.processes.count
+            if item.type == "url" { remote += 1 }
+            if let native = item.nativeRule { countNative(native) }
+        }
+        let parts = [(chinese ? "域名" : "Domains", domains), ("IP", ips),
+                     (chinese ? "应用" : "Apps", apps), (chinese ? "远程" : "Remote", remote)]
+            .filter { $0.1 > 0 }.map { "\($0.0) \($0.1)" }
+        return parts.isEmpty ? (chinese ? "待添加匹配内容" : "Add matching content") : parts.joined(separator: " · ")
+    }
+    /// Search the predicates directly, without formatting large JSON documents.
+    func matchesSearch(_ query: String) -> Bool {
+        guard !query.isEmpty else { return true }
+        func contains(_ value: String) -> Bool { value.localizedCaseInsensitiveContains(query) }
+        func searchJSON(_ value: JSONValue) -> Bool {
+            switch value {
+            case let .string(text): return contains(text)
+            case let .array(values): return values.contains(where: searchJSON)
+            case let .object(fields): return fields.contains { contains($0.key) || searchJSON($0.value) }
+            default: return false
+            }
+        }
+        return contains(name) || domains.contains(where: contains) || cidrs.contains(where: contains)
+            || processes.contains(where: contains) || applications.contains { contains($0.name) || contains($0.path) }
+            || contains(url) || nativeRule.map(searchJSON) == true
+            || conditions.contains { $0.matchesSearch(query) }
+    }
+
+    var matchItemCount: Int? {
+        switch type {
+        case "manual": return domains.count + cidrs.count
+        case "application": return applications.count + processes.count
+        case "native":
+            func count(_ value: JSONValue) -> Int {
+                guard case let .object(fields) = value else { return 0 }
+                return fields.reduce(0) { total, entry in
+                    if entry.key == "rules", case let .array(children) = entry.value {
+                        return total + children.reduce(0) { $0 + count($1) }
+                    }
+                    guard ["domain", "domain_suffix", "domain_keyword", "domain_regex", "ip_cidr"].contains(entry.key) else { return total }
+                    if case let .array(items) = entry.value { return total + items.count }
+                    if case .string = entry.value { return total + 1 }
+                    return total
+                }
+            }
+            return nativeRule.map(count)
+        default: return nil // Remote contents are only available after preparation.
+        }
+    }
     var nativeRule: JSONValue?
+    var noResolve: Bool = false
     var id: String
     var name: String
     var type: String  // url / manual / application
@@ -388,7 +455,8 @@ struct RuleSet: Codable, Identifiable, Hashable {
         domains: [String] = [],
         cidrs: [String] = [],
         applications: [ApplicationRuleApplication] = [],
-        processes: [String] = []
+        processes: [String] = [],
+        conditions: [RuleSet] = []
     ) {
         self.id = id
         self.name = name
@@ -402,10 +470,13 @@ struct RuleSet: Codable, Identifiable, Hashable {
         self.cidrs = cidrs
         self.applications = applications
         self.processes = processes
+        self.conditions = conditions
     }
 
     enum CodingKeys: String, CodingKey {
+        case conditions
         case nativeRule = "native_rule"
+        case noResolve = "no_resolve"
         case id
         case name
         case type
@@ -422,7 +493,9 @@ struct RuleSet: Codable, Identifiable, Hashable {
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        conditions = try values.decodeIfPresent([RuleSet].self, forKey: .conditions) ?? []
         nativeRule = try values.decodeIfPresent(JSONValue.self, forKey: .nativeRule)
+        noResolve = try values.decodeIfPresent(Bool.self, forKey: .noResolve) ?? false
         id = try values.decode(String.self, forKey: .id)
         name = try values.decode(String.self, forKey: .name)
         type = try values.decode(String.self, forKey: .type)
@@ -570,6 +643,7 @@ struct RuleSet: Codable, Identifiable, Hashable {
 }
 
 struct RuleBinding: Codable, Hashable, Identifiable {
+    var conditionIDs: [String] = []
     var ruleSetID: String
     var lineID: String = ""
     var subscriptionID: String = ""
@@ -589,6 +663,7 @@ struct RuleBinding: Codable, Hashable, Identifiable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case conditionIDs = "condition_ids"
         case ruleSetID = "rule_set_id"
         case lineID = "line_id"
         case subscriptionID = "subscription_id"
@@ -597,11 +672,13 @@ struct RuleBinding: Codable, Hashable, Identifiable {
     init(
         ruleSetID: String,
         lineID: String = "",
-        subscriptionID: String = ""
+        subscriptionID: String = "",
+        conditionIDs: [String] = []
     ) {
         self.ruleSetID = ruleSetID
         self.lineID = lineID
         self.subscriptionID = subscriptionID
+        self.conditionIDs = conditionIDs
     }
 
     init(from decoder: Decoder) throws {
@@ -609,6 +686,7 @@ struct RuleBinding: Codable, Hashable, Identifiable {
         ruleSetID = try c.decode(String.self, forKey: .ruleSetID)
         lineID = try c.decodeIfPresent(String.self, forKey: .lineID) ?? ""
         subscriptionID = try c.decodeIfPresent(String.self, forKey: .subscriptionID) ?? ""
+        conditionIDs = try c.decodeIfPresent([String].self, forKey: .conditionIDs) ?? []
     }
 }
 
@@ -652,6 +730,7 @@ struct SubProxyGroup: Codable, Hashable {
 }
 
 struct SubRule: Codable, Hashable {
+    var options: String = ""
     var type: String
     var value: String = ""
     var group: String
@@ -659,12 +738,13 @@ struct SubRule: Codable, Hashable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         type = try c.decode(String.self, forKey: .type)
+        options = try c.decodeIfPresent(String.self, forKey: .options) ?? ""
         value = try c.decodeIfPresent(String.self, forKey: .value) ?? ""
         group = try c.decode(String.self, forKey: .group)
     }
 
     enum CodingKeys: String, CodingKey {
-        case type, value, group
+        case type, value, group, options
     }
 }
 
@@ -729,6 +809,7 @@ struct Subscription: Codable, Identifiable, Hashable {
 }
 
 struct Scenario: Codable, Identifiable, Hashable {
+    var matchOrder: [String] = []
     var id: String
     var name: String
     /// 稳定的语义图标 Key；nil 表示根据名称与已保存 SSID 自动选择。
@@ -753,16 +834,18 @@ struct Scenario: Codable, Identifiable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, bindings
+        case matchOrder = "match_order"
         case iconOverride = "icon"
         case matchSSIDs = "match_ssids"
         case defaultLineID = "default_line_id"
         case defaultSubscriptionID = "default_subscription_id"
     }
 
-    init(id: String, name: String, matchSSIDs: [String] = [], bindings: [RuleBinding] = [], defaultLineID: String = "", defaultSubscriptionID: String = "", iconOverride: String? = nil) {
+    init(id: String, name: String, matchSSIDs: [String] = [], bindings: [RuleBinding] = [], defaultLineID: String = "", defaultSubscriptionID: String = "", iconOverride: String? = nil, matchOrder: [String] = []) {
         self.id = id; self.name = name; self.iconOverride = iconOverride
         self.matchSSIDs = matchSSIDs
         self.bindings = bindings
+        self.matchOrder = matchOrder
         self.defaultLineID = defaultLineID; self.defaultSubscriptionID = defaultSubscriptionID
     }
 
@@ -777,6 +860,7 @@ struct Scenario: Codable, Identifiable, Hashable {
             forKey: .matchSSIDs
         ) ?? []
         bindings = try c.decodeIfPresent([RuleBinding].self, forKey: .bindings) ?? []
+        matchOrder = try c.decodeIfPresent([String].self, forKey: .matchOrder) ?? []
         defaultLineID = try c.decodeIfPresent(String.self, forKey: .defaultLineID) ?? ""
         defaultSubscriptionID = try c.decodeIfPresent(String.self, forKey: .defaultSubscriptionID) ?? ""
     }
@@ -784,6 +868,7 @@ struct Scenario: Codable, Identifiable, Hashable {
 
 struct Profile: Codable, Hashable {
     var profileID: String = ""
+    var importWarnings: [SubRule] = []
     var lines: [Line] = []
     var ruleSets: [RuleSet] = []
     var scenarios: [Scenario] = []
@@ -793,6 +878,7 @@ struct Profile: Codable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case profileID = "profile_id"
+        case importWarnings = "import_warnings"
         case lines = "lines"
         case ruleSets = "rule_sets"
         case scenarios = "scenarios"
@@ -803,9 +889,45 @@ struct Profile: Codable, Hashable {
 
     init() {}
 
+    /// Called after an explicit editor change, never during subscription validation.
+    /// Removing a selected condition must not turn a partial binding into an all-rule binding.
+    mutating func reconcileMatchingReferences() {
+        let members = Dictionary(uniqueKeysWithValues: ruleSets.map { ($0.id, Set($0.matchingResources.map(\.id))) })
+        for index in scenarios.indices {
+            scenarios[index].bindings = scenarios[index].bindings.compactMap { binding in
+                guard !binding.conditionIDs.isEmpty else { return binding }
+                var copy = binding
+                copy.conditionIDs = binding.conditionIDs.filter { members[binding.ruleSetID]?.contains($0) == true }
+                return copy.conditionIDs.isEmpty ? nil : copy
+            }
+            let selected = Set(scenarios[index].bindings.flatMap { binding in
+                binding.conditionIDs.isEmpty ? Array(members[binding.ruleSetID] ?? []) : binding.conditionIDs
+            })
+            scenarios[index].matchOrder.removeAll { !selected.contains($0) }
+        }
+    }
+
+    mutating func appendMatchingContent(_ content: RuleSet, to ruleID: String) {
+        guard let index = ruleSets.firstIndex(where: { $0.id == ruleID }) else { return }
+        if ruleSets[index].type != "group" {
+            var original = ruleSets[index]
+            original.id = UUID().uuidString
+            original.enabled = true
+            ruleSets[index] = RuleSet(id: ruleID, name: ruleSets[index].name, type: "group", enabled: ruleSets[index].enabled, conditions: [original])
+            for scene in scenarios.indices {
+                scenarios[scene].matchOrder = scenarios[scene].matchOrder.map { $0 == ruleID ? original.id : $0 }
+                for binding in scenarios[scene].bindings.indices {
+                    scenarios[scene].bindings[binding].conditionIDs = scenarios[scene].bindings[binding].conditionIDs.map { $0 == ruleID ? original.id : $0 }
+                }
+            }
+        }
+        ruleSets[index].conditions.append(content)
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         profileID = try c.decodeIfPresent(String.self, forKey: .profileID) ?? ""
+        importWarnings = try c.decodeIfPresent([SubRule].self, forKey: .importWarnings) ?? []
         lines = try c.decodeIfPresent([Line].self, forKey: .lines) ?? []
         ruleSets = try c.decodeIfPresent([RuleSet].self, forKey: .ruleSets) ?? []
         scenarios = try c.decodeIfPresent(
@@ -823,6 +945,7 @@ struct Profile: Codable, Hashable {
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(profileID, forKey: .profileID)
+        if !importWarnings.isEmpty { try c.encode(importWarnings, forKey: .importWarnings) }
         try c.encode(lines, forKey: .lines)
         try c.encode(ruleSets, forKey: .ruleSets)
         try c.encode(scenarios, forKey: .scenarios)
@@ -894,4 +1017,93 @@ extension Profile {
             defaultLineID: directLineID
         )
     }
+}
+
+// Group membership is private to its shared RuleSet; editors can still validate
+// a leaf change against the complete Profile without exposing extra navigation.
+extension Profile {
+    var matchingResources: [RuleSet] { ruleSets.flatMap(\.matchingResources) }
+    mutating func updateMatchingResource(id: String, update: (inout RuleSet) -> Void) -> Bool {
+        for i in ruleSets.indices {
+            if ruleSets[i].id == id { update(&ruleSets[i]); return true }
+            if let j = ruleSets[i].conditions.firstIndex(where: { $0.id == id }) {
+                update(&ruleSets[i].conditions[j]); return true
+            }
+        }
+        return false
+    }
+}
+
+extension Profile {
+    /// Editor guard for membership references, including ancestors affected by this edge.
+    /// Empty groups remain editable drafts; Go validates complete documents and runtime readiness.
+    func lineGroupMemberIssue(_ memberID: String, addingTo groupID: String) -> String? {
+        guard let group = lines.first(where: { $0.id == groupID }), group.isGroup else {
+            return "线路组已不存在"
+        }
+        guard !group.groupMembers.contains(memberID) else { return "此成员已在组内" }
+        guard memberID != groupID else { return "不能将组添加到自身" }
+        var resources = Dictionary(lines.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        resources[groupID]?.groupMembers.append(memberID)
+        var affected: Set<String> = [groupID]
+        var changed = true
+        while changed {
+            changed = false
+            for item in lines where item.isGroup && !affected.contains(item.id) {
+                if item.groupMembers.contains(where: { affected.contains($0) }) {
+                    affected.insert(item.id)
+                    changed = true
+                }
+            }
+        }
+        var checked: Set<String> = []
+        func visit(_ id: String, path: Set<String>, underURLTest: Bool) -> String? {
+            if path.contains(id) { return "添加后会形成循环引用" }
+            if path.count > 32 { return "组嵌套不能超过 32 层" }
+            if id == "direct" {
+                return underURLTest ? "测速组暂不支持包含直连，包括子组中的直连" : nil
+            }
+            guard let item = resources[id] else { return "包含已不存在的线路" }
+            if item.type == "vpn" || item.type == "tailscale" {
+                return "VPN 和 Tailscale 需直接用于场景"
+            }
+            if item.type == "direct", underURLTest {
+                return "测速组暂不支持包含直连，包括子组中的直连"
+            }
+            guard item.isGroup else { return nil }
+            let key = "\(path.count)/\(underURLTest)/\(id)"
+            if checked.contains(key) { return nil }
+            var next = path
+            next.insert(id)
+            for child in item.groupMembers {
+                if let issue = visit(child, path: next, underURLTest: underURLTest || item.type == "urltest") {
+                    return issue
+                }
+            }
+            checked.insert(key)
+            return nil
+        }
+        for id in affected.sorted() {
+            if let issue = visit(id, path: [], underURLTest: false) { return issue }
+        }
+        return nil
+    }
+
+    mutating func addLineGroupMember(_ memberID: String, to groupID: String) throws {
+        if let issue = lineGroupMemberIssue(memberID, addingTo: groupID) {
+            throw LineGroupMembershipError(errorDescription: issue)
+        }
+        guard let index = lines.firstIndex(where: { $0.id == groupID }) else { return }
+        lines[index].groupMembers.append(memberID)
+    }
+
+    mutating func removeLineGroupMember(_ memberID: String, from groupID: String) {
+        guard let index = lines.firstIndex(where: { $0.id == groupID && $0.isGroup }) else { return }
+        lines[index].groupMembers.removeAll { $0 == memberID }
+        if lines[index].groupDefault == memberID { lines[index].groupDefault = "" }
+    }
+}
+
+private struct LineGroupMembershipError: LocalizedError {
+    let errorDescription: String?
 }

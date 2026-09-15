@@ -136,7 +136,11 @@ func surgeLineToRule(line string) (config.SubscriptionRule, bool) {
 		}
 		value := strings.TrimSpace(parts[1])
 		group := strings.TrimSpace(parts[2])
-		return config.SubscriptionRule{Type: typ, Value: value, Group: group}, true
+		options := ""
+		if len(parts) == 4 {
+			options = strings.TrimSpace(parts[3])
+		}
+		return config.SubscriptionRule{Type: typ, Value: value, Group: group, Options: options}, true
 	}
 }
 
@@ -150,6 +154,9 @@ func surgeLineToLine(line string) (config.Line, bool) {
 	rest := strings.TrimSpace(line[eqIdx+1:])
 
 	parts := strings.SplitN(rest, ",", 4)
+	if len(parts) == 1 && strings.EqualFold(strings.TrimSpace(parts[0]), "direct") {
+		return config.Line{ID: shortID(), Name: name, Type: config.LineTypeDirect, Enabled: true}, true
+	}
 	if len(parts) < 3 {
 		return config.Line{}, false
 	}

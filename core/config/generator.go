@@ -377,6 +377,11 @@ func generateSingBox(
 	underlayInterface string,
 	transparentIngress *transparentProxyIngress,
 ) ([]byte, error) {
+	var groupErr error
+	profile, groupErr = ExpandRuleSetGroups(profile)
+	if groupErr != nil {
+		return nil, groupErr
+	}
 	scenario := profile.ActiveScenario()
 	if scenario == nil {
 		return nil, fmt.Errorf("no active scenario")
@@ -872,6 +877,11 @@ type ApplicationSOCKSCredential struct {
 // follows the exact same Scenario boundary and derivation used by the generated
 // inbound and route rules, so Swift never reproduces the hash algorithm.
 func ActiveApplicationSOCKSCredentials(profile *Profile, baseUsername string) ([]ApplicationSOCKSCredential, error) {
+	var groupErr error
+	profile, groupErr = ExpandRuleSetGroups(profile)
+	if groupErr != nil {
+		return nil, groupErr
+	}
 	if profile == nil {
 		return nil, fmt.Errorf("profile is nil")
 	}
@@ -959,6 +969,11 @@ func effectiveActiveMagicDNSEndpointTags(profile *Profile, scenario *Scenario) [
 // Scenario. The desktop helper uses this same decision boundary for login/exit-node
 // preflight before it starts the external sing-box data plane.
 func ActiveTailscaleLine(profile *Profile) (*Line, error) {
+	var groupErr error
+	profile, groupErr = ExpandRuleSetGroups(profile)
+	if groupErr != nil {
+		return nil, groupErr
+	}
 	if profile == nil {
 		return nil, fmt.Errorf("profile is nil")
 	}
@@ -1754,6 +1769,9 @@ func compileTransparentProxyRuleSet(
 			}
 			return []map[string]interface{}{resolve, route}
 		}
+		if ruleSet.NoResolve {
+			return []map[string]interface{}{route}
+		}
 		return []map[string]interface{}{transparentProxySystemResolveRule(), route}
 	case RuleSetTypeApplication:
 		selectors := applicationRuleSetSelectors(ruleSet)
@@ -1837,6 +1855,9 @@ func compileTransparentProxyRuleSet(
 			}
 			return []map[string]interface{}{match, route}
 		case RuleSetMatchIP, RuleSetMatchMixed, RuleSetMatchUnknown:
+			if ruleSet.NoResolve {
+				return []map[string]interface{}{route}
+			}
 			return []map[string]interface{}{transparentProxySystemResolveRule(), route}
 		}
 	}

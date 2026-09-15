@@ -164,6 +164,24 @@ func CloneProfile(profileJSON, namespace string) (string, error) {
 	return string(encoded), err
 }
 
+// ReimportProfileScenario uses only app-owned saved content. No network, vault
+// access or connection lifecycle is involved in this bridge.
+func ReimportProfileScenario(profileJSON, scenarioID, namespace string) (string, error) {
+	profile, err := config.ParseProfile([]byte(profileJSON))
+	if err != nil {
+		return "", err
+	}
+	result, err := config.ReimportScenario(profile, scenarioID, namespace)
+	if err != nil {
+		return "", err
+	}
+	if err := validateProfileNativeOptions(result); err != nil {
+		return "", err
+	}
+	encoded, err := json.Marshal(result)
+	return string(encoded), err
+}
+
 func validateProfileNativeOptions(profile *config.Profile) error {
 	ctx := boxContext(context.Background())
 	for _, line := range profile.Lines {
@@ -183,4 +201,90 @@ func validateProfileNativeOptions(profile *config.Profile) error {
 		}
 	}
 	return nil
+}
+
+// CompactProfileRuleSets is a local, side-effect-free migration. Comparing the
+// execution fingerprints protects ordering, DNS and application attribution.
+func CompactProfileRuleSets(profileJSON string) (string, error) {
+	profile, err := config.ParseProfile([]byte(profileJSON))
+	if err != nil {
+		return "", err
+	}
+	before, err := config.BuildConnectionPlan(profile)
+	if err != nil {
+		return "", err
+	}
+	compacted, err := config.CompactProfileRuleSets(profile)
+	if err != nil {
+		return "", err
+	}
+	after, err := config.BuildConnectionPlan(compacted)
+	if err != nil {
+		return "", err
+	}
+	if before.ConfigurationFingerprint != after.ConfigurationFingerprint {
+		return "", fmt.Errorf("compaction would change runtime configuration")
+	}
+	encoded, err := json.Marshal(compacted)
+	return string(encoded), err
+}
+
+// SeparateImportedRuleResources verifies all existing Scenarios, including local
+// additions. It never opens a Line, downloads resources or accesses storage.
+func SeparateImportedRuleResources(profileJSON string) (string, error) {
+	profile, err := config.ParseProfile([]byte(profileJSON))
+	if err != nil {
+		return "", err
+	}
+	separated, err := config.SeparateImportedRuleResources(profile)
+	if err != nil {
+		return "", err
+	}
+	for _, scene := range profile.Scenarios {
+		beforeProfile, afterProfile := *profile, *separated
+		beforeProfile.ActiveScenarioID, afterProfile.ActiveScenarioID = scene.ID, scene.ID
+		before, err := config.BuildConnectionPlan(&beforeProfile)
+		if err != nil {
+			return "", err
+		}
+		after, err := config.BuildConnectionPlan(&afterProfile)
+		if err != nil {
+			return "", err
+		}
+		if before.ConfigurationFingerprint != after.ConfigurationFingerprint {
+			return "", fmt.Errorf("migration would change a Scenario's runtime configuration")
+		}
+	}
+	encoded, err := json.Marshal(separated)
+	return string(encoded), err
+}
+
+// GroupProfileRulesByDestination migrates the document, verifies every Scenario,
+// and performs no network or storage operations.
+func GroupProfileRulesByDestination(profileJSON, referenceScenarioID string) (string, error) {
+	profile, err := config.ParseProfile([]byte(profileJSON))
+	if err != nil {
+		return "", err
+	}
+	grouped, err := config.GroupProfileRulesByDestination(profile, referenceScenarioID)
+	if err != nil {
+		return "", err
+	}
+	for _, scene := range profile.Scenarios {
+		beforeProfile, afterProfile := *profile, *grouped
+		beforeProfile.ActiveScenarioID, afterProfile.ActiveScenarioID = scene.ID, scene.ID
+		before, err := config.BuildConnectionPlan(&beforeProfile)
+		if err != nil {
+			return "", err
+		}
+		after, err := config.BuildConnectionPlan(&afterProfile)
+		if err != nil {
+			return "", err
+		}
+		if before.ConfigurationFingerprint != after.ConfigurationFingerprint {
+			return "", fmt.Errorf("grouping would change a Scenario's runtime configuration")
+		}
+	}
+	encoded, err := json.Marshal(grouped)
+	return string(encoded), err
 }

@@ -194,7 +194,6 @@ final class DebugServer {
         dict["activeProfileID"] = s.profileLibrary.activeProfileID
         dict["editingProfileID"] = s.profileLibrary.editingProfileID
         dict["browsedProfileID"] = s.browsedProfileID
-        dict["settingsArea"] = s.settingsArea.rawValue
         dict["profileLibraryReady"] = s.profileLibraryLoaded && s.profilePersistenceError == nil
         // 配置改了但引擎还在跑旧快照 —— 验收改动是否真正生效必须看这个
         dict["configDirty"] = s.configDirty
@@ -230,6 +229,16 @@ final class DebugServer {
            let p = try? JSONSerialization.jsonObject(with: d) {
             dict["profile"] = redactSecrets(p)
         }
+        if let d = try? JSONEncoder().encode(s.editingProfile),
+           let p = try? JSONSerialization.jsonObject(with: d) {
+            dict["editingProfile"] = redactSecrets(p)
+        }
+        dict["profileEditorPosition"] = [
+            "tab": s.editorPosition.tab,
+            "expandedLineIDs": s.editorPosition.expandedLineIDs.sorted(),
+            "expandedRuleIDs": s.editorPosition.expandedRuleIDs.sorted(),
+            "expandedScenarioID": s.editorPosition.expandedScenarioID ?? "",
+        ] as [String: Any]
 
         dict["network"] = [
             "transactionID": net.transactionID ?? "",
@@ -390,7 +399,7 @@ final class DebugServer {
 
     @MainActor
     private static func settingsWindow() -> NSWindow? {
-        NSApp.windows.first { $0.title.contains("设置") || $0.title.contains("Settings") }
+        NSApp.windows.first { $0.identifier?.rawValue == "settings" }
     }
 
     @MainActor
@@ -662,6 +671,117 @@ final class DebugServer {
                 "configDirty": state.configDirty,
             ]
             return ok(result)
+        #if XDIAL_NEXT_IDENTITY
+        case "reimport-profile-scenario":
+            guard state.profileLibraryLoaded,
+                  !state.hasPendingScenarioSwitch, state.engine.status == "disconnected",
+                  let sourceID = obj["profileID"] as? String,
+                  let source = state.profileLibrary.profiles.first(where: { $0.id == sourceID }),
+                  let scenarioID = obj["scenarioID"] as? String,
+                  let newID = obj["newProfileID"] as? String, UUID(uuidString: newID) != nil,
+                  let name = obj["name"] as? String, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !state.profileLibrary.profiles.contains(where: { $0.id == newID }) else {
+                return ("409 Conflict", json(["error": "Requires saved source, a fresh Profile identity and disconnected Next"]))
+            }
+            do {
+                let candidate = try await ProfileDocumentService.reimportSavedScenario(source.profile, scenarioID: scenarioID, newProfileID: newID)
+                guard !state.hasPendingScenarioSwitch, state.engine.status == "disconnected",
+                      state.profileLibrary.profiles.first(where: { $0.id == sourceID }) == source,
+                      !state.profileLibrary.profiles.contains(where: { $0.id == newID }) else {
+                    return ("409 Conflict", json(["error": "Source or connection state changed; nothing saved"]))
+                }
+                let preview = obj["preview"] as? Bool ?? true
+                if !preview {
+                    let record = ProfileRecord(id: newID, name: name, profile: candidate)
+                    guard state.insertProfile(record) else {
+                        return ("500 Internal Server Error", json(["error": "Encrypted save failed"]))
+                    }
+                }
+                return ok([
+                    "ok": true, "preview": preview, "profileID": newID,
+                    "lineCount": candidate.lines.filter { !$0.isGroup }.count,
+                    "groupNames": candidate.lines.filter(\.isGroup).map(\.name),
+                    "ruleNames": candidate.ruleSets.map(\.name),
+                    "scenarioCount": candidate.scenarios.count,
+                    "sourceUnchanged": state.profileLibrary.profiles.first(where: { $0.id == sourceID }) == source,
+                ])
+            } catch {
+                return ("422 Unprocessable Entity", json(["error": "Saved configuration could not be reimported; source unchanged"]))
+            }
+        case "separate-imported-rule-resources", "group-rules-by-destination":
+            guard state.profileLibraryLoaded,
+                  let id = obj["profileID"] as? String,
+                  let index = state.profileLibrary.profiles.firstIndex(where: { $0.id == id }),
+                  state.profileLibrary.profiles[index].source == nil,
+                  state.profileLibrary.profiles[index].baseline == nil,
+                  !state.hasPendingScenarioSwitch,
+                  state.engine.status == "disconnected" else {
+                return ("409 Conflict", json(["error": "Requires a local Profile and disconnected Next"]))
+            }
+            do {
+                let original = state.profileLibrary
+                let previous = original.profiles[index].profile
+                let candidate: Profile
+                if action == "group-rules-by-destination" {
+                    guard let reference = obj["referenceScenarioID"] as? String else {
+                        return ("400 Bad Request", json(["error": "missing referenceScenarioID"]))
+                    }
+                    candidate = try ProfileDocumentService.groupRulesByDestination(previous, referenceScenarioID: reference)
+                } else {
+                    candidate = try ProfileDocumentService.separateImportedRuleResources(previous)
+                }
+                let preview = obj["preview"] as? Bool ?? true
+                if !preview {
+                    state.profileLibrary.profiles[index].profile = candidate
+                    guard state.persistProfileLibrary() else {
+                        state.profileLibrary = original
+                        return ("500 Internal Server Error", json(["error": "Encrypted save failed"]))
+                    }
+                    if state.profileLibrary.activeProfileID == id { state.profile = candidate }
+                }
+                return ok([
+                    "ok": true, "preview": preview,
+                    "before": previous.ruleSets.count, "after": candidate.ruleSets.count,
+                    "lineCount": candidate.lines.count,
+                    "verifiedScenarios": candidate.scenarios.enumerated().map { index, scenario in
+                        ["name": scenario.name, "id": scenario.id,
+                         "beforeBindings": previous.scenarios[index].bindings.count,
+                         "afterBindings": scenario.bindings.count,
+                         "sourceOrderCount": scenario.matchOrder.count,
+                         "partialBindings": scenario.bindings.filter { !$0.conditionIDs.isEmpty }.count] as [String: Any]
+                    },
+                    "ruleNames": candidate.ruleSets.map(\.name),
+                ])
+            } catch {
+                return ("422 Unprocessable Entity", json(["error": "Profile migration could not preserve every Scenario; unchanged"]))
+            }
+        case "compact-profile-rule-sets":
+            guard state.profileLibraryLoaded,
+                  let id = obj["profileID"] as? String,
+                  let index = state.profileLibrary.profiles.firstIndex(where: { $0.id == id }),
+                  state.profileLibrary.profiles[index].source == nil,
+                  state.profileLibrary.profiles[index].baseline == nil,
+                  !state.hasPendingScenarioSwitch,
+                  state.engine.status == "disconnected" else {
+                return ("409 Conflict", json(["error": "Requires a local Profile and disconnected Next"]))
+            }
+            do {
+                let original = state.profileLibrary
+                let previous = original.profiles[index].profile
+                let candidate = try ProfileDocumentService.compactRuleSets(previous)
+                // Keep Swift-only defaults and all non-rule user state exactly.
+                state.profileLibrary.profiles[index].profile.ruleSets = candidate.ruleSets
+                state.profileLibrary.profiles[index].profile.scenarios[0].bindings = candidate.scenarios[0].bindings
+                guard state.persistProfileLibrary() else {
+                    state.profileLibrary = original
+                    return ("500 Internal Server Error", json(["error": "Encrypted save failed"]))
+                }
+                if state.profileLibrary.activeProfileID == id { state.profile = state.profileLibrary.profiles[index].profile }
+                return ok(["ok": true, "before": previous.ruleSets.count, "after": candidate.ruleSets.count])
+            } catch {
+                return ("422 Unprocessable Entity", json(["error": "Profile cannot be safely compacted; unchanged"]))
+            }
+        #endif
         case "open-settings":
             ApplicationWindowLifecycleController.shared
                 .prepareToPresentSettingsWindow()

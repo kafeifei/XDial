@@ -47,6 +47,7 @@ type runtimeConfigurationTarget struct {
 }
 
 type runtimeConfigurationRuleSet struct {
+	NoResolve      bool                         `json:"no_resolve,omitempty"`
 	NativeRule     json.RawMessage              `json:"native_rule,omitempty"`
 	ID             string                       `json:"id"`
 	Type           RuleSetType                  `json:"type"`
@@ -150,9 +151,10 @@ func (builder *runtimeConfigurationBuilder) includeRuleSet(ruleSet *RuleSet) {
 	}
 
 	entry := runtimeConfigurationRuleSet{
-		ID:     ruleSet.ID,
-		Type:   ruleSet.Type,
-		Invert: ruleSet.Invert,
+		ID:        ruleSet.ID,
+		Type:      ruleSet.Type,
+		Invert:    ruleSet.Invert,
+		NoResolve: ruleSet.NoResolve,
 	}
 	switch ruleSet.Type {
 	case RuleSetTypeNative:

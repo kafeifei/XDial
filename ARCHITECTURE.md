@@ -278,8 +278,11 @@ URL RuleSet 的 `fetch_line_id` 默认 Direct，仅拥有资源的 DNS、HTTPS�
 
 后台刷新可复用正式数据面已有的同一获取 Line，否则建立同类隔离会话；进程级单例冲突时
 保留有效缓存、延后刷新，不破坏已提交连接。
-GEOIP 资源仅来自显式 `geoip_rule_set_url_template`，含 `{code}` 且为 HTTPS 或规范化绝对
-`file://` 路径；缺失或非法时生成失败，无内置公共源或回退源，凭据不烘入应用与仓库。
+旧 Subscription 的 GEOIP 资源仅来自显式 `geoip_rule_set_url_template`，含 `{code}` 且为 HTTPS
+或规范化绝对 `file://` 路径；缺失或非法时生成失败，运行时无内置公共源或回退源。
+Next 的整份配置导入适配可将 GEOIP 转成具名、显式 URL RuleSet：导入预览说明来源，
+用户保存后按普通 RuleSet 的获取事务执行，来源可在本地配置中修改。此转换不为运行时
+添加隐式 GEOIP 兜底，也不把凭据或用户实际配置烘入应用与仓库。
 
 ## 8. SSID 激活（D39）
 

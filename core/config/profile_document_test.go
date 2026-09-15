@@ -44,7 +44,11 @@ func TestProfileDocumentNativeGroupAndDomainRouting(t *testing.T) {
 		t.Fatal("group dependencies were not compiled")
 	}
 	encodedDNS, _ := json.Marshal(cfg.DNS)
-	if !strings.Contains(string(encodedDNS), sbRuleSetTag(&profile.RuleSets[0])) {
+	flat, err := ExpandRuleSetGroups(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encodedDNS), sbRuleSetTag(&flat.RuleSets[0])) {
 		t.Fatal("domain rule lost its DNS ownership")
 	}
 	singboxCheckConfig(t, raw, "profile-native-group")

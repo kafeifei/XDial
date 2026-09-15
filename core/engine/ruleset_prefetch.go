@@ -66,6 +66,11 @@ func prepareRuleSets(
 	cacheDir string,
 	fetcher *ruleSetFetcher,
 ) (*config.Profile, []string) {
+	expanded, err := config.ExpandRuleSetGroups(profile)
+	if err != nil {
+		return profile, []string{err.Error()}
+	}
+	profile = expanded
 	scenario := profile.ActiveScenario()
 	if scenario == nil {
 		return profile, nil
