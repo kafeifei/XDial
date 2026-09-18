@@ -866,9 +866,15 @@ struct Scenario: Codable, Identifiable, Hashable {
     }
 }
 
+struct ImportAdjustment: Codable, Hashable {
+    var code: String
+    var count: Int
+}
+
 struct Profile: Codable, Hashable {
     var profileID: String = ""
     var importWarnings: [SubRule] = []
+    var importAdjustments: [ImportAdjustment] = []
     var lines: [Line] = []
     var ruleSets: [RuleSet] = []
     var scenarios: [Scenario] = []
@@ -879,6 +885,7 @@ struct Profile: Codable, Hashable {
     enum CodingKeys: String, CodingKey {
         case profileID = "profile_id"
         case importWarnings = "import_warnings"
+        case importAdjustments = "import_adjustments"
         case lines = "lines"
         case ruleSets = "rule_sets"
         case scenarios = "scenarios"
@@ -928,6 +935,7 @@ struct Profile: Codable, Hashable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         profileID = try c.decodeIfPresent(String.self, forKey: .profileID) ?? ""
         importWarnings = try c.decodeIfPresent([SubRule].self, forKey: .importWarnings) ?? []
+        importAdjustments = try c.decodeIfPresent([ImportAdjustment].self, forKey: .importAdjustments) ?? []
         lines = try c.decodeIfPresent([Line].self, forKey: .lines) ?? []
         ruleSets = try c.decodeIfPresent([RuleSet].self, forKey: .ruleSets) ?? []
         scenarios = try c.decodeIfPresent(
@@ -946,6 +954,7 @@ struct Profile: Codable, Hashable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(profileID, forKey: .profileID)
         if !importWarnings.isEmpty { try c.encode(importWarnings, forKey: .importWarnings) }
+        if !importAdjustments.isEmpty { try c.encode(importAdjustments, forKey: .importAdjustments) }
         try c.encode(lines, forKey: .lines)
         try c.encode(ruleSets, forKey: .ruleSets)
         try c.encode(scenarios, forKey: .scenarios)
@@ -1035,6 +1044,42 @@ extension Profile {
 }
 
 extension Profile {
+    /// Current edited leaves for testing, so a changed child cannot borrow an old runtime measurement.
+    func latencyTestLines(for roots: [Line]) -> [Line] {
+        let catalog = Dictionary(lines.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var seen: Set<String> = []
+        var result: [Line] = []
+        func visit(_ item: Line) {
+            guard seen.insert(item.id).inserted else { return }
+            if item.isGroup { item.groupMembers.forEach { if let child = catalog[$0] { visit(child) } } }
+            else { result.append(item) }
+        }
+        roots.forEach { visit($0) }
+        return result
+    }
+
+    /// nil selects native URLTest; a member selects the native selector.
+    mutating func selectLineGroupMember(_ memberID: String?, in groupID: String) throws {
+        guard let index = lines.firstIndex(where: { $0.id == groupID && $0.isGroup }) else {
+            throw LineGroupMembershipError(errorDescription: "线路组已不存在")
+        }
+        if let memberID, !lines[index].groupMembers.contains(memberID) {
+            throw LineGroupMembershipError(errorDescription: "所选线路不在组内")
+        }
+        var candidate = self
+        candidate.lines[index].type = memberID == nil ? "urltest" : "selector"
+        candidate.lines[index].groupDefault = memberID ?? ""
+        // Reuse the membership guard so ancestor URLTests remain valid too.
+        if let first = candidate.lines[index].groupMembers.first {
+            candidate.lines[index].groupMembers.removeFirst()
+            if let issue = candidate.lineGroupMemberIssue(first, addingTo: groupID) {
+                throw LineGroupMembershipError(errorDescription: issue)
+            }
+        }
+        lines[index].type = memberID == nil ? "urltest" : "selector"
+        lines[index].groupDefault = memberID ?? ""
+    }
+
     /// Editor guard for membership references, including ancestors affected by this edge.
     /// Empty groups remain editable drafts; Go validates complete documents and runtime readiness.
     func lineGroupMemberIssue(_ memberID: String, addingTo groupID: String) -> String? {
@@ -1061,14 +1106,14 @@ extension Profile {
             if path.contains(id) { return "添加后会形成循环引用" }
             if path.count > 32 { return "组嵌套不能超过 32 层" }
             if id == "direct" {
-                return underURLTest ? "测速组暂不支持包含直连，包括子组中的直连" : nil
+                return underURLTest ? "自动选择暂不支持直连，包括子组中的直连" : nil
             }
             guard let item = resources[id] else { return "包含已不存在的线路" }
             if item.type == "vpn" || item.type == "tailscale" {
                 return "VPN 和 Tailscale 需直接用于场景"
             }
             if item.type == "direct", underURLTest {
-                return "测速组暂不支持包含直连，包括子组中的直连"
+                return "自动选择暂不支持直连，包括子组中的直连"
             }
             guard item.isGroup else { return nil }
             let key = "\(path.count)/\(underURLTest)/\(id)"

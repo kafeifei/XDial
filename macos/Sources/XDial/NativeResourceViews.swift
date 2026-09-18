@@ -3,11 +3,13 @@ import SwiftUI
 extension Line {
     var memberTypeLabel: String {
         switch type {
-        case "selector": return "手动选择组"
-        case "urltest": return "测速组"
+        case "selector", "urltest": return "线路组"
         case "direct": return "直连"
         default: return type.uppercased()
         }
+    }
+    var chosenGroupMemberID: String? {
+        type == "urltest" ? nil : (groupDefault.isEmpty ? groupMembers.first : groupDefault)
     }
 }
 
@@ -16,6 +18,11 @@ struct LineGroupRow: View {
     let onDelete: () -> Void
     @EnvironmentObject var state: AppState
     @State private var showAddMember = false
+    @State private var showSettings = false
+    @State private var reordering = false
+    @State private var search = ""
+    @State private var error: String?
+    private var profileID: String { state.editingRecord.id }
     private var expanded: Bool {
         get { state.editorPosition.expandedLineIDs.contains(line.id) }
         nonmutating set {
@@ -24,89 +31,182 @@ struct LineGroupRow: View {
         }
     }
     private var readOnly: Bool { state.editingRecord.baseline?.lines.contains(where: { $0.id == line.id }) == true }
-
-    var body: some View {
-        CollapsibleCard(isExpanded: expanded, onToggle: { expanded.toggle() },
-                        onDelete: readOnly ? nil : onDelete,
-                        header: {
-            Image(systemName: line.type == "urltest" ? "speedometer" : "square.stack.3d.up")
-                .foregroundStyle(.secondary)
-            Text(line.name).font(.system(size: 13, weight: .medium))
-            Spacer()
-            Text("\(line.groupMembers.count) 个成员").font(.caption).foregroundStyle(.secondary)
-            Text(line.type == "urltest" ? "自动测速" : "手动选择").font(.caption).foregroundStyle(.secondary)
-            Text(readOnly ? "订阅" : "自建").font(.caption).foregroundStyle(.secondary)
-        }, detail: {
-            VStack(alignment: .leading, spacing: 10) {
-                TextField("名称", text: $line.name).textFieldStyle(.roundedBorder)
-                    .disabled(readOnly).onChange(of: line.name) { state.saveEditingProfile() }
-                if line.type == "selector" {
-                    Picker("选用成员", selection: $line.groupDefault) {
-                        Text("第一条成员").tag("")
-                        ForEach(line.groupMembers, id: \.self) { id in
-                            Text(state.editingProfile.lines.first { $0.id == id }?.name ?? id).tag(id)
-                        }
-                    }
-                    .disabled(line.groupMembers.isEmpty)
-                    .onChange(of: line.groupDefault) { state.saveEditingProfile() }
-                } else {
-                    Label("运行时自动测速并选用成员", systemImage: "speedometer")
-                        .foregroundStyle(.secondary)
-                    HStack(spacing: 8) {
-                        TextField("测速 URL（留空使用默认值）", text: $line.groupURL)
-                            .onChange(of: line.groupURL) { state.saveEditingProfile() }
-                        TextField("间隔，如 3m", text: $line.groupInterval)
-                            .frame(width: 105)
-                            .onChange(of: line.groupInterval) { state.saveEditingProfile() }
-                    }.textFieldStyle(.roundedBorder).disabled(readOnly)
-                }
-                Divider()
-                HStack {
-                    Text("成员 · \(line.groupMembers.count)").foregroundStyle(.secondary)
-                    Spacer()
-                    if !readOnly {
-                        Button { showAddMember = true } label: {
-                            Label("添加线路或组", systemImage: "plus")
-                        }.buttonStyle(.borderless)
-                    }
-                }
-                if line.groupMembers.isEmpty {
-                    Text("尚未添加成员").foregroundStyle(.secondary).padding(.vertical, 6)
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 0) {
-                            ForEach(line.groupMembers, id: \.self) { id in
-                                memberRow(id)
-                            }
-                        }
-                    }
-                    .frame(height: CGFloat(min(line.groupMembers.count, 7)) * 30)
-                }
-            }.font(.caption)
-        })
-        .sheet(isPresented: $showAddMember) {
-            LineGroupMemberSheet(groupID: line.id)
-        }
+    private var members: [Line] {
+        let catalog = Dictionary(state.editingProfile.lines.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        return line.groupMembers.compactMap { catalog[$0] }.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }
+    }
+    private var choiceLabel: String {
+        guard let id = line.chosenGroupMemberID else { return "自动选择" }
+        return state.editingProfile.lines.first { $0.id == id }?.name ?? "成员已不存在"
     }
 
-    private func memberRow(_ id: String) -> some View {
-        let member = state.editingProfile.lines.first { $0.id == id }
-        return HStack(spacing: 8) {
-            Image(systemName: member?.isGroup == true ? "square.stack.3d.up" : "network")
-                .foregroundStyle(.secondary).frame(width: 16)
-            Text(member?.name ?? "缺失线路：\(id)").lineLimit(1)
-            Spacer(minLength: 8)
-            Text(member?.memberTypeLabel ?? "引用失效").foregroundStyle(.secondary)
-            if !readOnly {
-                Button {
-                    state.editingProfile.removeLineGroupMember(id, from: line.id)
-                    state.saveEditingProfile()
-                } label: { Image(systemName: "minus.circle") }
-                    .buttonStyle(.borderless)
-                    .help("从组中移除，保留原线路")
-                    .accessibilityLabel("移除成员 \(member?.name ?? id)")
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button { withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() } } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.system(size: 9, weight: .semibold)).frame(width: 12)
+                        Image(systemName: "square.stack.3d.up").foregroundStyle(.secondary)
+                        Text(line.name).font(.system(size: 13, weight: .medium)).lineLimit(1)
+                        Text("\(line.groupMembers.count)").font(.caption).foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        if !expanded { Text(choiceLabel).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                if !expanded { latency(line, interactive: false) }
+                Button { showSettings.toggle(); expanded = true } label: {
+                    Image(systemName: "slider.horizontal.3").frame(width: 24, height: 24)
+                }.buttonStyle(.plain).foregroundStyle(.secondary).help("线路组设置")
+                    .accessibilityLabel("设置 \(line.name)")
+            }.padding(.horizontal, 12).padding(.vertical, 8)
+            if expanded {
+                Divider()
+                VStack(spacing: 6) {
+                    if showSettings { settings }
+                    HStack(spacing: 10) {
+                        SettingsSearchField("搜索成员", text: $search)
+                        LineLatencyBatchButton(store: state.lineLatencies, lines: [line], profileID: profileID, title: "整组测速", control: .group(line.id))
+                        if !readOnly {
+                            Button { showAddMember = true } label: { Label("添加", systemImage: "plus") }
+                            Button { reordering.toggle() } label: { Image(systemName: "arrow.up.arrow.down") }
+                                .help(reordering ? "完成排序" : "调整成员顺序")
+                        }
+                    }.buttonStyle(.borderless).font(.caption).padding(.bottom, 3)
+                    selectionRow(nil)
+                    Divider()
+                    if line.groupMembers.isEmpty {
+                        Text("添加线路后，即可自动择优或固定选择一条线路")
+                            .foregroundStyle(.secondary).font(.caption).frame(maxWidth: .infinity).padding(.vertical, 18)
+                    } else {
+                        ScrollView {
+                            LazyVStack(spacing: 1) {
+                                ForEach(members) { member in selectionRow(member) }
+                            }.padding(.trailing, 18)
+                        }.frame(height: CGFloat(max(1, min(members.count, 7))) * 32)
+                    }
+                    if let error { Text(error).font(.caption).foregroundStyle(XDialPalette.danger).frame(maxWidth: .infinity, alignment: .leading) }
+                    Divider()
+                    HStack(spacing: 6) {
+                        GroupTestingCaption(store: state.lineLatencies, line: line, profileID: profileID)
+                        Spacer()
+                        Text(readOnly ? "订阅" : "本地")
+                        if state.editingActiveProfile && state.configDirty { Text("修改待应用").foregroundStyle(XDialPalette.warning) }
+                    }.font(.system(size: 10)).foregroundStyle(.secondary).padding(.top, 2)
+                }.padding(12)
             }
-        }.frame(height: 30)
+        }
+        .background(XDialPalette.surface, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(XDialPalette.divider, lineWidth: 0.75))
+        .sheet(isPresented: $showAddMember) { LineGroupMemberSheet(groupID: line.id) }
+    }
+
+    private func latency(_ member: Line, interactive: Bool = true) -> some View {
+        LineLatencyView(store: state.lineLatencies, line: member, profileID: profileID, group: member.id == line.id ? nil : line, allowsTesting: interactive)
+    }
+
+    private func selectionRow(_ member: Line?) -> some View {
+        let selected = member.map { line.chosenGroupMemberID == $0.id } ?? (line.type == "urltest")
+        return HStack(spacing: 8) {
+            Button { select(member?.id) } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                        .foregroundStyle(selected ? XDialPalette.primaryAction : .secondary).frame(width: 17)
+                    if let member {
+                        Text(member.name).lineLimit(1).font(.system(size: 12))
+                    } else {
+                        Text("自动选择").font(.system(size: 12, weight: .medium))
+                        GroupSelectionCaption(store: state.lineLatencies, line: line, profileID: profileID, catalog: state.editingProfile.lines)
+                    }
+                    Spacer(minLength: 4)
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain).accessibilityLabel(member?.name ?? "自动选择")
+                .accessibilityValue(selected ? "已选择" : "未选择")
+            if let member {
+                Text(member.memberTypeLabel).font(.system(size: 10)).foregroundStyle(.secondary)
+                latency(member)
+                if member.isGroup {
+                    Button { state.editorPosition.expandedLineIDs.insert(member.id) } label: {
+                        Image(systemName: "arrow.turn.down.right").frame(width: 20)
+                    }.buttonStyle(.plain).help("展开子组")
+                }
+                if !readOnly {
+                    if reordering && search.isEmpty {
+                        Button { move(member.id, by: -1) } label: { Image(systemName: "chevron.up") }
+                            .disabled(line.groupMembers.first == member.id)
+                        Button { move(member.id, by: 1) } label: { Image(systemName: "chevron.down") }
+                            .disabled(line.groupMembers.last == member.id)
+                    } else {
+                        Button {
+                            state.editingProfile.removeLineGroupMember(member.id, from: line.id)
+                            state.saveEditingProfile()
+                        } label: { Image(systemName: "minus.circle").frame(width: 20) }
+                        .help("从组中移除，保留原线路").accessibilityLabel("移除 \(member.name)")
+                    }
+                }
+            } else {
+                if line.type == "urltest" { latency(line, interactive: false) }
+                else { Text("未启用").font(.system(size: 10)).foregroundStyle(.secondary) }
+                Text("择优").font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 30)
+            }
+        }.buttonStyle(.borderless).padding(.horizontal, 6).frame(height: 32)
+            .background(selected ? XDialPalette.selection.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 5))
+    }
+
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                TextField("名称", text: $line.name).disabled(readOnly)
+                TextField("自动测速间隔，如 3m", text: $line.groupInterval).frame(width: 145)
+            }
+            TextField("自动测速 URL（留空使用默认值）", text: $line.groupURL)
+            HStack {
+                Text(readOnly ? "成员随订阅更新；选线与测速参数可单独修改" : "成员可包含线路或其他线路组")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !readOnly { Button("删除线路组", role: .destructive, action: onDelete) }
+                Button("完成") { showSettings = false }
+            }
+            Divider()
+        }.font(.caption).textFieldStyle(.roundedBorder)
+            .onChange(of: line.name) { state.saveEditingProfile() }
+            .onChange(of: line.groupURL) { state.saveEditingProfile() }
+            .onChange(of: line.groupInterval) { state.saveEditingProfile() }
+    }
+    private func select(_ memberID: String?) {
+        do {
+            try state.editingProfile.selectLineGroupMember(memberID, in: line.id)
+            state.saveEditingProfile(); error = nil
+        } catch { self.error = error.localizedDescription }
+    }
+    private func move(_ id: String, by offset: Int) {
+        guard let index = line.groupMembers.firstIndex(of: id), line.groupMembers.indices.contains(index + offset) else { return }
+        line.groupMembers.swapAt(index, index + offset); state.saveEditingProfile()
+    }
+}
+
+private struct GroupTestingCaption: View {
+    @ObservedObject var store: LineLatencyStore
+    let line: Line
+    let profileID: String
+    var body: some View {
+        if line.type == "urltest" {
+            Text("\(store.isAvailable(line, profileID: profileID) ? "自动测速" : "连接后自动测速") · \(line.groupInterval.isEmpty ? "3m" : line.groupInterval)")
+        } else { Text("已固定选择 · 测速不会切换线路") }
+    }
+}
+
+private struct GroupSelectionCaption: View {
+    @ObservedObject var store: LineLatencyStore
+    let line: Line
+    let profileID: String
+    let catalog: [Line]
+    var body: some View {
+        if line.type == "urltest", let fact = store.measurement(line, profileID: profileID),
+           let id = fact.selectedLineID, let current = catalog.first(where: { $0.id == id }) {
+            Text("\(store.isAvailable(line, profileID: profileID) ? "当前使用" : "本次优选")：\(current.name)")
+                .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                .help(store.isAvailable(line, profileID: profileID) ? "sing-box 当前出口" : "sing-box 根据本次测速得出的优选结果，尚未用于连接")
+        }
     }
 }
 
@@ -115,60 +215,65 @@ private struct LineGroupMemberSheet: View {
     @EnvironmentObject var state: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""
+    @State private var selected: Set<String> = []
     @State private var error: String?
-
     private var group: Line? { state.editingProfile.lines.first { $0.id == groupID } }
     private var candidates: [Line] {
         state.editingProfile.lines.filter {
             $0.id != groupID && !(group?.groupMembers.contains($0.id) ?? false) &&
             $0.type != "vpn" && $0.type != "tailscale" &&
-            (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) ||
-             $0.memberTypeLabel.localizedCaseInsensitiveContains(search))
+            (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.memberTypeLabel.localizedCaseInsensitiveContains(search))
         }
     }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("添加到「\(group?.name ?? "线路组")」").font(.headline)
-            TextField("搜索线路或组", text: $search).textFieldStyle(.roundedBorder)
+            HStack {
+                SettingsSearchField("搜索线路或组", text: $search)
+                LineLatencyBatchButton(store: state.lineLatencies, lines: candidates, profileID: state.editingRecord.id, control: .candidates(groupID))
+            }.buttonStyle(.borderless)
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(candidates) { member in
-                        let issue = state.editingProfile.lineGroupMemberIssue(member.id, addingTo: groupID)
-                        HStack(spacing: 10) {
-                            Image(systemName: member.isGroup ? "square.stack.3d.up" : "network")
-                                .foregroundStyle(.secondary).frame(width: 18)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(member.name).lineLimit(1)
-                                if let issue { Text(issue).font(.caption).foregroundStyle(.secondary) }
-                            }
-                            Spacer(minLength: 8)
-                            Text(member.memberTypeLabel).font(.caption).foregroundStyle(.secondary)
-                            Button {
-                                do {
-                                    try state.editingProfile.addLineGroupMember(member.id, to: groupID)
-                                    state.saveEditingProfile()
-                                    error = nil
-                                } catch { self.error = error.localizedDescription }
-                            } label: { Image(systemName: "plus.circle") }
-                                .buttonStyle(.borderless).disabled(issue != nil)
-                                .accessibilityLabel("添加成员 \(member.name)")
-                        }.padding(.vertical, 7)
+                        candidateRow(member)
                     }
-                    if candidates.isEmpty {
-                        Text(search.isEmpty ? "所有可用成员都已添加" : "没有匹配的线路或组")
-                            .foregroundStyle(.secondary).padding(.vertical, 24)
-                    }
-                }
+                    if candidates.isEmpty { Text("没有可添加的成员").foregroundStyle(.secondary).padding(.vertical, 24) }
+                }.padding(.trailing, 20)
             }.frame(height: 300)
             if let error { Text(error).font(.caption).foregroundStyle(XDialPalette.danger) }
             HStack {
-                Text("已添加 \(group?.groupMembers.count ?? 0) 个成员")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text("已选 \(selected.count) 项").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
+                Button("取消") { dismiss() }
+                Button("添加所选") { addSelected() }.keyboardShortcut(.defaultAction).disabled(selected.isEmpty)
             }
-        }.padding(20).frame(width: 460)
+        }.padding(20).frame(width: 510)
+    }
+    private func candidateRow(_ member: Line) -> some View {
+        let issue = state.editingProfile.lineGroupMemberIssue(member.id, addingTo: groupID)
+        return HStack(spacing: 10) {
+            Toggle(isOn: Binding(get: { selected.contains(member.id) }, set: { value in
+                if value { selected.insert(member.id) } else { selected.remove(member.id) }
+            })) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(member.name).lineLimit(1).font(.system(size: 12))
+                    if let issue { Text(issue).font(.system(size: 10)).foregroundStyle(.secondary) }
+                }
+            }.toggleStyle(.checkbox).disabled(issue != nil)
+            Spacer(minLength: 8)
+            Text(member.memberTypeLabel).font(.system(size: 10)).foregroundStyle(.secondary)
+            LineLatencyView(store: state.lineLatencies, line: member, profileID: state.editingRecord.id)
+        }.padding(.vertical, 7)
+    }
+    private func addSelected() {
+        do {
+            var profile = state.editingProfile
+            // Stable catalog order, independent of filtering or checkbox click order.
+            for member in profile.lines where selected.contains(member.id) {
+                try profile.addLineGroupMember(member.id, to: groupID)
+            }
+            state.editingProfile = profile; state.saveEditingProfile(); dismiss()
+        } catch { self.error = error.localizedDescription }
     }
 }
 

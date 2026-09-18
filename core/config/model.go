@@ -244,8 +244,16 @@ type TailscaleIdentity struct {
 	Hostname string `json:"hostname,omitempty"`
 }
 
+// ImportAdjustment records a bounded compatibility adaptation. Unlike an
+// unsupported rule, it does not discard a route or require a missing capability.
+type ImportAdjustment struct {
+	Code  string `json:"code"`
+	Count int    `json:"count"`
+}
+
 // Profile 完整配置
 type Profile struct {
+	ImportAdjustments []ImportAdjustment `json:"import_adjustments,omitempty"`
 	// ImportWarnings retains source rules with no equivalent in sing-box. They
 	// are shown for review, never compiled as if they were supported matches.
 	ImportWarnings   []SubscriptionRule `json:"import_warnings,omitempty"`

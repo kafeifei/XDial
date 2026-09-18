@@ -144,3 +144,32 @@ func TestGroupedProfileCompactionAndRemoteBootstrap(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSubscriptionImportNormalizesAnyTLSTFOAcrossFormats(t *testing.T) {
+	cases := map[string]string{
+		"surge": "[Proxy]\nDirect = direct\nEdge = anytls, edge.example, 443, password=fixture, skip-cert-verify=true, tfo=true, tls=true\n[Proxy Group]\nProxy = select, Edge\n[Rule]\nDOMAIN-SUFFIX,example.org,Proxy\nFINAL,Proxy",
+		"clash": "proxies:\n  - {name: Edge, type: anytls, server: edge.example, port: 443, password: fixture, tfo: true}\nproxy-groups:\n  - {name: Proxy, type: select, proxies: [Edge]}\nrules:\n  - DOMAIN-SUFFIX,example.org,Proxy\n  - MATCH,Proxy",
+		"uri":   "anytls://fixture@edge.example:443?tfo=true#Edge",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := ImportProfile(content, "auto", name, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			profile, err := config.ParseProfile([]byte(encoded))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(profile.ImportAdjustments) != 1 || profile.ImportAdjustments[0].Code != "anytls-tfo-disabled" || profile.ImportAdjustments[0].Count != 1 {
+				t.Fatal("adjustment not exposed to the import preview")
+			}
+			if name != "uri" && len(profile.RuleSets) != 1 {
+				t.Fatal("adaptation dropped routing rules")
+			}
+			if err := ValidateProfileDocument(encoded); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

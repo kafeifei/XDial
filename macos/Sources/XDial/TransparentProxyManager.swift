@@ -672,6 +672,23 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
     }
 
+    func lineLatencies(transactionID: String, probeLineID: String? = nil, groupID: String? = nil,
+                       completion: @escaping (Result<[ProviderLineLatency], Error>) -> Void) {
+        let request = ProviderDiagnosticsRequest(
+            cmd: probeLineID == nil ? .lineLatencySnapshot : .probeLineLatency,
+            transactionID: transactionID, lineID: probeLineID, groupID: groupID)
+        sendProviderDiagnostics(request, timeout: probeLineID == nil ? 5 : 12) { result in
+            completion(result.flatMap { data in
+                guard let facts = data.lineLatencies,
+                      facts.allSatisfy({ ($0.milliseconds ?? 0) >= 0 && ($0.milliseconds ?? 0) <= 65_535 }),
+                      probeLineID == nil || facts.contains(where: { $0.lineID == probeLineID }) else {
+                    return .failure(ProviderDiagnosticsHostError.payloadMismatch)
+                }
+                return .success(facts)
+            })
+        }
+    }
+
     func probeLineOutboundAddress(
         transactionID: String,
         lineID: String,

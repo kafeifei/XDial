@@ -50,6 +50,8 @@ struct ProfileDocumentCheck {
               profile.ruleSets.count == roundTrip.ruleSets.count,
               profile.scenarios.count == roundTrip.scenarios.count,
               profile.importWarnings == roundTrip.importWarnings,
+              profile.importAdjustments == copy.importAdjustments,
+              profile.importAdjustments == roundTrip.importAdjustments,
               profile.matchingResources.filter(\.noResolve).count == roundTrip.matchingResources.filter(\.noResolve).count,
               profile.matchingResources.count == copy.matchingResources.count,
               profile.matchingResources.count == roundTrip.matchingResources.count else {

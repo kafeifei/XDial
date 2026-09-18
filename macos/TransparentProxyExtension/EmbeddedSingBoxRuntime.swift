@@ -1967,6 +1967,29 @@ final class EmbeddedSingBoxRuntime {
         }
     }
 
+    func lineLatencySnapshot(session: Session) throws -> [ProviderLineLatency] {
+        guard let engine = currentEngine() else { throw RuntimeError.diagnosticsUnavailable }
+        let catalog = String(decoding: try JSONEncoder().encode(session.lineOutbounds), as: UTF8.self)
+        var failure: NSError?
+        let raw = engine.lineLatencySnapshot(catalog, error: &failure)
+        if let failure { throw failure }
+        return try JSONDecoder().decode([ProviderLineLatency].self, from: Data(raw.utf8))
+    }
+
+    func probeLineLatency(lineID: String, groupID: String?, session: Session) throws -> [ProviderLineLatency] {
+        guard let engine = currentEngine(), let tag = session.lineOutbounds[lineID] else {
+            throw RuntimeError.lineCapabilityUnavailable
+        }
+        var delay = 0
+        let groupTag: String
+        if let groupID {
+            guard let committedTag = session.lineOutbounds[groupID] else { throw RuntimeError.lineCapabilityUnavailable }
+            groupTag = committedTag
+        } else { groupTag = "" }
+        try engine.testLineLatency(tag, groupTag: groupTag, timeoutMS: 5_000, ret0_: &delay)
+        return try lineLatencySnapshot(session: session)
+    }
+
     func probeLineOutboundAddress(
         lineID: String,
         addressFamily: LineAddressFamily,

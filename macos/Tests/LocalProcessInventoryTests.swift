@@ -2,6 +2,37 @@ import Foundation
 import XCTest
 
 final class LocalProcessInventoryTests: XCTestCase {
+    func testOtherInstalledChannelsDoNotBlockHelperRegistration() {
+        for name in ["XDial.app", "XDail Debug.app", "XDial Next.app"]
+        where name != XDialBuildIdentity.applicationBundleName {
+            for executable in ["XDial", "xdial-daemon"] {
+                let entry = LocalProcessInventory.Entry(
+                    pid: 42, name: nil,
+                    executableURL: URL(fileURLWithPath:
+                        "/Applications/\(name)/Contents/MacOS/\(executable)")
+                )
+                XCTAssertEqual(entry.belongsToProductBundle(
+                    XDialBuildIdentity.applicationDestinationURL,
+                    excludingSiblingBundleURLs: XDialBuildIdentity.siblingApplicationDestinationURLs,
+                    executableNames: ["xdial", "xdial-daemon"]
+                ), false, "The installed \(name) process must not block this channel")
+            }
+        }
+    }
+
+    func testCurrentChannelProcessStillBlocksHelperRegistration() {
+        let entry = LocalProcessInventory.Entry(
+            pid: 42, name: nil,
+            executableURL: XDialBuildIdentity.applicationDestinationURL
+                .appendingPathComponent("Contents/MacOS/xdial-daemon")
+        )
+        XCTAssertEqual(entry.belongsToProductBundle(
+            XDialBuildIdentity.applicationDestinationURL,
+            excludingSiblingBundleURLs: XDialBuildIdentity.siblingApplicationDestinationURLs,
+            executableNames: ["xdial", "xdial-daemon"]
+        ), true)
+    }
+
     func testKnownSiblingPathDoesNotMatchCurrentProductBundle() {
         let siblingURL = XDialBuildIdentity.isDevelopment
             ? URL(fileURLWithPath: "/Applications/XDial.app")
@@ -32,9 +63,8 @@ final class LocalProcessInventoryTests: XCTestCase {
         XCTAssertNil(
             entry.belongsToProductBundle(
                 XDialBuildIdentity.applicationDestinationURL,
-                excludingSiblingBundleURLs: [
-                    XDialBuildIdentity.siblingApplicationDestinationURL,
-                ],
+                excludingSiblingBundleURLs:
+                    XDialBuildIdentity.siblingApplicationDestinationURLs,
                 executableNames: ["xdial", "xdial-daemon"]
             )
         )
@@ -53,9 +83,8 @@ final class LocalProcessInventoryTests: XCTestCase {
         XCTAssertEqual(
             entry.belongsToProductBundle(
                 XDialBuildIdentity.applicationDestinationURL,
-                excludingSiblingBundleURLs: [
-                    XDialBuildIdentity.siblingApplicationDestinationURL,
-                ],
+                excludingSiblingBundleURLs:
+                    XDialBuildIdentity.siblingApplicationDestinationURLs,
                 executableNames: ["xdial", "xdial-daemon"]
             ),
             false
@@ -73,9 +102,8 @@ final class LocalProcessInventoryTests: XCTestCase {
         XCTAssertNil(
             entry.belongsToProductBundle(
                 XDialBuildIdentity.applicationDestinationURL,
-                excludingSiblingBundleURLs: [
-                    XDialBuildIdentity.siblingApplicationDestinationURL,
-                ],
+                excludingSiblingBundleURLs:
+                    XDialBuildIdentity.siblingApplicationDestinationURLs,
                 executableNames: ["xdial", "xdial-daemon"]
             )
         )

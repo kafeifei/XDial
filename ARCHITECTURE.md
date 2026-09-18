@@ -25,8 +25,12 @@ XDial 对系统增加一个网络叠加层。外部已有的 Wi-Fi、网线、VP
 | Scenario | 绑定 RuleSet → Line、指定默认 Line；用户流量裁决的唯一连接点 |
 
 用户流量依赖方向为 `Scenario → {RuleSet, Line}`。只有 active Scenario 的有效依赖进入
-运行配置；未引用对象没有流量规则、活会话或网络请求。限时 Tailscale 配置会话与
-`URL RuleSet → fetch Line` 是独立资源会话，均无系统 Ingress。
+运行配置；未引用对象不因浏览或保存配置而创建流量规则、活会话或网络请求。限时 Tailscale
+配置会话、`URL RuleSet → fetch Line` 和用户显式发起的限时线路测速是独立资源会话，均无系统
+Ingress。测速只创建指定普通代理/Direct 的 sing-box 出口并执行一次 HTTPS HEAD，不创建
+TUN、系统代理、系统 DNS、默认路由或持久状态；不启动未连接的 AnyConnect/Tailscale 身份。
+批量测速最多并发 3 条，每条限时 5 秒，可取消排队；完成即关闭其独立 Box。它不选择或应用
+场景出口，也不把独立测试结果当作当前连接的原生 URLTest 选线事实。
 
 供给规则是可见、可禁用、可排序、可不用的申报，不是隐式注入。Scenario 显式绑定优先于
 订阅供给；MagicDNS 的 DNS 优先级是 [单独限定的例外](#32-tailscale-与-magicdnsd33)。
@@ -251,8 +255,14 @@ Provider 掉线或共享组件失败才提升为完整恢复。完整恢复在 R
 同通道替换要求身份与签名匹配，保留临时旧包，二次验签后清理；失败恢复旧包，下载原件保留。
 helper / 扩展失败停在对应安装步骤，幂等重试以 macOS 结构化状态为依据。
 
-Debug 与正式版的 App、嵌套组件、签名、数据、凭据、App Group、IPC 和维护标记全部独立；
-不自动迁移或清理另一通道。FormalDevelopment 保留正式身份，仅用于正式身份验证。
+Debug、Next 与正式版的 App、嵌套组件、签名、运行目录、App Group、IPC 和维护标记独立。
+支持新版格式的构建共用 `~/.xdial/configuration/profiles.enc` 和
+`com.kafeifei.xdial.configuration` 的配置库密钥。仅当共享库不存在时，只读复制历史库或
+转换旧配置为默认 Profile；原文件不修改，也不把新版修改回写旧版。现存库损坏或不可解密
+时停止加载和保存，不能回退为空配置。跨进程写入通过文件锁和读取快照校验防止覆盖。
+卸载不勾选删除数据时保留配置；明确勾选时删除共享库、已知旧配置和对应凭据，须先退出
+其他版本以防重新写回。系统组件只由各自卸载事务维护。
+FormalDevelopment 保留正式身份，仅用于正式身份验证。
 签名 profile 与 entitlement 属于对应身份，不以移除能力或借用正式身份填补 Debug 签名缺口。
 独立安装不代表两个数据面同时接管已被证明兼容。
 

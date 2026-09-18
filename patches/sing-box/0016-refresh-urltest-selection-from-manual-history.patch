@@ -1,0 +1,22 @@
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -112,6 +112,19 @@
+ func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
+ 	return s.group.URLTest(ctx)
+ }
++
++// RefreshSelection applies newly recorded measurements using the native selection
++// policy. It does not start probes or change a manually pinned selector.
++// A running native test already performs this update before releasing checking.
++func (s *URLTest) RefreshSelection() {
++	if s.group == nil || s.group.checking.Swap(true) {
++		return
++	}
++	defer s.group.checking.Store(false)
++	s.group.performUpdateCheck()
++}
++
++func (s *URLTest) TestURL() string { return s.link }
+ 
+ func (s *URLTest) CheckOutbounds() {
+ 	s.group.CheckOutbounds(true)

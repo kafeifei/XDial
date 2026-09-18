@@ -28,24 +28,8 @@ struct LineAddressView: View {
             Text(name)
                 .font(.callout)
                 .lineLimit(1)
-                .frame(width: 92, alignment: .leading)
+                .frame(width: 76, alignment: .leading)
                 .help(name)
-            if failed {
-                Button { retry(family) } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "info.circle")
-                        addressText(address.isEmpty ? text("missing") : address)
-                    }
-                    .font(.callout)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(XDialPalette.textSecondary)
-                .help(address.isEmpty ? text("retryHint") : text("updateFailed"))
-                .accessibilityLabel(name + ", " + text("retryLabel"))
-                .accessibilityHint(text("retryHint"))
-            }
             addressMenu
         }
         .frame(minHeight: 24)
@@ -65,55 +49,46 @@ struct LineAddressView: View {
                     .disabled(!isAvailable(value))
                 }
             }
+            if !address.isEmpty {
+                Divider()
+                Button(language == .zh ? "复制地址" : "Copy address") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(address, forType: .string)
+                }
+            }
+            if failed {
+                Button(text("retryLabel")) { retry(family) }
+            }
         } label: {
             HStack(spacing: 6) {
-                if !failed {
-                    if !address.isEmpty {
-                        addressText(address)
-                    }
-                    if pending {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .accessibilityLabel(text("query"))
-                    } else if address.isEmpty {
-                        Text(text("unavailable")).font(.callout)
-                    }
+                if !address.isEmpty {
+                    addressText(address)
+                } else if pending {
+                    ProgressView().controlSize(.mini).accessibilityLabel(text("query"))
+                } else {
+                    Text(text(failed ? "missing" : "unavailable")).font(.system(size: 11)).lineLimit(1)
                 }
-                Text(family == .ipv4 ? "v4" : "v6")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(XDialPalette.textSecondary)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .medium))
+                if failed { Image(systemName: "info.circle").font(.system(size: 10)) }
             }
-            .frame(maxWidth: failed ? nil : .infinity, alignment: .trailing)
+            .frame(maxWidth: .infinity, alignment: .trailing)
             .contentShape(Rectangle())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .foregroundStyle(XDialPalette.textSecondary)
-        .fixedSize(horizontal: failed, vertical: true)
+        .lineLimit(1)
         .help(address.isEmpty ? text("display") : address)
         .accessibilityLabel(name + ", " + text("display"))
         .accessibilityValue((family == .ipv4 ? "IPv4" : "IPv6") + ", " + address)
     }
 
-    /// Prefer a complete single line, then smaller type, then wrapping.
-    /// Every candidate preserves all digits, including stale observations.
+    /// Full addresses remain available in the menu and clipboard, never wrapped.
     private func addressText(_ value: String) -> some View {
-        ViewThatFits(in: .horizontal) {
-            Text(value)
-                .font(.system(.callout, design: .monospaced))
-                .fixedSize(horizontal: true, vertical: true)
-            Text(value)
-                .font(.system(size: 11, design: .monospaced))
-                .fixedSize(horizontal: true, vertical: true)
-            Text(value)
-                .font(.system(size: 11, design: .monospaced))
-                .lineLimit(nil)
-                .fixedSize(horizontal: false, vertical: true)
-                .multilineTextAlignment(.trailing)
-        }
+        Text(value)
+            .font(.system(size: 11, design: .monospaced))
+            .lineLimit(1)
+            .truncationMode(.middle)
     }
 
     private func menuLabel(_ value: LineAddressFamily) -> String {

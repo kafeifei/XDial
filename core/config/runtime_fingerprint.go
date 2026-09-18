@@ -1,9 +1,11 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
 )
 
@@ -255,6 +257,26 @@ func (builder *runtimeConfigurationBuilder) fingerprint() (string, error) {
 		RuleSets:      sortedRuntimeConfigurationRuleSets(builder.ruleSets),
 		Lines:         sortedRuntimeConfigurationLines(builder.lines),
 		Subscriptions: sortedRuntimeConfigurationSubscriptions(builder.subscriptions),
+	}
+	// RawMessage preserves the host encoder's object key order. Canonicalize
+	// native rules recursively so repeated Swift saves of the same rule do not
+	// look like unapplied edits. Keep arrays ordered and numbers lossless.
+	for i := range projection.RuleSets {
+		entry := &projection.RuleSets[i]
+		if len(entry.NativeRule) == 0 {
+			continue
+		}
+		var rule any
+		decoder := json.NewDecoder(bytes.NewReader(entry.NativeRule))
+		decoder.UseNumber()
+		if err := decoder.Decode(&rule); err != nil {
+			return "", fmt.Errorf("decode native rule for runtime fingerprint: %w", err)
+		}
+		canonical, err := json.Marshal(rule)
+		if err != nil {
+			return "", fmt.Errorf("encode native rule for runtime fingerprint: %w", err)
+		}
+		entry.NativeRule = canonical
 	}
 	if builder.usesTailscale {
 		projection.Tailscale = &runtimeConfigurationTailscale{

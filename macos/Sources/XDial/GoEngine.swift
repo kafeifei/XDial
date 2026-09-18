@@ -229,6 +229,11 @@ final class GoEngine: ObservableObject {
         )
     }
 
+    func lineLatencies(transactionID: String, probeLineID: String? = nil, groupID: String? = nil,
+                       completion: @escaping (Result<[ProviderLineLatency], Error>) -> Void) {
+        transparentProxy.lineLatencies(transactionID: transactionID, probeLineID: probeLineID, groupID: groupID, completion: completion)
+    }
+
     func probeLineOutboundAddress(
         transactionID: String,
         lineID: String,

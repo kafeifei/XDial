@@ -32,25 +32,28 @@ type documentScenario struct {
 	Route             documentRoute       `json:"route"`
 }
 type documentObject struct {
-	NoResolve    bool               `json:"no_resolve,omitempty"`
-	Kind         RuleSetType        `json:"kind,omitempty"`
-	Domains      []string           `json:"domains,omitempty"`
-	CIDRs        []string           `json:"cidrs,omitempty"`
-	Name         string             `json:"name"`
-	Disabled     bool               `json:"disabled,omitempty"`
-	Invert       bool               `json:"invert,omitempty"`
-	Applications []ApplicationMatch `json:"applications,omitempty"`
-	Processes    []string           `json:"processes,omitempty"`
+	GroupURL      string             `json:"group_url,omitempty"`
+	GroupInterval string             `json:"group_interval,omitempty"`
+	NoResolve     bool               `json:"no_resolve,omitempty"`
+	Kind          RuleSetType        `json:"kind,omitempty"`
+	Domains       []string           `json:"domains,omitempty"`
+	CIDRs         []string           `json:"cidrs,omitempty"`
+	Name          string             `json:"name"`
+	Disabled      bool               `json:"disabled,omitempty"`
+	Invert        bool               `json:"invert,omitempty"`
+	Applications  []ApplicationMatch `json:"applications,omitempty"`
+	Processes     []string           `json:"processes,omitempty"`
 }
 type documentMetadata struct {
-	RuleGroups     []documentRuleGroup       `json:"rule_groups,omitempty"`
-	ImportWarnings []SubscriptionRule        `json:"import_warnings,omitempty"`
-	RequiresInput  bool                      `json:"requires_input,omitempty"`
-	SchemaVersion  int                       `json:"schema_version"`
-	Lines          map[string]documentObject `json:"lines,omitempty"`
-	Rules          map[string]documentObject `json:"rules,omitempty"`
-	AdapterLines   []Line                    `json:"adapter_lines,omitempty"`
-	Scenarios      []documentScenario        `json:"scenarios"`
+	ImportAdjustments []ImportAdjustment        `json:"import_adjustments,omitempty"`
+	RuleGroups        []documentRuleGroup       `json:"rule_groups,omitempty"`
+	ImportWarnings    []SubscriptionRule        `json:"import_warnings,omitempty"`
+	RequiresInput     bool                      `json:"requires_input,omitempty"`
+	SchemaVersion     int                       `json:"schema_version"`
+	Lines             map[string]documentObject `json:"lines,omitempty"`
+	Rules             map[string]documentObject `json:"rules,omitempty"`
+	AdapterLines      []Line                    `json:"adapter_lines,omitempty"`
+	Scenarios         []documentScenario        `json:"scenarios"`
 }
 
 // Matching resources remain native route.rule_set entries. This metadata only
@@ -128,7 +131,7 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 	if document.XDial.SchemaVersion != 0 && document.XDial.SchemaVersion != 1 {
 		return nil, fmt.Errorf("unsupported XDial schema version")
 	}
-	profile := &Profile{ImportWarnings: document.XDial.ImportWarnings, ID: namespace, Lines: []Line{{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true}}}
+	profile := &Profile{ImportAdjustments: document.XDial.ImportAdjustments, ImportWarnings: document.XDial.ImportWarnings, ID: namespace, Lines: []Line{{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true}}}
 	tags := map[string]string{"direct": "direct"}
 	seen := map[string]bool{}
 	for _, raw := range document.Outbounds {
@@ -168,6 +171,9 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 		if metadata, ok := document.XDial.Lines[header.Tag]; ok {
 			line.Name = metadata.Name
 			line.Enabled = !metadata.Disabled
+			if line.Type == LineTypeSelector {
+				line.GroupURL, line.GroupInterval = metadata.GroupURL, metadata.GroupInterval
+			}
 		}
 		if line.Type == LineTypeDirect {
 			profile.Lines[0] = *line
@@ -546,12 +552,15 @@ func ExportProfileDocument(profile *Profile) ([]byte, error) {
 	if err := validateDocumentProfile(profile); err != nil {
 		return nil, err
 	}
-	document := ProfileDocument{XDial: documentMetadata{ImportWarnings: profile.ImportWarnings, SchemaVersion: 1, Lines: map[string]documentObject{}, Rules: map[string]documentObject{}}}
+	document := ProfileDocument{XDial: documentMetadata{ImportAdjustments: profile.ImportAdjustments, ImportWarnings: profile.ImportWarnings, SchemaVersion: 1, Lines: map[string]documentObject{}, Rules: map[string]documentObject{}}}
 	if len(profile.Subscriptions) > 0 {
 		return nil, fmt.Errorf("legacy nested subscriptions must be migrated before export")
 	}
 	for _, line := range profile.Lines {
 		metadata := documentObject{Name: line.Name, Disabled: !line.Enabled}
+		if line.Type == LineTypeSelector {
+			metadata.GroupURL, metadata.GroupInterval = line.GroupURL, line.GroupInterval
+		}
 		document.XDial.Lines[line.ID] = metadata
 		var outbound map[string]interface{}
 		if line.Type == LineTypeDirect {

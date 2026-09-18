@@ -11,7 +11,7 @@ if CommandLine.arguments.contains("--import-xdial-debug") ||
         guard checkOnly || NSRunningApplication.runningApplications(
             withBundleIdentifier: XDialBuildIdentity.applicationIdentifier
         ).filter({ $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }).isEmpty else {
-            throw ProfileLibraryError.invalid("Next 正在运行，请使用配置菜单导入，或关闭 Next 后执行；XDail Debug 可以继续运行")
+            throw ProfileLibraryError.invalid("Next 正在运行，请关闭 Next 后再执行诊断导入；XDail Debug 可以继续运行")
         }
         let id = UUID().uuidString.lowercased()
         let profile = try ProfileDocumentService.importExistingDebug(id: id)

@@ -68,9 +68,13 @@ enum ProfileDocumentService {
 
     static func importExistingDebug(id: String) throws -> Profile {
         let original = try ExistingXDialProfileReader.readDebug()
+        return try convertLegacyProfile(original, id: id)
+    }
+
+    static func convertLegacyProfile(_ original: Profile, id: String) throws -> Profile {
         var imported = try copy(original, id: id)
         if imported.lines.contains(where: { $0.type == "tailscale" }) {
-            imported.tailscale.hostname = "xdial-next-" + String(id.prefix(8))
+            imported.tailscale.hostname = "xdial-" + String(id.prefix(8))
         }
         try validate(imported)
         return imported

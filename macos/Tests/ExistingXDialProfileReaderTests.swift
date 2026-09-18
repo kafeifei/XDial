@@ -2,6 +2,18 @@ import Foundation
 import XCTest
 
 final class ExistingXDialProfileReaderTests: XCTestCase {
+    func testConvertsOldFieldNamesWithoutLosingReferences() throws {
+        let data = Data(#"{"exits":[{"id":"direct","name":"Direct","type":"direct"}],"rules":[{"id":"rule","name":"Rule","type":"manual","domains":["example.com"]}],"strategies":[{"id":"scene","name":"Scene","bindings":[{"rule_id":"rule","exit_id":"direct"}],"default_exit_id":"direct"}],"active_strategy_id":"scene"}"#.utf8)
+        let profile = try ExistingXDialProfileReader.restore(profileData: data, vaultData: nil)
+        XCTAssertEqual(profile.activeScenarioID, "scene")
+        XCTAssertEqual(profile.scenarios[0].defaultLineID, "direct")
+        XCTAssertEqual(profile.scenarios[0].bindings[0].ruleSetID, "rule")
+        XCTAssertEqual(profile.scenarios[0].bindings[0].lineID, "direct")
+        XCTAssertEqual(profile.ruleSets[0].domains, ["example.com"])
+        let malformed = Data(String(decoding: data, as: UTF8.self).replacingOccurrences(of: "\"exits\":[{", with: "\"exits\":[12,{").utf8)
+        XCTAssertThrowsError(try ExistingXDialProfileReader.restore(profileData: malformed, vaultData: nil))
+    }
+
     func testCopiesCredentialsWithoutChangingSourceFilesOrCreatingRuntimeState() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }

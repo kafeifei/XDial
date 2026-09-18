@@ -291,6 +291,34 @@ func TestRuntimeConfigurationFingerprintContractIsOpaqueAndDeterministic(t *test
 	}
 }
 
+func TestRuntimeConfigurationFingerprintIgnoresNativeRuleObjectOrder(t *testing.T) {
+	profile := invBaseProfile()
+	profile.RuleSets = []RuleSet{{
+		ID: "native", Type: RuleSetTypeNative, Enabled: true,
+		NativeRule: json.RawMessage(`{"type":"logical","mode":"or","rules":[{"domain_suffix":["example.com"],"domain":["host.example.com"]},{"ip_cidr":["192.0.2.0/24"],"invert":true}]}`),
+	}}
+	profile.Scenarios[0].Bindings = []RuleBinding{{RuleSetID: "native", LineID: builtinDirectLineID}}
+	baseline := runtimeFingerprintForTest(t, profile)
+
+	// Swift JSONEncoder can reorder dictionary keys on each save, including
+	// objects nested inside logical rules. Neither that nor escaping is an edit.
+	profile.RuleSets[0].NativeRule = json.RawMessage(`{
+		"rules": [{"domain":["host.example.com"],"domain_suffix":["example\u002ecom"]},
+		          {"invert":true,"ip_cidr":["192.0.2.0\/24"]}],
+		"mode":"or", "type":"logical"
+	}`)
+	if got := runtimeFingerprintForTest(t, profile); got != baseline {
+		t.Fatalf("equivalent native rules have different fingerprints: %s != %s", got, baseline)
+	}
+
+	profile.RuleSets[0].NativeRule = json.RawMessage(strings.Replace(
+		string(profile.RuleSets[0].NativeRule), "192.0.2.0", "198.51.100.0", 1,
+	))
+	if got := runtimeFingerprintForTest(t, profile); got == baseline {
+		t.Fatal("changing a native match must still mark the runtime configuration dirty")
+	}
+}
+
 func runtimeFingerprintTestProfile() *Profile {
 	profile := invBaseProfile()
 	profile.Lines = append(

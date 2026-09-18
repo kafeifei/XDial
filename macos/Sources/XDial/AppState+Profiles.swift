@@ -58,9 +58,11 @@ extension AppState {
 
     func loadProfileLibrary() {
         do {
-            let existing = try profileLibraryStore.load()
-            let loaded = existing ?? ProfileLibrary()
-            if existing == nil { try profileLibraryStore.save(loaded) }
+            let loaded = try profileLibraryStore.loadOrCreate {
+                try ProfileLibraryMigration.initialLibrary {
+                    try ProfileDocumentService.convertLegacyProfile($0, id: $1)
+                }
+            }
             profileLibrary = loaded
             profile = loaded.profiles.first { $0.id == loaded.activeProfileID }!.profile
             browsedProfileID = loaded.activeProfileID
@@ -81,31 +83,37 @@ extension AppState {
         return true
     }
 
-    func renameEditingProfile(_ name: String) {
+    @discardableResult
+    func updateProfileMetadata(_ id: String, name: String, source: ProfileSource?) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let index = profileLibrary.profiles.firstIndex(where: { $0.id == editingRecord.id }) else { return }
+        guard !trimmed.isEmpty, let index = profileLibrary.profiles.firstIndex(where: { $0.id == id }) else { return false }
+        let original = profileLibrary
         profileLibrary.profiles[index].name = trimmed
-        persistProfileLibrary()
+        profileLibrary.profiles[index].source = source
+        guard persistProfileLibrary() else { profileLibrary = original; return false }
+        return true
     }
 
-    var canDeleteEditingProfile: Bool {
+    func canDeleteProfile(_ id: String) -> Bool {
+        profileLibrary.profiles.contains(where: { $0.id == id }) &&
         profileLibrary.profiles.count > 1 &&
-        !(editingActiveProfile && engine.status != "disconnected") &&
+        !(id == profileLibrary.activeProfileID && engine.status != "disconnected") &&
         !hasPendingScenarioSwitch
     }
 
-    func deleteEditingProfile() {
-        guard canDeleteEditingProfile else { return }
+    @discardableResult
+    func deleteProfile(_ id: String) -> Bool {
+        guard canDeleteProfile(id) else { return false }
         let original = profileLibrary
-        let id = editingRecord.id
         profileLibrary.profiles.removeAll { $0.id == id }
         let fallback = profileLibrary.profiles[0]
-        profileLibrary.editingProfileID = fallback.id
+        if profileLibrary.editingProfileID == id { profileLibrary.editingProfileID = fallback.id }
         if profileLibrary.activeProfileID == id { profileLibrary.activeProfileID = fallback.id }
-        guard persistProfileLibrary() else { profileLibrary = original; return }
+        guard persistProfileLibrary() else { profileLibrary = original; return false }
         if original.activeProfileID == id { profile = fallback.profile }
         if browsedProfileID == id { browsedProfileID = fallback.id }
         editorPositions.removeValue(forKey: id)
+        return true
     }
 
     func copyEditingScenario(_ id: String) {

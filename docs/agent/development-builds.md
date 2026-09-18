@@ -13,14 +13,16 @@
 | 安装路径 | `/Applications/XDail Debug.app` | `/Applications/XDial.app` |
 | Host | `com.kafeifei.xdial.debug` | `com.kafeifei.xdial.app` |
 | Settings UI / Extension / Helper / Daemon | Host 加 `.settings-ui` / `.transparent-proxy` / `.helper` / `.daemon` | 同左 |
-| 偏好与钥匙串 service | `com.kafeifei.xdial.debug` | `com.kafeifei.xdial` |
-| 用户配置 | `~/.xdial-debug` | `~/.xdial` |
+| 通道偏好域 | `com.kafeifei.xdial.debug` | `com.kafeifei.xdial` |
+| 通道运行目录 | `~/.xdial-debug` | `~/.xdial` |
+| 新版共享配置 / 密钥 service | `~/.xdial/configuration/profiles.enc` / `com.kafeifei.xdial.configuration` | 同左 |
 | helper 状态目录 | `/Library/Application Support/XDial Debug` | `/Library/Application Support/XDial` |
 | App Group | `UVZM439VGU.com.kafeifei.xdial.debug.network` | `UVZM439VGU.com.kafeifei.xdial.network` |
 | helper socket | `/tmp/xdial-debug.sock` | `/tmp/xdial.sock` |
 | 诊断 HTTP | `127.0.0.1:19877` | 当前构建不包含；旧正式身份 Debug 可能使用 `19876` |
 
-Debug 使用独立配置，不迁移、导入或清理正式数据，也不消费正式更新包。身份定义在
+新版 Profile 库跨通道共享，首次转换和显式删除数据的边界见 [Next 配置说明](profile-next.md)。
+系统组件及运行目录仍独立，Debug 不消费正式更新包。身份定义在
 [XDialBuildIdentity.swift](../../macos/Shared/XDialBuildIdentity.swift)；通道隔离合同见
 [ARCHITECTURE.md](../../ARCHITECTURE.md)。独立安装不表示两个数据面同时接管已经过验证。
 

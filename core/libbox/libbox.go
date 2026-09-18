@@ -25,7 +25,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -432,21 +431,21 @@ func (l *Libbox) SelectOutbound(groupTag, outboundTag string) error {
 	return nil
 }
 
-// TestOutbound performs one bounded HTTPS HEAD request through a specific
+// TestOutbound performs one bounded HTTP(S) HEAD request through a specific
 // running outbound and returns round-trip milliseconds.
 func (l *Libbox) TestOutbound(outboundTag, testURL string, timeoutMS int) (int, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if !l.running || l.box == nil || l.runtimeCtx == nil ||
 		l.switchCommitInProgress {
+		l.mu.Unlock()
 		return 0, fmt.Errorf("connection is not running")
 	}
 	if testURL == "" {
 		testURL = "https://www.gstatic.com/generate_204"
 	}
-	parsed, err := url.Parse(testURL)
-	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Hostname() == "" || parsed.User != nil {
-		return 0, fmt.Errorf("test address must be HTTPS")
+	if !validLatencyTestURL(testURL) {
+		l.mu.Unlock()
+		return 0, fmt.Errorf("test address must be HTTP or HTTPS")
 	}
 	if timeoutMS < 500 {
 		timeoutMS = 500
@@ -456,11 +455,48 @@ func (l *Libbox) TestOutbound(outboundTag, testURL string, timeoutMS int) (int, 
 	}
 	outbound, loaded := l.box.Outbound().Outbound(outboundTag)
 	if !loaded {
+		l.mu.Unlock()
 		return 0, fmt.Errorf("test outbound is unavailable")
 	}
 	ctx, cancel := context.WithTimeout(l.runtimeCtx, time.Duration(timeoutMS)*time.Millisecond)
+	generation := l.boxGeneration
+	history := service.PtrFromContext[urltest.HistoryStorage](l.runtimeCtx)
+	realTag := outbound.Tag()
+	seen := map[string]bool{}
+	for depth := 0; depth < 32; depth++ {
+		selected, ok := outbound.(adapter.OutboundGroup)
+		if !ok || seen[outbound.Tag()] {
+			break
+		}
+		seen[outbound.Tag()] = true
+		next, exists := l.box.Outbound().Outbound(selected.Now())
+		if !exists {
+			break
+		}
+		outbound = next
+		realTag = outbound.Tag()
+	}
+	l.runtimeUsers.Add(1)
+	l.mu.Unlock()
+	defer l.runtimeUsers.Done()
 	defer cancel()
 	delay, err := urltest.URLTest(ctx, testURL, outbound)
+	if !l.probeGenerationIsCurrent(generation) {
+		return 0, fmt.Errorf("connection changed during outbound test")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.running || l.boxGeneration != generation || l.switchCommitInProgress {
+		return 0, fmt.Errorf("connection changed during outbound test")
+	}
+	if history != nil {
+		if err != nil {
+			history.DeleteURLTestHistory(realTag)
+		} else {
+			history.StoreURLTestHistory(realTag, &adapter.URLTestHistory{Time: time.Now(), Delay: delay})
+		}
+		refreshNativeGroupSelections(l.box)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("outbound test failed")
 	}

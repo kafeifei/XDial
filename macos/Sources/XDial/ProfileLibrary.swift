@@ -35,17 +35,22 @@ struct ProfileRecord: Codable, Identifiable, Hashable {
             throw ProfileLibraryError.invalid("订阅新增了无法执行的规则，已保留原配置；请重新导入并查看兼容提示")
         }
         var merged = incoming
-        // Selector choice belongs to the user even when membership comes from a source.
-        for index in merged.lines.indices where merged.lines[index].type == "selector" {
-            guard let current = profile.lines.first(where: { $0.id == merged.lines[index].id }),
-                  let previous = old.lines.first(where: { $0.id == current.id }),
-                  current.groupDefault != previous.groupDefault else { continue }
-            guard current.groupDefault.isEmpty || merged.lines[index].groupMembers.contains(current.groupDefault) else {
-                throw ProfileLibraryError.invalid("订阅更新移除了所选线路，已保留原配置")
-            }
-            merged.lines[index].groupDefault = current.groupDefault
-        }
         merged.lines += profile.lines.filter { item in !old.lines.contains { $0.id == item.id } }
+        // Membership belongs to the subscription; selection and probe preferences belong to the user.
+        for item in incoming.lines where item.isGroup {
+            guard let current = profile.lines.first(where: { $0.id == item.id && $0.isGroup }),
+                  let previous = old.lines.first(where: { $0.id == item.id }),
+                  let index = merged.lines.firstIndex(where: { $0.id == item.id }) else { continue }
+            if current.groupURL != previous.groupURL { merged.lines[index].groupURL = current.groupURL }
+            if current.groupInterval != previous.groupInterval { merged.lines[index].groupInterval = current.groupInterval }
+            guard current.type != previous.type || current.groupDefault != previous.groupDefault else { continue }
+            let member = current.type == "urltest" ? nil : (current.groupDefault.isEmpty ? current.groupMembers.first : current.groupDefault)
+            if current.type == "selector" && member == nil {
+                throw ProfileLibraryError.invalid("订阅更新无法保留空组的选线，已保留原配置")
+            }
+            do { try merged.selectLineGroupMember(member, in: item.id) }
+            catch { throw ProfileLibraryError.invalid("订阅更新无法保留所选线路：" + error.localizedDescription) }
+        }
         merged.ruleSets += profile.ruleSets.filter { item in !old.ruleSets.contains { $0.id == item.id } }
         merged.scenarios += profile.scenarios.filter { item in !old.scenarios.contains { $0.id == item.id } }
         // Business selector choices now live in Scenario bindings. Refresh the
@@ -113,7 +118,7 @@ struct ProfileLibrary: Codable, Hashable {
     var editingProfileID: String
 
     init() {
-        let record = ProfileRecord.empty(named: "我的配置")
+        let record = ProfileRecord.empty(named: "默认配置")
         profiles = [record]
         activeProfileID = record.id
         editingProfileID = record.id
@@ -139,7 +144,7 @@ enum ProfileLibraryError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case let .invalid(message): return message
-        case let .keychain(status): return "无法访问 XDial Next 钥匙串（\(status)），配置尚未保存"
+        case let .keychain(status): return "无法访问配置钥匙串（\(status)），配置尚未保存"
         }
     }
 }

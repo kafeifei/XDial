@@ -6,6 +6,7 @@ struct LineTargetPicker: View {
     @ObservedObject var state: AppState
     @Binding var selection: String
     var label: String = "选择出口"
+    var allowsSubscriptions = true
     @State private var presented = false
     @State private var query = ""
 
@@ -20,6 +21,9 @@ struct LineTargetPicker: View {
         Button { query = ""; presented = true } label: {
             HStack(spacing: 6) {
                 Text(selectedName).lineLimit(1).truncationMode(.middle)
+                if let line = state.editingProfile.lines.first(where: { "port:\($0.id)" == selection }) {
+                    LineLatencyView(store: state.lineLatencies, line: line, profileID: state.editingRecord.id, allowsTesting: false)
+                }
                 Spacer(minLength: 4)
                 Image(systemName: "chevron.up.chevron.down").font(.system(size: 9))
             }.frame(maxWidth: .infinity)
@@ -28,18 +32,17 @@ struct LineTargetPicker: View {
         .accessibilityLabel(label).accessibilityValue(selectedName)
         .popover(isPresented: $presented) {
             VStack(spacing: 8) {
-                TextField(state.tr("搜索线路或组", "Search lines or groups"), text: $query)
-                    .textFieldStyle(.roundedBorder)
+                SettingsSearchField(state.tr("搜索线路或组", "Search lines or groups"), text: $query)
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 3) {
                         choices(groups: true)
                         choices(groups: false)
-                        ForEach(state.editingProfile.subscriptions.filter { $0.enabled && (query.isEmpty || $0.name.localizedCaseInsensitiveContains(query)) }) { sub in
+                        ForEach(state.editingProfile.subscriptions.filter { allowsSubscriptions && $0.enabled && (query.isEmpty || $0.name.localizedCaseInsensitiveContains(query)) }) { sub in
                             choice(name: sub.name, detail: state.tr("订阅", "Subscription"), target: "sub:\(sub.id)")
                         }
                     }
                 }.frame(height: 310)
-            }.padding(12).frame(width: 310)
+            }.padding(12).frame(width: 390)
         }
     }
 
@@ -52,7 +55,10 @@ struct LineTargetPicker: View {
             Text(groups ? state.tr("线路组", "Line Groups") : state.tr("线路", "Lines"))
                 .font(.caption).foregroundStyle(.secondary).padding(.top, 5)
             ForEach(lines) { line in
-                choice(name: line.name, detail: line.memberTypeLabel, target: "port:\(line.id)")
+                HStack(spacing: 4) {
+                    choice(name: line.name, detail: line.memberTypeLabel, target: "port:\(line.id)")
+                    LineLatencyView(store: state.lineLatencies, line: line, profileID: state.editingRecord.id)
+                }
             }
         }
     }

@@ -11,6 +11,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	boxservice "github.com/sagernet/sing-box/adapter/service"
+	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport"
 	"github.com/sagernet/sing-box/dns/transport/hosts"
@@ -23,6 +24,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/trojan"
 	"github.com/sagernet/sing-box/protocol/tun"
 	"github.com/sagernet/sing-box/protocol/vmess"
+	"github.com/sagernet/sing/service"
 )
 
 // boxContext 构造一个只注册 XDial 实际用到的协议的精简 sing-box 上下文。
@@ -31,6 +33,9 @@ import (
 // 是因为 tvOS NetworkExtension 进程内存预算极紧(iOS 17 起仅 15MB 量级),
 // 多余的协议注册会直接挤占内存预算。
 func boxContext(ctx context.Context) context.Context {
+	// Each Box generation owns its native measurements; candidates never reuse
+	// the active generation's history or influence its automatic selection.
+	ctx = service.ContextWithPtr(service.ExtendContext(ctx), urltest.NewHistoryStorage())
 	endpointRegistry := endpoint.NewRegistry()
 	registerTailscaleEndpoint(endpointRegistry)
 	return box.Context(

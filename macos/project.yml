@@ -351,6 +351,9 @@ targets:
       - Sources/XDial/DebugStateRedactor.swift
       - Sources/XDial/Models.swift
       - Sources/XDial/ExistingXDialProfileReader.swift
+      - Sources/XDial/ConfigurationStorage.swift
+      - Sources/XDial/ConfigurationDataDeletion.swift
+      - Sources/XDial/ProfileLibraryMigration.swift
       - Sources/XDial/ProfileVaultProjection.swift
       - Sources/XDial/ProfileLibrary.swift
       - Sources/XDial/ProfileLibraryStore.swift
@@ -360,6 +363,7 @@ targets:
       - Sources/XDial/MenuBarRecoveryController.swift
       - Sources/XDial/MenuBarTrackingRepair.swift
       - Sources/XDial/NetworkInfo.swift
+      - Sources/XDial/LineLatencyStore.swift
       - Sources/XDial/RotaryDial.swift
       - Sources/XDial/ScenarioIconCatalog.swift
       - Sources/XDial/ScenarioGridLayout.swift

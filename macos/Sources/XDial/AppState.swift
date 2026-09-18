@@ -21,6 +21,8 @@ final class AppState: ObservableObject {
     @Published private(set) var scenarioSwitchTargetProfileID: String?
     let profileLibraryStore = ProfileLibraryStore()
     private var profileRefreshTimer: AnyCancellable?
+    let lineLatencies = LineLatencyStore()
+    private var lineLatencyTimer: AnyCancellable?
     var profileLibraryLoaded = false
     @Published private(set) var currentSSID: String?
     @Published private(set) var wifiSSIDAccessState:
@@ -484,56 +486,9 @@ final class AppState: ObservableObject {
         return profile.subscriptions.filter { ids.contains($0.id) && $0.enabled }
     }
 
-    /// macOS Packet Tunnel 试验版启用了 App Sandbox，配置因此落在容器目录。
-    /// 桌面端回到 root helper 后，进程重新使用正常用户目录；这里做一次有界迁移，
-    /// 只搬 XDial 自己的 profile/语言/登录项开关，不触碰任何系统网络配置。
-    private static func importSandboxPreferencesIfNeeded() {
-        guard XDialBuildIdentity.allowsFormalDataMigration else { return }
-        let marker = "xdial.migratedFromSandboxProfileV1"
-        let defaults = xdialDefaults
-        guard !defaults.bool(forKey: marker) else { return }
-
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let source = home.appendingPathComponent(
-            "Library/Containers/"
-                + XDialBuildIdentity.legacyApplicationIdentifier
-                + "/Data/Library/Preferences/"
-                + XDialBuildIdentity.formalDataIdentifier + ".plist"
-        )
-        guard let values = NSDictionary(contentsOf: source),
-              let profileData = values["xdial.profile"] as? Data else { return }
-
-        let destination = home.appendingPathComponent(
-            "Library/Preferences/"
-                + XDialBuildIdentity.formalDataIdentifier + ".plist"
-        )
-        let sourceValues = try? source.resourceValues(forKeys: [.contentModificationDateKey])
-        let destinationValues = try? destination.resourceValues(
-            forKeys: [.contentModificationDateKey]
-        )
-        let sourceDate = sourceValues?.contentModificationDate ?? .distantPast
-        let destinationDate = destinationValues?.contentModificationDate ?? .distantPast
-
-        // 已经在非沙盒版本里改过更新配置时，不用更旧的试验版快照覆盖它。
-        if defaults.data(forKey: "xdial.profile") == nil || sourceDate > destinationDate {
-            defaults.set(profileData, forKey: "xdial.profile")
-            if let language = values["xdial.language"] as? String {
-                defaults.set(language, forKey: "xdial.language")
-            }
-            if let launchAtLogin = values["xdial.launchAtLogin"] as? Bool {
-                defaults.set(launchAtLogin, forKey: "xdial.launchAtLogin")
-            }
-            KeychainStore.importSandboxVaultIfNeeded()
-            appLog("migrated Packet Tunnel sandbox profile into desktop helper app")
-        }
-        defaults.set(true, forKey: marker)
-    }
-
     init() {
         // 先用 bootstrap 初始化，loadSaved 后会被覆盖
         self.profile = Profile.bootstrap()
-
-        Self.importSandboxPreferencesIfNeeded()
 
         // 语言：先读已保存，没有则用系统语言
         if let savedLang = xdialDefaults.string(forKey: "xdial.language"),
@@ -619,6 +574,7 @@ final class AppState: ObservableObject {
                         status: status,
                         report: report
                     )
+                    self.synchronizeLineLatencies()
                     self.synchronizeAppliedConfiguration(
                         status: status,
                         report: report
@@ -632,6 +588,18 @@ final class AppState: ObservableObject {
             }
             .store(in: &engineSubs)
         loadSaved()
+        lineLatencies.standaloneRequest = { line, url in try await StandaloneLineLatencyService.probe(line, testURL: url) }
+        lineLatencies.groupSelectionRequest = { lines, facts in try await StandaloneLineLatencyService.evaluateGroups(lines, facts: facts) }
+        lineLatencies.updateCatalogs(profileLibrary.profiles)
+        $profileLibrary.sink { [weak self] library in
+            self?.lineLatencies.updateCatalogs(library.profiles)
+        }.store(in: &engineSubs)
+        lineLatencies.request = { [weak self] tx, id, groupID, completion in
+            guard let self else { completion(.failure(CocoaError(.userCancelled))); return }
+            self.engine.lineLatencies(transactionID: tx, probeLineID: id, groupID: groupID, completion: completion)
+        }
+        lineLatencyTimer = Timer.publish(every: 5, on: .main, in: .common)
+            .autoconnect().sink { [weak self] _ in self?.synchronizeLineLatencies() }
         profileRefreshTimer = Timer.publish(every: 60, on: .main, in: .common)
             .autoconnect().sink { [weak self] _ in self?.refreshDueProfiles() }
         updateRelaunchDecision =
@@ -703,6 +671,30 @@ final class AppState: ObservableObject {
     #if DEBUG
     private static let debugServer = DebugServer()
     #endif
+
+    private func synchronizeLineLatencies() {
+        defer {
+            if !engine.isBusy, let scenario = activeScenario {
+                lineLatencies.ensureScenarioMeasurements(scenario, profileID: profileLibrary.activeProfileID)
+            }
+        }
+        guard let runtime = ConnectionReportRuntimeFacts.committedLines(status: engine.status, report: engine.connectionReport) else {
+            lineLatencies.bind(transactionID: nil)
+            return
+        }
+        if lineLatencies.transactionID != runtime.transactionID {
+            // On adoption, never attribute old runtime measurements to unapplied edits.
+            guard let report = engine.connectionReport,
+                  runtimeConfigurationSignature() == .valid(report.configurationFingerprint) else {
+                lineLatencies.bind(transactionID: nil)
+                return
+            }
+            lineLatencies.bind(transactionID: runtime.transactionID,
+                               profileID: profileLibrary.activeProfileID,
+                               lines: profile.lines.filter { runtime.lineIDs.contains($0.id) })
+        }
+        lineLatencies.refresh()
+    }
 
     private let lineObservationQueue = LineObservationQueue()
     private var lineObservationTransactionID: String?
@@ -1246,6 +1238,12 @@ final class AppState: ObservableObject {
     }
 
     func uninstall(deleteData: Bool, completion: @escaping (Bool, String?) -> Void) {
+        do {
+            if deleteData { try ConfigurationDataDeletion.validateExclusiveAccess() }
+        } catch {
+            completion(false, error.localizedDescription)
+            return
+        }
         connectionDesired.userRequestedDisconnection()
         connectionAttempts.cancel()
         launchAutoConnectPending = false
@@ -2686,51 +2684,6 @@ final class AppState: ObservableObject {
             }
         }
         return m
-    }
-
-    /// 把旧格式 profile (v0.2: exits/rules/strategies) 迁移到新格式 (lines/rule_sets/scenarios)
-    static func migrate(oldProfile: [String: Any]) -> Profile? {
-        var p = Profile()
-        // 旧版本的 v0.2 里是 exits/rules/strategies
-        if let oldExits = oldProfile["exits"] as? [[String: Any]] {
-            p.lines = oldExits.compactMap { dict -> Line? in
-                guard let data = try? JSONSerialization.data(withJSONObject: dict),
-                      let line = try? JSONDecoder().decode(Line.self, from: data) else { return nil }
-                return line
-            }
-        }
-        if let oldRules = oldProfile["rules"] as? [[String: Any]] {
-            p.ruleSets = oldRules.compactMap { dict -> RuleSet? in
-                guard let data = try? JSONSerialization.data(withJSONObject: dict),
-                      let c = try? JSONDecoder().decode(RuleSet.self, from: data) else { return nil }
-                return c
-            }
-        }
-        if let oldStrategies = oldProfile["strategies"] as? [[String: Any]] {
-            p.scenarios = oldStrategies.compactMap { dict -> Scenario? in
-                // 旧 strategy.bindings 用 rule_id/exit_id；旧 default_exit_id
-                var fixed = dict
-                if let oldBindings = dict["bindings"] as? [[String: Any]] {
-                    fixed["bindings"] = oldBindings.map { b -> [String: Any] in
-                        var nb = b
-                        if let r = b["rule_id"] { nb["rule_set_id"] = r; nb.removeValue(forKey: "rule_id") }
-                        if let e = b["exit_id"] { nb["line_id"] = e; nb.removeValue(forKey: "exit_id") }
-                        return nb
-                    }
-                }
-                if let de = dict["default_exit_id"] {
-                    fixed["default_line_id"] = de
-                    fixed.removeValue(forKey: "default_exit_id")
-                }
-                guard let data = try? JSONSerialization.data(withJSONObject: fixed),
-                      let c = try? JSONDecoder().decode(Scenario.self, from: data) else { return nil }
-                return c
-            }
-        }
-        if let active = oldProfile["active_strategy_id"] as? String {
-            p.activeScenarioID = active
-        }
-        return p.lines.isEmpty && p.ruleSets.isEmpty && p.scenarios.isEmpty ? nil : p
     }
 
     func checkHelper() {

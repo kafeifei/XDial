@@ -174,26 +174,12 @@ private func reorder<Item>(
 struct SettingsView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.openWindow) private var openWindow
+    @State private var hoveredTab: Int?
+    @State private var hoveringGeneral = false
     private var tab: Int { state.editorPosition.tab }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                ProfileNavigation()
-            }
-            .padding(.horizontal, 16).frame(height: 48)
-            .background(titleAccent.opacity(0.07))
-
-            HStack(spacing: 4) {
-                settingsTab(0, title: state.tr("线路", "Lines"), symbol: "point.3.connected.trianglepath.dotted")
-                settingsTab(3, title: state.tr("线路组", "Line Groups"), symbol: "square.stack.3d.up")
-                settingsTab(1, title: state.tr("规则", "Rules"), symbol: "list.bullet.rectangle")
-                settingsTab(2, title: state.tr("场景", "Scenarios"), symbol: "square.grid.2x2")
-                Spacer(minLength: 8)
-                Text(state.editingRecord.source == nil ? state.tr("本地配置", "Local") : state.tr("订阅配置", "Subscription"))
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 16).padding(.vertical, 8)
             if let error = state.profilePersistenceError ?? state.profileOperationError {
                 Text(error).font(.caption).foregroundStyle(XDialPalette.danger)
                     .textSelection(.enabled).padding(12)
@@ -211,61 +197,99 @@ struct SettingsView: View {
         }
         .frame(width: 620, height: 580)
         .background(XDialPalette.canvas)
+        .toolbar {
+            navigationToolbarItem.withoutSharedBackground()
+            if #available(macOS 26.0, *) {
+                ToolbarSpacer(.flexible)
+            } else {
+                ToolbarItem(placement: .automatic) { Spacer() }
+            }
+            generalToolbarItem.withoutSharedBackground()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .xdialSettingsSelectTab)) { notification in
             guard let index = notification.userInfo?["index"] as? Int, (0 ... 4).contains(index) else { return }
             if index == 4 {
-                ApplicationWindowLifecycleController.shared.prepareToPresentSettingsWindow()
-                openWindow(id: "general")
-                NSApp.activate(ignoringOtherApps: true)
+                openGeneralSettings()
             } else {
                 state.editorPosition.tab = index
             }
         }
     }
 
-    private var titleAccent: Color {
-        if state.isConnected { return XDialPalette.success }
-        if state.isBusy { return XDialPalette.progress }
-        if state.engine.lastError != nil { return XDialPalette.danger }
-        return Color.secondary.opacity(0.82)
+    private func openGeneralSettings() {
+        ApplicationWindowLifecycleController.shared.prepareToPresentSettingsWindow()
+        openWindow(id: "general")
+        NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func settingsTab(
-        _ index: Int,
-        title: String,
-        symbol: String
-    ) -> some View {
-        let selected = tab == index
-        return Button {
-            state.editorPosition.tab = index
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: symbol)
-                    .font(.system(size: 10.5, weight: .medium))
-                Text(title)
-                    .font(.system(size: 12, weight: .medium))
+    private var navigationToolbarItem: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            HStack(spacing: 2) {
+                ProfileNavigation()
+                    .padding(.leading, 6)
+                    .padding(.trailing, 4)
+                Rectangle()
+                    .fill(.primary.opacity(0.12))
+                    .frame(width: 1, height: 16)
+                    .padding(.trailing, 5)
+                settingsTab(0, title: state.tr("线路", "Lines"))
+                settingsTab(3, title: state.tr("线路组", "Line Groups"))
+                settingsTab(1, title: state.tr("规则", "Rules"))
+                settingsTab(2, title: state.tr("场景", "Scenarios"))
             }
-            .foregroundStyle(
-                selected ? XDialPalette.selection : Color.secondary
-            )
-            .frame(width: 76, height: 28)
-            .background(
-                selected
-                    ? XDialPalette.selection.opacity(0.18)
-                    : Color.clear,
-                in: Capsule()
-            )
-            .overlay {
-                if selected {
-                    Capsule().stroke(
-                        XDialPalette.selection.opacity(0.52),
-                        lineWidth: 0.75
-                    )
+            .padding(3)
+            .background(XDialPalette.surface.opacity(0.58), in: RoundedRectangle(cornerRadius: 11))
+            .overlay { RoundedRectangle(cornerRadius: 11).strokeBorder(.white.opacity(0.40), lineWidth: 0.5) }
+            .fixedSize()
+            .accessibilityElement(children: .contain)
+        }
+    }
+
+    private var generalToolbarItem: some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            Button(action: openGeneralSettings) {
+                HStack(spacing: 6) {
+                    Image(systemName: "slider.horizontal.3").font(.system(size: 12, weight: .medium))
+                    Text(state.tr("通用", "General")).font(.system(size: 13, weight: .medium))
                 }
+                .foregroundStyle(XDialPalette.textPrimary.opacity(0.88))
+                .padding(.horizontal, 10)
+                .frame(height: 34)
+                .background(XDialPalette.surface.opacity(hoveringGeneral ? 0.95 : 0.58), in: RoundedRectangle(cornerRadius: 10))
+                .contentShape(RoundedRectangle(cornerRadius: 10))
             }
-            .contentShape(Capsule())
+            .buttonStyle(.plain)
+            .onHover { hoveringGeneral = $0 }
+            .animation(.easeOut(duration: 0.12), value: hoveringGeneral)
+            .help(state.tr("通用设置", "General Settings"))
+        }
+    }
+
+    private func settingsTab(_ index: Int, title: String) -> some View {
+        let selected = tab == index
+        return Button { state.editorPosition.tab = index } label: {
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(selected ? XDialPalette.textPrimary : XDialPalette.textSecondary)
+                .padding(.horizontal, 11)
+                .frame(height: 30)
+                .background {
+                    if selected {
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(XDialPalette.elevated)
+                            .shadow(color: .black.opacity(0.08), radius: 1.5, y: 1)
+                    } else if hoveredTab == index {
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(XDialPalette.surface.opacity(0.85))
+                    }
+                }
+                .contentShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+        .onHover { hoveredTab = $0 ? index : nil }
+        .animation(.easeOut(duration: 0.12), value: hoveredTab)
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     /// 当前事务依赖的已保存配置发生变化时，三个配置 Tab 共用这一条状态轨。
@@ -382,6 +406,13 @@ struct SettingsView: View {
     }
 }
 
+extension ToolbarContent {
+    @ToolbarContentBuilder fileprivate func withoutSharedBackground() -> some ToolbarContent {
+        if #available(macOS 26.0, *) { self.sharedBackgroundVisibility(.hidden) }
+        else { self }
+    }
+}
+
 // MARK: - 线路 Tab
 
 struct LinesTab: View {
@@ -391,12 +422,18 @@ struct LinesTab: View {
     @State private var draggedItem: SettingsReorderItem?
     @State private var searchText = ""
 
+    private var visibleLines: [Line] {
+        state.editingProfile.lines.filter {
+            $0.isGroup == groupsOnly && (searchText.isEmpty || $0.name.localizedCaseInsensitiveContains(searchText))
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                TextField(groupsOnly ? state.tr("搜索线路组", "Search line groups") : state.tr("搜索线路", "Search lines"), text: $searchText)
-                    .textFieldStyle(.roundedBorder)
-                Text("\(state.editingProfile.lines.filter { $0.isGroup == groupsOnly }.count)")
+                SettingsSearchField(groupsOnly ? state.tr("搜索线路组", "Search line groups") : state.tr("搜索线路", "Search lines"), text: $searchText)
+                LineLatencyBatchButton(store: state.lineLatencies, lines: visibleLines, profileID: state.editingRecord.id, control: .catalog(groupsOnly: groupsOnly))
+                Text("\(visibleLines.count)")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, 14).padding(.top, 10)
             ScrollView {
@@ -428,8 +465,7 @@ struct LinesTab: View {
             AddBar {
                 Menu {
                     if groupsOnly {
-                    lineTypeButton("手动选择组", type: "selector", icon: "square.stack.3d.up")
-                    lineTypeButton("自动测速组", type: "urltest", icon: "speedometer")
+                    lineTypeButton("新建线路组", type: "urltest", icon: "square.stack.3d.up")
                     } else {
                     lineTypeButton("VPN", type: "vpn", icon: "lock.shield")
                     lineTypeButton(
@@ -491,7 +527,7 @@ struct LinesTab: View {
         }
         var line = Line(id: id, name: name, type: type)
         if line.isGroup {
-            line.name = type == "selector" ? "手动选择组" : "自动测速组"
+            line.name = "线路组"
         }
         state.editingProfile.lines.append(line)
         state.editorPosition.expandedLineIDs.insert(line.id)
@@ -752,6 +788,7 @@ struct LineRow: View {
                         .lineLimit(1).truncationMode(.middle)
                 }
                 Spacer()
+                LineLatencyView(store: state.lineLatencies, line: line, profileID: state.editingRecord.id)
                 Text(typeLabel).font(.caption).foregroundStyle(.secondary)
                 Text(sourceOwned ? "订阅" : "自建").font(.caption).foregroundStyle(.secondary)
             },
@@ -1621,6 +1658,8 @@ struct RulesTab: View {
     @EnvironmentObject var state: AppState
     @State private var draggedItem: SettingsReorderItem?
     @State private var searchText = ""
+    @State private var page = 0
+    private let pageSize = 50
 
     private var query: String { searchText.trimmingCharacters(in: .whitespacesAndNewlines) }
 
@@ -1630,19 +1669,28 @@ struct RulesTab: View {
 
     var body: some View {
         let visible = visibleRuleIDs
+        let rules = $state.editingProfile.ruleSets.filter { visible.contains($0.wrappedValue.id) }
+        let pageCount = max(1, (rules.count + pageSize - 1) / pageSize)
+        let currentPage = min(page, pageCount - 1)
+        let pageRules = Array(rules.dropFirst(currentPage * pageSize).prefix(pageSize))
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                TextField(state.tr("搜索名称、域名、IP 或应用", "Search name, domain, IP or app"), text: $searchText)
-                    .textFieldStyle(.roundedBorder)
+                SettingsSearchField(state.tr("搜索名称、域名、IP 或应用", "Search name, domain, IP or app"), text: Binding(
+                    get: { searchText },
+                    set: { searchText = $0; page = 0 }
+                ))
                 Text(state.tr("\(visible.count) / \(state.editingProfile.ruleSets.count) 个规则", "\(visible.count) / \(state.editingProfile.ruleSets.count) rules"))
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding(.horizontal, 14).padding(.top, 10)
             ScrollView {
-                LazyVStack(spacing: 8) {
-                    ForEach($state.editingProfile.ruleSets) { $rule in
-                        if visible.contains(rule.id) {
-                        RuleSetRow(rule: $rule, onDelete: { delete(rule) }, searchQuery: query)
+                // Expanded cards must have concrete heights. Nested lazy stacks
+                // can repeatedly invalidate the scroll geometry on macOS. Bound
+                // the eager list so old imports with thousands of rules stay cheap.
+                VStack(spacing: 8) {
+                    ForEach(pageRules, id: \.wrappedValue.id) { binding in
+                        let rule = binding.wrappedValue
+                        RuleSetRow(rule: binding, onDelete: { delete(rule) }, searchQuery: query)
                             .settingsReorderable(
                                 SettingsReorderItem(
                                     kind: "rule",
@@ -1653,12 +1701,22 @@ struct RulesTab: View {
                             ) { item, targetID in
                                 moveRule(item, to: targetID)
                             }
-                        }
                     }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
                 .settingsReorderDropArea(draggedItem: $draggedItem)
+            }
+            .transaction { $0.animation = nil; $0.disablesAnimations = true }
+            .id(currentPage)
+            if pageCount > 1 {
+                HStack(spacing: 12) {
+                    Button(state.tr("上一页", "Previous")) { page = currentPage - 1 }
+                        .disabled(currentPage == 0)
+                    Text("\(currentPage + 1) / \(pageCount)").monospacedDigit()
+                    Button(state.tr("下一页", "Next")) { page = currentPage + 1 }
+                        .disabled(currentPage + 1 == pageCount)
+                }.font(.caption).padding(.vertical, 6)
             }
             Divider()
             AddBar {
@@ -1667,6 +1725,7 @@ struct RulesTab: View {
                     state.editingProfile.ruleSets.append(rule)
                     state.editorPosition.expandedRuleIDs.insert(rule.id)
                     searchText = ""
+                    page = (state.editingProfile.ruleSets.count - 1) / pageSize
                     state.saveEditingProfile()
                 } label: {
                     Label(
@@ -1676,6 +1735,7 @@ struct RulesTab: View {
                 }
             }
         }
+        .onChange(of: state.editingRecord.id) { page = 0 }
     }
 
     private func delete(_ rule: RuleSet) {
@@ -1820,7 +1880,9 @@ struct RuleSetRow: View {
                     if rule.type == "group" {
                         Text(state.tr("以下内容任一匹配即命中", "Match any of the following"))
                             .font(.caption).foregroundStyle(.secondary).padding(.vertical, 5)
-                        LazyVStack(spacing: 6) {
+                        // Conditions share the card's scroll geometry and need
+                        // concrete heights during expand/collapse as well.
+                        VStack(spacing: 6) {
                             ForEach($rule.conditions) { $condition in
                                 if searchQuery.isEmpty || rule.name.localizedCaseInsensitiveContains(searchQuery) || condition.matchesSearch(searchQuery) {
                                 AnyView(RuleSetRow(rule: $condition, onDelete: {
@@ -1915,18 +1977,11 @@ struct RuleSetRow: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
                     .onChange(of: rule.url) { _, _ in state.saveEditingProfile() }
-                Picker("", selection: $rule.fetchLineID) {
-                    Text(state.tr("直连", "Direct")).tag("direct")
-                    ForEach(state.editingProfile.lines.filter {
-                        $0.enabled && $0.id != "direct"
-                    }) { line in
-                        Text(line.name).tag(line.id)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .frame(width: 120)
-                .help(state.tr("选择获取线路", "Select fetch line"))
+                LineTargetPicker(state: state, selection: Binding(
+                    get: { "port:" + rule.fetchLineID },
+                    set: { if $0.hasPrefix("port:") { rule.fetchLineID = String($0.dropFirst(5)) } }
+                ), label: state.tr("选择获取线路", "Select fetch line"), allowsSubscriptions: false)
+                .frame(width: 185)
                 .onChange(of: rule.fetchLineID) { _, _ in state.saveEditingProfile() }
             }
             HStack {

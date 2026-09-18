@@ -1,8 +1,58 @@
 import CryptoKit
+import Darwin
 import Foundation
 import XCTest
 
 final class ProfileLibraryTests: XCTestCase {
+    func testWriterMustHoldSharedFileLock() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = SymmetricKey(size: .bits256)
+        let store = ProfileLibraryStore(directory: directory, keyProvider: { _ in key })
+        let original = ProfileLibrary()
+        try store.save(original)
+        let fd = open(directory.appendingPathComponent("profiles.lock").path, O_RDWR)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0)
+        defer { flock(fd, LOCK_UN) }
+        var edited = original
+        edited.profiles[0].name = "Blocked concurrent edit"
+        XCTAssertThrowsError(try store.save(edited))
+        XCTAssertEqual(try store.load(), original)
+    }
+
+    func testConcurrentVersionsCannotOverwriteEachOthersEdits() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = SymmetricKey(size: .bits256)
+        let first = ProfileLibraryStore(directory: directory, keyProvider: { _ in key })
+        let second = ProfileLibraryStore(directory: directory, keyProvider: { _ in key })
+        try first.save(ProfileLibrary())
+        var a = try XCTUnwrap(first.load())
+        var b = try XCTUnwrap(second.load())
+        a.profiles[0].name = "New edit"
+        try first.save(a)
+        b.profiles[0].name = "Stale edit"
+        XCTAssertThrowsError(try second.save(b))
+        XCTAssertEqual(try first.load(), a)
+        XCTAssertEqual(try second.load(), a)
+        try second.save(a)
+    }
+
+    func testOpenVersionCannotRecreateDeletedConfiguration() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = SymmetricKey(size: .bits256)
+        let store = ProfileLibraryStore(directory: directory, keyProvider: { _ in key })
+        let library = ProfileLibrary()
+        try store.save(library)
+        let file = directory.appendingPathComponent("profiles.enc")
+        try FileManager.default.removeItem(at: file)
+        XCTAssertThrowsError(try store.save(library))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    }
+
     func testRefreshKeepsIndependentSceneExitOverrides() throws {
         var record = ProfileRecord.empty(named: "Source")
         record.profile.lines += [Line(id: "a", name: "A", type: "anytls"), Line(id: "b", name: "B", type: "anytls")]
@@ -178,10 +228,11 @@ final class ProfileLibraryTests: XCTestCase {
         XCTAssertThrowsError(try library.validated())
     }
     func testSubscriptionImportMetadataSurvivesSwiftRoundTrip() throws {
-        let data = Data(#"{"lines":[],"rule_sets":[{"id":"ip","name":"IP","type":"native","no_resolve":true,"native_rule":{"ip_cidr":["192.0.2.0/24"]}}],"import_warnings":[{"type":"USER-AGENT","value":"Example*","group":"Proxy","options":""}]}"#.utf8)
+        let data = Data(#"{"lines":[],"rule_sets":[{"id":"ip","name":"IP","type":"native","no_resolve":true,"native_rule":{"ip_cidr":["192.0.2.0/24"]}}],"import_warnings":[{"type":"USER-AGENT","value":"Example*","group":"Proxy","options":""}],"import_adjustments":[{"code":"anytls-tfo-disabled","count":141}]}"#.utf8)
         let profile = try JSONDecoder().decode(Profile.self, from: data)
         XCTAssertTrue(profile.ruleSets[0].noResolve)
         XCTAssertEqual(profile.importWarnings[0].value, "Example*")
+        XCTAssertEqual(profile.importAdjustments, [ImportAdjustment(code: "anytls-tfo-disabled", count: 141)])
         let copy = try JSONDecoder().decode(Profile.self, from: JSONEncoder().encode(profile))
         XCTAssertEqual(copy, profile)
     }
@@ -197,6 +248,16 @@ final class ProfileLibraryTests: XCTestCase {
         XCTAssertEqual(try record.refreshed(with: incoming).profile.importWarnings, [warning])
         incoming.importWarnings = []
         XCTAssertEqual(try record.refreshed(with: incoming).profile.importWarnings, [])
+    }
+
+    func testRefreshRetainsTransportAdjustmentsWithoutTreatingThemAsDroppedRules() throws {
+        let record = ProfileRecord.empty(named: "Source")
+        var incoming = record.profile
+        incoming.importAdjustments = [ImportAdjustment(code: "anytls-tfo-disabled", count: 2)]
+        let refreshed = try record.refreshed(with: incoming)
+        XCTAssertEqual(refreshed.profile.importAdjustments, incoming.importAdjustments)
+        XCTAssertEqual(refreshed.baseline?.importAdjustments, incoming.importAdjustments)
+        XCTAssertTrue(refreshed.profile.importWarnings.isEmpty)
     }
 
     func testGroupedConditionsSurviveStorageAndSourceRefresh() throws {

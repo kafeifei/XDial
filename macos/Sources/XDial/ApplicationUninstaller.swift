@@ -13,6 +13,12 @@ enum ApplicationUninstaller {
         deleteData: Bool,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
+        do {
+            if deleteData { try ConfigurationDataDeletion.validateExclusiveAccess() }
+        } catch {
+            completion(.failure(error))
+            return
+        }
         GoEngine.shared.stop()
         GoEngine.shared.uninstallSystemExtension { result in
             if case let .failure(error) = result {
@@ -32,23 +38,8 @@ enum ApplicationUninstaller {
                         }
                     }
                     if deleteData {
-                        xdialDefaults.removeObject(
-                            forKey: "xdial.profile"
-                        )
-                        xdialDefaults.removeObject(
-                            forKey: "xdial.language"
-                        )
-                        xdialDefaults.removeObject(
-                            forKey: "xdial.appearance"
-                        )
-                        xdialDefaults.removeObject(
-                            forKey: "xdial.launchAtLogin"
-                        )
-                        xdialDefaults.removeObject(
-                            forKey: "xdial.autoConnect"
-                        )
-                        KeychainStore.deleteVault()
-                        ProfileLibraryStore.removeKeyOnExplicitDataDeletion()
+                        try ConfigurationDataDeletion.validateExclusiveAccess()
+                        try ConfigurationDataDeletion.run(deleteData: true)
                         try? FileManager.default.removeItem(
                             atPath: appLogPath()
                         )

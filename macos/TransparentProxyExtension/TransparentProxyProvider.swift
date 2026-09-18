@@ -709,6 +709,13 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
 
             let response: ProviderDiagnosticsResponse
             switch request.cmd {
+            case .lineLatencySnapshot:
+                do {
+                    response = .success(transactionID: request.transactionID,
+                        data: ProviderDiagnosticsData(lineLatencies: try runtime.lineLatencySnapshot(session: session)))
+                } catch {
+                    response = .failure(transactionID: request.transactionID, code: "snapshot-unavailable")
+                }
             case .trafficSnapshot:
                 guard let snapshot = self.traffic.snapshot(
                     transactionID: request.transactionID
@@ -784,7 +791,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                         code: "snapshot-unavailable"
                     )
                 }
-            case .probeLineOutboundAddress:
+            case .probeLineOutboundAddress, .probeLineLatency:
                 self.beginLineOutboundAddressProbe(
                     request: request,
                     runtime: runtime,
@@ -2171,12 +2178,15 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
 
         let gate = outboundProbeGate
         diagnosticsQueue.async { [weak self] in
-            let result = Result {
-                try runtime.probeLineOutboundAddress(
+            let result = Result<ProviderDiagnosticsData, Error> {
+                if request.cmd == .probeLineLatency {
+                    return ProviderDiagnosticsData(lineLatencies: try runtime.probeLineLatency(lineID: lineID, groupID: request.groupID, session: session))
+                }
+                return ProviderDiagnosticsData(lineOutboundAddress: try runtime.probeLineOutboundAddress(
                     lineID: lineID,
                     addressFamily: request.effectiveAddressFamily,
                     session: session
-                )
+                ))
             }
             guard let self else {
                 gate.finish(token)
@@ -2272,12 +2282,10 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
 
                 let response: ProviderDiagnosticsResponse
                 switch result {
-                case let .success(address):
+                case let .success(data):
                     response = .success(
                         transactionID: request.transactionID,
-                        data: ProviderDiagnosticsData(
-                            lineOutboundAddress: address
-                        )
+                        data: data
                     )
                 case .failure:
                     response = .failure(

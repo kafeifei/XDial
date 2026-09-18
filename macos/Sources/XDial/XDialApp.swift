@@ -17,8 +17,8 @@ private final class SettingsWindowChromeView: NSView {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.titlebarSeparatorStyle = .none
-            // Keep controls in the content view. The system title bar owns
-            // dragging; no coordinate-based interception of Profile menus.
+            // Native toolbars own title-bar controls and dragging. Content stays
+            // below them, without overlays or coordinate-based hit testing.
             window.styleMask.remove(.fullSizeContentView)
             window.isMovableByWindowBackground = false
             window.backgroundColor = XDialPalette.canvasNSColor
@@ -201,6 +201,7 @@ struct XDialApp: App {
         .defaultSize(width: 620, height: 580)
         .windowResizability(.contentSize)
         .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified)
 
         Window("\(XDialBuildIdentity.productTitle) 通用设置", id: "general") {
             GeneralSettingsView()

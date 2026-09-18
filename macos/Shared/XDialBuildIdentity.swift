@@ -113,11 +113,14 @@ enum XDialBuildIdentity {
         fileURLWithPath: "/Applications/\(applicationBundleName)",
         isDirectory: true
     )
-    static let siblingApplicationDestinationURL = URL(
-        fileURLWithPath: "/Applications/"
-            + (isDevelopment ? "XDial.app" : "XDail Debug.app"),
-        isDirectory: true
-    )
+    // Every independently installed channel is a known sibling. In particular,
+    // Next must exclude Debug as well as the formal app when checking whether
+    // its own helper has exited during a registration refresh.
+    static let siblingApplicationDestinationURLs: [URL] = [
+        "XDial.app", "XDail Debug.app", "XDial Next.app",
+    ].filter { $0 != applicationBundleName }.map {
+        URL(fileURLWithPath: "/Applications/\($0)", isDirectory: true)
+    }
     static let settingsEntryTypeIdentifier =
         applicationIdentifier + ".settings-entry"
     static let settingsDockActivationNotification =

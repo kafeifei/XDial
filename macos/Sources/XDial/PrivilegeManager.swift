@@ -174,9 +174,8 @@ enum PrivilegeManager {
         for entry in entries where entry.pid != ProcessInfo.processInfo.processIdentifier {
             switch entry.belongsToProductBundle(
                 XDialBuildIdentity.applicationDestinationURL,
-                excludingSiblingBundleURLs: [
-                    XDialBuildIdentity.siblingApplicationDestinationURL,
-                ],
+                excludingSiblingBundleURLs:
+                    XDialBuildIdentity.siblingApplicationDestinationURLs,
                 executableNames: ["xdial", "xdial-daemon"]
             ) {
             case .some(true): return .unresponsive
@@ -194,9 +193,8 @@ enum PrivilegeManager {
             if entry.pid == hostPID || entry.pid == daemonPID { return true }
             return entry.belongsToProductBundle(
                 XDialBuildIdentity.applicationDestinationURL,
-                excludingSiblingBundleURLs: [
-                    XDialBuildIdentity.siblingApplicationDestinationURL,
-                ],
+                excludingSiblingBundleURLs:
+                    XDialBuildIdentity.siblingApplicationDestinationURLs,
                 executableNames: ["xdial", "xdial-daemon"]
             ) == false
         }

@@ -205,3 +205,62 @@ func TestSubscriptionProfileKeepsRemoteSourceAndDNSBoundaries(t *testing.T) {
 		t.Fatal("different sources or DNS behavior were conflated")
 	}
 }
+
+func TestSubscriptionImportAdaptsAnyTLSTFOWithoutChangingOtherOptions(t *testing.T) {
+	original := Line{Name: "AnyTLS", Type: LineTypeAnyTLS, Enabled: true, TFO: true,
+		AnyTLSServer: "edge.example", AnyTLSPort: 443, AnyTLSPassword: "fixture-password",
+		AnyTLSSNI: "tls.example", AnyTLSALPN: []string{"h2"}, AllowInsecure: true, UDP: true}
+	other := Line{Name: "Trojan", Type: LineTypeTrojan, Enabled: true, TFO: true,
+		TrojanServer: "trojan.example", TrojanPort: 443, TrojanPassword: "other-password"}
+	for _, nodesOnly := range []bool{false, true} {
+		profile, err := ImportSubscriptionProfile("fixture", []Line{original, other}, nil, nil, nodesOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(profile.ImportAdjustments, []ImportAdjustment{{Code: "anytls-tfo-disabled", Count: 1}}) {
+			t.Fatalf("missing compatibility notice: %+v", profile.ImportAdjustments)
+		}
+		var imported Line
+		for _, line := range profile.Lines {
+			if line.Type == LineTypeAnyTLS {
+				imported = line
+			}
+			if line.Type == LineTypeTrojan && !line.TFO {
+				t.Fatal("adaptation affected a different protocol")
+			}
+		}
+		want := original
+		want.ID = imported.ID
+		want.TFO = false
+		if !reflect.DeepEqual(imported, want) || !original.TFO {
+			t.Fatal("adaptation changed credentials/TLS options or mutated the source")
+		}
+		if _, err := BuildConnectionPlan(profile); err != nil {
+			t.Fatal(err)
+		}
+		if lineHasUsableOutbound(&original) {
+			t.Fatal("direct runtime validation must still reject AnyTLS TFO")
+		}
+		data, err := ExportProfileDocument(profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		restored, err := ImportProfileDocument(data, "restored")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, copy := range []*Profile{restored, CloneProfile(profile, "clone")} {
+			if !reflect.DeepEqual(copy.ImportAdjustments, profile.ImportAdjustments) {
+				t.Fatal("round trip lost compatibility metadata")
+			}
+		}
+	}
+}
+
+func TestSubscriptionTFOAdaptationStillRejectsIncompleteAnyTLS(t *testing.T) {
+	_, err := ImportSubscriptionProfile("fixture", []Line{{Name: "secret-must-not-appear", Type: LineTypeAnyTLS,
+		AnyTLSServer: "edge.example", AnyTLSPort: 443, TFO: true}}, nil, nil, true)
+	if err == nil || err.Error() != "订阅中的第 1 条线路（anytls）配置不完整或暂不支持" {
+		t.Fatalf("incomplete node must fail with a bounded node diagnostic: %v", err)
+	}
+}

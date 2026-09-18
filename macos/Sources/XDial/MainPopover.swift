@@ -5,6 +5,7 @@ private struct PolicyMapping: Identifiable {
     let id: String
     let ruleName: String
     let lineName: String
+    let lineID: String
     let error: ConnectionReportError?
 }
 
@@ -22,6 +23,7 @@ struct MainPopover: View {
     @State private var hoveredScenarioID: String?
     @State private var settingsButtonHovered = false
     @State private var showsConnectionDetails = true
+    @State private var showsPolicyMappings = false
 
     private let minimumPopoverWidth: CGFloat = 340
     private let maximumScenariosPerRow = 4
@@ -905,7 +907,13 @@ struct MainPopover: View {
                     .opacity(0.55)
             }
             if hasPolicies {
-                policyOverview(report)
+                DisclosureGroup(isExpanded: $showsPolicyMappings) {
+                    policyOverview(report).padding(.top, 6)
+                } label: {
+                    Text(state.tr("分流规则", "Routing rules"))
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                .disclosureGroupStyle(.automatic)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -916,6 +924,7 @@ struct MainPopover: View {
     private func lineOverview(_ report: ConnectionReport) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(lineTasks(in: report)) { task in
+                HStack(alignment: .center, spacing: 6) {
                 LineAddressView(
                     name: task.name,
                     info: networkInfo.observation(
@@ -934,6 +943,13 @@ struct MainPopover: View {
                     }
                 )
                 .id(report.transactionID + ":" + task.id)
+                if let line = state.profile.lines.first(where: { $0.id == task.resourceID }) {
+                    LineLatencyView(store: state.lineLatencies, line: line, profileID: state.profileLibrary.activeProfileID)
+                        .frame(width: 76, alignment: .trailing)
+                }
+                }
+                .frame(height: 26)
+                .contentShape(Rectangle())
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -941,20 +957,13 @@ struct MainPopover: View {
 
     private func policyOverview(_ report: ConnectionReport) -> some View {
         let mappings = policyMappings(in: report)
-        let columns = [
-            GridItem(.flexible(), spacing: 16, alignment: .leading),
-            GridItem(.flexible(), alignment: .leading),
-        ]
-        return LazyVGrid(
-            columns: columns,
-            alignment: .leading,
-            spacing: 8
-        ) {
+        return VStack(alignment: .leading, spacing: 6) {
             ForEach(mappings) { mapping in
                 HStack(spacing: 5) {
                     Text(mapping.ruleName)
                         .font(.system(size: 11, weight: .medium))
                         .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     Image(systemName: "arrow.right")
                         .font(.system(size: 8, weight: .medium))
                         .foregroundStyle(.tertiary)
@@ -962,6 +971,10 @@ struct MainPopover: View {
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(successColor)
                         .lineLimit(1)
+                        .frame(width: 90, alignment: .leading)
+                    if let line = state.profile.lines.first(where: { $0.id == mapping.lineID }) {
+                        LineLatencyView(store: state.lineLatencies, line: line, profileID: state.profileLibrary.activeProfileID, allowsTesting: false)
+                    }
                     if mapping.error != nil {
                         Image(systemName: "exclamationmark.circle.fill")
                             .font(.system(size: 10))
@@ -1416,6 +1429,7 @@ struct MainPopover: View {
                     lineID: binding.lineID,
                     subscriptionID: binding.subscriptionID
                 ),
+                lineID: binding.lineID,
                 error: policyError(binding, in: report)
             )
         }
@@ -1430,6 +1444,7 @@ struct MainPopover: View {
                         lineID: scenario.defaultLineID,
                         subscriptionID: scenario.defaultSubscriptionID
                     ),
+                    lineID: scenario.defaultLineID,
                     error: lineError(
                         lineID: scenario.defaultLineID,
                         in: report

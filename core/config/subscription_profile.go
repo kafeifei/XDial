@@ -13,7 +13,8 @@ func ImportSubscriptionProfile(namespace string, lines []Line, groups []ProxyGro
 	profile := &Profile{ID: namespace, Lines: []Line{{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true}}}
 	tags := map[string]string{"DIRECT": "direct"}
 	var members []string
-	for _, original := range lines {
+	var disabledAnyTLSTFO int
+	for index, original := range lines {
 		line := original
 		line.ID = documentID(namespace, "line", line.Name)
 		if line.Type == LineTypeDirect {
@@ -26,12 +27,22 @@ func ImportSubscriptionProfile(namespace string, lines []Line, groups []ProxyGro
 		if tags[line.Name] != "" {
 			return nil, fmt.Errorf("duplicate subscription node name")
 		}
+		// Surge/Clash providers may enable TFO for every node. sing-box rejects
+		// it for AnyTLS. Adapt only this optional transport optimization while
+		// retaining the original parser result and the runtime's strict guard.
+		if line.Type == LineTypeAnyTLS && line.TFO {
+			line.TFO = false
+			disabledAnyTLSTFO++
+		}
 		if !lineHasUsableOutbound(&line) {
-			return nil, fmt.Errorf("subscription contains an unsupported or incomplete node")
+			return nil, fmt.Errorf("订阅中的第 %d 条线路（%s）配置不完整或暂不支持", index+1, line.Type)
 		}
 		tags[line.Name] = line.ID
 		profile.Lines = append(profile.Lines, line)
 		members = append(members, line.ID)
+	}
+	if disabledAnyTLSTFO > 0 {
+		profile.ImportAdjustments = []ImportAdjustment{{Code: "anytls-tfo-disabled", Count: disabledAnyTLSTFO}}
 	}
 	if len(members) == 0 {
 		return nil, fmt.Errorf("subscription contains no usable lines")

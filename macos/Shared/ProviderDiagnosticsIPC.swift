@@ -1,6 +1,8 @@
 import Foundation
 
 enum ProviderDiagnosticsCommand: String, Codable {
+    case lineLatencySnapshot = "line-latency-snapshot"
+    case probeLineLatency = "probe-line-latency"
     case probeLineOutboundAddress = "probe-line-outbound-address"
     case routingProbeSnapshot = "routing-probe-snapshot"
     case beginRouteProbe = "begin-route-probe"
@@ -13,6 +15,7 @@ struct ProviderDiagnosticsRequest: Codable, Equatable {
     let cmd: ProviderDiagnosticsCommand
     let transactionID: String
     let lineID: String?
+    let groupID: String?
     let addressFamily: LineAddressFamily?
     let probeID: String?
     let host: String?
@@ -24,6 +27,7 @@ struct ProviderDiagnosticsRequest: Codable, Equatable {
         case cmd
         case transactionID = "transaction_id"
         case lineID = "line_id"
+        case groupID = "group_id"
         case addressFamily = "address_family"
         case probeID = "probe_id"
         case host
@@ -36,6 +40,7 @@ struct ProviderDiagnosticsRequest: Codable, Equatable {
         cmd: ProviderDiagnosticsCommand,
         transactionID: String,
         lineID: String? = nil,
+        groupID: String? = nil,
         addressFamily: LineAddressFamily? = nil,
         probeID: String? = nil,
         host: String? = nil,
@@ -46,6 +51,7 @@ struct ProviderDiagnosticsRequest: Codable, Equatable {
         self.cmd = cmd
         self.transactionID = transactionID
         self.lineID = lineID
+        self.groupID = groupID
         self.addressFamily = addressFamily
         self.probeID = probeID
         self.host = host
@@ -220,7 +226,22 @@ struct ProviderTrafficSnapshot: Codable, Equatable {
     }
 }
 
+struct ProviderLineLatency: Codable, Equatable {
+    let lineID: String
+    let milliseconds: Int?
+    let observedAt: Int64?
+    let selectedLineID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case lineID = "line_id"
+        case milliseconds
+        case observedAt = "observed_at"
+        case selectedLineID = "selected_line_id"
+    }
+}
+
 struct ProviderDiagnosticsData: Codable, Equatable {
+    let lineLatencies: [ProviderLineLatency]?
     let routingProbe: ProviderRoutingProbeSnapshot?
     let lineOutboundAddress: ProviderLineOutboundAddress?
     let begunRouteProbe: ProviderBegunRouteProbe?
@@ -229,6 +250,7 @@ struct ProviderDiagnosticsData: Codable, Equatable {
     let traffic: ProviderTrafficSnapshot?
 
     enum CodingKeys: String, CodingKey {
+        case lineLatencies = "line_latencies"
         case routingProbe = "routing_probe"
         case lineOutboundAddress = "line_outbound_address"
         case begunRouteProbe = "begun_route_probe"
@@ -237,6 +259,7 @@ struct ProviderDiagnosticsData: Codable, Equatable {
     }
 
     init(
+        lineLatencies: [ProviderLineLatency]? = nil,
         routingProbe: ProviderRoutingProbeSnapshot? = nil,
         lineOutboundAddress: ProviderLineOutboundAddress? = nil,
         begunRouteProbe: ProviderBegunRouteProbe? = nil,
@@ -244,6 +267,7 @@ struct ProviderDiagnosticsData: Codable, Equatable {
             ProviderApplicationAttributionSnapshot? = nil,
         traffic: ProviderTrafficSnapshot? = nil
     ) {
+        self.lineLatencies = lineLatencies
         self.routingProbe = routingProbe
         self.lineOutboundAddress = lineOutboundAddress
         self.begunRouteProbe = begunRouteProbe
@@ -483,10 +507,13 @@ enum ProviderDiagnosticsCodec {
 
         var allowedKeys = baseKeys
         switch command {
-        case .applicationAttributionSnapshot, .trafficSnapshot:
+        case .applicationAttributionSnapshot, .trafficSnapshot, .lineLatencySnapshot:
             break
         case .routingProbeSnapshot:
             allowedKeys.insert("probe_id")
+        case .probeLineLatency:
+            allowedKeys.insert("line_id")
+            if dictionary["group_id"] != nil { allowedKeys.insert("group_id") }
         case .probeLineOutboundAddress:
             allowedKeys.insert("line_id")
             if dictionary["address_family"] != nil {
@@ -509,8 +536,11 @@ enum ProviderDiagnosticsCodec {
         else {
             throw ProviderDiagnosticsCodecError.invalidRequest
         }
+        if let groupID = request.groupID, !isSafeOpaqueID(groupID, maximumBytes: 256) {
+            throw ProviderDiagnosticsCodecError.invalidRequest
+        }
         switch request.cmd {
-        case .applicationAttributionSnapshot, .trafficSnapshot:
+        case .applicationAttributionSnapshot, .trafficSnapshot, .lineLatencySnapshot:
             break
         case .routingProbeSnapshot:
             guard
@@ -519,7 +549,7 @@ enum ProviderDiagnosticsCodec {
             else {
                 throw ProviderDiagnosticsCodecError.invalidRequest
             }
-        case .probeLineOutboundAddress:
+        case .probeLineOutboundAddress, .probeLineLatency:
             guard
                 let lineID = request.lineID,
                 isSafeOpaqueID(lineID, maximumBytes: 256)

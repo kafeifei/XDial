@@ -196,3 +196,40 @@ func TestProfileDocumentMatchIdentitySurvivesPrependingRule(t *testing.T) {
 		t.Fatal("visual order changed group runtime identity")
 	}
 }
+
+func TestPinnedGroupRetainsAutomaticProbeSettingsAcrossExport(t *testing.T) {
+	profile, err := ImportProfileDocument([]byte(profileDocumentFixture), "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := profile.FindLine(profile.Scenarios[0].Bindings[0].LineID)
+	group.GroupURL, group.GroupInterval = "https://example.com/test", "5m"
+	encoded, err := ExportProfileDocument(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]interface{}
+	_ = json.Unmarshal(encoded, &doc)
+	for _, item := range doc["outbounds"].([]interface{}) {
+		outbound := item.(map[string]interface{})
+		if outbound["type"] == "selector" && (outbound["url"] != nil || outbound["interval"] != nil) {
+			t.Fatal("selector received invalid native URLTest fields")
+		}
+	}
+	restored, err := ImportProfileDocument(encoded, "copy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, line := range restored.Lines {
+		if line.IsGroup() {
+			found = true
+			if line.GroupURL != group.GroupURL || line.GroupInterval != group.GroupInterval {
+				t.Fatal("lost automatic test settings")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("lost pinned group")
+	}
+}
