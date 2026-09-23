@@ -76,10 +76,21 @@ Scenario 先选 Line，仅最终属于 Direct 的 flow 恢复该绑定，其他 
 ### 3.2 Tailscale 与 MagicDNS（D33）
 
 内置 Tailscale 是盒内 endpoint，不创建系统接口、不接管系统 DNS、不接受或发布系统路由。
-每个 Profile 共用一份持久身份；不同 Line 可选择不同 exit node，但 active Scenario 至多
+每个安装通道内，每个 Profile 共用一份持久身份；不同 Line 可选择不同 exit node，但 active Scenario 至多
 使用一条 Tailscale Line。未登录、需要认证或指定节点不可用产生结构化失败，不自动换节点。
 
-显式配置动作可启动限时 setup session；关闭配置、超时、完整连接开始或 daemon 退出即停止。
+Tailscale 设备名在运行快照中按 Debug、Next、正式版添加 `xdial-debug-`、`xdial-next-`、
+`xdial-stable-` 前缀；不回写共享 Profile，不改变通道内的状态目录或 node key。
+
+登录管理按持久身份确定所有者，而不是用整个 XDial 的连接状态禁用操作。已提交的 Provider
+通过带事务 ID 的独立控制 IPC 提供当前身份的状态与登录续期；不在当前连接中的身份可启动
+无系统入口的限时 setup session。Provider 拒绝或事务变化不能推断为“身份空闲”；只有明确
+`identity-not-active` 才转到 setup，持久目录的独占锁继续防止两个实例同时使用同一身份。
+退出正在承载流量的身份必须先由用户停止使用它，不隐式断开当前连接。
+
+setup 状态刷新复用现有实例和登录 URL；删除线路、空闲超时、连接交接或 daemon 退出即停止。
+完整连接和场景切换先阻止新登录操作，等待已接受的操作结束，再确认 setup 已释放，才创建
+候选数据面。场景切换的旧连接在此期间保持运行；释放失败不启动候选、不破坏旧连接。
 Auth Key 仅作为单次注册输入，请求返回后 UI 清空，不进入 Profile、Keychain、订阅、日志、
 Debug 或运行配置；已持久化 node key 的有效性不取决于该 Auth Key 是否过期。
 

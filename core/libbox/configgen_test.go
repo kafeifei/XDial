@@ -1832,3 +1832,25 @@ func TestGenerateTransparentProxySessionWithLineCapabilitiesAcceptsAllSupportedM
 		t.Fatalf("Direct-only session rejected an empty non-Direct capability map: %v", err)
 	}
 }
+
+func TestTailscaleSetupUsesRequestedIdentityInsteadOfActiveScenario(t *testing.T) {
+	base := t.TempDir()
+	raw := `{"profile_id":"global-configuration","tailscale":{"hostname":"fallback"},"lines":[{"id":"active","type":"tailscale","enabled":true,"identity_profile_id":"source-a","identity_hostname":"xdial-debug-active"},{"id":"editing","type":"tailscale","enabled":true,"identity_profile_id":"source-b","identity_hostname":"xdial-debug-editing"}],"scenarios":[{"id":"s","default_line_id":"active"}],"active_scenario_id":"s"}`
+	generated, err := GenerateTailscaleSetupConfig(raw, "editing", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Endpoints []struct {
+			State    string `json:"state_directory"`
+			Hostname string `json:"hostname"`
+		}
+		Inbounds []any
+	}
+	if err := json.Unmarshal([]byte(generated), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Endpoints) != 1 || doc.Endpoints[0].State != filepath.Join(base, "profiles", "source-b", "tailscale") || doc.Endpoints[0].Hostname != "xdial-debug-editing" || len(doc.Inbounds) != 0 {
+		t.Fatalf("setup selected the wrong owner: %+v", doc)
+	}
+}

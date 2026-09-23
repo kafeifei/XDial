@@ -48,6 +48,8 @@ final class EmbeddedSingBoxRuntime {
         /// Opaque identity of the process-owned Tailscale capability borrowed
         /// by this generation. `nil` means the generation has no Tailscale Line.
         let tailscaleRuntimeIdentity: String?
+        let tailscaleIdentityProfileID: String?
+        let tailscaleEndpointTag: String?
     }
 
     struct PreparedSwitch {
@@ -93,12 +95,14 @@ final class EmbeddedSingBoxRuntime {
         }
 
         struct Tailscale: Codable {
+            let identityProfileID: String?
             let endpointTag: String
             let exitNode: String
             let magicDNSEnabled: Bool
             let dnsServerTag: String?
 
             enum CodingKeys: String, CodingKey {
+                case identityProfileID = "identity_profile_id"
                 case endpointTag = "endpoint_tag"
                 case exitNode = "exit_node"
                 case magicDNSEnabled = "magic_dns_enabled"
@@ -625,7 +629,9 @@ final class EmbeddedSingBoxRuntime {
                 anyConnectRuntimeIdentity:
                     anyConnectRuntimeIdentity,
                 tailscaleRuntimeIdentity:
-                    tailscaleRuntime?.identity
+                    tailscaleRuntime?.identity,
+                tailscaleIdentityProfileID: finalEnvelope.tailscale?.identityProfileID,
+                tailscaleEndpointTag: finalEnvelope.tailscale?.endpointTag
             )
         } catch {
             callback.markStopped()
@@ -871,7 +877,9 @@ final class EmbeddedSingBoxRuntime {
                         .anyConnectRuntimeIdentity,
                 tailscaleRuntimeIdentity:
                     finalPreparedGeneration.tailscaleRuntime?
-                        .identity
+                        .identity,
+                tailscaleIdentityProfileID: finalEnvelope.tailscale?.identityProfileID,
+                tailscaleEndpointTag: finalEnvelope.tailscale?.endpointTag
             )
             engineLock.lock()
             let mayPublish = engine === instance &&
@@ -1965,6 +1973,24 @@ final class EmbeddedSingBoxRuntime {
                 }
             }
         }
+    }
+
+    func tailscaleControl(_ command: TailscaleControlCommand, session: Session) throws -> String {
+        guard let engine = currentEngine(), let tag = session.tailscaleEndpointTag else {
+            throw RuntimeError.lineCapabilityUnavailable
+        }
+        var failure: NSError?
+        let raw: String
+        switch command {
+        case .status:
+            raw = engine.tailscaleStatus(tag, error: &failure)
+        case .login:
+            raw = engine.beginTailscaleLogin(tag, error: &failure)
+        case .logout:
+            throw RuntimeError.lineCapabilityUnavailable
+        }
+        if let failure { throw failure }
+        return raw
     }
 
     func lineLatencySnapshot(session: Session) throws -> [ProviderLineLatency] {

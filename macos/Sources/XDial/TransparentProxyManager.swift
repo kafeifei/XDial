@@ -1982,6 +1982,38 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
 
     /// 每次都从系统当前配置重新取得 connected manager/session。这里不缓存
     /// `NETunnelProviderSession`，避免重连后把请求发给上一笔事务的连接对象。
+    func sendTailscaleControl(_ request: TailscaleControlRequest,
+        completion: @escaping (Result<TailscaleControlResponse, Error>) -> Void) {
+        let gate = HostCompletionGate(completion)
+        guard request.isValid, diagnosticsTransactionIsCurrent(request.transactionID),
+              let data = try? JSONEncoder().encode(request) else {
+            gate.finish(.failure(ProviderDiagnosticsHostError.transactionMismatch)); return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            gate.finish(.failure(ProviderDiagnosticsHostError.timedOut))
+        }
+        withExistingManager(purpose: .diagnostics) { result in
+            guard case let .success(manager?) = result,
+                  manager.connection.status == .connected,
+                  self.diagnosticsTransactionIsCurrent(request.transactionID),
+                  let session = manager.connection as? NETunnelProviderSession else {
+                gate.finish(.failure(ProviderDiagnosticsHostError.notConnected)); return
+            }
+            do {
+                try session.sendProviderMessage(data) { raw in
+                    guard self.diagnosticsTransactionIsCurrent(request.transactionID),
+                          let raw, raw.count <= 1_048_576,
+                          let response = try? JSONDecoder().decode(TailscaleControlResponse.self, from: raw),
+                          response.requestID == request.requestID,
+                          response.transactionID == request.transactionID else {
+                        gate.finish(.failure(ProviderDiagnosticsHostError.invalidResponse)); return
+                    }
+                    gate.finish(.success(response))
+                }
+            } catch { gate.finish(.failure(ProviderDiagnosticsHostError.sendFailed)) }
+        }
+    }
+
     private func sendProviderDiagnostics(
         _ request: ProviderDiagnosticsRequest,
         timeout: TimeInterval,

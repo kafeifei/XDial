@@ -198,10 +198,11 @@ type transparentProxyAnyConnect struct {
 }
 
 type transparentProxyTailscale struct {
-	EndpointTag     string `json:"endpoint_tag"`
-	ExitNode        string `json:"exit_node"`
-	MagicDNSEnabled bool   `json:"magic_dns_enabled"`
-	DNSServerTag    string `json:"dns_server_tag,omitempty"`
+	IdentityProfileID string `json:"identity_profile_id"`
+	EndpointTag       string `json:"endpoint_tag"`
+	ExitNode          string `json:"exit_node"`
+	MagicDNSEnabled   bool   `json:"magic_dns_enabled"`
+	DNSServerTag      string `json:"dns_server_tag,omitempty"`
 }
 
 // GenerateConnectionPlan compiles the active Scenario into a side-effect-free,
@@ -605,10 +606,11 @@ func GenerateTransparentProxyRuleSetBootstrapWithCapabilities(
 				dnsServerTag = config.TailscaleMagicDNSDNSServerTag(endpointTag)
 			}
 			session.Tailscale = &transparentProxyTailscale{
-				EndpointTag:     endpointTag,
-				ExitNode:        exitNode,
-				MagicDNSEnabled: tailscaleLine.TailscaleMagicDNS,
-				DNSServerTag:    dnsServerTag,
+				IdentityProfileID: config.TailscaleIdentityProfileID(profile, tailscaleLine),
+				EndpointTag:       endpointTag,
+				ExitNode:          exitNode,
+				MagicDNSEnabled:   tailscaleLine.TailscaleMagicDNS,
+				DNSServerTag:      dnsServerTag,
 			}
 		}
 		if group.Preflight {
@@ -765,10 +767,11 @@ func generateTransparentProxySession(
 			dnsServerTag = config.TailscaleMagicDNSDNSServerTag(endpointTag)
 		}
 		session.Tailscale = &transparentProxyTailscale{
-			EndpointTag:     endpointTag,
-			ExitNode:        exitNode,
-			MagicDNSEnabled: tailscaleLine.TailscaleMagicDNS,
-			DNSServerTag:    dnsServerTag,
+			IdentityProfileID: config.TailscaleIdentityProfileID(profile, tailscaleLine),
+			EndpointTag:       endpointTag,
+			ExitNode:          exitNode,
+			MagicDNSEnabled:   tailscaleLine.TailscaleMagicDNS,
+			DNSServerTag:      dnsServerTag,
 		}
 	}
 	encoded, err := json.Marshal(session)
@@ -1175,16 +1178,17 @@ func GenerateTailscaleSetupConfigWithAuthKey(profileJSON string, lineID string, 
 	if lineID == "" {
 		return "", fmt.Errorf("Tailscale line is missing")
 	}
-	basePath, err = config.ProfileDataPath(profile, basePath)
-	if err != nil {
-		return "", err
-	}
 	line := profile.FindLine(lineID)
 	if line == nil {
 		return "", fmt.Errorf("Tailscale line is missing")
 	}
 	if line.Type != config.LineTypeTailscale {
 		return "", fmt.Errorf("line is not a Tailscale line")
+	}
+	identityProfile := &config.Profile{ID: config.TailscaleIdentityProfileID(profile, line)}
+	basePath, err = config.ProfileDataPath(identityProfile, basePath)
+	if err != nil {
+		return "", err
 	}
 	if basePath == "" || !filepath.IsAbs(basePath) {
 		return "", fmt.Errorf("shared Tailscale state directory is unavailable")
@@ -1205,8 +1209,12 @@ func GenerateTailscaleSetupConfigWithAuthKey(profileJSON string, lineID string, 
 		// 与 buildTailscaleEndpoint 保持同一身份语义：state 全局单份、
 		// 设备名来自全局身份、常驻节点（ephemeral 会在会话切换时丢身份）。
 	}
-	if profile.Tailscale.Hostname != "" {
-		endpoint["hostname"] = profile.Tailscale.Hostname
+	hostname := line.IdentityHostname
+	if hostname == "" {
+		hostname = profile.Tailscale.Hostname
+	}
+	if hostname != "" {
+		endpoint["hostname"] = hostname
 	}
 	if authKey != "" {
 		endpoint["auth_key"] = authKey

@@ -306,11 +306,15 @@ struct TailscaleRuntimeStatus: Decodable, Hashable {
     let backendState: String
     let authURL: String
     let exitNodes: [TailscaleRuntimeExitNode]
+    var deviceName: String? = nil
+    // Host-only ownership fact. Never decoded from a setup response.
+    var isInUse = false
 
     enum CodingKeys: String, CodingKey {
         case backendState = "backend_state"
         case authURL = "auth_url"
         case exitNodes = "exit_nodes"
+        case deviceName = "device_name"
     }
 
     var isRunning: Bool { backendState.lowercased() == "running" }

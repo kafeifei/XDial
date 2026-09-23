@@ -24,16 +24,24 @@ const (
 // Manager owns the explicit, bounded Tailscale configuration session defined by D33.
 // It never creates a TUN or changes system DNS/routes; the only persisted state is the
 // Tailscale identity written by the upstream endpoint into basePath/tailscale.
+type setupRuntime interface {
+	TailscaleStatus(string) (string, error)
+	BeginTailscaleLogin(string) (string, error)
+	TailscaleLogout(string) error
+	Stop() error
+}
+
 type Manager struct {
 	operationMu sync.Mutex
 	basePath    string
 	idleTimeout time.Duration
 
-	runtime     *libbox.Libbox
-	lineID      string
-	endpointTag string
-	idleTimer   *time.Timer
-	timerGen    uint64
+	runtime       setupRuntime
+	lineID        string
+	endpointTag   string
+	sessionConfig string
+	idleTimer     *time.Timer
+	timerGen      uint64
 }
 
 func New(basePath string) *Manager {
@@ -43,13 +51,14 @@ func New(basePath string) *Manager {
 	}
 }
 
-// Prepare replaces any previous setup session and returns the current structured
-// LocalAPI status. authKey is used only while building this in-memory setup config.
+// Prepare reuses a matching setup session; a changed identity replaces it.
+// authKey is used only while building this in-memory setup config.
 func (m *Manager) Prepare(profileJSON, lineID, authKey string) (string, error) {
 	m.operationMu.Lock()
 	defer m.operationMu.Unlock()
 
 	lineID = strings.TrimSpace(lineID)
+	authKey = strings.TrimSpace(authKey)
 	configJSON, err := libbox.GenerateTailscaleSetupConfigWithAuthKey(
 		profileJSON,
 		lineID,
@@ -58,6 +67,13 @@ func (m *Manager) Prepare(profileJSON, lineID, authKey string) (string, error) {
 	)
 	if err != nil {
 		return "", err
+	}
+	if authKey == "" && m.runtime != nil && m.sessionConfig == configJSON {
+		status, err := m.runtime.TailscaleStatus(m.endpointTag)
+		if err == nil {
+			m.touchLocked()
+		}
+		return status, err
 	}
 	interfaceName, err := engine.DetectUnderlayInterface(context.Background())
 	if err != nil {
@@ -93,6 +109,8 @@ func (m *Manager) Prepare(profileJSON, lineID, authKey string) (string, error) {
 	m.runtime = runtime
 	m.lineID = lineID
 	m.endpointTag = endpointTag
+	// Cache only the key-free configuration, including after Auth Key registration.
+	m.sessionConfig, _ = libbox.GenerateTailscaleSetupConfig(profileJSON, lineID, m.basePath)
 	m.touchLocked()
 	return status, nil
 }
@@ -170,7 +188,7 @@ func (m *Manager) StopLine(lineID string) error {
 	return m.stopLocked()
 }
 
-func (m *Manager) runtimeForLineLocked(lineID string) (*libbox.Libbox, error) {
+func (m *Manager) runtimeForLineLocked(lineID string) (setupRuntime, error) {
 	if m.runtime == nil || strings.TrimSpace(lineID) != m.lineID {
 		return nil, fmt.Errorf("Tailscale setup session is unavailable")
 	}
@@ -251,6 +269,7 @@ func (m *Manager) stopLocked() error {
 	m.runtime = nil
 	m.lineID = ""
 	m.endpointTag = ""
+	m.sessionConfig = ""
 	if runtime == nil {
 		return nil
 	}

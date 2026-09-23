@@ -827,7 +827,7 @@ struct LineRow: View {
 
 
     private var tailscaleStatusColor: Color {
-        if tailscaleRuntimeConnected {
+        if tailscaleRuntimeConnected && tailscaleStatus == nil {
             return XDialPalette.success
         }
         if tailscaleStatus?.isRunning == true {
@@ -844,11 +844,14 @@ struct LineRow: View {
     }
 
     private var tailscaleStatusLabel: String {
-        if tailscaleRuntimeConnected {
+        if tailscaleRuntimeConnected && (tailscaleStatus == nil || tailscaleStatus?.isRunning == true) {
             return state.tr("已连接", "Connected")
         }
         if tailscaleStatus?.isRunning == true {
             return state.tr("已登录", "Signed in")
+        }
+        if tailscaleStatus?.backendState == "NeedsMachineAuth" {
+            return state.tr("等待设备批准", "Awaiting device approval")
         }
         if tailscaleStatus != nil {
             return state.tr("需要登录", "Sign-in required")
@@ -924,7 +927,7 @@ struct LineRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         case "tailscale":
-            tailscaleDetail.disabled(sourceOwned)
+            tailscaleDetail
         default:
             EmptyView()
         }
@@ -951,7 +954,7 @@ struct LineRow: View {
                     }
                     .buttonStyle(.plain)
                     .help(state.tr("刷新状态", "Refresh status"))
-                    .disabled(state.engine.status != "disconnected")
+                    .disabled(state.engine.isBusy)
                 }
             }
 
@@ -974,7 +977,7 @@ struct LineRow: View {
             )
             .toggleStyle(.switch)
             .font(.caption)
-            .disabled(state.engine.status != "disconnected")
+            .disabled(sourceOwned)
             .accessibilityIdentifier("tailscale-magic-dns-toggle")
 
             Text(state.tr(
@@ -985,25 +988,17 @@ struct LineRow: View {
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
 
-            if tailscaleRuntimeConnected {
-                tailscaleConnectedFields
-            } else if let status = tailscaleStatus, status.isRunning {
+            if let status = tailscaleStatus, status.isRunning {
                 tailscaleSignedInFields(status)
+            } else if tailscaleStatus?.backendState == "NeedsMachineAuth" {
+                Text(state.tr("设备已注册，等待 Tailnet 管理员批准；批准后刷新状态。",
+                    "Device registered. Waiting for Tailnet administrator approval; refresh after approval."))
+                    .font(.caption).foregroundStyle(.secondary)
             } else {
                 tailscaleSignInFields
             }
         }
         .padding(.top, 2)
-    }
-
-    private var tailscaleConnectedFields: some View {
-        Text(state.tr(
-            "本次连接事务已确认 Tailscale 线路就绪。断开 XDial 后可以刷新登录与出口节点配置。",
-            "The current connection transaction confirmed this Tailscale line is ready. Disconnect XDial to refresh sign-in or exit-node configuration."
-        ))
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var tailscaleSignInFields: some View {
@@ -1026,7 +1021,7 @@ struct LineRow: View {
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(tailscaleBusy || state.engine.status != "disconnected")
+            .disabled(tailscaleBusy || state.engine.isBusy)
             .accessibilityIdentifier("tailscale-browser-login")
 
             DisclosureGroup(
@@ -1050,7 +1045,8 @@ struct LineRow: View {
                     .disabled(
                         authKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             || tailscaleBusy
-                            || state.engine.status != "disconnected"
+                            || state.engine.isBusy
+                            || tailscaleStatus?.isInUse == true
                     )
                 }
                 .padding(.top, 5)
@@ -1066,7 +1062,7 @@ struct LineRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(width: 70, alignment: .leading)
-            Text(state.editingProfile.tailscale.hostname)
+            Text(status.deviceName ?? state.tr("正在获取", "Loading"))
                 .font(.caption.monospaced())
                 .textSelection(.enabled)
             Spacer()
@@ -1122,7 +1118,14 @@ struct LineRow: View {
             Button(state.tr("退出登录", "Sign Out"), role: .destructive) {
                 logoutTailscale()
             }
-            .disabled(tailscaleBusy)
+            .disabled(tailscaleBusy || (status.isInUse && state.engine.isConnected))
+        }
+        if status.isInUse && state.engine.isConnected {
+            Text(state.tr(
+                "当前连接正在使用这份身份。退出登录前，请断开连接或切换到不使用它的场景。",
+                "This identity is in use. Disconnect or switch to a scenario that does not use it before signing out."
+            ))
+            .font(.caption2).foregroundStyle(.secondary)
         }
     }
 
@@ -1137,13 +1140,6 @@ struct LineRow: View {
     private func prepareTailscale(authKey: String = "") {
         guard line.type == "tailscale", !tailscaleBusy else { return }
         guard requireInstallation() else { return }
-        guard state.engine.status == "disconnected" else {
-            state.setTailscaleConfigurationError(state.tr(
-                "请先断开 XDial，再配置 Tailscale 登录状态。",
-                "Disconnect XDial before configuring Tailscale sign-in."
-            ), for: line.id)
-            return
-        }
         state.setTailscaleConfigurationBusy(true, for: line.id)
         state.setTailscaleConfigurationError(nil, for: line.id)
         state.engine.prepareTailscale(
@@ -1157,8 +1153,7 @@ struct LineRow: View {
     }
 
     private func refreshTailscaleStatus() {
-        // setup session 会在连接数据面或 helper 重启时被关闭。刷新必须具备
-        // 自愈能力：重建隔离会话并读取同一份持久身份，而不是查询旧会话。
+        // Resolve the current owner; a live setup lease is reused, not restarted.
         prepareTailscale()
     }
 
@@ -1167,8 +1162,7 @@ struct LineRow: View {
         guard requireInstallation() else { return }
         state.setTailscaleConfigurationBusy(true, for: line.id)
         state.setTailscaleConfigurationError(nil, for: line.id)
-        // 设置窗口或 helper 重启后，旧卡片可能还在但 setup session 已经结束。
-        // 登录按钮先重建会话，不能假设 onAppear 曾成功执行。
+        // Resolve the current owner before login; never open a second writer.
         state.engine.prepareTailscale(
             profileJSON: state.buildEditingProfileJSON(),
             lineID: line.id
@@ -1190,15 +1184,6 @@ struct LineRow: View {
                         false,
                         for: line.id
                     )
-                    return
-                }
-                if let url = validatedAuthURL(status.authURL) {
-                    state.setTailscaleConfigurationBusy(
-                        false,
-                        for: line.id
-                    )
-                    NSWorkspace.shared.open(url)
-                    startTailscalePolling()
                     return
                 }
                 requestTailscaleLoginURL()

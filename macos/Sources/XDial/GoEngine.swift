@@ -34,6 +34,10 @@ final class GoEngine: ObservableObject {
     private var readSource: DispatchSourceRead?
     private var readBuffer = Data()
     private var requestSeq: UInt64 = 0
+    private let tailscaleConfigurationLease = TailscaleConfigurationLease()
+    private var tailscaleSwitchHandoffCancelled = false
+    private var tailscaleStartGeneration = 0
+    private var tailscaleSetupProfiles: [String: String] = [:]
     private var pendingCallbacks: [String: (DaemonResponse) -> Void] = [:]
     private var transparentProxySystemStatus = "disconnected"
     var underlayChangeHandler: ((String, Bool) -> Void)?
@@ -139,6 +143,8 @@ final class GoEngine: ObservableObject {
         profileJSON: String,
         automaticRetryTrigger: AutomaticReconnectTrigger? = nil
     ) {
+        tailscaleStartGeneration += 1
+        let startGeneration = tailscaleStartGeneration
         lastError = nil
         // The journal remains available for recovery and diagnostics, but the
         // previous terminal report must not flash while a new transaction is
@@ -147,10 +153,27 @@ final class GoEngine: ObservableObject {
         explicitlyStoppedTransactionID = nil
         transparentProxySystemStatus = "connecting"
         reconcileTransparentProxyStatus()
-        transparentProxy.start(
-            profileJSON: profileJSON,
-            automaticRetryTrigger: automaticRetryTrigger
-        )
+        guard !tailscaleConfigurationLease.suspended else {
+            lastError = "Tailscale 配置会话正在交接，请稍后再试"
+            transparentProxySystemStatus = "disconnected"
+            reconcileTransparentProxyStatus()
+            return
+        }
+        tailscaleConfigurationLease.suspend { [self] in
+            releaseTailscaleSetupForConnection { result in
+                self.tailscaleConfigurationLease.resume()
+                // A user disconnect while releasing setup cancels this start.
+                guard self.tailscaleStartGeneration == startGeneration else { return }
+                if case let .failure(error) = result {
+                    self.lastError = error.localizedDescription
+                    self.transparentProxySystemStatus = "disconnected"
+                    self.reconcileTransparentProxyStatus()
+                    return
+                }
+                self.transparentProxy.start(profileJSON: profileJSON,
+                    automaticRetryTrigger: automaticRetryTrigger)
+            }
+        }
     }
 
     /// Replace the committed Scenario inside the current Provider session.
@@ -163,26 +186,61 @@ final class GoEngine: ObservableObject {
         expectedUnderlayFingerprint: String? = nil,
         completion: @escaping (Result<ConnectionReport, Error>) -> Void
     ) {
+        guard !tailscaleConfigurationLease.suspended else {
+            completion(.failure(requestError("连接正在切换，请稍后再试"))); return
+        }
         lastError = nil
-        transparentProxy.switchScenario(
-            profileJSON: profileJSON,
-            refreshLineRuntimes: refreshLineRuntimes,
-            networkEpochID: networkEpochID,
-            expectedUnderlayFingerprint: expectedUnderlayFingerprint
-        ) { [weak self] result in
-            Task { @MainActor [weak self] in
-                switch result {
-                case let .success(report):
-                    self?.applyConnectionReport(report)
-                case let .failure(error):
-                    self?.lastError = error.localizedDescription
+        tailscaleSwitchHandoffCancelled = false
+        tailscaleConfigurationLease.suspend { [self] in
+            releaseTailscaleSetupForConnection { result in
+                guard !self.tailscaleSwitchHandoffCancelled else {
+                    self.tailscaleConfigurationLease.resume()
+                    completion(.failure(self.requestError("场景切换已取消"))); return
                 }
-                completion(result)
+                if case let .failure(error) = result {
+                    self.tailscaleConfigurationLease.resume()
+                    completion(.failure(error)); return
+                }
+                self.transparentProxy.switchScenario(
+                    profileJSON: profileJSON,
+                    refreshLineRuntimes: refreshLineRuntimes,
+                    networkEpochID: networkEpochID,
+                    expectedUnderlayFingerprint: expectedUnderlayFingerprint
+                ) { [weak self] result in
+                    Task { @MainActor [weak self] in
+                        self?.tailscaleConfigurationLease.resume()
+                        switch result {
+                        case let .success(report): self?.applyConnectionReport(report)
+                        case let .failure(error): self?.lastError = error.localizedDescription
+                        }
+                        completion(result)
+                    }
+                }
             }
         }
     }
 
+    private func releaseTailscaleSetupForConnection(
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard ensureSocket() else {
+            completion(.failure(requestError("无法联系后台服务以结束 Tailscale 配置会话"))); return
+        }
+        let gate = TailscaleRequestCompletion<Void>(completion)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+            gate.finish(.failure(self.requestError("结束 Tailscale 配置会话超时")))
+        }
+        let sent = sendRequest(cmd: "tailscale-stop-setup") { response in
+            if response.ok == true { gate.finish(.success(())) }
+            else { gate.finish(.failure(self.requestError("无法结束 Tailscale 配置会话"))) }
+        }
+        if !sent {
+            gate.finish(.failure(requestError("无法发送 Tailscale 配置会话结束请求")))
+        }
+    }
+
     func cancelScenarioSwitch() {
+        tailscaleSwitchHandoffCancelled = true
         transparentProxy.cancelScenarioSwitch()
     }
 
@@ -305,6 +363,8 @@ final class GoEngine: ObservableObject {
     #endif
 
     func stop(userInitiated: Bool = false) {
+        tailscaleStartGeneration += 1
+        tailscaleSwitchHandoffCancelled = true
         appLog("stop() called for Transparent Proxy, status=\(status)")
         if userInitiated {
             explicitlyStoppedTransactionID =
@@ -497,14 +557,87 @@ final class GoEngine: ObservableObject {
     }
 
     private func performTailscaleStatusRequest(
+        cmd: String, profile: String? = nil, lineID: String, authKey: String = "",
+        completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
+    ) {
+        guard tailscaleConfigurationLease.begin() else {
+            completion(.failure(requestError("连接正在切换，请稍后再试"))); return
+        }
+        let originalCompletion = completion
+        let completion: (Result<TailscaleRuntimeStatus, Error>) -> Void = { [self] result in
+            tailscaleConfigurationLease.end()
+            originalCompletion(result)
+        }
+        if let profile { tailscaleSetupProfiles[lineID] = profile }
+        guard !isBusy, scenarioSwitchProjection?.inFlight != true else {
+            completion(.failure(requestError("连接正在切换，请稍后再试"))); return
+        }
+        let setup = { [self] in
+            // Explicit login/logout recover an expired lease; polling never restarts it.
+            guard cmd == "tailscale-login" || cmd == "tailscale-logout",
+                  let stored = tailscaleSetupProfiles[lineID] else {
+                performTailscaleDaemonRequest(cmd: cmd, profile: profile, lineID: lineID,
+                    authKey: authKey, completion: completion)
+                return
+            }
+            performTailscaleDaemonRequest(cmd: "tailscale-prepare", profile: stored, lineID: lineID) { result in
+                switch result {
+                case .failure: completion(result)
+                case .success:
+                    self.performTailscaleDaemonRequest(cmd: cmd, lineID: lineID, completion: completion)
+                }
+            }
+        }
+        guard isConnected else { setup(); return }
+        guard let stored = tailscaleSetupProfiles[lineID],
+              let data = stored.data(using: .utf8),
+              let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let lines = document["lines"] as? [[String: Any]],
+              let line = lines.first(where: { $0["id"] as? String == lineID }),
+              let identityID = (line["identity_profile_id"] as? String).flatMap({ $0.isEmpty ? nil : $0 })
+                    ?? document["profile_id"] as? String,
+              let transactionID = connectionReport?.transactionID else {
+            completion(.failure(requestError("请先刷新这条 Tailscale 线路"))); return
+        }
+        let command: TailscaleControlCommand = cmd == "tailscale-login" ? .login
+            : cmd == "tailscale-logout" ? .logout : .status
+        transparentProxy.sendTailscaleControl(TailscaleControlRequest(
+            transactionID: transactionID, identityProfileID: identityID, command: command)) { result in
+            Task { @MainActor in
+                switch result {
+                case let .failure(error): completion(.failure(error))
+                case let .success(response):
+                    if response.code == "identity-not-active" { setup(); return }
+                    guard response.code == "ok", authKey.isEmpty,
+                          let raw = response.statusJSON?.data(using: .utf8),
+                          var status = try? JSONDecoder().decode(TailscaleRuntimeStatus.self, from: raw) else {
+                        let message = response.code == "identity-in-use" || !authKey.isEmpty
+                            ? "这份 Tailscale 身份正在承载流量；请先停止使用它，再退出登录或更换身份"
+                            : "当前 Tailscale 状态暂不可用，请稍后刷新"
+                        completion(.failure(self.requestError(message))); return
+                    }
+                    status.isInUse = true
+                    completion(.success(status))
+                }
+            }
+        }
+    }
+
+    private func performTailscaleDaemonRequest(
         cmd: String,
         profile: String? = nil,
         lineID: String,
         authKey: String = "",
         completion: @escaping (Result<TailscaleRuntimeStatus, Error>) -> Void
     ) {
+        let gate = TailscaleRequestCompletion<TailscaleRuntimeStatus>(completion)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+            gate.finish(.failure(self.requestError("Tailscale 请求超时，请刷新后重试")))
+        }
+        let completion: (Result<TailscaleRuntimeStatus, Error>) -> Void = { gate.finish($0) }
         Task { [weak self] in
             let ok = await self?.ensureHelperAsync() ?? false
+            guard gate.isPending else { return }
             guard let self, ok, self.ensureSocket() else {
                 completion(.failure(
                     self?.requestError(
@@ -849,5 +982,17 @@ struct EngineStatus: Decodable {
         scenarioID = try values.decodeIfPresent(String.self, forKey: .scenarioID)
         connectedAt = try values.decodeIfPresent(Int.self, forKey: .connectedAt)
         error = try values.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+@MainActor
+private final class TailscaleRequestCompletion<Value> {
+    private var completion: ((Result<Value, Error>) -> Void)?
+    init(_ completion: @escaping (Result<Value, Error>) -> Void) { self.completion = completion }
+    var isPending: Bool { completion != nil }
+    func finish(_ result: Result<Value, Error>) {
+        let callback = completion
+        completion = nil
+        callback?(result)
     }
 }

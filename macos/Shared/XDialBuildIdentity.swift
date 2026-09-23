@@ -5,6 +5,16 @@ import Foundation
 /// the established production identity; only Debug defines
 /// XDIAL_DEVELOPMENT_IDENTITY.
 enum XDialBuildIdentity {
+    static var tailscaleDeviceChannel: String {
+        #if XDIAL_NEXT_IDENTITY
+        return "next"
+        #elseif XDIAL_DEVELOPMENT_IDENTITY
+        return "debug"
+        #else
+        return "stable"
+        #endif
+    }
+
     static let formalApplicationIdentifier = "com.kafeifei.xdial.app"
     static let formalHelperIdentifier = "com.kafeifei.xdial.app.helper"
     static let formalDaemonIdentifier = "com.kafeifei.xdial.app.daemon"

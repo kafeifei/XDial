@@ -279,6 +279,12 @@ func handleClient(
 			}
 			switch req.Cmd {
 			case "start":
+				projected, err := config.ProfileWithTailscaleChannel(req.Profile, buildFlavor)
+				if err != nil {
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile"})
+					return
+				}
+				req.Profile = projected
 				profile, err := config.ParseProfile([]byte(req.Profile))
 				if err != nil {
 					client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
@@ -364,14 +370,16 @@ func handleClient(
 				}
 
 			case "tailscale-prepare":
-				networkRuntimeMu.Lock()
-				if status := engineStatus(eng); status != "disconnected" {
-					networkRuntimeMu.Unlock()
+				profileJSON, err := config.ProfileWithTailscaleChannel(req.Profile, buildFlavor)
+				if err != nil {
 					req.AuthKey = ""
-					client.SendResponse(Response{ID: req.ID, OK: false, Message: "disconnect XDial before configuring Tailscale"})
+					client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid Tailscale profile"})
 					return
 				}
-				data, err := tailscaleSetup.Prepare(req.Profile, req.LineID, req.AuthKey)
+				networkRuntimeMu.Lock()
+				// Independent identities may sign in while the Provider runs.
+				// The persistent-state flock still forbids two owners of one identity.
+				data, err := tailscaleSetup.Prepare(profileJSON, req.LineID, req.AuthKey)
 				req.AuthKey = ""
 				networkRuntimeMu.Unlock()
 				if err != nil {
@@ -419,7 +427,12 @@ func handleClient(
 
 			case "tailscale-stop-setup":
 				networkRuntimeMu.Lock()
-				err := tailscaleSetup.StopLine(req.LineID)
+				var err error
+				if req.LineID == "" {
+					err = tailscaleSetup.Stop()
+				} else {
+					err = tailscaleSetup.StopLine(req.LineID)
+				}
 				networkRuntimeMu.Unlock()
 				if err != nil {
 					client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})

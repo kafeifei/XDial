@@ -1,4 +1,5 @@
 import Foundation
+import Libbox
 import SwiftUI
 
 extension AppState {
@@ -189,6 +190,8 @@ extension AppState {
         var snapshot = editingRecord.profile
         snapshot.profileID = editingRecord.id
         guard let data = try? JSONEncoder().encode(snapshot) else { return "{}" }
-        return String(decoding: data, as: UTF8.self)
+        var error: NSError?
+        return LibboxProfileWithTailscaleChannel(String(decoding: data, as: UTF8.self),
+            XDialBuildIdentity.tailscaleDeviceChannel, &error)
     }
 }

@@ -3,6 +3,7 @@
 package tailscalesetup
 
 import (
+	"github.com/kafeifei/xdial/core/libbox"
 	"strings"
 	"testing"
 	"time"
@@ -102,5 +103,39 @@ func TestWaitForSettledStatusTimesOut(t *testing.T) {
 func TestTailscaleStatusSettledRejectsMalformedStatus(t *testing.T) {
 	if _, _, err := tailscaleStatusSettled(`{`); err == nil {
 		t.Fatal("expected malformed status to fail")
+	}
+}
+
+type fakeSetupRuntime struct{ reads, stops int }
+
+func (f *fakeSetupRuntime) TailscaleStatus(string) (string, error) {
+	f.reads++
+	return `{"backend_state":"NeedsLogin","auth_url":"https://login.example/a/stable"}`, nil
+}
+func (f *fakeSetupRuntime) BeginTailscaleLogin(string) (string, error) { return f.TailscaleStatus("") }
+func (f *fakeSetupRuntime) TailscaleLogout(string) error               { return nil }
+func (f *fakeSetupRuntime) Stop() error                                { f.stops++; return nil }
+
+func TestPrepareReusesLoginSessionAndURL(t *testing.T) {
+	raw := `{"profile_id":"test","lines":[{"id":"ts","type":"tailscale"}]}`
+	m := New(t.TempDir())
+	configJSON, err := libbox.GenerateTailscaleSetupConfig(raw, "ts", m.basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeSetupRuntime{}
+	m.runtime, m.lineID, m.endpointTag, m.sessionConfig = runtime, "ts", "tailscale-ts", configJSON
+	defer m.Stop()
+	for i := 0; i < 3; i++ {
+		result, err := m.Prepare(raw, "ts", "")
+		if err != nil || !strings.Contains(result, "a/stable") {
+			t.Fatalf("lost login session: %s %v", result, err)
+		}
+	}
+	if runtime.reads != 3 || runtime.stops != 0 {
+		t.Fatalf("refresh restarted runtime: %+v", runtime)
+	}
+	if err := m.StopLine("other"); err != nil || runtime.stops != 0 {
+		t.Fatal("unrelated card stopped login")
 	}
 }

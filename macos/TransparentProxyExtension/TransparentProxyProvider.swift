@@ -602,11 +602,49 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         }
     }
 
+    private func handleTailscaleControl(_ data: Data, completion: @escaping (Data?) -> Void) {
+        guard data.count <= 4096,
+              let request = try? JSONDecoder().decode(TailscaleControlRequest.self, from: data) else {
+            completion(nil)
+            return
+        }
+        engineQueue.async { [weak self] in
+            guard let self else { completion(nil); return }
+            func reply(_ code: String, _ status: String? = nil) {
+                completion(try? JSONEncoder().encode(TailscaleControlResponse(
+                    requestID: request.requestID, transactionID: request.transactionID,
+                    code: code, statusJSON: status)))
+            }
+            self.scenarioSwitchLock.lock()
+            let switching = self.activeScenarioSwitch != nil
+            self.scenarioSwitchLock.unlock()
+            if let code = TailscaleControlPolicy.rejection(request: request,
+                transactionID: self.generation,
+                committed: self.settingsCommitted && !self.settingsCommitInFlight
+                    && !self.rollbackInProgress && self.runtime != nil && self.session != nil,
+                switching: switching,
+                activeIdentity: self.session?.tailscaleIdentityProfileID) {
+                reply(code)
+                return
+            }
+            guard let runtime = self.runtime, let session = self.session else {
+                reply("connection-busy"); return
+            }
+            do { reply("ok", try runtime.tailscaleControl(request.command, session: session)) }
+            catch { reply("tailscale-request-failed") }
+        }
+    }
+
     override func handleAppMessage(
         _ messageData: Data,
         completionHandler: ((Data?) -> Void)?
     ) {
         guard let completionHandler else { return }
+        if let header = try? JSONSerialization.jsonObject(with: messageData) as? [String: Any],
+           header["kind"] as? String == "tailscale-control" {
+            handleTailscaleControl(messageData, completion: completionHandler)
+            return
+        }
         if Self.isScenarioSwitchMessage(messageData) {
             handleScenarioSwitchMessage(
                 messageData,

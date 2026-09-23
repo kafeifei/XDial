@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import Libbox
 import ServiceManagement
 import SwiftUI
 
@@ -341,7 +342,12 @@ final class AppState: ObservableObject {
         generation: Int,
         remaining: Int
     ) {
-        guard remaining > 0 else { return }
+        guard remaining > 0 else {
+            setTailscaleConfigurationBusy(false, for: lineID)
+            setTailscaleConfigurationError(tr("登录等待已结束；可重新打开浏览器继续登录。",
+                "Sign-in timed out. Open the browser again to continue."), for: lineID)
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
             [weak self] in
             guard let self else { return }
@@ -1350,7 +1356,7 @@ final class AppState: ObservableObject {
             return
         }
         guard canConnect else { return }
-        let generation = connectionAttempts.begin()
+        _ = connectionAttempts.begin()
         clearLineObservations()
         // 这次 save 本身就是在下发前落盘，不该把自己标成"未下发"
         save(markDirty: false)
@@ -1365,40 +1371,9 @@ final class AppState: ObservableObject {
         for lineID in tailscaleLineIDs {
             cancelTailscaleConfigurationPolling(lineID: lineID)
         }
-        stopTailscaleSetupSessions(
-            lineIDs: tailscaleLineIDs,
-            profileJSON: profileJSON,
-            generation: generation,
-            automaticRetryTrigger: automaticRetryTrigger
-        )
-    }
-
-    private func stopTailscaleSetupSessions(
-        lineIDs: [String],
-        profileJSON: String,
-        generation: Int,
-        automaticRetryTrigger: AutomaticReconnectTrigger?
-    ) {
-        guard connectionAttempts.isCurrent(generation) else { return }
-        guard let lineID = lineIDs.first else {
-            engine.start(
-                profileJSON: profileJSON,
-                automaticRetryTrigger: automaticRetryTrigger
-            )
-            return
-        }
-        engine.stopTailscaleSetup(lineID: lineID) { [weak self] in
-            guard let self,
-                  self.connectionAttempts.isCurrent(generation) else {
-                return
-            }
-            self.stopTailscaleSetupSessions(
-                lineIDs: Array(lineIDs.dropFirst()),
-                profileJSON: profileJSON,
-                generation: generation,
-                automaticRetryTrigger: automaticRetryTrigger
-            )
-        }
+        // GoEngine serializes account operations and releases the setup owner
+        // once for the whole connection, including leases from an earlier UI.
+        engine.start(profileJSON: profileJSON, automaticRetryTrigger: automaticRetryTrigger)
     }
 
     func retryAutomaticReconnectNow() {
@@ -2839,7 +2814,9 @@ final class AppState: ObservableObject {
             snapshot.activeScenarioID = activeScenarioID
         }
         guard let data = try? JSONEncoder().encode(snapshot) else { return "{}" }
-        return String(data: data, encoding: .utf8) ?? "{}"
+        var error: NSError?
+        return LibboxProfileWithTailscaleChannel(String(decoding: data, as: UTF8.self),
+            XDialBuildIdentity.tailscaleDeviceChannel, &error)
     }
 }
 

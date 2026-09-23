@@ -25,6 +25,7 @@ import (
 const tailscaleStatusTimeout = 5 * time.Second
 
 type tailscaleStatusPayload struct {
+	DeviceName             string                    `json:"device_name,omitempty"`
 	BackendState           string                    `json:"backend_state"`
 	AuthURL                string                    `json:"auth_url"`
 	HealthCount            int                       `json:"health_count"`
@@ -936,6 +937,9 @@ func encodeTailscaleStatus(
 			strings.TrimSpace(status.CurrentTailnet.MagicDNSSuffix) != "",
 		Readiness: readiness,
 		ExitNodes: make([]tailscaleStatusExitNode, 0),
+	}
+	if status.Self != nil {
+		payload.DeviceName = status.Self.HostName
 	}
 	for peerPublicKey, peer := range status.Peer {
 		if peer == nil || !peer.ExitNodeOption {
