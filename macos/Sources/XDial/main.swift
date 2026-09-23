@@ -1,6 +1,9 @@
 import AppKit
 
 #if DEBUG
+if CommandLine.arguments.contains("--check-scenario-layout") {
+    MainActor.assumeIsolated { SettingsLayoutPreview.checkScenarioLayout() }
+}
 if let index = CommandLine.arguments.firstIndex(of: "--render-settings-preview"),
    CommandLine.arguments.indices.contains(index + 1) {
     MainActor.assumeIsolated { SettingsLayoutPreview.run(directory: CommandLine.arguments[index + 1]) }

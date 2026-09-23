@@ -269,12 +269,15 @@ cli-next: $(PATCHED_WORKFILE)
 	$(MACOS_GO_BUILD_ENV) $(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS) -X main.buildFlavor=next" -o $(BUILD_DIR)/xdial-next ./cmd/xdial/
 
 # Development builds include DebugServer and must never be distributed.
-.PHONY: app-debug app-next cli-next
+.PHONY: app-debug app-next cli-next test-scenario-layout
 app-debug:
 	$(MAKE) app DEVELOPMENT_CHANNEL=debug
 
 app-next:
 	$(MAKE) app DEVELOPMENT_CHANNEL=next
+
+test-scenario-layout:
+	python3 test/scenario_layout_test.py "$(APP_BUNDLE)"
 
 app: cli-$(DEVELOPMENT_CHANNEL) libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
 	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration $(DEVELOPMENT_CONFIGURATION) \

@@ -15,7 +15,10 @@ struct ScenarioBindingList: View {
     @State private var hasMoved = false
 
     var body: some View {
-        LazyVStack(spacing: 6) {
+        // Bindings form the height of one expanded card. A second lazy layout
+        // here can keep revising that height while the outer scroll viewport
+        // updates visibility, preventing SwiftUI's transaction from settling.
+        VStack(spacing: 6) {
             ForEach($bindings) { $binding in
                 let item = SettingsReorderItem(
                     kind: "scenario-binding:\(scenarioID)",

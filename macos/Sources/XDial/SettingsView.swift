@@ -2092,7 +2092,10 @@ struct ScenariosTab: View {
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                LazyVStack(spacing: 8) {
+                // Scenario cards change height when expanded. Keep their
+                // layout deterministic instead of estimating offscreen card
+                // heights and feeding those estimates back into visibility.
+                VStack(spacing: 8) {
                     ForEach($state.editingProfile.scenarios) { $scenario in
                         let scenarioID = scenario.id
                         ScenarioRow(
