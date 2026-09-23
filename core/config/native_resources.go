@@ -206,6 +206,7 @@ func CloneProfile(profile *Profile, namespace string) *Profile {
 	}
 	for i := range result.Lines {
 		line := &result.Lines[i]
+		line.IdentityProfileID, line.IdentityHostname = "", ""
 		line.ID = lines[line.ID]
 		for j, member := range line.GroupMembers {
 			line.GroupMembers[j] = lines[member]
@@ -282,6 +283,17 @@ func ProfileDataPath(profile *Profile, base string) (string, error) {
 		return base, nil
 	}
 	id := profile.ID
+	// A global runtime still uses the original source's persistent Tailscale node.
+	// The Go dependency collector owns this choice; the host only supplies ownership.
+	if profile.ActiveScenario() != nil {
+		line, err := ActiveTailscaleLine(profile)
+		if err != nil {
+			return "", err
+		}
+		if line != nil && line.IdentityProfileID != "" {
+			id = line.IdentityProfileID
+		}
+	}
 	if len(id) > 80 || strings.IndexFunc(id, func(r rune) bool {
 		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-')
 	}) >= 0 {

@@ -1,18 +1,5 @@
 import SwiftUI
 
-extension Line {
-    var memberTypeLabel: String {
-        switch type {
-        case "selector", "urltest": return "线路组"
-        case "direct": return "直连"
-        default: return type.uppercased()
-        }
-    }
-    var chosenGroupMemberID: String? {
-        type == "urltest" ? nil : (groupDefault.isEmpty ? groupMembers.first : groupDefault)
-    }
-}
-
 struct LineGroupRow: View {
     @Binding var line: Line
     let onDelete: () -> Void
@@ -22,7 +9,7 @@ struct LineGroupRow: View {
     @State private var reordering = false
     @State private var search = ""
     @State private var error: String?
-    private var profileID: String { state.editingRecord.id }
+    private var profileID: String { ProfileLibrary.configurationID }
     private var expanded: Bool {
         get { state.editorPosition.expandedLineIDs.contains(line.id) }
         nonmutating set {
@@ -30,14 +17,18 @@ struct LineGroupRow: View {
             else { state.editorPosition.expandedLineIDs.remove(line.id) }
         }
     }
-    private var readOnly: Bool { state.editingRecord.baseline?.lines.contains(where: { $0.id == line.id }) == true }
+    private var readOnly: Bool { false }
+    private func sourceMember(_ id: String) -> Bool {
+        guard let source = state.profileLibrary.groupSources[line.id], source.followsMembers else { return false }
+        return source.sourceMembers.contains(id)
+    }
     private var members: [Line] {
-        let catalog = Dictionary(state.editingProfile.lines.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        return line.groupMembers.compactMap { catalog[$0] }.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }
+        let catalog = state.configurationCatalog
+        return line.groupMembers.compactMap { catalog.line($0) }.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }
     }
     private var choiceLabel: String {
         guard let id = line.chosenGroupMemberID else { return "自动选择" }
-        return state.editingProfile.lines.first { $0.id == id }?.name ?? "成员已不存在"
+        return state.configurationCatalog.line(id)?.name ?? "成员已不存在"
     }
 
     var body: some View {
@@ -60,6 +51,7 @@ struct LineGroupRow: View {
                     .accessibilityLabel("设置 \(line.name)")
             }.padding(.horizontal, 12).padding(.vertical, 8)
             if expanded {
+                let members = members
                 Divider()
                 VStack(spacing: 6) {
                     if showSettings { settings }
@@ -72,17 +64,16 @@ struct LineGroupRow: View {
                                 .help(reordering ? "完成排序" : "调整成员顺序")
                         }
                     }.buttonStyle(.borderless).font(.caption).padding(.bottom, 3)
-                    selectionRow(nil)
+                    automaticSelectionRow
                     Divider()
                     if line.groupMembers.isEmpty {
                         Text("添加线路后，即可自动择优或固定选择一条线路")
                             .foregroundStyle(.secondary).font(.caption).frame(maxWidth: .infinity).padding(.vertical, 18)
                     } else {
-                        ScrollView {
-                            LazyVStack(spacing: 1) {
-                                ForEach(members) { member in selectionRow(member) }
-                            }.padding(.trailing, 18)
-                        }.frame(height: CGFloat(max(1, min(members.count, 7))) * 32)
+                        NativeGroupMembersView(group: line, members: members, state: state,
+                            latencies: state.lineLatencies, reordering: reordering && search.isEmpty,
+                            select: select, move: move, remove: remove)
+                            .frame(height: CGFloat(max(1, min(members.count, 7))) * 32)
                     }
                     if let error { Text(error).font(.caption).foregroundStyle(XDialPalette.danger).frame(maxWidth: .infinity, alignment: .leading) }
                     Divider()
@@ -104,50 +95,22 @@ struct LineGroupRow: View {
         LineLatencyView(store: state.lineLatencies, line: member, profileID: profileID, group: member.id == line.id ? nil : line, allowsTesting: interactive)
     }
 
-    private func selectionRow(_ member: Line?) -> some View {
-        let selected = member.map { line.chosenGroupMemberID == $0.id } ?? (line.type == "urltest")
+    private var automaticSelectionRow: some View {
+        let selected = line.type == "urltest"
         return HStack(spacing: 8) {
-            Button { select(member?.id) } label: {
+            Button { select(nil) } label: {
                 HStack(spacing: 8) {
                     Image(systemName: selected ? "largecircle.fill.circle" : "circle")
                         .foregroundStyle(selected ? XDialPalette.primaryAction : .secondary).frame(width: 17)
-                    if let member {
-                        Text(member.name).lineLimit(1).font(.system(size: 12))
-                    } else {
-                        Text("自动选择").font(.system(size: 12, weight: .medium))
-                        GroupSelectionCaption(store: state.lineLatencies, line: line, profileID: profileID, catalog: state.editingProfile.lines)
-                    }
+                    Text("自动选择").font(.system(size: 12, weight: .medium))
+                    GroupSelectionCaption(store: state.lineLatencies, line: line, profileID: profileID, catalog: state.editingProfile.lines)
                     Spacer(minLength: 4)
                 }.contentShape(Rectangle())
-            }.buttonStyle(.plain).accessibilityLabel(member?.name ?? "自动选择")
+            }.buttonStyle(.plain).accessibilityLabel("自动选择")
                 .accessibilityValue(selected ? "已选择" : "未选择")
-            if let member {
-                Text(member.memberTypeLabel).font(.system(size: 10)).foregroundStyle(.secondary)
-                latency(member)
-                if member.isGroup {
-                    Button { state.editorPosition.expandedLineIDs.insert(member.id) } label: {
-                        Image(systemName: "arrow.turn.down.right").frame(width: 20)
-                    }.buttonStyle(.plain).help("展开子组")
-                }
-                if !readOnly {
-                    if reordering && search.isEmpty {
-                        Button { move(member.id, by: -1) } label: { Image(systemName: "chevron.up") }
-                            .disabled(line.groupMembers.first == member.id)
-                        Button { move(member.id, by: 1) } label: { Image(systemName: "chevron.down") }
-                            .disabled(line.groupMembers.last == member.id)
-                    } else {
-                        Button {
-                            state.editingProfile.removeLineGroupMember(member.id, from: line.id)
-                            state.saveEditingProfile()
-                        } label: { Image(systemName: "minus.circle").frame(width: 20) }
-                        .help("从组中移除，保留原线路").accessibilityLabel("移除 \(member.name)")
-                    }
-                }
-            } else {
-                if line.type == "urltest" { latency(line, interactive: false) }
-                else { Text("未启用").font(.system(size: 10)).foregroundStyle(.secondary) }
-                Text("择优").font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 30)
-            }
+            if selected { latency(line, interactive: false) }
+            else { Text("未启用").font(.system(size: 10)).foregroundStyle(.secondary) }
+            Text("择优").font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 30)
         }.buttonStyle(.borderless).padding(.horizontal, 6).frame(height: 32)
             .background(selected ? XDialPalette.selection.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 5))
     }
@@ -155,10 +118,17 @@ struct LineGroupRow: View {
     private var settings: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                TextField("名称", text: $line.name).disabled(readOnly)
-                TextField("自动测速间隔，如 3m", text: $line.groupInterval).frame(width: 145)
+                SettingsDraftInput($line.name, onCommit: state.saveEditingProfile) { TextField("名称", text: $0) }.disabled(readOnly)
+                SettingsDraftInput($line.groupInterval, onCommit: state.saveEditingProfile) { TextField("自动测速间隔，如 3m", text: $0) }.frame(width: 145)
             }
-            TextField("自动测速 URL（留空使用默认值）", text: $line.groupURL)
+            if let source = state.profileLibrary.groupSources[line.id],
+               let record = state.profileLibrary.profiles.first(where: { $0.id == source.profileID }), record.source != nil {
+                Toggle("跟随「\(record.name)」的源组成员", isOn: Binding(
+                    get: { state.profileLibrary.groupSources[line.id]?.followsMembers == true },
+                    set: { state.setGroupFollowsSource(line.id, enabled: $0) }
+                ))
+            }
+            SettingsDraftInput($line.groupURL, onCommit: state.saveEditingProfile) { TextField("自动测速 URL（留空使用默认值）", text: $0) }
             HStack {
                 Text(readOnly ? "成员随订阅更新；选线与测速参数可单独修改" : "成员可包含线路或其他线路组")
                     .foregroundStyle(.secondary)
@@ -168,9 +138,6 @@ struct LineGroupRow: View {
             }
             Divider()
         }.font(.caption).textFieldStyle(.roundedBorder)
-            .onChange(of: line.name) { state.saveEditingProfile() }
-            .onChange(of: line.groupURL) { state.saveEditingProfile() }
-            .onChange(of: line.groupInterval) { state.saveEditingProfile() }
     }
     private func select(_ memberID: String?) {
         do {
@@ -178,9 +145,53 @@ struct LineGroupRow: View {
             state.saveEditingProfile(); error = nil
         } catch { self.error = error.localizedDescription }
     }
+    private func remove(_ id: String) {
+        guard !readOnly, !sourceMember(id), line.groupMembers.contains(id) else { return }
+        state.editingProfile.removeLineGroupMember(id, from: line.id)
+        state.saveEditingProfile()
+    }
     private func move(_ id: String, by offset: Int) {
-        guard let index = line.groupMembers.firstIndex(of: id), line.groupMembers.indices.contains(index + offset) else { return }
+        guard !readOnly, !sourceMember(id), let index = line.groupMembers.firstIndex(of: id), line.groupMembers.indices.contains(index + offset) else { return }
         line.groupMembers.swapAt(index, index + offset); state.saveEditingProfile()
+    }
+}
+
+/// Only this adapter observes measurements for the member list. AppKit cells
+/// receive plain display values and never subscribe to application state.
+private struct NativeGroupMembersView: View {
+    let group: Line
+    let members: [Line]
+    @ObservedObject var state: AppState
+    @ObservedObject var latencies: LineLatencyStore
+    let reordering: Bool
+    let select: (String?) -> Void
+    let move: (String, Int) -> Void
+    let remove: (String) -> Void
+
+    var body: some View {
+        let source = state.profileLibrary.groupSources[group.id]
+        let followedMembers = Set(source?.followsMembers == true ? source?.sourceMembers ?? [] : [])
+        let rows = LineGroupMemberTable.rows(group: group, members: members,
+            followedMembers: followedMembers, sourceNames: state.configurationCatalog.lineSources,
+            globalSourceName: state.tr("全局", "Global"), reordering: reordering, store: latencies)
+        LineGroupMemberTable(rows: rows) { id, action in
+            guard let currentGroup = state.configurationCatalog.line(group.id),
+                  currentGroup.groupMembers.contains(id),
+                  let member = state.configurationCatalog.line(id) else { return }
+            switch action {
+            case .select: select(id)
+            case .remove: remove(id)
+            case .moveUp: move(id, -1)
+            case .moveDown: move(id, 1)
+            case .expand:
+                if member.isGroup { state.editorPosition.expandedLineIDs.insert(id) }
+            case .test:
+                let profileID = ProfileLibrary.configurationID
+                let control = LineLatencyStore.TestControl.line(id, groupID: group.id)
+                if let job = latencies.activeJob(for: control, profileID: profileID) { latencies.cancel(job.id) }
+                else { latencies.test([member], profileID: profileID, group: currentGroup, scope: .currentExit, control: control) }
+            }
+        }
     }
 }
 
@@ -230,7 +241,7 @@ private struct LineGroupMemberSheet: View {
             Text("添加到「\(group?.name ?? "线路组")」").font(.headline)
             HStack {
                 SettingsSearchField("搜索线路或组", text: $search)
-                LineLatencyBatchButton(store: state.lineLatencies, lines: candidates, profileID: state.editingRecord.id, control: .candidates(groupID))
+                LineLatencyBatchButton(store: state.lineLatencies, lines: candidates, profileID: ProfileLibrary.configurationID, control: .candidates(groupID))
             }.buttonStyle(.borderless)
             ScrollView {
                 LazyVStack(spacing: 0) {
@@ -261,8 +272,8 @@ private struct LineGroupMemberSheet: View {
                 }
             }.toggleStyle(.checkbox).disabled(issue != nil)
             Spacer(minLength: 8)
-            Text(member.memberTypeLabel).font(.system(size: 10)).foregroundStyle(.secondary)
-            LineLatencyView(store: state.lineLatencies, line: member, profileID: state.editingRecord.id)
+            Text(member.isGroup ? "全局组" : state.lineSourceName(member.id)).font(.system(size: 10)).foregroundStyle(.secondary)
+            LineLatencyView(store: state.lineLatencies, line: member, profileID: ProfileLibrary.configurationID)
         }.padding(.vertical, 7)
     }
     private func addSelected() {
@@ -282,7 +293,7 @@ struct NativeRuleEditor: View {
     @EnvironmentObject var state: AppState
     @State private var text = ""
     @State private var error: String?
-    private var readOnly: Bool { state.editingRecord.baseline?.matchingResources.contains(where: { $0.id == rule.id }) == true }
+    var readOnly = false
     private var simpleFields: [String]? {
         guard case let .object(fields) = rule.nativeRule, !fields.isEmpty,
               fields.keys.allSatisfy({ NativeMatchFieldEditor.labels[$0] != nil }),
@@ -300,8 +311,10 @@ struct NativeRuleEditor: View {
                 ForEach(fields, id: \.self) { key in NativeMatchFieldEditor(rule: $rule, fieldKey: key, readOnly: readOnly) }
             } else {
             Text("sing-box 匹配规则").font(.caption).foregroundStyle(.secondary)
-            TextEditor(text: $text).font(.system(.caption, design: .monospaced))
-                .frame(height: 150).disabled(readOnly)
+            Group {
+                if readOnly { SettingsReadOnlyText(text: rule.nativeRule?.formatted ?? "{}", multiline: true) }
+                else { TextEditor(text: $text).font(.system(.caption, design: .monospaced)) }
+            }.frame(height: 150)
             if let error { Text(error).font(.caption).foregroundStyle(XDialPalette.danger) }
             if !readOnly {
                 Button("保存规则") {
@@ -346,8 +359,10 @@ struct NativeMatchFieldEditor: View {
                 Spacer()
                 Text("每行一项").font(.caption).foregroundStyle(.secondary)
             }
-            TextEditor(text: $text).font(.system(.caption, design: .monospaced))
-                .frame(height: 125).disabled(readOnly)
+            Group {
+                if readOnly { SettingsReadOnlyText(text: text, multiline: true) }
+                else { TextEditor(text: $text).font(.system(.caption, design: .monospaced)) }
+            }.frame(height: 125)
             if let error { Text(error).font(.caption).foregroundStyle(XDialPalette.danger) }
             if !readOnly {
                 Button("保存匹配内容") { save() }
@@ -387,6 +402,7 @@ struct NativeMatchFieldEditor: View {
 
 struct NativeLineOptionsEditor: View {
     @Binding var line: Line
+    var readOnly = false
     @EnvironmentObject var state: AppState
     @State private var text = "{}"
     @State private var error: String?
@@ -395,8 +411,12 @@ struct NativeLineOptionsEditor: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("填写 TLS、传输等附加选项；服务器与凭据使用上方表单。")
                 .font(.caption).foregroundStyle(.secondary)
-            TextEditor(text: $text).font(.system(.caption, design: .monospaced)).frame(minHeight: 110)
+            Group {
+                if readOnly { SettingsReadOnlyText(text: line.nativeOptions?.formatted ?? "{}", multiline: true) }
+                else { TextEditor(text: $text).font(.system(.caption, design: .monospaced)) }
+            }.frame(minHeight: 110)
             if let error { Text(error).font(.caption).foregroundStyle(XDialPalette.danger) }
+            if !readOnly {
             Button("保存高级选项") {
                 do {
                     let value = try JSONDecoder().decode(JSONValue.self, from: Data(text.utf8))
@@ -409,6 +429,7 @@ struct NativeLineOptionsEditor: View {
                     state.saveEditingProfile()
                     error = nil
                 } catch { self.error = error.localizedDescription }
+            }
             }
         }
         .onAppear { text = line.nativeOptions?.formatted ?? "{}" }

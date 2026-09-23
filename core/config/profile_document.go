@@ -45,6 +45,7 @@ type documentObject struct {
 	Processes     []string           `json:"processes,omitempty"`
 }
 type documentMetadata struct {
+	ResourcesOnly     bool                      `json:"resources_only,omitempty"`
 	ImportAdjustments []ImportAdjustment        `json:"import_adjustments,omitempty"`
 	RuleGroups        []documentRuleGroup       `json:"rule_groups,omitempty"`
 	ImportWarnings    []SubscriptionRule        `json:"import_warnings,omitempty"`
@@ -87,6 +88,9 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 		if len(profile.Subscriptions) > 0 {
 			return nil, fmt.Errorf("legacy nested subscriptions require migration; import their source links as Profiles")
 		}
+		if err := validateDocumentProfile(profile); err != nil {
+			return nil, err
+		}
 		profile = CloneProfile(profile, namespace)
 		return profile, validateDocumentProfile(profile)
 	}
@@ -128,8 +132,11 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		return nil, fmt.Errorf("invalid sing-box configuration")
 	}
-	if document.XDial.SchemaVersion != 0 && document.XDial.SchemaVersion != 1 {
+	if document.XDial.SchemaVersion < 0 || document.XDial.SchemaVersion > 2 {
 		return nil, fmt.Errorf("unsupported XDial schema version")
+	}
+	if document.XDial.ResourcesOnly && (document.XDial.SchemaVersion != 2 || len(document.XDial.Scenarios) != 0 || len(document.Route.Rules) != 0 || document.Route.Final != "") {
+		return nil, fmt.Errorf("resource-only documents cannot contain routing policies")
 	}
 	profile := &Profile{ImportAdjustments: document.XDial.ImportAdjustments, ImportWarnings: document.XDial.ImportWarnings, ID: namespace, Lines: []Line{{ID: "direct", Name: "直连", Type: LineTypeDirect, Enabled: true}}}
 	tags := map[string]string{"direct": "direct"}
@@ -183,6 +190,7 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 	}
 	for _, original := range document.XDial.AdapterLines {
 		line := original
+		line.IdentityProfileID, line.IdentityHostname = "", ""
 		line.ID = tags[original.ID]
 		profile.Lines = append(profile.Lines, line)
 	}
@@ -265,7 +273,7 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 		return nil, err
 	}
 	scenarios := document.XDial.Scenarios
-	if len(scenarios) == 0 {
+	if len(scenarios) == 0 && !document.XDial.ResourcesOnly {
 		scenarios = []documentScenario{{ID: "default", Name: "默认场景", Route: document.Route}}
 	}
 	for _, entry := range scenarios {
@@ -349,7 +357,9 @@ func ImportProfileDocument(data []byte, namespace string) (*Profile, error) {
 		}
 		profile.Scenarios = append(profile.Scenarios, scenario)
 	}
-	profile.ActiveScenarioID = profile.Scenarios[0].ID
+	if len(profile.Scenarios) > 0 {
+		profile.ActiveScenarioID = profile.Scenarios[0].ID
+	}
 	if document.XDial.SchemaVersion == 0 && len(document.XDial.Scenarios) == 0 {
 		grouped, err := GroupProfileRulesByDestination(profile, profile.ActiveScenarioID)
 		if err != nil {
@@ -486,8 +496,8 @@ func validateDocumentProfile(profile *Profile) error {
 	if groupErr != nil {
 		return groupErr
 	}
-	if len(profile.Lines) == 0 || len(profile.Scenarios) == 0 {
-		return fmt.Errorf("configuration requires a Line and Scenario")
+	if len(profile.Lines) == 0 {
+		return fmt.Errorf("configuration requires a Line")
 	}
 	if len(profile.Subscriptions) != 0 {
 		return fmt.Errorf("nested subscriptions are not supported in a Profile document")
@@ -552,11 +562,15 @@ func ExportProfileDocument(profile *Profile) ([]byte, error) {
 	if err := validateDocumentProfile(profile); err != nil {
 		return nil, err
 	}
-	document := ProfileDocument{XDial: documentMetadata{ImportAdjustments: profile.ImportAdjustments, ImportWarnings: profile.ImportWarnings, SchemaVersion: 1, Lines: map[string]documentObject{}, Rules: map[string]documentObject{}}}
+	document := ProfileDocument{XDial: documentMetadata{ResourcesOnly: len(profile.Scenarios) == 0, ImportAdjustments: profile.ImportAdjustments, ImportWarnings: profile.ImportWarnings, SchemaVersion: 1, Lines: map[string]documentObject{}, Rules: map[string]documentObject{}}}
+	if document.XDial.ResourcesOnly {
+		document.XDial.SchemaVersion = 2
+	}
 	if len(profile.Subscriptions) > 0 {
 		return nil, fmt.Errorf("legacy nested subscriptions must be migrated before export")
 	}
 	for _, line := range profile.Lines {
+		line.IdentityProfileID, line.IdentityHostname = "", ""
 		metadata := documentObject{Name: line.Name, Disabled: !line.Enabled}
 		if line.Type == LineTypeSelector {
 			metadata.GroupURL, metadata.GroupInterval = line.GroupURL, line.GroupInterval

@@ -14,15 +14,20 @@ struct LineTargetPicker: View {
         if selection.hasPrefix("sub:") {
             return state.editingProfile.subscriptions.first { "sub:\($0.id)" == selection }?.name ?? "（已删除）"
         }
-        return state.editingProfile.lines.first { "port:\($0.id)" == selection }?.name ?? state.tr("选择出口", "Choose Exit")
+        return selectedLine?.name ?? state.tr("选择出口", "Choose Exit")
+    }
+
+    private var selectedLine: Line? {
+        guard selection.hasPrefix("port:") else { return nil }
+        return state.configurationCatalog.line(String(selection.dropFirst(5)))
     }
 
     var body: some View {
         Button { query = ""; presented = true } label: {
             HStack(spacing: 6) {
                 Text(selectedName).lineLimit(1).truncationMode(.middle)
-                if let line = state.editingProfile.lines.first(where: { "port:\($0.id)" == selection }) {
-                    LineLatencyView(store: state.lineLatencies, line: line, profileID: state.editingRecord.id, allowsTesting: false)
+                if let line = selectedLine {
+                    LineLatencyView(store: state.lineLatencies, line: line, profileID: ProfileLibrary.configurationID, allowsTesting: false)
                 }
                 Spacer(minLength: 4)
                 Image(systemName: "chevron.up.chevron.down").font(.system(size: 9))
@@ -56,8 +61,8 @@ struct LineTargetPicker: View {
                 .font(.caption).foregroundStyle(.secondary).padding(.top, 5)
             ForEach(lines) { line in
                 HStack(spacing: 4) {
-                    choice(name: line.name, detail: line.memberTypeLabel, target: "port:\(line.id)")
-                    LineLatencyView(store: state.lineLatencies, line: line, profileID: state.editingRecord.id)
+                    choice(name: line.name, detail: line.isGroup ? state.tr("全局线路组", "Global Group") : state.lineSourceName(line.id), target: "port:\(line.id)")
+                    LineLatencyView(store: state.lineLatencies, line: line, profileID: ProfileLibrary.configurationID)
                 }
             }
         }

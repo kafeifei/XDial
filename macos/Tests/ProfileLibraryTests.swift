@@ -77,8 +77,9 @@ final class ProfileLibraryTests: XCTestCase {
     func testLibraryPromotesOldSchemaAndRejectsFutureSchemas() throws {
         var library = ProfileLibrary()
         library.schemaVersion = 1
-        XCTAssertEqual(try library.validated().schemaVersion, 2)
-        library.schemaVersion = 3
+        library.activeProfileID = library.profiles[0].id
+        XCTAssertEqual(try library.validated().schemaVersion, 3)
+        library.schemaVersion = 4
         XCTAssertThrowsError(try library.validated())
     }
     func testGroupedRuleEditingKeepsScopeAndRemovesDeletedReferences() throws {

@@ -2,9 +2,10 @@
 
 macOS 菜单栏网络分流工具；iOS / tvOS 共用 Go 核心。
 
-本分支 `xdial-next` 长期独立维护 XDial Next，基线为 `2eab57f`。
-按用户要求不合入 main、不发布稳定版、不覆盖 XDial / XDail Debug。
-`make app` 构建独立的 XDial Next；未经要求不重启应用或网络。
+远程 `xdial-next` 分支长期独立维护 XDial Next，基线为 `2eab57f`。
+按用户要求不合入 main、不发布稳定版；Next 发布只进入 GitHub prerelease。
+`make app` 构建 Next 调试包，`make app-debug` 构建既有 Debug 身份；只有明确要求时才覆盖对应安装。
+分发流程见 [Next 发布](docs/agent/next-releases.md)。未经要求不重启应用或网络。
 
 ## 核心边界
 

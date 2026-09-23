@@ -216,49 +216,15 @@ mkdir -p "$git_fixture"
     "$contract" assert-git-tag v1.2.5
 )
 
-release_source="$test_root/release-source.git"
-release_work="$test_root/release-work"
-git init -q --bare "$release_source"
-git init -q -b main "$release_work"
-(
-    cd "$release_work"
-    git config user.name 'XDial Test'
-    git config user.email 'xdial-test@example.invalid'
-    printf '%s\n' source >tracked.txt
-    git add tracked.txt
-    git commit -qm source
-    git remote add origin "$release_source"
-    git push -qu origin main
-    git tag v2.3.4
-    git update-ref -d refs/remotes/origin/main
-    release_notes="$test_root/release-input-notes.md"
-    printf '%s\n' '# XDial v2.3.4' '' '## 更新了什么' '' '- 门禁测试。' \
-        >"$release_notes"
-    make -s --no-print-directory -f "$repository_root/Makefile" release-inputs \
-        RELEASE_CONTRACT="$contract" RELEASE_TAG=v2.3.4 RELEASE_BUILD_NUMBER=234 \
-        RELEASE_NOTES_FILE="$release_notes"
-    [[ "$(git rev-parse refs/remotes/origin/main)" == "$(git rev-parse HEAD)" ]] \
-        || fail "release-inputs did not refresh origin/main"
-
-    # A failed refresh must not fall through to a stale, otherwise valid ref.
-    git remote remove origin
-    git update-ref refs/remotes/origin/main HEAD
-    expect_failure make -s --no-print-directory -f "$repository_root/Makefile" \
-        release-inputs RELEASE_CONTRACT="$contract" RELEASE_TAG=v2.3.4 \
-        RELEASE_BUILD_NUMBER=234 RELEASE_NOTES_FILE="$release_notes"
-
-    # Explicit formal-identity acceptance builds have synthetic versions and no
-    # stable tag. They alone may bypass the stable tag/main check.
-    git tag -d v2.3.4 >/dev/null
-    printf '%s\n' '# XDial v9.9.9' '' '## 更新了什么' '' '- 验收包。' \
-        >"$release_notes"
-    make -s --no-print-directory -f "$repository_root/Makefile" release-inputs \
-        RELEASE_CONTRACT="$contract" RELEASE_TAG=v9.9.9 RELEASE_BUILD_NUMBER=999 \
-        RELEASE_NOTES_FILE="$release_notes" \
-        RELEASE_UPDATE_ACCEPTANCE_ID=pages-fixture
-    expect_failure make -s --no-print-directory -f "$repository_root/Makefile" \
-        publish RELEASE_TAG=v9.9.9 RELEASE_UPDATE_ACCEPTANCE_ID=pages-fixture
-)
+# This independent Next branch must not enable the stable publisher or its
+# acceptance bypass, even though the shared stable verification contract works.
+expect_failure make -s --no-print-directory -f "$repository_root/Makefile" \
+    release-inputs RELEASE_TAG=v2.3.4 RELEASE_BUILD_NUMBER=234
+expect_failure make -s --no-print-directory -f "$repository_root/Makefile" \
+    release-inputs RELEASE_TAG=v9.9.9 RELEASE_BUILD_NUMBER=999 \
+    RELEASE_UPDATE_ACCEPTANCE_ID=pages-fixture
+expect_failure make -s --no-print-directory -f "$repository_root/Makefile" \
+    publish RELEASE_TAG=v9.9.9
 
 fixture_root="$test_root/archive-fixture"
 fixture_app="$fixture_root/XDial.app"

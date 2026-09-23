@@ -111,6 +111,30 @@ final class LocalProcessInventoryTests: XCTestCase {
 
     private let productNames: Set<String> = ["xdial", "xdial-daemon"]
 
+    func testMissingPathUsesSiblingEvidenceWithoutWeakeningUnknownProtection() {
+        for name: String? in [nil, "XDial", "xdial-daemon"] {
+            let process = LocalProcessInventory.Entry(pid: 42, name: name, executableURL: nil)
+            for identified in [true, false] {
+                XCTAssertEqual(process.belongsToProductBundle(
+                    XDialBuildIdentity.applicationDestinationURL, excludingSiblingBundleURLs: [],
+                    executableNames: productNames, identifySibling: { pid in
+                        XCTAssertEqual(pid, 42)
+                        return identified
+                    }
+                ), identified ? false : nil)
+            }
+        }
+    }
+
+    func testCurrentProductPathTakesPrecedenceOverSiblingEvidence() {
+        let process = LocalProcessInventory.Entry(pid: 42, name: "xdial-daemon", executableURL:
+            XDialBuildIdentity.applicationDestinationURL.appendingPathComponent("Contents/MacOS/xdial-daemon"))
+        XCTAssertEqual(process.belongsToProductBundle(
+            XDialBuildIdentity.applicationDestinationURL, excludingSiblingBundleURLs: [],
+            executableNames: productNames, identifySibling: { _ in XCTFail("Known current path cannot be overridden"); return true }
+        ), true)
+    }
+
     func testDeniedNameWithKnownSystemExecutableIsUnrelated() {
         for path in ["/sbin/launchd", "/usr/libexec/logd"] {
             let process = LocalProcessInventory.Entry(pid: 1, name: nil,

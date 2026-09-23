@@ -1,8 +1,9 @@
 # macOS 构建与安装
 
-> 本独立分支默认构建 XDial Next；当前入口与隔离约束见 [profile-next.md](profile-next.md)。以下 Debug / 正式说明用于既有通道参考。
+> 本独立分支默认 `make app` 构建 XDial Next 调试包；`make app-debug` 构建既有 Debug 身份。
+> Next 分发入口见 [next-releases.md](next-releases.md)。以下正式说明用于既有通道参考。
 
-日常 Debug 由 `make app` 生成 `build/XDail Debug.app`，使用 Apple Development 签名，
+日常 Debug 由 `make app-debug` 生成 `build/XDail Debug.app`，使用 Apple Development 签名，
 不提交公证。`FormalDevelopment` 保留正式身份，仅用于该身份的专项验证。
 正式归档由 `make release` 生成，签名、公证与发布机制见 [updates.md](updates.md)。
 
@@ -33,10 +34,10 @@ Debug 的开发证书与 host、extension provisioning profiles 必须匹配 Deb
 开发者账号服务：
 
 ```sh
-make app MACOS_DEBUG_XCODEBUILD_FLAGS=-allowProvisioningUpdates
+make app-debug MACOS_DEBUG_XCODEBUILD_FLAGS=-allowProvisioningUpdates
 ```
 
-`make app` 末尾的 [verify-macos-debug-app.py](../../scripts/verify-macos-debug-app.py)
+两个开发构建入口末尾的 [verify-macos-debug-app.py](../../scripts/verify-macos-debug-app.py)
 校验嵌套组件身份、签名、开发 profile、App Group、daemon plist 与 helper 编译通道，
 不启动 App。host、Settings UI 和 extension 使用同次构建的 `DEBUG_BUILD_VERSION`，
 默认取 Unix 时间戳；构建号用于系统识别扩展升级，不等于源码提交。
@@ -45,14 +46,15 @@ make app MACOS_DEBUG_XCODEBUILD_FLAGS=-allowProvisioningUpdates
 
 | 入口 | 实际效果 |
 |---|---|
-| `make app` | 构建并校验候选包，不替换 `/Applications`，不启动 App |
+| `make app` / `make app-next` | 构建并校验 Next 开发候选包，不替换 `/Applications`，不启动 App |
+| `make app-debug` | 构建并校验 Debug 开发候选包，不替换 `/Applications`，不启动 App |
 | 候选包的 `Contents/MacOS/XDial --install-only` | 安装到该通道的 `/Applications` 路径；替换时终止同通道旧 App，并维护旧 helper；不启动后继 App |
-| `make restart` | 完整构建 Debug 后退出旧 Debug、安装、启动最终 App，等待安装与连接意图收敛 |
+| `make restart` | 本独立 Next 分支禁用；不会停止或启动 App |
 | 从 `/Applications` 外正常启动 App | 自动定位、替换同通道安装并启动最终 App，不是隔离的源码运行 |
 
 `--install-only` 不提供保留旧进程或连接的安装能力。实现见
 [ApplicationRelocator.swift](../../macos/Sources/XDial/ApplicationRelocator.swift)；
-`make restart` 的交接和验收见 [restart-macos-app.sh](../../scripts/restart-macos-app.sh)。
+既有重启脚本的交接和验收见 [restart-macos-app.sh](../../scripts/restart-macos-app.sh)。
 该脚本在新事务提交后执行一次 HTTPS 检查，目标由 `XDIAL_RESTART_PROBE_URL` 指定，
 未设置时为 `https://www.apple.com/`；这次访问仅反映该目标的当前路径结果。
 

@@ -880,7 +880,11 @@ func lineRuntimeIdentity(
 	if profile == nil || line == nil {
 		return "", fmt.Errorf("Line is unavailable")
 	}
-	material := lineRuntimeIdentityMaterial{Type: line.Type, ProfileID: profile.ID, NativeOptions: line.NativeOptions}
+	identityProfileID := profile.ID
+	if line.IdentityProfileID != "" {
+		identityProfileID = line.IdentityProfileID
+	}
+	material := lineRuntimeIdentityMaterial{Type: line.Type, ProfileID: identityProfileID, NativeOptions: line.NativeOptions}
 	switch line.Type {
 	case config.LineTypeSelector, config.LineTypeURLTest:
 		material.Configuration = config.GroupLineOutbounds(profile, line.ID)
@@ -973,12 +977,16 @@ func lineRuntimeIdentity(
 			AllowInsecure:            line.AllowInsecure,
 		}
 	case config.LineTypeTailscale:
+		hostname := profile.Tailscale.Hostname
+		if line.IdentityHostname != "" {
+			hostname = line.IdentityHostname
+		}
 		material.Configuration = struct {
 			Hostname string `json:"hostname"`
 			ExitNode string `json:"exit_node"`
 			MagicDNS bool   `json:"magic_dns"`
 		}{
-			Hostname: profile.Tailscale.Hostname,
+			Hostname: hostname,
 			ExitNode: line.TailscaleExitNode,
 			MagicDNS: line.TailscaleMagicDNS,
 		}

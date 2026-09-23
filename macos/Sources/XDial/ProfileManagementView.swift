@@ -161,6 +161,7 @@ struct ProfileDetailSheet: View {
     @State private var interval: Double = 86400
     @State private var error: String?
     @State private var action: ProfileManagementAction?
+    @State private var confirmingRegenerate = false
 
     private var current: ProfileRecord {
         state.profileLibrary.profiles.first { $0.id == record.id } ?? record
@@ -203,6 +204,18 @@ struct ProfileDetailSheet: View {
                     }
                 }
             }
+            if current.source != nil, current.baseline != nil {
+                let available = state.profileLibrary.availableTemplateCount(profileID: record.id)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("更新线路和规则，并同步已跟随的组成员；保留你的场景与选线设置。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("导入新增组和场景（\(available)）") { state.importSourceTemplates(record.id) }
+                            .disabled(available == 0 || refreshing)
+                        Button("从订阅重新生成…") { confirmingRegenerate = true }.disabled(refreshing)
+                    }
+                }
+            }
             if !current.profile.importWarnings.isEmpty || !current.profile.importAdjustments.isEmpty {
                 Button { action = .compatibility } label: {
                     Label("导入兼容说明", systemImage: "info.circle")
@@ -218,7 +231,7 @@ struct ProfileDetailSheet: View {
                     .disabled(!state.canDeleteProfile(record.id))
             }
             if !state.canDeleteProfile(record.id) {
-                Text(state.profileLibrary.profiles.count == 1 ? "至少保留一份配置。" : "配置正在使用或场景正在切换，暂时无法删除。")
+                Text(state.profileLibrary.profiles.count == 1 ? "至少保留一份配置。" : "全局组或场景仍引用此配置，或正在切换场景，暂时无法删除。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let error = error ?? state.profilePersistenceError ?? state.profileOperationError {
@@ -231,7 +244,13 @@ struct ProfileDetailSheet: View {
                     .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
-        .padding(24).frame(width: 440)
+        .padding(24).frame(width: 480)
+        .confirmationDialog("从订阅重新生成线路组和场景？", isPresented: $confirmingRegenerate) {
+            Button("重新生成", role: .destructive) { state.importSourceTemplates(record.id, replacing: true) }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将覆盖由此订阅创建的组和场景设置，保留已有 SSID；手动新建的组和场景不受影响。")
+        }
         .onAppear {
             name = current.name
             url = current.source?.url ?? ""
@@ -288,11 +307,11 @@ struct ProfileManagementSheet: View {
             if action == .compatibility {
                 importDetails(record.profile)
             } else if action == .delete {
-                Text("删除「\(record.name)」及其中的线路、规则和场景？")
+                Text("删除「\(record.name)」及其中的线路和规则？")
                 Text("订阅服务和服务器上的内容不会被删除。")
                     .font(.caption).foregroundStyle(.secondary)
             } else if action == .export {
-                Text("导出为包含场景的 XDial 配置。密码、密钥和订阅地址将被移除，使用前需要重新填写。")
+                Text("导出此 Profile 的线路和规则。全局线路组和场景不包含在内；密码、密钥和订阅地址将被移除，使用前需要重新填写。")
                     .font(.callout)
             } else {
                 TextField("配置名称", text: $name).textFieldStyle(.roundedBorder)
@@ -311,7 +330,7 @@ struct ProfileManagementSheet: View {
                         Text(fileName).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
                     }
                 }
-                if action == .empty { Text("创建直连线路和默认场景，随后可以自行添加。\n保存配置后，在菜单栏点击场景即可连接。").font(.caption).foregroundStyle(.secondary) }
+                if action == .empty { Text("创建一份独立的线路和规则来源。随后可在全局线路组和场景中使用这些资源。").font(.caption).foregroundStyle(.secondary) }
                 if action == .file || action == .subscription { Toggle("仅导入线路，另建默认场景", isOn: $nodesOnly).font(.caption) }
                 if let preview {
                     VStack(alignment: .leading, spacing: 6) {
@@ -431,18 +450,20 @@ struct ProfileManagementSheet: View {
                 error = state.profilePersistenceError ?? "配置正在使用或已不存在，无法删除"; return
             }
         case .empty:
-            if !state.insertProfile(.empty(named: name)) { error = state.profilePersistenceError; return }
+            var created = ProfileRecord.empty(named: name)
+            created.profile.scenarios = []; created.profile.activeScenarioID = ""
+            if !state.insertProfile(created) { error = state.profileOperationError ?? state.profilePersistenceError; return }
         case .copy:
             var copied = record
             copied.id = newID; copied.name = name; copied.source = nil; copied.baseline = nil
             do { copied.profile = try ProfileDocumentService.copy(record.profile, id: newID) }
             catch { self.error = error.localizedDescription; return }
-            if !state.insertProfile(copied) { error = state.profilePersistenceError; return }
+            if !state.insertProfile(copied) { error = state.profileOperationError ?? state.profilePersistenceError; return }
         case .file, .subscription:
             guard let preview else { return }
             let source = action == .subscription ? ProfileSource(url: url, nodesOnly: nodesOnly, refreshInterval: interval, updatedAt: Date()) : nil
             let imported = ProfileRecord(id: newID, name: name, profile: preview, source: source, baseline: source == nil ? nil : preview)
-            if !state.insertProfile(imported) { error = state.profilePersistenceError; return }
+            if !state.insertProfile(imported) { error = state.profileOperationError ?? state.profilePersistenceError; return }
         case .export:
             do {
                 let data = try ProfileDocumentService.export(record.profile)

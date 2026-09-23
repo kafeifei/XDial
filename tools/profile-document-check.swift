@@ -58,6 +58,21 @@ struct ProfileDocumentCheck {
             throw NSError(domain: "ProfileDocumentCheck", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "Round trip lost resources"])
         }
+        // Source-only exports must survive the real bridge without creating policy.
+        var resources = profile
+        resources.scenarios = []; resources.activeScenarioID = ""
+        resources.lines.removeAll(where: \.isGroup)
+        let resourceJSON = String(decoding: try JSONEncoder().encode(resources), as: UTF8.self)
+        let resourceDocument = LibboxExportProfile(resourceJSON, &error)
+        if let error { throw error }
+        let resourceImport = LibboxImportProfile(resourceDocument, "auto", "resource-roundtrip", false, &error)
+        if let error { throw error }
+        let restoredResources = try JSONDecoder().decode(Profile.self, from: Data(resourceImport.utf8))
+        guard restoredResources.scenarios.isEmpty, restoredResources.activeScenarioID.isEmpty,
+              restoredResources.ruleSets.count == resources.ruleSets.count else {
+            throw NSError(domain: "ProfileDocumentCheck", code: 6,
+                          userInfo: [NSLocalizedDescriptionKey: "Resource-only round trip introduced routing"])
+        }
         print("Profile document bridge passed: \(profile.lines.count) Lines, \(profile.ruleSets.count) RuleSets, \(profile.scenarios.count) Scenarios, \(profile.importWarnings.count) compatibility warnings")
     }
 }

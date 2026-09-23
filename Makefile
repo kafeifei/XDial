@@ -2,7 +2,18 @@ BUILD_DIR := build
 # $(abspath) 按空格拆分参数，带空格的 bundle 路径必须由无空格的绝对
 # BUILD_DIR 拼出，不能整体交给 abspath/realpath。
 BUILD_DIR_ABS := $(abspath $(BUILD_DIR))
+DEVELOPMENT_CHANNEL ?= next
+ifeq ($(DEVELOPMENT_CHANNEL),next)
+DEVELOPMENT_CONFIGURATION := Next
 APP_BUNDLE_NAME := XDial Next.app
+else ifeq ($(DEVELOPMENT_CHANNEL),debug)
+DEVELOPMENT_CONFIGURATION := Debug
+APP_BUNDLE_NAME := XDail Debug.app
+else
+$(error DEVELOPMENT_CHANNEL must be next or debug)
+endif
+DEVELOPMENT_DERIVED_DATA := $(BUILD_DIR)/macos-$(DEVELOPMENT_CHANNEL)-xcode
+DEVELOPMENT_PRODUCT := $(DEVELOPMENT_DERIVED_DATA)/Build/Products/$(DEVELOPMENT_CONFIGURATION)/$(APP_BUNDLE_NAME)
 APP_BUNDLE := $(BUILD_DIR)/$(APP_BUNDLE_NAME)
 APP_BUNDLE_ABS := $(BUILD_DIR_ABS)/$(APP_BUNDLE_NAME)
 RELEASE_BUNDLE := $(BUILD_DIR)/release/XDial.app
@@ -178,7 +189,8 @@ test: public-content-gate $(PATCHED_WORKFILE) test-patched-tailscale test-patche
 
 test-release-contract:
 	bash test/release_contract_test.sh
-	python3 -m unittest discover -s test -p publish_release_test.py
+	bash test/next_release_contract_test.sh
+	python3 -m unittest discover -s test -p 'publish*release_test.py'
 
 # Opt-in macOS login-session check: launches only isolated fixture apps.
 .PHONY: test-installation-launch
@@ -256,41 +268,44 @@ cli-next: $(PATCHED_WORKFILE)
 	@mkdir -p $(BUILD_DIR)
 	$(MACOS_GO_BUILD_ENV) $(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -ldflags "$(GO_LDFLAGS) -X main.buildFlavor=next" -o $(BUILD_DIR)/xdial-next ./cmd/xdial/
 
-# debug 构建(含 DebugServer,仅本地开发用,不得分发)
-app: cli-next libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
-	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration Next \
+# Development builds include DebugServer and must never be distributed.
+.PHONY: app-debug app-next cli-next
+app-debug:
+	$(MAKE) app DEVELOPMENT_CHANNEL=debug
+
+app-next:
+	$(MAKE) app DEVELOPMENT_CHANNEL=next
+
+app: cli-$(DEVELOPMENT_CHANNEL) libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns $(MACOS_APP_LAUNCHER) macos-identity-contract
+	xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy -configuration $(DEVELOPMENT_CONFIGURATION) \
 		-destination 'platform=macOS,arch=arm64' \
-		-derivedDataPath $(BUILD_DIR)/macos-next-xcode \
+		-derivedDataPath $(DEVELOPMENT_DERIVED_DATA) \
 		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		$(MACOS_DEBUG_XCODEBUILD_FLAGS) build
-	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration Next \
+	xcodebuild -project macos/XDial.xcodeproj -scheme XDial -configuration $(DEVELOPMENT_CONFIGURATION) \
 		-destination 'platform=macOS,arch=arm64' \
-		-derivedDataPath $(BUILD_DIR)/macos-next-xcode \
+		-derivedDataPath $(DEVELOPMENT_DERIVED_DATA) \
 		CURRENT_PROJECT_VERSION=$(DEBUG_BUILD_VERSION) \
 		$(MACOS_DEBUG_XCODEBUILD_FLAGS) build
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Info.plist')" = com.kafeifei.xdial.next
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = com.kafeifei.xdial.next.settings-ui
-	@test "$$(plutil -extract CFBundleIdentifier raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Library/SystemExtensions/com.kafeifei.xdial.next.transparent-proxy.systemextension/Contents/Info.plist')" = com.kafeifei.xdial.next.transparent-proxy
-	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Info.plist')" = true
-	@test "$$(plutil -extract LSUIElement raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = false
-	@test "$$(plutil -extract CFBundleDisplayName raw '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = 'XDial Next'
-	@test -f '$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app/Contents/Helpers/XDial Settings UI.app/Contents/Resources/SettingsDockIcon.icns'
+	@test "$$(plutil -extract LSUIElement raw '$(DEVELOPMENT_PRODUCT)/Contents/Info.plist')" = true
+	@test "$$(plutil -extract LSUIElement raw '$(DEVELOPMENT_PRODUCT)/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = false
+	@test "$$(plutil -extract CFBundleDisplayName raw '$(DEVELOPMENT_PRODUCT)/Contents/Helpers/XDial Settings UI.app/Contents/Info.plist')" = '$(basename $(APP_BUNDLE_NAME))'
+	@test -f '$(DEVELOPMENT_PRODUCT)/Contents/Helpers/XDial Settings UI.app/Contents/Resources/SettingsDockIcon.icns'
 	rm -rf "$(APP_BUNDLE)"
-	ditto "$(BUILD_DIR)/macos-next-xcode/Build/Products/Next/XDial Next.app" "$(APP_BUNDLE)"
-	@test "$$(plutil -extract LSUIElement raw '$(APP_BUNDLE)/Contents/Info.plist')" = true
-	python3 scripts/verify-macos-debug-app.py "$(APP_BUNDLE)" next
+	ditto "$(DEVELOPMENT_PRODUCT)" "$(APP_BUNDLE)"
+	python3 scripts/verify-macos-debug-app.py "$(APP_BUNDLE)" $(DEVELOPMENT_CHANNEL)
 
 # GitHub 托管 runner 不持有 System Extension 的签名证书和 provisioning profile。
 # 这里分别编译 Debug / Release 的扩展与宿主，只验证源码和链接；产物没有签名、不可分发。
-ci-macos-build: cli cli-debug libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
-	@set -e; for configuration in Debug Release; do \
+ci-macos-build: cli cli-debug cli-next libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
+	@set -e; for configuration in Debug Next Release NextRelease; do \
 		xcodebuild -project macos/XDial.xcodeproj -scheme XDialTransparentProxy \
 			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
 			-derivedDataPath $(BUILD_DIR)/macos-xcode-ci CODE_SIGNING_ALLOWED=NO build; \
 		xcodebuild -project macos/XDial.xcodeproj -scheme XDial \
 			-configuration "$$configuration" -destination 'platform=macOS,arch=arm64' \
 			-derivedDataPath $(BUILD_DIR)/macos-xcode-ci CODE_SIGNING_ALLOWED=NO build; \
-		product_name=XDial; if [ "$$configuration" = Debug ]; then product_name='XDail Debug'; fi; \
+		case "$$configuration" in Debug) product_name='XDail Debug';; Next*) product_name='XDial Next';; *) product_name=XDial;; esac; \
 		test "$$(plutil -extract LSUIElement raw "$(BUILD_DIR)/macos-xcode-ci/Build/Products/$$configuration/$$product_name.app/Contents/Info.plist")" = true; \
 		python3 $(MACOS_DEPLOYMENT_VERIFIER) "$(BUILD_DIR)/macos-xcode-ci/Build/Products/$$configuration/$$product_name.app" >/dev/null; \
 	done
@@ -358,6 +373,49 @@ publish:
 		exit 1; \
 	}
 	python3 scripts/publish-release.py "$(RELEASE_TAG)"
+
+# Next has a dedicated branch, identity and GitHub prerelease. Stable remains disabled.
+NEXT_RELEASE_CONTRACT = XDIAL_RELEASE_CHANNEL=next $(RELEASE_CONTRACT)
+NEXT_RELEASE_BUNDLE := $(BUILD_DIR)/next-release/XDial Next.app
+NEXT_RELEASE_VERSION = $(patsubst next-v%,%,$(RELEASE_TAG))
+NEXT_RELEASE_ARCHIVE = $(BUILD_DIR)/next-release/XDial-Next-$(RELEASE_TAG).zip
+NEXT_RELEASE_SOURCE = $(shell git rev-parse HEAD)
+MACOS_NEXT_RELEASE_XCODEBUILD_FLAGS ?=
+
+.PHONY: release-next-inputs release-next-app release-next publish-next
+release-next-inputs:
+	@$(NEXT_RELEASE_CONTRACT) validate-inputs "$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
+	@$(NEXT_RELEASE_CONTRACT) validate-notes "$(RELEASE_TAG)" NEXT_RELEASE_NOTES.md
+	@git fetch --no-tags origin refs/heads/xdial-next:refs/remotes/origin/xdial-next
+	@$(NEXT_RELEASE_CONTRACT) assert-git-tag "$(RELEASE_TAG)"
+	@bash scripts/check-public-content.sh
+
+release-next-app: release-next-inputs libbox-macos-xcframework macos/AppIcon.icns macos/SettingsDockIcon.icns macos-identity-contract
+	$(MACOS_GO_BUILD_ENV) $(PATCHED_GO_ENV) go build -tags '$(DESKTOP_GO_TAGS)' -trimpath \
+		-ldflags "-X main.version=$(RELEASE_TAG) -X main.buildFlavor=next -s -w" \
+		-o $(BUILD_DIR)/xdial-next-release ./cmd/xdial/
+	@set -e; for scheme in XDialTransparentProxy XDial; do \
+		xcodebuild -project macos/XDial.xcodeproj -scheme "$$scheme" -configuration NextRelease \
+			-destination 'platform=macOS,arch=arm64' \
+			-derivedDataPath $(BUILD_DIR)/macos-next-release \
+			XDIAL_HELPER_SOURCE="$(BUILD_DIR_ABS)/xdial-next-release" \
+			MARKETING_VERSION="$(NEXT_RELEASE_VERSION)" \
+			CURRENT_PROJECT_VERSION="$(RELEASE_BUILD_NUMBER)" \
+			XDIAL_SOURCE_REVISION="$(NEXT_RELEASE_SOURCE)" \
+			$(MACOS_NEXT_RELEASE_XCODEBUILD_FLAGS) build; \
+	done
+	rm -rf "$(NEXT_RELEASE_BUNDLE)"
+	ditto "$(BUILD_DIR)/macos-next-release/Build/Products/NextRelease/XDial Next.app" "$(NEXT_RELEASE_BUNDLE)"
+	@$(NEXT_RELEASE_CONTRACT) verify-app "$(NEXT_RELEASE_BUNDLE)" "$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
+
+release-next: release-next-app
+	@$(NEXT_RELEASE_CONTRACT) notarize "$(NEXT_RELEASE_BUNDLE)" "$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)" "$(BUILD_DIR)/next-release/notarization.json"
+	@$(NEXT_RELEASE_CONTRACT) archive "$(NEXT_RELEASE_BUNDLE)" "$(RELEASE_TAG)" "$(BUILD_DIR)/next-release"
+	@$(NEXT_RELEASE_CONTRACT) verify-archive "$(NEXT_RELEASE_ARCHIVE)" "$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
+	@echo "Next release archive: $(NEXT_RELEASE_ARCHIVE)"
+
+publish-next:
+	python3 scripts/publish-next-release.py "$(RELEASE_TAG)"
 
 # 一键重启：先完整构建并签名新版本，成功后才让旧实例完成网络回滚并退出。
 # 构建目录中的进程紧接着执行无 UI 的原子安装，然后只启动

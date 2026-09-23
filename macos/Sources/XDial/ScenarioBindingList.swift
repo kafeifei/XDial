@@ -70,7 +70,7 @@ struct ScenarioBindingList: View {
     }
 
     private func ruleName(for ruleSetID: String) -> String {
-        state.editingProfile.ruleSets.first(where: { $0.id == ruleSetID })?.name
+        state.configurationCatalog.rule(ruleSetID)?.name
             ?? state.tr("（已删除）", "(Deleted)")
     }
 
@@ -102,6 +102,7 @@ struct ScenarioBindingList: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .help(ruleName)
+                    Text(state.ruleSourceName(ruleSetID)).font(.caption2).foregroundStyle(.secondary)
                     if !binding.wrappedValue.conditionIDs.isEmpty {
                         Menu {
                             Button(state.tr("使用完整规则", "Use Entire Rule")) {

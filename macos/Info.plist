@@ -54,8 +54,12 @@
 			<string>$(XDIAL_SETTINGS_ENTRY_IDENTIFIER)</string>
 		</dict>
 	</array>
+	<key>XDialBuildConfiguration</key>
+	<string>$(CONFIGURATION)</string>
 	<key>XDialBuildFlavor</key>
 	<string>$(XDIAL_BUILD_FLAVOR)</string>
+	<key>XDialSourceRevision</key>
+	<string>$(XDIAL_SOURCE_REVISION)</string>
 	<key>XDialTransparentProxyBundleIdentifier</key>
 	<string>$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)</string>
 	<key>XDialUpdateAcceptanceID</key>

@@ -11,9 +11,12 @@ final class AppState: ObservableObject {
     #endif
 
     @Published var profile: Profile
-    @Published var profileLibrary = ProfileLibrary()
+    @Published var profileLibrary = ProfileLibrary() {
+        didSet { configurationCatalogCache = nil }
+    }
+    var configurationCatalogCache: ConfigurationCatalog?
     @Published var browsedProfileID = ""
-    @Published var editorPositions: [String: ProfileEditorPosition] = [:]
+    let editorPosition = ProfileEditorPosition()
     @Published var profilePersistenceError: String?
     @Published var profileOperationError: String?
     @Published var refreshingProfileIDs: Set<String> = []
@@ -24,6 +27,7 @@ final class AppState: ObservableObject {
     let lineLatencies = LineLatencyStore()
     private var lineLatencyTimer: AnyCancellable?
     var profileLibraryLoaded = false
+    private var isLayoutPreview = false
     @Published private(set) var currentSSID: String?
     @Published private(set) var wifiSSIDAccessState:
         WiFiSSIDAccessState = .checking
@@ -81,8 +85,8 @@ final class AppState: ObservableObject {
         }
     }
 
-    let engine = GoEngine.shared
-    let installation = InstallationCoordinator.shared
+    lazy var engine = GoEngine.shared
+    lazy var installation = InstallationCoordinator.shared
     private var engineSubs = Set<AnyCancellable>()
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
@@ -486,7 +490,18 @@ final class AppState: ObservableObject {
         return profile.subscriptions.filter { ids.contains($0.id) && $0.enabled }
     }
 
-    init() {
+    init(previewLibrary: ProfileLibrary? = nil) {
+        if let previewLibrary {
+            self.profile = previewLibrary.snapshot()
+            self.profileLibrary = previewLibrary
+            self.language = .zh
+            self.appearance = .light
+            self.launchAtLogin = false
+            self.autoConnect = false
+            self.isLayoutPreview = true
+            self.lineLatencies.updateCatalogs([previewLibrary.runtimeRecord])
+            return
+        }
         // 先用 bootstrap 初始化，loadSaved 后会被覆盖
         self.profile = Profile.bootstrap()
 
@@ -590,9 +605,9 @@ final class AppState: ObservableObject {
         loadSaved()
         lineLatencies.standaloneRequest = { line, url in try await StandaloneLineLatencyService.probe(line, testURL: url) }
         lineLatencies.groupSelectionRequest = { lines, facts in try await StandaloneLineLatencyService.evaluateGroups(lines, facts: facts) }
-        lineLatencies.updateCatalogs(profileLibrary.profiles)
+        lineLatencies.updateCatalogs([profileLibrary.runtimeRecord])
         $profileLibrary.sink { [weak self] library in
-            self?.lineLatencies.updateCatalogs(library.profiles)
+            self?.lineLatencies.updateCatalogs([library.runtimeRecord])
         }.store(in: &engineSubs)
         lineLatencies.request = { [weak self] tx, id, groupID, completion in
             guard let self else { completion(.failure(CocoaError(.userCancelled))); return }
@@ -1459,8 +1474,8 @@ final class AppState: ObservableObject {
         profileID: String? = nil
     ) -> Bool {
         guard profileLibraryLoaded, profilePersistenceError == nil else { return false }
-        let targetProfileID = profileID ?? profileLibrary.activeProfileID
-        guard let targetProfile = profileLibrary.profiles.first(where: { $0.id == targetProfileID })?.profile else { return false }
+        let targetProfileID = ProfileLibrary.configurationID
+        let targetProfile = profileLibrary.snapshot()
         guard let scenario = targetProfile.scenarios.first(where: { $0.id == id }) else {
             return false
         }
@@ -1526,7 +1541,7 @@ final class AppState: ObservableObject {
         }
 
         let targetProfileID = scenarioSwitchTargetProfileID ?? profileLibrary.activeProfileID
-        guard let targetRecord = profileLibrary.profiles.first(where: { $0.id == targetProfileID }) else { return }
+        let targetRecord = profileLibrary.runtimeRecord
         if engine.status == "disconnected" {
             let generation = scenarioSwitchGeneration
             profileLibrary.activeProfileID = targetProfileID
@@ -1650,7 +1665,7 @@ final class AppState: ObservableObject {
                 report.state == .committed,
                 !report.systemTakeoverRemoved
             {
-                guard let targetRecord = profileLibrary.profiles.first(where: { $0.id == inFlight.targetProfileID }) else { return }
+                let targetRecord = profileLibrary.runtimeRecord
                 profileLibrary.activeProfileID = inFlight.targetProfileID
                 var updated = targetRecord.profile
                 updated.activeScenarioID = targetScenarioID
@@ -2523,37 +2538,41 @@ final class AppState: ObservableObject {
     ///   内部写入传 false：连接前的落盘（马上就下发了），以及 verified 这类纯展示
     ///   标记的回写（不影响数据面行为）。
     func save(markDirty: Bool = true) {
-        if profile.lines.contains(where: { $0.type == "tailscale" }),
-           profile.tailscale.hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            profile.tailscale.hostname = Self.newTailscaleHostname()
+        guard !isLayoutPreview else { return }
+        for index in profileLibrary.profiles.indices {
+            if profileLibrary.profiles[index].profile.lines.contains(where: { $0.type == "tailscale" }),
+               profileLibrary.profiles[index].profile.tailscale.hostname.isEmpty {
+                profileLibrary.profiles[index].profile.tailscale.hostname = Self.newTailscaleHostname()
+            }
         }
+        var normalized = profile
         // 先把所有 ASCII 字段做一次全角→半角清洗（兜底）
-        for i in profile.lines.indices {
-            profile.lines[i].vpnServer = profile.lines[i].vpnServer.normalizedASCII()
-            profile.lines[i].vpnUsername = profile.lines[i].vpnUsername.normalizedASCII()
-            profile.lines[i].vpnPassword = profile.lines[i].vpnPassword.normalizedASCII()
-            profile.lines[i].trojanServer = profile.lines[i].trojanServer.normalizedASCII()
-            profile.lines[i].trojanPassword = profile.lines[i].trojanPassword.normalizedASCII()
-            profile.lines[i].trojanSNI = profile.lines[i].trojanSNI.normalizedASCII()
-            profile.lines[i].ssServer = profile.lines[i].ssServer.normalizedASCII()
-            profile.lines[i].ssMethod = profile.lines[i].ssMethod.normalizedASCII()
-            profile.lines[i].ssPassword = profile.lines[i].ssPassword.normalizedASCII()
-            profile.lines[i].vmessServer = profile.lines[i].vmessServer.normalizedASCII()
-            profile.lines[i].vmessUUID = profile.lines[i].vmessUUID.normalizedASCII()
-            profile.lines[i].anytlsServer = profile.lines[i].anytlsServer.normalizedASCII()
-            profile.lines[i].anytlsPassword = profile.lines[i].anytlsPassword.normalizedASCII()
-            profile.lines[i].anytlsSNI = profile.lines[i].anytlsSNI.normalizedASCII()
+        for i in normalized.lines.indices {
+            normalized.lines[i].vpnServer = normalized.lines[i].vpnServer.normalizedASCII()
+            normalized.lines[i].vpnUsername = normalized.lines[i].vpnUsername.normalizedASCII()
+            normalized.lines[i].vpnPassword = normalized.lines[i].vpnPassword.normalizedASCII()
+            normalized.lines[i].trojanServer = normalized.lines[i].trojanServer.normalizedASCII()
+            normalized.lines[i].trojanPassword = normalized.lines[i].trojanPassword.normalizedASCII()
+            normalized.lines[i].trojanSNI = normalized.lines[i].trojanSNI.normalizedASCII()
+            normalized.lines[i].ssServer = normalized.lines[i].ssServer.normalizedASCII()
+            normalized.lines[i].ssMethod = normalized.lines[i].ssMethod.normalizedASCII()
+            normalized.lines[i].ssPassword = normalized.lines[i].ssPassword.normalizedASCII()
+            normalized.lines[i].vmessServer = normalized.lines[i].vmessServer.normalizedASCII()
+            normalized.lines[i].vmessUUID = normalized.lines[i].vmessUUID.normalizedASCII()
+            normalized.lines[i].anytlsServer = normalized.lines[i].anytlsServer.normalizedASCII()
+            normalized.lines[i].anytlsPassword = normalized.lines[i].anytlsPassword.normalizedASCII()
+            normalized.lines[i].anytlsSNI = normalized.lines[i].anytlsSNI.normalizedASCII()
         }
-        for i in profile.ruleSets.indices {
-            profile.ruleSets[i].url = profile.ruleSets[i].url.normalizedASCII()
+        for i in normalized.ruleSets.indices {
+            normalized.ruleSets[i].url = normalized.ruleSets[i].url.normalizedASCII()
         }
         // 直连恒为已验证
-        for i in profile.lines.indices where profile.lines[i].type == "direct" {
-            profile.lines[i].verified = true
+        for i in normalized.lines.indices where normalized.lines[i].type == "direct" {
+            normalized.lines[i].verified = true
         }
 
-        guard let index = profileLibrary.profiles.firstIndex(where: { $0.id == profileLibrary.activeProfileID }) else { return }
-        profileLibrary.profiles[index].profile = profile
+        profileLibrary.applyDraft(normalized, editingProfileID: profileLibrary.editingProfileID)
+        profile = profileLibrary.snapshot()
         guard persistProfileLibrary() else { return }
 
         configurationChanges.recordSave(
@@ -2789,7 +2808,7 @@ final class AppState: ObservableObject {
     func deleteScenario(id: String) {
         guard editingProfile.scenarios.count > 1, !hasPendingScenarioSwitch,
               !(editingActiveProfile && engine.status != "disconnected" && engine.connectionReport?.scenario.id == id),
-              !(scenarioSwitchTargetProfileID == editingRecord.id && scenarioSwitchTargetID == id),
+              !(scenarioSwitchTargetID == id),
               editingProfile.scenarios.contains(where: { $0.id == id }) else {
             return
         }

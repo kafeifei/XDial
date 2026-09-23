@@ -21,15 +21,18 @@ const (
 
 // Line 线路：流量从哪个通道出去
 type Line struct {
-	GroupMembers  []string        `json:"group_members,omitempty"`
-	GroupDefault  string          `json:"group_default,omitempty"`
-	GroupURL      string          `json:"group_url,omitempty"`
-	GroupInterval string          `json:"group_interval,omitempty"`
-	NativeOptions json.RawMessage `json:"native_options,omitempty"`
-	ID            string          `json:"id"`
-	Name          string          `json:"name"`
-	Type          LineType        `json:"type"`
-	Enabled       bool            `json:"enabled"`
+	// Runtime ownership supplied by the global library; never an outbound choice.
+	IdentityProfileID string          `json:"identity_profile_id,omitempty"`
+	IdentityHostname  string          `json:"identity_hostname,omitempty"`
+	GroupMembers      []string        `json:"group_members,omitempty"`
+	GroupDefault      string          `json:"group_default,omitempty"`
+	GroupURL          string          `json:"group_url,omitempty"`
+	GroupInterval     string          `json:"group_interval,omitempty"`
+	NativeOptions     json.RawMessage `json:"native_options,omitempty"`
+	ID                string          `json:"id"`
+	Name              string          `json:"name"`
+	Type              LineType        `json:"type"`
+	Enabled           bool            `json:"enabled"`
 
 	// VPN (AnyConnect via sslcon)
 	VPNServer   string `json:"vpn_server,omitempty"`

@@ -5,6 +5,7 @@ options:
 configs:
   Debug: debug
   Next: debug
+  NextRelease: release
   FormalDevelopment: release
   Release: release
 
@@ -31,8 +32,9 @@ settings:
     XDIAL_SETTINGS_ENTRY_IDENTIFIER: com.kafeifei.xdial.app.settings-entry
     XDIAL_BUILD_FLAVOR: release
     XDIAL_UPDATE_ACCEPTANCE_ID: ""
+    XDIAL_SOURCE_REVISION: "unversioned"
   configs:
-    Next:
+    Next: &nextIdentity
       XDIAL_APPLICATION_BUNDLE_IDENTIFIER: com.kafeifei.xdial.next
       XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER: com.kafeifei.xdial.next.transparent-proxy
       XDIAL_SETTINGS_UI_BUNDLE_IDENTIFIER: com.kafeifei.xdial.next.settings-ui
@@ -44,6 +46,10 @@ settings:
       XDIAL_SETTINGS_ENTRY_IDENTIFIER: com.kafeifei.xdial.next.settings-entry
       XDIAL_BUILD_FLAVOR: next
       SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG XDIAL_NEXT_IDENTITY"
+
+    NextRelease:
+      <<: *nextIdentity
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) XDIAL_NEXT_IDENTITY"
 
     Debug:
       XDIAL_APPLICATION_BUNDLE_IDENTIFIER: com.kafeifei.xdial.debug
@@ -90,6 +96,14 @@ targets:
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
           CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxyNext.entitlements
+        NextRelease:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          PROVISIONING_PROFILE_SPECIFIER: XDial Next Developer ID Transparent Proxy
+          CODE_SIGN_ENTITLEMENTS: TransparentProxyExtension/XDialTransparentProxyNextRelease.entitlements
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
+          ENABLE_HARDENED_RUNTIME: YES
         Debug:
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
@@ -145,6 +159,12 @@ targets:
         Next:
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
+        NextRelease:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
+          ENABLE_HARDENED_RUNTIME: YES
         Debug:
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
@@ -189,6 +209,8 @@ targets:
               - public.data
             UTTypeDescription: XDial Settings Reorder Item
         XDialBuildFlavor: "$(XDIAL_BUILD_FLAVOR)"
+        XDialBuildConfiguration: "$(CONFIGURATION)"
+        XDialSourceRevision: "$(XDIAL_SOURCE_REVISION)"
         XDialUpdateAcceptanceID: "$(XDIAL_UPDATE_ACCEPTANCE_ID)"
         XDialTransparentProxyBundleIdentifier: "$(XDIAL_TRANSPARENT_PROXY_BUNDLE_IDENTIFIER)"
     settings:
@@ -201,6 +223,17 @@ targets:
           CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: Apple Development
           CODE_SIGN_ENTITLEMENTS: XDialNext.entitlements
+          PRODUCT_NAME: XDial Next
+          PRODUCT_MODULE_NAME: XDial
+          EXECUTABLE_NAME: XDial
+        NextRelease:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          PROVISIONING_PROFILE_SPECIFIER: XDial Next Developer ID Host
+          CODE_SIGN_ENTITLEMENTS: XDialNextRelease.entitlements
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
+          ENABLE_HARDENED_RUNTIME: YES
           PRODUCT_NAME: XDial Next
           PRODUCT_MODULE_NAME: XDial
           EXECUTABLE_NAME: XDial
@@ -249,7 +282,7 @@ targets:
           if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ]; then
             exit 0
           fi
-          if [ "${CONFIGURATION}" = "Release" ]; then
+          if [ "${CONFIGURATION}" = "Release" ] || [ "${CONFIGURATION}" = "NextRelease" ]; then
             /usr/bin/codesign --force --options runtime --timestamp \
               --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
               "${carrier_destination}"
@@ -270,6 +303,10 @@ targets:
           preset_source="${XDIAL_RULE_SET_PRESETS_FILE:-${SRCROOT}/PrivateConfig/RuleSetPresets.json}"
           preset_dir="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
           preset_destination="${preset_dir}/RuleSetPresets.json"
+          if [ "${CONFIGURATION}" = "NextRelease" ]; then
+            rm -f "${preset_destination}"
+            exit 0
+          fi
           if [ -f "${preset_source}" ]; then
             mkdir -p "${preset_dir}"
             cp "${preset_source}" "${preset_destination}"
@@ -312,7 +349,7 @@ targets:
           if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ]; then
             exit 0
           fi
-          if [ "${CONFIGURATION}" = "Release" ]; then
+          if [ "${CONFIGURATION}" = "Release" ] || [ "${CONFIGURATION}" = "NextRelease" ]; then
             /usr/bin/codesign --force --options runtime --timestamp \
               --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
               --identifier "${XDIAL_HELPER_IDENTIFIER}" \
@@ -356,6 +393,12 @@ targets:
       - Sources/XDial/ProfileLibraryMigration.swift
       - Sources/XDial/ProfileVaultProjection.swift
       - Sources/XDial/ProfileLibrary.swift
+      - Sources/XDial/GlobalConfiguration.swift
+      - Sources/XDial/ConfigurationEditorState.swift
+      - Sources/XDial/SettingsLineTable.swift
+      - Sources/XDial/SettingsReadOnlyText.swift
+      - Sources/XDial/LineGroupMemberTable.swift
+      - Sources/XDial/LineLatencyView.swift
       - Sources/XDial/ProfileLibraryStore.swift
       - Sources/XDial/Localization.swift
       - Sources/XDial/MenuBarStatusIcon.swift
@@ -369,6 +412,7 @@ targets:
       - Sources/XDial/ScenarioGridLayout.swift
       - Sources/XDial/WiFiSSIDAccessPolicy.swift
       - Sources/XDial/XDialBrandPalette.swift
+      - Sources/XDial/XDialPalette.swift
       - TransparentProxyExtension/ConnectionTransactionReporter.swift
     settings:
       base:

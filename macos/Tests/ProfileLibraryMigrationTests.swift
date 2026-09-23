@@ -49,10 +49,10 @@ final class ProfileLibraryMigrationTests: XCTestCase {
         XCTAssertEqual(conversions, 1)
         XCTAssertEqual(library.profiles.count, 1)
         XCTAssertEqual(library.profiles[0].name, "默认配置")
-        XCTAssertEqual(library.activeProfileID, library.profiles[0].id)
+        XCTAssertEqual(library.activeProfileID, ProfileLibrary.configurationID)
         XCTAssertEqual(library.editingProfileID, library.profiles[0].id)
         XCTAssertEqual(library.profiles[0].profile.lines.last?.vpnPassword, "saved-password")
-        XCTAssertEqual(library.profiles[0].profile.scenarios, old.scenarios)
+        XCTAssertEqual(library.scenarios, old.scenarios)
         var changed = library
         changed.profiles[0].profile.lines[1].name = "Edited in new version"
         try store.save(changed)
@@ -78,8 +78,8 @@ final class ProfileLibraryMigrationTests: XCTestCase {
         let source = ConfigurationStorage.desktopLocations[2]
         let oldStore = ProfileLibraryStore(directory: home.appendingPathComponent(source.dataPath), keyProvider: { _ in key })
         var original = ProfileLibrary()
-        original.profiles.append(.empty(named: "Second"))
-        original.activeProfileID = original.profiles[1].id
+        try original.insert(.empty(named: "Second"))
+        original.activeScenarioID = original.scenarios.last!.id
         try oldStore.save(original)
         let oldFile = oldStore.directory.appendingPathComponent("profiles.enc")
         let bytes = try Data(contentsOf: oldFile)

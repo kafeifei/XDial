@@ -12,6 +12,7 @@ final class ProfileLibraryStore {
     private var cachedKey: SymmetricKey?
     private let keychainService: String
     private var loadedDigest: Data?
+    private var needsSchemaBackup = false
     private var fileURL: URL { directory.appendingPathComponent("profiles.enc") }
 
     init(directory: URL = ConfigurationStorage.directory(),
@@ -30,7 +31,9 @@ final class ProfileLibraryStore {
         let box = try AES.GCM.SealedBox(combined: data)
         let plaintext = try AES.GCM.open(box, using: key(create: false),
                                         authenticating: Data("XDial Profile Library v1".utf8))
-        let library = try JSONDecoder().decode(ProfileLibrary.self, from: plaintext).validated()
+        let decoded = try JSONDecoder().decode(ProfileLibrary.self, from: plaintext)
+        needsSchemaBackup = decoded.schemaVersion < 3
+        let library = try decoded.validated()
         loadedDigest = Data(SHA256.hash(data: data))
         return library
     }
@@ -65,6 +68,12 @@ final class ProfileLibraryStore {
         let currentDigest = current.map { Data(SHA256.hash(data: $0)) }
         guard currentDigest == loadedDigest else {
             throw ProfileLibraryError.invalid("共享配置已被其他版本更新或删除，当前修改未保存；请重新打开应用后再编辑")
+        }
+        if needsSchemaBackup, let current {
+            let backup = directory.appendingPathComponent("profiles-before-global-" + UUID().uuidString + ".enc")
+            try current.write(to: backup, options: [.withoutOverwriting])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
+            needsSchemaBackup = false
         }
         let sealed = try AES.GCM.seal(data, using: key(create: current == nil),
                                       authenticating: Data("XDial Profile Library v1".utf8))

@@ -44,9 +44,11 @@ enum ProfileLibraryMigration {
         let converted = try convertProfile(original, id)
         let record = ProfileRecord(id: id, name: "默认配置", profile: converted)
         var library = ProfileLibrary()
+        library.schemaVersion = 2
+        library.groups = []; library.scenarios = []; library.activeScenarioID = ""
         library.profiles = [record]
         library.activeProfileID = id
         library.editingProfileID = id
-        return library
+        return try library.validated()
     }
 }

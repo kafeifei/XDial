@@ -2,11 +2,27 @@
 
 set -euo pipefail
 
-readonly PRODUCT_NAME="XDial"
-readonly RELEASE_APPLICATION_IDENTIFIER="com.kafeifei.xdial.app"
-readonly RELEASE_SETTINGS_IDENTIFIER="com.kafeifei.xdial.app.settings-ui"
-readonly RELEASE_EXTENSION_IDENTIFIER="com.kafeifei.xdial.app.transparent-proxy"
-readonly RELEASE_HELPER_IDENTIFIER="com.kafeifei.xdial.app.helper"
+# The explicit channel selects a complete identity, never individual bundle IDs.
+readonly RELEASE_CHANNEL="${XDIAL_RELEASE_CHANNEL:-stable}"
+case "$RELEASE_CHANNEL" in
+    stable)
+        PRODUCT_NAME="XDial"
+        ARCHIVE_PREFIX="XDial"
+        RELEASE_APPLICATION_IDENTIFIER="com.kafeifei.xdial.app"
+        RELEASE_BRANCH="main"
+        ;;
+    next)
+        PRODUCT_NAME="XDial Next"
+        ARCHIVE_PREFIX="XDial-Next"
+        RELEASE_APPLICATION_IDENTIFIER="com.kafeifei.xdial.next"
+        RELEASE_BRANCH="xdial-next"
+        ;;
+    *) echo "error: unknown release channel: $RELEASE_CHANNEL" >&2; exit 1 ;;
+esac
+readonly PRODUCT_NAME ARCHIVE_PREFIX RELEASE_APPLICATION_IDENTIFIER RELEASE_BRANCH
+readonly RELEASE_SETTINGS_IDENTIFIER="$RELEASE_APPLICATION_IDENTIFIER.settings-ui"
+readonly RELEASE_EXTENSION_IDENTIFIER="$RELEASE_APPLICATION_IDENTIFIER.transparent-proxy"
+readonly RELEASE_HELPER_IDENTIFIER="$RELEASE_APPLICATION_IDENTIFIER.helper"
 readonly RELEASE_TEAM_IDENTIFIER="UVZM439VGU"
 readonly RELEASE_CONTRACT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly DEPLOYMENT_TARGET_VERIFIER="$RELEASE_CONTRACT_DIRECTORY/verify-macos-deployment-target.py"
@@ -42,10 +58,15 @@ EOF
 
 version_from_tag() {
     local tag="$1"
-    if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    local canonical="$tag"
+    if [[ "$RELEASE_CHANNEL" == next ]]; then
+        [[ "$tag" == next-v* ]] || fail "Next tag must be next-vMAJOR.MINOR.PATCH"
+        canonical="${tag#next-}"
+    fi
+    if [[ ! "$canonical" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
         fail "release tag must be exact stable SemVer vMAJOR.MINOR.PATCH: $tag"
     fi
-    printf '%s\n' "${tag#v}"
+    printf '%s\n' "${canonical#v}"
 }
 
 validate_inputs() {
@@ -62,8 +83,8 @@ validate_notes() {
     local notes_path="$2"
     validate_inputs "$tag" 1
     [[ -f "$notes_path" ]] || fail "release notes do not exist: $notes_path"
-    grep -Fqx "# XDial $tag" "$notes_path" \
-        || fail "release notes must contain the exact heading '# XDial $tag'"
+    grep -Fqx "# $PRODUCT_NAME $tag" "$notes_path" \
+        || fail "release notes must contain the exact heading '# $PRODUCT_NAME $tag'"
     awk '
         /^## 更新了什么[[:space:]]*$/ { in_updates = 1; next }
         in_updates && /^## / { exit }
@@ -85,13 +106,16 @@ assert_git_tag() {
     [[ -n "$tagged_commit" ]] || fail "release tag does not exist locally: $tag"
     [[ "$tagged_commit" == "$head" ]] \
         || fail "release tag $tag does not point at HEAD"
-    remote_main="$(git rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null || true)"
-    [[ -n "$remote_main" ]] || fail "fetch origin/main before validating a release tag"
+    remote_main="$(git rev-parse -q --verify "refs/remotes/origin/$RELEASE_BRANCH^{commit}" 2>/dev/null || true)"
+    [[ -n "$remote_main" ]] || fail "fetch origin/$RELEASE_BRANCH before validating a release tag"
     main_history="$(git rev-list --first-parent "$remote_main")"
     grep -Fxq "$tagged_commit" <<<"$main_history" \
-        || fail "release tag $tag must point to a commit on origin/main's first-parent history"
+        || fail "release tag $tag must point to a commit on origin/$RELEASE_BRANCH's first-parent history"
     [[ -z "$(git status --porcelain)" ]] \
         || fail "release worktree must be clean"
+    if [[ "$RELEASE_CHANNEL" == next ]]; then
+        [[ "$head" == "$remote_main" ]] || fail "Next release must match origin/xdial-next HEAD"
+    fi
 }
 
 plist_value() {
@@ -286,6 +310,11 @@ verify_app() {
 
     assert_app_deployment_target "$app_path"
 
+    if [[ "$RELEASE_CHANNEL" == next ]]; then
+        python3 "$RELEASE_CONTRACT_DIRECTORY/verify-next-release-identity.py" \
+            "$app_path" "$tag"
+    fi
+
     assert_plist_value "$app_path/Contents/Info.plist" CFBundleIdentifier \
         "$RELEASE_APPLICATION_IDENTIFIER"
     assert_plist_nonempty "$app_path/Contents/Info.plist" \
@@ -360,7 +389,7 @@ notarize_app() {
     notary_auth_args
     temp_root="$(mktemp -d "${TMPDIR:-/tmp}/xdial-notary.XXXXXX")"
     cleanup_root="$temp_root"
-    submission_path="$temp_root/$PRODUCT_NAME-$tag.zip"
+    submission_path="$temp_root/$ARCHIVE_PREFIX-$tag.zip"
     result_path="$temp_root/notary-result.json"
 
     /usr/bin/ditto -c -k --keepParent "$app_path" "$submission_path"
@@ -400,7 +429,7 @@ archive_app() {
     [[ "$(basename "$app_path")" == "$PRODUCT_NAME.app" ]] \
         || fail "archive source must be named $PRODUCT_NAME.app"
 
-    archive_name="$PRODUCT_NAME-$tag.zip"
+    archive_name="$ARCHIVE_PREFIX-$tag.zip"
     archive_path="$output_directory/$archive_name"
     mkdir -p "$output_directory"
     rm -f "$archive_path" "$archive_path.sha256"
@@ -451,7 +480,7 @@ verify_archive() {
     local expected_name temp_root
 
     validate_inputs "$tag" "$build_number"
-    expected_name="$PRODUCT_NAME-$tag.zip"
+    expected_name="$ARCHIVE_PREFIX-$tag.zip"
     [[ "$(basename "$archive_path")" == "$expected_name" ]] \
         || fail "release archive must be named $expected_name"
     verify_checksum "$archive_path" "$archive_path.sha256"

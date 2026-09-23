@@ -27,7 +27,8 @@ enum LocalProcessInventory {
         func belongsToProductBundle(
             _ bundleURL: URL,
             excludingSiblingBundleURLs: [URL],
-            executableNames: Set<String>
+            executableNames: Set<String>,
+            identifySibling: (Int32) -> Bool = { _ in false }
         ) -> Bool? {
             if let executableURL {
                 guard matchesExecutableName(in: executableNames) == true
@@ -44,10 +45,10 @@ enum LocalProcessInventory {
                 if excludingSiblingBundleURLs.contains(where: isInside) {
                     return false
                 }
-                return nil
+                return identifySibling(pid) ? false : nil
             }
             switch matchesExecutableName(in: executableNames) {
-            case .some(true), .none: return nil
+            case .some(true), .none: return identifySibling(pid) ? false : nil
             case .some(false): return false
             }
         }

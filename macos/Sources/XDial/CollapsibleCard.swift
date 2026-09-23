@@ -7,6 +7,7 @@ struct CollapsibleCard<Header: View, Detail: View>: View {
     let onToggle: () -> Void
     let onDelete: (() -> Void)?
     let enabled: Binding<Bool>?
+    let lightweightSwitch: Bool
     let accentBar: Bool
     @ViewBuilder let header: () -> Header
     @ViewBuilder let detail: () -> Detail
@@ -17,6 +18,7 @@ struct CollapsibleCard<Header: View, Detail: View>: View {
         onToggle: @escaping () -> Void,
         onDelete: (() -> Void)? = nil,
         enabled: Binding<Bool>? = nil,
+        lightweightSwitch: Bool = false,
         accentBar: Bool = false,
         @ViewBuilder header: @escaping () -> Header,
         @ViewBuilder detail: @escaping () -> Detail
@@ -26,6 +28,7 @@ struct CollapsibleCard<Header: View, Detail: View>: View {
         self.onToggle = onToggle
         self.onDelete = onDelete
         self.enabled = enabled
+        self.lightweightSwitch = lightweightSwitch
         self.accentBar = accentBar
         self.header = header
         self.detail = detail
@@ -45,11 +48,17 @@ struct CollapsibleCard<Header: View, Detail: View>: View {
                 Spacer()
 
                 if let enabled {
-                    Toggle("", isOn: enabled)
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .labelsHidden()
-                        .disabled(locked)
+                    if lightweightSwitch {
+                        Toggle("启用", isOn: enabled)
+                            .toggleStyle(ListRowSwitchStyle())
+                            .disabled(locked)
+                    } else {
+                        Toggle("", isOn: enabled)
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                            .labelsHidden()
+                            .disabled(locked)
+                    }
                 }
 
                 if let onDelete {
@@ -102,6 +111,35 @@ struct CollapsibleCard<Header: View, Detail: View>: View {
                     lineWidth: 0.75
                 )
         }
+    }
+}
+
+/// Avoid an NSSwitch host for every lazily created line row while retaining
+/// Button keyboard activation and Toggle accessibility semantics.
+private struct ListRowSwitchStyle: ToggleStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            configuration.isOn.toggle()
+        } label: {
+            Capsule()
+                .fill(configuration.isOn ? Color.accentColor : Color.secondary.opacity(0.25))
+                .overlay(alignment: configuration.isOn ? .trailing : .leading) {
+                    Circle()
+                        .fill(.white)
+                        .frame(width: 13, height: 13)
+                        .padding(1)
+                }
+                .frame(width: 26, height: 15)
+                .opacity(isEnabled ? 1 : 0.45)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("启用")
+        .accessibilityValue(configuration.isOn ? "1" : "0")
+        .accessibilityRemoveTraits(.isButton)
+        .accessibilityAddTraits(.isToggle)
     }
 }
 

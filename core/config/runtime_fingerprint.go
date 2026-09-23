@@ -76,9 +76,11 @@ type runtimeConfigurationVPNLine struct {
 }
 
 type runtimeConfigurationTailscaleLine struct {
-	ExitNode string `json:"exit_node,omitempty"`
-	MagicDNS bool   `json:"magic_dns,omitempty"`
-	AuthKey  string `json:"auth_key,omitempty"`
+	IdentityProfileID string `json:"identity_profile_id,omitempty"`
+	IdentityHostname  string `json:"identity_hostname,omitempty"`
+	ExitNode          string `json:"exit_node,omitempty"`
+	MagicDNS          bool   `json:"magic_dns,omitempty"`
+	AuthKey           string `json:"auth_key,omitempty"`
 }
 
 type runtimeConfigurationSubscription struct {
@@ -196,9 +198,11 @@ func (builder *runtimeConfigurationBuilder) includeLine(line *Line) {
 		}
 	case LineTypeTailscale:
 		configuration = runtimeConfigurationTailscaleLine{
-			ExitNode: line.TailscaleExitNode,
-			MagicDNS: line.TailscaleMagicDNS,
-			AuthKey:  line.TailscaleAuthKey,
+			IdentityProfileID: line.IdentityProfileID,
+			IdentityHostname:  line.IdentityHostname,
+			ExitNode:          line.TailscaleExitNode,
+			MagicDNS:          line.TailscaleMagicDNS,
+			AuthKey:           line.TailscaleAuthKey,
 		}
 		builder.usesTailscale = true
 	default:

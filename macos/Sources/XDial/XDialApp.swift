@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-private struct SettingsWindowChrome: NSViewRepresentable {
+struct SettingsWindowChrome: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         SettingsWindowChromeView()
     }
@@ -203,15 +203,6 @@ struct XDialApp: App {
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)
 
-        Window("\(XDialBuildIdentity.productTitle) 通用设置", id: "general") {
-            GeneralSettingsView()
-                .environmentObject(state)
-                .tint(XDialPalette.accent)
-                .background(SettingsWindowChrome())
-        }
-        .defaultSize(width: 620, height: 380)
-        .windowResizability(.contentSize)
-        .windowStyle(.titleBar)
 
         Window("XDial 安装与卸载", id: "installation") {
             InstallationView(
@@ -241,7 +232,6 @@ final class ApplicationWindowLifecycleController {
 
     private enum ManagedWindowKind: String {
         case settings
-        case general
         case installation
         case update
     }
@@ -311,7 +301,7 @@ final class ApplicationWindowLifecycleController {
               let kind = kind(of: window) else { return }
         window.hidesOnDeactivate = false
         switch kind {
-        case .settings, .general:
+        case .settings:
             prepareToPresentSettingsWindow()
         case .installation:
             window.level = .floating
@@ -351,7 +341,7 @@ final class ApplicationWindowLifecycleController {
 
     private func bringSettingsWindowForward() {
         guard let settingsWindow = (NSApp.orderedWindows + NSApp.windows).first(where: { window in
-            (kind(of: window) == .settings || kind(of: window) == .general)
+            kind(of: window) == .settings
                 && (window.isVisible || window.isMiniaturized)
         }) else { return }
         if settingsWindow.isMiniaturized {
@@ -406,7 +396,7 @@ final class ApplicationWindowLifecycleController {
     }
 
     private var hasOpenSettingsWindow: Bool {
-        hasOpenWindow(.settings) || hasOpenWindow(.general)
+        hasOpenWindow(.settings)
     }
 
     private func kind(of window: NSWindow) -> ManagedWindowKind? {

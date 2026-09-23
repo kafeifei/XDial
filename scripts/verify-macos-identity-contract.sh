@@ -103,20 +103,35 @@ for target in XDial XDialSettingsUI XDialTransparentProxy XDialTests; do
     [[ " $(build_setting Debug "$target" SWIFT_ACTIVE_COMPILATION_CONDITIONS) " == *' XDIAL_DEVELOPMENT_IDENTITY '* ]] \
         || fail "Debug/$target missing development identity condition"
 done
-assert_setting Next XDial com.kafeifei.xdial.next
-assert_setting Next XDialSettingsUI com.kafeifei.xdial.next.settings-ui
-assert_setting Next XDialTransparentProxy com.kafeifei.xdial.next.transparent-proxy
-assert_build_setting Next XDial PRODUCT_NAME 'XDial Next'
-assert_build_setting Next XDial EXECUTABLE_NAME XDial
-assert_build_setting Next XDial XDIAL_HELPER_IDENTIFIER com.kafeifei.xdial.next.helper
-assert_build_setting Next XDial XDIAL_DAEMON_PLIST com.kafeifei.xdial.next.daemon.plist
-assert_build_setting Next XDial XDIAL_DAEMON_ENTITLEMENTS XDialDaemonNext.entitlements
+for configuration in Next NextRelease; do
+    assert_setting "$configuration" XDial com.kafeifei.xdial.next
+    assert_setting "$configuration" XDialSettingsUI com.kafeifei.xdial.next.settings-ui
+    assert_setting "$configuration" XDialTransparentProxy com.kafeifei.xdial.next.transparent-proxy
+    assert_build_setting "$configuration" XDial PRODUCT_NAME 'XDial Next'
+    assert_build_setting "$configuration" XDial EXECUTABLE_NAME XDial
+    assert_build_setting "$configuration" XDial XDIAL_HELPER_IDENTIFIER com.kafeifei.xdial.next.helper
+    assert_build_setting "$configuration" XDial XDIAL_DAEMON_PLIST com.kafeifei.xdial.next.daemon.plist
+    assert_build_setting "$configuration" XDial XDIAL_DAEMON_ENTITLEMENTS XDialDaemonNext.entitlements
+    for target in XDial XDialSettingsUI XDialTransparentProxy XDialTests; do
+        conditions=" $(build_setting "$configuration" "$target" SWIFT_ACTIVE_COMPILATION_CONDITIONS) "
+        [[ "$conditions" == *' XDIAL_NEXT_IDENTITY '* ]] || fail "$configuration/$target missing Next identity"
+        if [[ "$configuration" == NextRelease ]]; then
+            [[ "$conditions" != *' DEBUG '* && "$conditions" != *' XDIAL_DEVELOPMENT_IDENTITY '* ]] \
+                || fail "$configuration/$target contains development flags"
+        fi
+    done
+done
 assert_build_setting Next XDial CODE_SIGN_ENTITLEMENTS XDialNext.entitlements
 assert_build_setting Next XDialTransparentProxy CODE_SIGN_ENTITLEMENTS TransparentProxyExtension/XDialTransparentProxyNext.entitlements
-for target in XDial XDialSettingsUI XDialTransparentProxy XDialTests; do
-    [[ " $(build_setting Next "$target" SWIFT_ACTIVE_COMPILATION_CONDITIONS) " == *' XDIAL_NEXT_IDENTITY '* ]] \
-        || fail "Next/$target missing development identity condition"
+assert_build_setting NextRelease XDial CODE_SIGN_ENTITLEMENTS XDialNextRelease.entitlements
+assert_build_setting NextRelease XDialTransparentProxy CODE_SIGN_ENTITLEMENTS TransparentProxyExtension/XDialTransparentProxyNextRelease.entitlements
+for target in XDial XDialSettingsUI XDialTransparentProxy; do
+    assert_build_setting NextRelease "$target" CODE_SIGN_IDENTITY 'Developer ID Application'
+    assert_build_setting NextRelease "$target" ENABLE_HARDENED_RUNTIME YES
+    assert_build_setting NextRelease "$target" CODE_SIGN_INJECT_BASE_ENTITLEMENTS NO
 done
+assert_build_setting NextRelease XDial PROVISIONING_PROFILE_SPECIFIER 'XDial Next Developer ID Host'
+assert_build_setting NextRelease XDialTransparentProxy PROVISIONING_PROFILE_SPECIFIER 'XDial Next Developer ID Transparent Proxy'
 for configuration in FormalDevelopment Release; do
     for target in XDial XDialSettingsUI XDialTransparentProxy; do
         [[ " $(build_setting "$configuration" "$target" SWIFT_ACTIVE_COMPILATION_CONDITIONS) " != *' XDIAL_DEVELOPMENT_IDENTITY '* ]] \
@@ -161,7 +176,7 @@ PYTHON
 
 python3 - <<'PYTHON'
 import pathlib, plistlib
-for path in ["XDialNext.entitlements", "XDialDaemonNext.entitlements", "TransparentProxyExtension/XDialTransparentProxyNext.entitlements"]:
+for path in ["XDialNext.entitlements", "XDialNextRelease.entitlements", "XDialDaemonNext.entitlements", "TransparentProxyExtension/XDialTransparentProxyNext.entitlements", "TransparentProxyExtension/XDialTransparentProxyNextRelease.entitlements"]:
     value = plistlib.loads((pathlib.Path("macos") / path).read_bytes())
     assert value["com.apple.security.application-groups"] == ["UVZM439VGU.com.kafeifei.xdial.next.network"], path
 value = plistlib.loads(pathlib.Path("macos/com.kafeifei.xdial.next.daemon.plist").read_bytes())

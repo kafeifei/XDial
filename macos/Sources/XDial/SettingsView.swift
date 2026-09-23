@@ -173,9 +173,7 @@ private func reorder<Item>(
 
 struct SettingsView: View {
     @EnvironmentObject var state: AppState
-    @Environment(\.openWindow) private var openWindow
     @State private var hoveredTab: Int?
-    @State private var hoveringGeneral = false
     private var tab: Int { state.editorPosition.tab }
 
     var body: some View {
@@ -188,9 +186,10 @@ struct SettingsView: View {
             Divider()
             ZStack {
                 if tab == 0 { LinesTab().id(state.editingRecord.id) }
-                else if tab == 3 { LinesTab(groupsOnly: true).id(state.editingRecord.id + "-groups") }
+                else if tab == 3 { LinesTab(groupsOnly: true) }
                 else if tab == 1 { RulesTab().id(state.editingRecord.id) }
-                else { ScenariosTab().id(state.editingRecord.id) }
+                else if tab == 2 { ScenariosTab() }
+                else { GeneralSettingsView() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(XDialPalette.canvas)
@@ -199,70 +198,45 @@ struct SettingsView: View {
         .background(XDialPalette.canvas)
         .toolbar {
             navigationToolbarItem.withoutSharedBackground()
-            if #available(macOS 26.0, *) {
-                ToolbarSpacer(.flexible)
-            } else {
-                ToolbarItem(placement: .automatic) { Spacer() }
-            }
-            generalToolbarItem.withoutSharedBackground()
         }
         .onReceive(NotificationCenter.default.publisher(for: .xdialSettingsSelectTab)) { notification in
             guard let index = notification.userInfo?["index"] as? Int, (0 ... 4).contains(index) else { return }
-            if index == 4 {
-                openGeneralSettings()
-            } else {
-                state.editorPosition.tab = index
-            }
+            state.editorPosition.tab = index
         }
-    }
-
-    private func openGeneralSettings() {
-        ApplicationWindowLifecycleController.shared.prepareToPresentSettingsWindow()
-        openWindow(id: "general")
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     private var navigationToolbarItem: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
-            HStack(spacing: 2) {
-                ProfileNavigation()
-                    .padding(.leading, 6)
-                    .padding(.trailing, 4)
-                Rectangle()
-                    .fill(.primary.opacity(0.12))
-                    .frame(width: 1, height: 16)
-                    .padding(.trailing, 5)
-                settingsTab(0, title: state.tr("线路", "Lines"))
-                settingsTab(3, title: state.tr("线路组", "Line Groups"))
-                settingsTab(1, title: state.tr("规则", "Rules"))
-                settingsTab(2, title: state.tr("场景", "Scenarios"))
+        ToolbarItem(placement: .principal) {
+            HStack(spacing: 10) {
+                navigationGroup {
+                    ProfileNavigation()
+                        .padding(.leading, 6)
+                        .padding(.trailing, 4)
+                    Rectangle()
+                        .fill(.primary.opacity(0.12))
+                        .frame(width: 1, height: 16)
+                        .padding(.trailing, 5)
+                    settingsTab(0, title: state.tr("线路", "Lines"))
+                    settingsTab(1, title: state.tr("规则", "Rules"))
+                }
+                navigationGroup {
+                    settingsTab(3, title: state.tr("线路组", "Line Groups"))
+                    settingsTab(2, title: state.tr("场景", "Scenarios"))
+                }
+                navigationGroup {
+                    settingsTab(4, title: state.tr("通用", "General"))
+                }
             }
-            .padding(3)
-            .background(XDialPalette.surface.opacity(0.58), in: RoundedRectangle(cornerRadius: 11))
-            .overlay { RoundedRectangle(cornerRadius: 11).strokeBorder(.white.opacity(0.40), lineWidth: 0.5) }
             .fixedSize()
-            .accessibilityElement(children: .contain)
         }
     }
 
-    private var generalToolbarItem: some ToolbarContent {
-        ToolbarItem(placement: .primaryAction) {
-            Button(action: openGeneralSettings) {
-                HStack(spacing: 6) {
-                    Image(systemName: "slider.horizontal.3").font(.system(size: 12, weight: .medium))
-                    Text(state.tr("通用", "General")).font(.system(size: 13, weight: .medium))
-                }
-                .foregroundStyle(XDialPalette.textPrimary.opacity(0.88))
-                .padding(.horizontal, 10)
-                .frame(height: 34)
-                .background(XDialPalette.surface.opacity(hoveringGeneral ? 0.95 : 0.58), in: RoundedRectangle(cornerRadius: 10))
-                .contentShape(RoundedRectangle(cornerRadius: 10))
-            }
-            .buttonStyle(.plain)
-            .onHover { hoveringGeneral = $0 }
-            .animation(.easeOut(duration: 0.12), value: hoveringGeneral)
-            .help(state.tr("通用设置", "General Settings"))
-        }
+    private func navigationGroup<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        HStack(spacing: 2, content: content)
+            .padding(3)
+            .background(XDialPalette.surface.opacity(0.58), in: RoundedRectangle(cornerRadius: 11))
+            .fixedSize()
+            .accessibilityElement(children: .contain)
     }
 
     private func settingsTab(_ index: Int, title: String) -> some View {
@@ -423,43 +397,52 @@ struct LinesTab: View {
     @State private var searchText = ""
 
     private var visibleLines: [Line] {
-        state.editingProfile.lines.filter {
-            $0.isGroup == groupsOnly && (searchText.isEmpty || $0.name.localizedCaseInsensitiveContains(searchText))
+        let lines = groupsOnly ? state.profileLibrary.groups
+            : [state.configurationCatalog.line("direct")!]
+                + state.editingRecord.profile.lines.filter { $0.id != "direct" }.compactMap { state.configurationCatalog.line($0.id) }
+        return lines.filter {
+            searchText.isEmpty || $0.name.localizedCaseInsensitiveContains(searchText)
         }
     }
 
     var body: some View {
+        let visibleLines = visibleLines
         VStack(spacing: 0) {
             HStack {
                 SettingsSearchField(groupsOnly ? state.tr("搜索线路组", "Search line groups") : state.tr("搜索线路", "Search lines"), text: $searchText)
-                LineLatencyBatchButton(store: state.lineLatencies, lines: visibleLines, profileID: state.editingRecord.id, control: .catalog(groupsOnly: groupsOnly))
+                LineLatencyBatchButton(store: state.lineLatencies, lines: visibleLines, profileID: ProfileLibrary.configurationID, control: .catalog(groupsOnly: groupsOnly))
                 Text("\(visibleLines.count)")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, 14).padding(.top, 10)
-            ScrollView {
-                LazyVStack(spacing: 8) {
-                    ForEach($state.editingProfile.lines) { $line in
-                        if line.isGroup == groupsOnly && (searchText.isEmpty || line.name.localizedCaseInsensitiveContains(searchText)) {
-                        Group {
-                            if line.isGroup { LineGroupRow(line: $line, onDelete: { delete(line) }) }
-                            else { LineRow(line: $line, onDelete: { delete(line) }) }
-                        }
-                            .settingsReorderable(
-                                SettingsReorderItem(
-                                    kind: "line",
-                                    id: line.id
-                                ),
-                                draggedItem: $draggedItem,
-                                allowsDragging: searchText.isEmpty
-                            ) { item, targetID in
-                                moveLine(item, to: targetID)
+            if !groupsOnly {
+                NativeLinesView(lines: visibleLines, state: state, latencies: state.lineLatencies,
+                    allowsReordering: searchText.isEmpty,
+                    move: { id, target in moveLine(SettingsReorderItem(kind: "line", id: id), to: target) },
+                    delete: delete)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(visibleLines) { line in
+                            Group {
+                                if line.isGroup { LineGroupRow(line: state.editingLineBinding(line), onDelete: { delete(line) }) }
+                                else { LineRow(line: state.editingLineBinding(line), onDelete: { delete(line) }) }
                             }
+                                .settingsReorderable(
+                                    SettingsReorderItem(
+                                        kind: "line",
+                                        id: line.id
+                                    ),
+                                    draggedItem: $draggedItem,
+                                    allowsDragging: searchText.isEmpty
+                                ) { item, targetID in
+                                    moveLine(item, to: targetID)
+                                }
                         }
                     }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                    .settingsReorderDropArea(draggedItem: $draggedItem)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
-                .settingsReorderDropArea(draggedItem: $draggedItem)
             }
             Divider()
             AddBar {
@@ -536,8 +519,8 @@ struct LinesTab: View {
 
     private func delete(_ line: Line) {
         if line.type == "direct" { return }
-        if state.editingProfile.scenarios.contains(where: { $0.defaultLineID == line.id || $0.bindings.contains(where: { $0.lineID == line.id }) }) || state.editingProfile.lines.contains(where: { $0.groupMembers.contains(line.id) }) {
-            state.profileOperationError = "此线路仍被场景或线路组使用，请先修改引用"
+        if state.editingProfile.matchingResources.contains(where: { $0.type == "url" && $0.fetchLineID == line.id }) || state.editingProfile.scenarios.contains(where: { $0.defaultLineID == line.id || $0.bindings.contains(where: { $0.lineID == line.id }) }) || state.editingProfile.lines.contains(where: { $0.groupMembers.contains(line.id) }) {
+            state.profileOperationError = "此线路仍被场景、线路组或规则下载使用，请先修改引用"
             return
         }
         if line.type == "tailscale" {
@@ -584,6 +567,20 @@ private struct RuntimeResourceBadge: View {
     let resourceID: String
     let enabled: Bool
     @EnvironmentObject private var state: AppState
+    var body: some View {
+        let value = RuntimeResourcePresentation(kind: kind, resourceID: resourceID, enabled: enabled, state: state)
+        Label(value.label, systemImage: value.icon)
+            .font(.caption2).foregroundStyle(value.color).lineLimit(1)
+            .help(value.helpText).accessibilityLabel(value.helpText)
+    }
+}
+
+@MainActor
+private struct RuntimeResourcePresentation {
+    let kind: String
+    let resourceID: String
+    let enabled: Bool
+    let state: AppState
 
     private var report: ConnectionReport? {
         state.engine.presentedConnectionReport
@@ -602,16 +599,7 @@ private struct RuntimeResourceBadge: View {
         report?.task(kind: kind, resourceID: resourceID)
     }
 
-    var body: some View {
-        Label(label, systemImage: icon)
-            .font(.caption2)
-            .foregroundStyle(color)
-            .lineLimit(1)
-            .help(helpText)
-            .accessibilityLabel(helpText)
-    }
-
-    private var label: String {
+    var label: String {
         switch runtimeState {
         case .disabled:
             return state.tr("已停用", "Disabled")
@@ -647,7 +635,7 @@ private struct RuntimeResourceBadge: View {
         }
     }
 
-    private var icon: String {
+    var icon: String {
         switch runtimeState {
         case .disabled, .notObserved, .notPlanned:
             return "circle"
@@ -669,7 +657,7 @@ private struct RuntimeResourceBadge: View {
         }
     }
 
-    private var color: Color {
+    var color: Color {
         switch runtimeState {
         case .disabled, .notObserved, .notPlanned:
             return .secondary
@@ -689,7 +677,7 @@ private struct RuntimeResourceBadge: View {
         }
     }
 
-    private var helpText: String {
+    var helpText: String {
         if let message = task?.error?.message, !message.isEmpty {
             return message
         }
@@ -769,6 +757,7 @@ struct LineRow: View {
             onToggle: { expanded.toggle() },
             onDelete: (isLocked || sourceOwned) ? nil : onDelete,
             enabled: Binding(get: { line.enabled }, set: { if !isLocked && !sourceOwned { line.enabled = $0; state.saveEditingProfile() } }),
+            lightweightSwitch: true,
             header: {
                 RuntimeResourceBadge(
                     kind: "line",
@@ -788,27 +777,27 @@ struct LineRow: View {
                         .lineLimit(1).truncationMode(.middle)
                 }
                 Spacer()
-                LineLatencyView(store: state.lineLatencies, line: line, profileID: state.editingRecord.id)
+                LineLatencyView(store: state.lineLatencies, line: line, profileID: ProfileLibrary.configurationID)
                 Text(typeLabel).font(.caption).foregroundStyle(.secondary)
                 Text(sourceOwned ? "订阅" : "自建").font(.caption).foregroundStyle(.secondary)
+                Button { state.copyEditingLine(line.id) } label: { Image(systemName: "doc.on.doc") }
+                    .buttonStyle(.plain).help(state.tr("复制为自建副本", "Duplicate as Local Line"))
             },
             detail: {
                 VStack(alignment: .leading, spacing: 4) {
                     runtimeFailure
                     HStack {
                         Text("名称").font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-                        TextField("名称", text: $line.name)
+                        SettingsDraftInput($line.name, readOnlyText: sourceOwned ? line.name : nil, onCommit: state.saveEditingProfile) { TextField("名称", text: $0) }
                             .textFieldStyle(.roundedBorder).font(.caption)
-                            .onChange(of: line.name) { _, _ in state.saveEditingProfile() }
                     }
                     detailFields
                     if ["trojan", "shadowsocks", "vmess", "anytls"].contains(line.type) {
                         DisclosureGroup("高级选项（sing-box）") {
-                            NativeLineOptionsEditor(line: $line)
+                            NativeLineOptionsEditor(line: $line, readOnly: sourceOwned)
                         }
                     }
                 }
-                .disabled(sourceOwned)
             }
         )
         .opacity(line.enabled ? 1.0 : 0.65)
@@ -833,75 +822,9 @@ struct LineRow: View {
         }
     }
 
-    private var briefInfo: String {
-        // 出口地址只是当前连接事务的 Provider 观察；运行状态只看上方 badge。
-        if let info = net.observation(
-            for: line.id,
-            transactionID: state.engine.connectionReport?.transactionID
-        ), !info.summary.isEmpty {
-            return info.summary
-        }
-        // 没有本次事务的有效观察时，只显示静态配置。
-        switch line.type {
-        case "tailscale":
-            if tailscaleRuntimeConnected {
-                if let status = tailscaleStatus,
-                   let node = status.exitNodes.first(where: {
-                       $0.ip == line.tailscaleExitNode
-                   }) {
-                    return state.tr(
-                        "已连接 · \(node.name)",
-                        "Connected · \(node.name)"
-                    )
-                }
-                return state.tr("已连接", "Connected")
-            }
-            if let status = tailscaleStatus {
-                if status.isRunning {
-                    if line.tailscaleExitNode.isEmpty {
-                        return state.tr("已登录 · 未选择出口", "Signed in · No exit node")
-                    }
-                    if let node = status.exitNodes.first(where: { $0.ip == line.tailscaleExitNode }) {
-                        return node.online
-                            ? state.tr("已登录 · \(node.name)", "Signed in · \(node.name)")
-                            : state.tr("出口节点离线", "Exit node offline")
-                    }
-                    return state.tr("出口节点不可用", "Exit node unavailable")
-                }
-                return state.tr("需要登录", "Sign-in required")
-            }
-            return state.tr("登录状态未检查", "Sign-in status not checked")
-        case "vpn":
-            return line.vpnServer
-        case "trojan":
-            guard !line.trojanServer.isEmpty else { return "" }
-            return "\(line.trojanServer):\(line.trojanPort)"
-        case "shadowsocks":
-            guard !line.ssServer.isEmpty else { return "" }
-            return "\(line.ssServer):\(line.ssPort)"
-        case "vmess":
-            guard !line.vmessServer.isEmpty else { return "" }
-            return "\(line.vmessServer):\(line.vmessPort)"
-        case "anytls":
-            guard !line.anytlsServer.isEmpty else { return "" }
-            return "\(line.anytlsServer):\(line.anytlsPort)"
-        default:
-            return ""
-        }
-    }
+    private var briefInfo: String { lineBriefInfo(line, state: state, net: net) }
+    private var typeLabel: String { lineTypeLabel(line) }
 
-    private var typeLabel: String {
-        switch line.type {
-        case "direct": return "直连"
-        case "vpn": return "VPN"
-        case "trojan": return "Trojan"
-        case "shadowsocks": return "SS"
-        case "vmess": return "VMess"
-        case "anytls": return "AnyTLS"
-        case "tailscale": return "Tailscale"
-        default: return line.type
-        }
-    }
 
     private var tailscaleStatusColor: Color {
         if tailscaleRuntimeConnected {
@@ -1001,7 +924,7 @@ struct LineRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         case "tailscale":
-            tailscaleDetail
+            tailscaleDetail.disabled(sourceOwned)
         default:
             EmptyView()
         }
@@ -1176,6 +1099,7 @@ struct LineRow: View {
                 }
             }
             .pickerStyle(.menu)
+            .disabled(sourceOwned)
             .labelsHidden()
             .accessibilityIdentifier("tailscale-exit-node-picker")
         }
@@ -1373,6 +1297,7 @@ struct LineRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Toggle("", isOn: $line.allowInsecure)
                     .labelsHidden()
+                    .disabled(sourceOwned)
                     .onChange(of: line.allowInsecure) { _, _ in
                         markLineChanged()
                     }
@@ -1417,9 +1342,17 @@ struct LineRow: View {
                 }
             }
             .pickerStyle(.menu)
+            .disabled(sourceOwned)
             .labelsHidden()
             Spacer()
         }
+    }
+
+    private func commitAnyTLSALPN() {
+        let protocols = anyTLSALPNInput.isEmpty ? [] : anyTLSALPNInput.components(separatedBy: .newlines)
+        guard line.anytlsALPN != protocols else { return }
+        line.anytlsALPN = protocols
+        markLineChanged()
     }
 
     private var anyTLSALPNField: some View {
@@ -1429,7 +1362,7 @@ struct LineRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 60, alignment: .leading)
             VStack(alignment: .leading, spacing: 3) {
-                TextEditor(text: $anyTLSALPNInput)
+                SettingsDraftInput($anyTLSALPNInput, readOnlyText: sourceOwned ? line.anytlsALPN.joined(separator: "\n") : nil, multiline: true, onCommit: commitAnyTLSALPN) { TextEditor(text: $0) }
                     .font(.caption.monospaced())
                     .frame(minHeight: 42, maxHeight: 58)
                     .padding(3)
@@ -1437,16 +1370,6 @@ struct LineRow: View {
                         RoundedRectangle(cornerRadius: 5)
                             .stroke(Color.secondary.opacity(0.35))
                     )
-                    .onChange(of: anyTLSALPNInput) { _, input in
-                        let protocols = input.isEmpty
-                            ? []
-                            : input.components(separatedBy: .newlines)
-                        guard line.anytlsALPN != protocols else {
-                            return
-                        }
-                        line.anytlsALPN = protocols
-                        markLineChanged()
-                    }
                     .onChange(of: line.anytlsALPN) { _, protocols in
                         let input = protocols.joined(separator: "\n")
                         if anyTLSALPNInput != input {
@@ -1483,7 +1406,7 @@ struct LineRow: View {
                     }
                 ))
                 .labelsHidden()
-                .disabled(!line.tfo)
+                .disabled(sourceOwned || !line.tfo)
                 Text(state.tr(
                     line.tfo
                         ? "订阅导入了 TFO；AnyTLS 不支持，请关闭后再连接"
@@ -1573,36 +1496,30 @@ struct LineRow: View {
     private func field(_ label: String, _ binding: SwiftUI.Binding<String>, placeholder: String = "") -> some View {
         HStack {
             Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-            ASCIITextField(placeholder: placeholder, text: binding)
+            SettingsDraftInput(binding, readOnlyText: sourceOwned ? String(describing: binding.wrappedValue) : nil, onCommit: markLineChanged) { ASCIITextField(placeholder: placeholder, text: $0) }
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
-                .onChange(of: binding.wrappedValue) { _, _ in
-                    markLineChanged()
-                }
         }
     }
 
     private func secureField(_ label: String, _ binding: SwiftUI.Binding<String>) -> some View {
         HStack {
             Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-            ASCIISecureField(placeholder: "", text: binding)
-                .textFieldStyle(.roundedBorder)
-                .font(.caption)
-                .onChange(of: binding.wrappedValue) { _, _ in
-                    markLineChanged()
-                }
+            if sourceOwned {
+                SettingsReadOnlySecret(text: binding.wrappedValue)
+            } else {
+                SettingsDraftInput(binding, onCommit: markLineChanged) { ASCIISecureField(placeholder: "", text: $0) }
+                    .textFieldStyle(.roundedBorder).font(.caption)
+            }
         }
     }
 
     private func intField(_ label: String, _ binding: SwiftUI.Binding<Int>) -> some View {
         HStack {
             Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-            TextField("", value: binding, format: .number)
+            SettingsDraftInput(binding, readOnlyText: sourceOwned ? String(describing: binding.wrappedValue) : nil, onCommit: markLineChanged) { TextField("", value: $0, format: .number) }
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
-                .onChange(of: binding.wrappedValue) { _, _ in
-                    markLineChanged()
-                }
         }
     }
 
@@ -1618,15 +1535,9 @@ struct LineRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 60, alignment: .leading)
             VStack(alignment: .leading, spacing: 2) {
-                TextField("", value: binding, format: .number)
+                SettingsDraftInput(binding, readOnlyText: sourceOwned ? String(describing: binding.wrappedValue) : nil, onCommit: markLineChanged) { TextField("", value: $0, format: .number) }
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
-                    .onChange(of: binding.wrappedValue) { _, _ in
-                        // 保留用户输入的事实，让模型校验与连接计划 fail-closed。
-                        // 边输边静默夹到边界会把 30 之类的正常输入改成 60，
-                        // 也会掩盖订阅里真正的非法值。
-                        markLineChanged()
-                    }
                 let effectiveHelp = help.isEmpty
                     ? "\(range.lowerBound)–\(range.upperBound)"
                     : help
@@ -1644,6 +1555,7 @@ struct LineRow: View {
             Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
             Toggle("", isOn: binding)
                 .labelsHidden()
+                .disabled(sourceOwned)
                 .onChange(of: binding.wrappedValue) { _, _ in
                     markLineChanged()
                 }
@@ -1663,13 +1575,8 @@ struct RulesTab: View {
 
     private var query: String { searchText.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-    private var visibleRuleIDs: Set<String> {
-        Set(state.editingProfile.ruleSets.filter { $0.matchesSearch(query) }.map(\.id))
-    }
-
     var body: some View {
-        let visible = visibleRuleIDs
-        let rules = $state.editingProfile.ruleSets.filter { visible.contains($0.wrappedValue.id) }
+        let rules = state.editingRecord.profile.ruleSets.filter { $0.matchesSearch(query) }
         let pageCount = max(1, (rules.count + pageSize - 1) / pageSize)
         let currentPage = min(page, pageCount - 1)
         let pageRules = Array(rules.dropFirst(currentPage * pageSize).prefix(pageSize))
@@ -1679,7 +1586,7 @@ struct RulesTab: View {
                     get: { searchText },
                     set: { searchText = $0; page = 0 }
                 ))
-                Text(state.tr("\(visible.count) / \(state.editingProfile.ruleSets.count) 个规则", "\(visible.count) / \(state.editingProfile.ruleSets.count) rules"))
+                Text(state.tr("\(rules.count) / \(state.editingRecord.profile.ruleSets.count) 个规则", "\(rules.count) / \(state.editingRecord.profile.ruleSets.count) rules"))
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding(.horizontal, 14).padding(.top, 10)
@@ -1688,9 +1595,8 @@ struct RulesTab: View {
                 // can repeatedly invalidate the scroll geometry on macOS. Bound
                 // the eager list so old imports with thousands of rules stay cheap.
                 VStack(spacing: 8) {
-                    ForEach(pageRules, id: \.wrappedValue.id) { binding in
-                        let rule = binding.wrappedValue
-                        RuleSetRow(rule: binding, onDelete: { delete(rule) }, searchQuery: query)
+                    ForEach(pageRules) { rule in
+                        RuleSetRow(rule: state.editingRuleBinding(rule), onDelete: { delete(rule) }, searchQuery: query)
                             .settingsReorderable(
                                 SettingsReorderItem(
                                     kind: "rule",
@@ -1725,7 +1631,7 @@ struct RulesTab: View {
                     state.editingProfile.ruleSets.append(rule)
                     state.editorPosition.expandedRuleIDs.insert(rule.id)
                     searchText = ""
-                    page = (state.editingProfile.ruleSets.count - 1) / pageSize
+                    page = (state.editingRecord.profile.ruleSets.count - 1) / pageSize
                     state.saveEditingProfile()
                 } label: {
                     Label(
@@ -1767,6 +1673,7 @@ struct RuleSetRow: View {
     @SwiftUI.Binding var rule: RuleSet
     var onDelete: (() -> Void)?
     var isCondition = false
+    var inheritedReadOnly = false
     var searchQuery = ""
     private static let presetCatalog = RuleSetPresetCatalog.load()
     private var expanded: Bool {
@@ -1779,17 +1686,18 @@ struct RuleSetRow: View {
     @State private var domainsText = ""
     @State private var cidrsText = ""
     @State private var processesText = ""
-    @State private var loaded = false
-    @State private var processesLoaded = false
     @State private var applicationSelectionError: String?
+    @State private var conditionPage = 0
+    private let conditionPageSize = 20
     @EnvironmentObject var state: AppState
 
     private var sourceOwned: Bool {
-        state.editingRecord.baseline?.ruleSets.contains(where: { $0.id == rule.id }) == true ||
+        inheritedReadOnly || state.editingRecord.baseline?.ruleSets.contains(where: { $0.id == rule.id }) == true ||
         state.editingRecord.baseline?.matchingResources.contains(where: { $0.id == rule.id }) == true
     }
 
     private func saveDomainsAndCIDRs() {
+        guard !sourceOwned else { return }
         rule.domains = domainsText.split(whereSeparator: \.isNewline)
             .map { RuleSet.sanitizeEntry(String($0)) }
             .filter { !$0.isEmpty }
@@ -1800,6 +1708,7 @@ struct RuleSetRow: View {
     }
 
     private func saveProcesses() {
+        guard !sourceOwned else { return }
         rule.processes = RuleSet.sanitizeProcesses(
             processesText.split(whereSeparator: \.isNewline).map(String.init)
         )
@@ -1813,6 +1722,10 @@ struct RuleSetRow: View {
             onDelete: sourceOwned ? nil : onDelete,
             enabled: Binding(get: { rule.enabled }, set: { guard !sourceOwned else { return }; rule.enabled = $0; state.saveEditingProfile() }),
             header: {
+                if !isCondition {
+                    Button { state.copyEditingRule(rule.id) } label: { Image(systemName: "doc.on.doc") }
+                        .buttonStyle(.plain).help(state.tr("复制为自建副本", "Duplicate as Local Rule"))
+                }
                 Text(rule.name).font(.system(size: 13, weight: .medium))
                 Spacer()
                 Text(ruleTypeLabel)
@@ -1858,6 +1771,7 @@ struct RuleSetRow: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    .disabled(sourceOwned)
                     .accessibilityLabel(state.tr("反向", "Invert"))
                     .help(state.tr(
                         "反向匹配：匹配该规则之外的流量",
@@ -1872,28 +1786,15 @@ struct RuleSetRow: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
-                        TextField("", text: $rule.name)
+                        SettingsDraftInput($rule.name, readOnlyText: sourceOwned ? rule.name : nil, onCommit: state.saveEditingProfile) { TextField("", text: $0) }
                             .textFieldStyle(.roundedBorder).font(.caption)
-                            .disabled(sourceOwned)
-                            .onChange(of: rule.name) { _, _ in state.saveEditingProfile() }
                     }
                     if rule.type == "group" {
                         Text(state.tr("以下内容任一匹配即命中", "Match any of the following"))
                             .font(.caption).foregroundStyle(.secondary).padding(.vertical, 5)
-                        // Conditions share the card's scroll geometry and need
-                        // concrete heights during expand/collapse as well.
-                        VStack(spacing: 6) {
-                            ForEach($rule.conditions) { $condition in
-                                if searchQuery.isEmpty || rule.name.localizedCaseInsensitiveContains(searchQuery) || condition.matchesSearch(searchQuery) {
-                                AnyView(RuleSetRow(rule: $condition, onDelete: {
-                                    rule.conditions.removeAll { $0.id == condition.id }
-                                    state.saveEditingProfile()
-                                }, isCondition: true))
-                                }
-                            }
-                        }
+                        conditionRows
                     } else if rule.type == "native" {
-                        NativeRuleEditor(rule: $rule)
+                        NativeRuleEditor(rule: $rule, readOnly: sourceOwned)
                     } else if rule.type == "url" {
                         urlFields
                     } else if rule.type == "application" {
@@ -1903,7 +1804,6 @@ struct RuleSetRow: View {
                     }
                     if !isCondition && !sourceOwned { addContentMenu.padding(.top, 8) }
                 }
-                .disabled(sourceOwned && rule.type != "group")
             }
         )
         .alert(
@@ -1916,6 +1816,41 @@ struct RuleSetRow: View {
             Button(state.tr("好", "OK"), role: .cancel) {}
         } message: {
             Text(applicationSelectionError ?? "")
+        }
+        .onChange(of: searchQuery) { conditionPage = 0 }
+        .onChange(of: rule.conditions.count) { old, new in
+            if new > old { conditionPage = max(0, (new - 1) / conditionPageSize) }
+        }
+    }
+
+    private var conditionRows: some View {
+        // Keep concrete heights (nested lazy stacks caused geometry feedback),
+        // but do not instantiate every child of a large imported rule at once.
+        let matches = rule.conditions.filter {
+            searchQuery.isEmpty || rule.name.localizedCaseInsensitiveContains(searchQuery) || $0.matchesSearch(searchQuery)
+        }
+        let pageCount = max(1, (matches.count + conditionPageSize - 1) / conditionPageSize)
+        let currentPage = min(conditionPage, pageCount - 1)
+        return VStack(spacing: 6) {
+            ForEach(Array(matches.dropFirst(currentPage * conditionPageSize).prefix(conditionPageSize))) { condition in
+                AnyView(RuleSetRow(rule: Binding(
+                    get: { rule.conditions.first { $0.id == condition.id } ?? condition },
+                    set: { value in
+                        guard let index = rule.conditions.firstIndex(where: { $0.id == condition.id }) else { return }
+                        rule.conditions[index] = value
+                    }
+                ), onDelete: {
+                    rule.conditions.removeAll { $0.id == condition.id }
+                    state.saveEditingProfile()
+                }, isCondition: true, inheritedReadOnly: sourceOwned, searchQuery: rule.name.localizedCaseInsensitiveContains(searchQuery) ? "" : searchQuery))
+            }
+            if pageCount > 1 {
+                HStack(spacing: 12) {
+                    Button(state.tr("上一页", "Previous")) { conditionPage = currentPage - 1 }.disabled(currentPage == 0)
+                    Text(state.tr("匹配内容 \(currentPage + 1) / \(pageCount)", "Conditions \(currentPage + 1) / \(pageCount)"))
+                    Button(state.tr("下一页", "Next")) { conditionPage = currentPage + 1 }.disabled(currentPage + 1 == pageCount)
+                }.font(.caption).padding(.vertical, 4)
+            }
         }
     }
 
@@ -1964,6 +1899,7 @@ struct RuleSetRow: View {
     }
 
     private func appendContent(_ content: RuleSet) {
+        guard !sourceOwned else { return }
         state.editingProfile.appendMatchingContent(content, to: rule.id)
         state.editorPosition.expandedRuleIDs.insert(content.id)
         state.saveEditingProfile()
@@ -1973,15 +1909,14 @@ struct RuleSetRow: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text("URL").font(.caption).foregroundStyle(.secondary).frame(width: 40, alignment: .leading)
-                ASCIITextField(placeholder: "https://...", text: $rule.url)
+                SettingsDraftInput($rule.url, readOnlyText: sourceOwned ? rule.url : nil, onCommit: state.saveEditingProfile) { ASCIITextField(placeholder: "https://...", text: $0) }
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
-                    .onChange(of: rule.url) { _, _ in state.saveEditingProfile() }
                 LineTargetPicker(state: state, selection: Binding(
                     get: { "port:" + rule.fetchLineID },
                     set: { if $0.hasPrefix("port:") { rule.fetchLineID = String($0.dropFirst(5)) } }
                 ), label: state.tr("选择获取线路", "Select fetch line"), allowsSubscriptions: false)
-                .frame(width: 185)
+                .frame(width: 185).disabled(sourceOwned)
                 .onChange(of: rule.fetchLineID) { _, _ in state.saveEditingProfile() }
             }
             HStack {
@@ -1992,7 +1927,7 @@ struct RuleSetRow: View {
                     Text("sing-box .json").tag("json")
                     Text("纯文本列表").tag("text")
                 }
-                .pickerStyle(.menu)
+                .pickerStyle(.menu).disabled(sourceOwned)
                 .labelsHidden()
                 .onChange(of: rule.format) { _, _ in state.saveEditingProfile() }
             }
@@ -2004,30 +1939,23 @@ struct RuleSetRow: View {
         VStack(alignment: .leading, spacing: 4) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("域名（每行一个）").font(.caption).foregroundStyle(.secondary)
-                TextEditor(text: $domainsText)
+                SettingsDraftInput($domainsText, readOnlyText: sourceOwned ? rule.domains.joined(separator: "\n") : nil, multiline: true, onCommit: saveDomainsAndCIDRs) { TextEditor(text: $0) }
                     .font(.system(size: 11, design: .monospaced))
                     .frame(height: 60)
                     .border(Color.gray.opacity(0.3))
-                    .onChange(of: domainsText) { _, _ in
-                        if loaded { saveDomainsAndCIDRs() }
-                    }
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text("IP CIDR（每行一个）").font(.caption).foregroundStyle(.secondary)
-                TextEditor(text: $cidrsText)
+                SettingsDraftInput($cidrsText, readOnlyText: sourceOwned ? rule.cidrs.joined(separator: "\n") : nil, multiline: true, onCommit: saveDomainsAndCIDRs) { TextEditor(text: $0) }
                     .font(.system(size: 11, design: .monospaced))
                     .frame(height: 50)
                     .border(Color.gray.opacity(0.3))
-                    .onChange(of: cidrsText) { _, _ in
-                        if loaded { saveDomainsAndCIDRs() }
-                    }
             }
         }
         .padding(.leading, 18)
         .onAppear {
             domainsText = rule.domains.joined(separator: "\n")
             cidrsText = rule.cidrs.joined(separator: "\n")
-            loaded = true
         }
     }
 
@@ -2070,6 +1998,7 @@ struct RuleSetRow: View {
                             Image(systemName: "minus.circle")
                         }
                         .buttonStyle(.plain)
+                        .disabled(sourceOwned)
                         .help(state.tr(
                             "移除应用程序",
                             "Remove application"
@@ -2087,7 +2016,7 @@ struct RuleSetRow: View {
                     }
                 }
             }
-            .controlSize(.small)
+            .controlSize(.small).disabled(sourceOwned)
             VStack(alignment: .leading, spacing: 2) {
                 Text(state.tr(
                     "附加程序规则（可选，每行一个）",
@@ -2095,13 +2024,10 @@ struct RuleSetRow: View {
                 ))
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                TextEditor(text: $processesText)
+                SettingsDraftInput($processesText, readOnlyText: sourceOwned ? rule.processes.joined(separator: "\n") : nil, multiline: true, onCommit: saveProcesses) { TextEditor(text: $0) }
                     .font(.system(size: 11, design: .monospaced))
                     .frame(height: 54)
                     .border(Color.gray.opacity(0.3))
-                    .onChange(of: processesText) { _, _ in
-                        if processesLoaded { saveProcesses() }
-                    }
             }
             Text(state.tr(
                 "所选应用程序会自动覆盖程序包内的主程序和所有辅助程序。包外程序可填写文件名（支持 * 和 ?）、完整绝对路径，或以 / 结尾的目录路径。",
@@ -2113,11 +2039,11 @@ struct RuleSetRow: View {
         .padding(.leading, 18)
         .onAppear {
             processesText = rule.processes.joined(separator: "\n")
-            processesLoaded = true
         }
     }
 
     private func chooseApplications(replacing: Bool) {
+        guard !sourceOwned else { return }
         do {
             let selected = try ApplicationRulePicker.chooseApplications()
             guard !selected.isEmpty else { return }
@@ -2248,7 +2174,7 @@ struct ScenarioRow: View {
     @State private var ssidError: String?
     @State private var showsIconPicker = false
 
-    private var sourceOwned: Bool { state.editingRecord.baseline?.scenarios.contains(where: { $0.id == scenario.id }) == true }
+    private var sourceOwned: Bool { false }
 
     private var bindingSummary: String {
         let n = scenario.bindings.count
@@ -2314,9 +2240,8 @@ struct ScenarioRow: View {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text(state.tr("名称", "Name")).font(.caption).foregroundStyle(.secondary).frame(width: 60, alignment: .leading)
-                        TextField("", text: $scenario.name)
+                        SettingsDraftInput($scenario.name, onCommit: state.saveEditingProfile) { TextField("", text: $0) }
                             .textFieldStyle(.roundedBorder).font(.caption)
-                            .onChange(of: scenario.name) { _, _ in state.saveEditingProfile() }
                         Button {
                             showsIconPicker.toggle()
                         } label: {
@@ -2510,7 +2435,7 @@ struct ScenarioRow: View {
                                 Button(state.tr("（无可用规则）", "(No rule available)")) {}.disabled(true)
                             } else {
                                 ForEach(available) { rule in
-                                    Button(rule.name) {
+                                    Button(rule.name + " · " + state.ruleSourceName(rule.id)) {
                                         let firstExit = state.editingProfile.lines.first?.id ?? ""
                                         scenario.bindings.append(RuleBinding(ruleSetID: rule.id, lineID: firstExit))
                                         state.saveEditingProfile()
@@ -2893,5 +2818,126 @@ private struct ScenarioIconPicker: View {
         }
         focusedKey = keys[nextIndex]
         hoveredKey = keys[nextIndex]
+    }
+}
+
+@MainActor
+private func lineBriefInfo(_ line: Line, state: AppState, net: NetworkInfo) -> String {
+    var tailscaleStatus: TailscaleRuntimeStatus? { state.tailscaleConfigurationStatus(for: line.id) }
+    var tailscaleRuntimeConnected: Bool { ConnectionReportRuntimeFacts.committedLines(status: state.engine.status, report: state.engine.connectionReport)?.lineIDs.contains(line.id) == true }
+    // 出口地址只是当前连接事务的 Provider 观察；运行状态只看上方 badge。
+    if let info = net.observation(
+        for: line.id,
+        transactionID: state.engine.connectionReport?.transactionID
+    ), !info.summary.isEmpty {
+        return info.summary
+    }
+    // 没有本次事务的有效观察时，只显示静态配置。
+    switch line.type {
+    case "tailscale":
+        if tailscaleRuntimeConnected {
+            if let status = tailscaleStatus,
+               let node = status.exitNodes.first(where: {
+                   $0.ip == line.tailscaleExitNode
+               }) {
+                return state.tr(
+                    "已连接 · \(node.name)",
+                    "Connected · \(node.name)"
+                )
+            }
+            return state.tr("已连接", "Connected")
+        }
+        if let status = tailscaleStatus {
+            if status.isRunning {
+                if line.tailscaleExitNode.isEmpty {
+                    return state.tr("已登录 · 未选择出口", "Signed in · No exit node")
+                }
+                if let node = status.exitNodes.first(where: { $0.ip == line.tailscaleExitNode }) {
+                    return node.online
+                        ? state.tr("已登录 · \(node.name)", "Signed in · \(node.name)")
+                        : state.tr("出口节点离线", "Exit node offline")
+                }
+                return state.tr("出口节点不可用", "Exit node unavailable")
+            }
+            return state.tr("需要登录", "Sign-in required")
+        }
+        return state.tr("登录状态未检查", "Sign-in status not checked")
+    case "vpn":
+        return line.vpnServer
+    case "trojan":
+        guard !line.trojanServer.isEmpty else { return "" }
+        return "\(line.trojanServer):\(line.trojanPort)"
+    case "shadowsocks":
+        guard !line.ssServer.isEmpty else { return "" }
+        return "\(line.ssServer):\(line.ssPort)"
+    case "vmess":
+        guard !line.vmessServer.isEmpty else { return "" }
+        return "\(line.vmessServer):\(line.vmessPort)"
+    case "anytls":
+        guard !line.anytlsServer.isEmpty else { return "" }
+        return "\(line.anytlsServer):\(line.anytlsPort)"
+    default:
+        return ""
+    }
+}
+
+
+@MainActor
+private func lineTypeLabel(_ line: Line) -> String {
+    switch line.type {
+    case "direct": return "直连"
+    case "vpn": return "VPN"
+    case "trojan": return "Trojan"
+    case "shadowsocks": return "SS"
+    case "vmess": return "VMess"
+    case "anytls": return "AnyTLS"
+    case "tailscale": return "Tailscale"
+    default: return line.type
+    }
+}
+
+private struct NativeLinesView: View {
+    let lines: [Line]
+    @ObservedObject var state: AppState
+    @ObservedObject var latencies: LineLatencyStore
+    @ObservedObject private var net = NetworkInfo.shared
+    let allowsReordering: Bool
+    let move: (String, String) -> Bool
+    let delete: (Line) -> Void
+
+    var body: some View {
+        let owned = Set(state.editingRecord.baseline?.lines.map(\.id) ?? [])
+        let summaries = Dictionary(uniqueKeysWithValues: lines.map { line in
+            let badge = RuntimeResourcePresentation(kind: "line", resourceID: line.id, enabled: line.enabled, state: state)
+            return (line.id, SettingsLineTable.Summary(
+                name: line.name, info: lineBriefInfo(line, state: state, net: net), type: lineTypeLabel(line),
+                enabled: line.enabled, locked: line.type == "direct", sourceOwned: owned.contains(line.id),
+                expanded: line.isGroup || state.editorPosition.expandedLineIDs.contains(line.id),
+                badgeLabel: badge.label, badgeIcon: badge.icon, badgeColor: badge.color, badgeHelp: badge.helpText,
+                latency: LineLatencyPresentation(store: latencies, line: line, profileID: ProfileLibrary.configurationID)))
+        })
+        SettingsLineTable(lines: lines, allowsReordering: allowsReordering, move: move,
+            content: { line in
+                AnyView(Group {
+                    if line.isGroup { LineGroupRow(line: state.editingLineBinding(line), onDelete: { delete(line) }) }
+                    else { LineRow(line: state.editingLineBinding(line), onDelete: { delete(line) }) }
+                }.environmentObject(state))
+            }, summaries: summaries,
+            toggleExpanded: { id in
+                if state.editorPosition.expandedLineIDs.contains(id) { state.editorPosition.expandedLineIDs.remove(id) }
+                else { state.editorPosition.expandedLineIDs.insert(id) }
+            }, toggleEnabled: { id, enabled in
+                guard let line = state.configurationCatalog.line(id), line.type != "direct", !owned.contains(id) else { return }
+                state.editingLineBinding(line).wrappedValue.enabled = enabled
+                state.saveEditingProfile()
+            }, testLine: { id in
+                guard let line = state.configurationCatalog.line(id) else { return }
+                let control = LineLatencyStore.TestControl.line(id, groupID: nil)
+                if let job = latencies.activeJob(for: control, profileID: ProfileLibrary.configurationID) { latencies.cancel(job.id) }
+                else { latencies.test([line], profileID: ProfileLibrary.configurationID, scope: .currentExit, control: control) }
+            }, deleteLine: { id in
+                guard let line = state.configurationCatalog.line(id), !owned.contains(id) else { return }
+                delete(line)
+            }, copyLine: state.copyEditingLine)
     }
 }

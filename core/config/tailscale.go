@@ -117,6 +117,9 @@ func buildTailscaleEndpoint(line *Line, identity TailscaleIdentity, basePath, au
 		// 会立刻回收 node key，连接时复用 state 会被要求重新登录。设备不堆积由
 		// 全局唯一 state + 固定 hostname 保证；退出登录走 Logout 显式删除设备记录。
 	}
+	if line.IdentityHostname != "" {
+		identity.Hostname = line.IdentityHostname
+	}
 	if identity.Hostname != "" {
 		endpoint["hostname"] = identity.Hostname
 	}

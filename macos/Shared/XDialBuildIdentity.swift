@@ -116,11 +116,18 @@ enum XDialBuildIdentity {
     // Every independently installed channel is a known sibling. In particular,
     // Next must exclude Debug as well as the formal app when checking whether
     // its own helper has exited during a registration refresh.
-    static let siblingApplicationDestinationURLs: [URL] = [
-        "XDial.app", "XDail Debug.app", "XDial Next.app",
-    ].filter { $0 != applicationBundleName }.map {
-        URL(fileURLWithPath: "/Applications/\($0)", isDirectory: true)
+    struct InstalledChannel {
+        let applicationIdentifier: String
+        let bundleName: String
+        let daemonSocketPath: String
+        var bundleURL: URL { URL(fileURLWithPath: "/Applications/\(bundleName)", isDirectory: true) }
     }
+    static let siblingChannels: [InstalledChannel] = [
+        .init(applicationIdentifier: "com.kafeifei.xdial.app", bundleName: "XDial.app", daemonSocketPath: "/tmp/xdial.sock"),
+        .init(applicationIdentifier: "com.kafeifei.xdial.debug", bundleName: "XDail Debug.app", daemonSocketPath: "/tmp/xdial-debug.sock"),
+        .init(applicationIdentifier: "com.kafeifei.xdial.next", bundleName: "XDial Next.app", daemonSocketPath: "/tmp/xdial-next.sock"),
+    ].filter { $0.applicationIdentifier != applicationIdentifier }
+    static let siblingApplicationDestinationURLs = siblingChannels.map(\.bundleURL)
     static let settingsEntryTypeIdentifier =
         applicationIdentifier + ".settings-entry"
     static let settingsDockActivationNotification =

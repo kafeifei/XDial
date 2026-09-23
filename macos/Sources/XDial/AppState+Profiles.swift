@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 extension AppState {
     var editingRecord: ProfileRecord {
@@ -6,23 +7,42 @@ extension AppState {
     }
 
     var editingProfile: Profile {
-        get { editingRecord.profile }
+        get {
+            configurationCatalog.profile
+        }
         set {
-            guard let index = profileLibrary.profiles.firstIndex(where: { $0.id == profileLibrary.editingProfileID }) else { return }
-            profileLibrary.profiles[index].profile = newValue
+            profileLibrary.applyDraft(newValue, editingProfileID: profileLibrary.editingProfileID)
         }
     }
 
     var browsingRecord: ProfileRecord {
-        profileLibrary.profiles.first { $0.id == browsedProfileID } ?? editingRecord
+        profileLibrary.runtimeRecord
     }
 
-    var editorPosition: ProfileEditorPosition {
-        get { editorPositions[profileLibrary.editingProfileID] ?? ProfileEditorPosition() }
-        set { editorPositions[profileLibrary.editingProfileID] = newValue }
+    var configurationCatalog: ConfigurationCatalog {
+        if let cached = configurationCatalogCache { return cached }
+        let catalog = ConfigurationCatalog(profileLibrary)
+        configurationCatalogCache = catalog
+        return catalog
     }
 
-    var editingActiveProfile: Bool { profileLibrary.editingProfileID == profileLibrary.activeProfileID }
+    // Resolve IDs again on write: filtering, reordering, or a subscription refresh
+    // can change array offsets while SwiftUI still holds a row's binding.
+    func editingLineBinding(_ line: Line) -> Binding<Line> {
+        Binding(get: { self.configurationCatalog.line(line.id) ?? line }, set: { value in
+            guard let index = self.configurationCatalog.lineIndices[line.id] else { return }
+            self.editingProfile.lines[index] = value
+        })
+    }
+
+    func editingRuleBinding(_ rule: RuleSet) -> Binding<RuleSet> {
+        Binding(get: { self.configurationCatalog.rule(rule.id) ?? rule }, set: { value in
+            guard let index = self.configurationCatalog.ruleIndices[rule.id] else { return }
+            self.editingProfile.ruleSets[index] = value
+        })
+    }
+
+    var editingActiveProfile: Bool { true }
 
     func selectEditingProfile(_ id: String) {
         guard profileLibrary.profiles.contains(where: { $0.id == id }) else { return }
@@ -33,12 +53,8 @@ extension AppState {
     func saveEditingProfile() {
         profileOperationError = nil
         editingProfile.reconcileMatchingReferences()
-        if editingActiveProfile {
-            profile = editingProfile
-            save()
-        } else {
-            persistProfileLibrary()
-        }
+        profile = profileLibrary.snapshot()
+        save()
     }
 
     func saveEditingVisualOrder() { saveEditingProfile() }
@@ -64,7 +80,7 @@ extension AppState {
                 }
             }
             profileLibrary = loaded
-            profile = loaded.profiles.first { $0.id == loaded.activeProfileID }!.profile
+            profile = loaded.snapshot()
             browsedProfileID = loaded.activeProfileID
             profileLibraryLoaded = true
             profilePersistenceError = nil
@@ -77,9 +93,11 @@ extension AppState {
     @discardableResult
     func insertProfile(_ record: ProfileRecord) -> Bool {
         let original = profileLibrary
-        profileLibrary.profiles.append(record)
-        profileLibrary.editingProfileID = record.id
+        do { try profileLibrary.insert(record) }
+        catch { profileOperationError = error.localizedDescription; return false }
         guard persistProfileLibrary() else { profileLibrary = original; return false }
+        profile = profileLibrary.snapshot()
+        save()
         return true
     }
 
@@ -96,24 +114,47 @@ extension AppState {
 
     func canDeleteProfile(_ id: String) -> Bool {
         profileLibrary.profiles.contains(where: { $0.id == id }) &&
-        profileLibrary.profiles.count > 1 &&
-        !(id == profileLibrary.activeProfileID && engine.status != "disconnected") &&
-        !hasPendingScenarioSwitch
+        !hasPendingScenarioSwitch && (try? profileLibrary.removingProfile(id)) != nil
     }
 
     @discardableResult
     func deleteProfile(_ id: String) -> Bool {
-        guard canDeleteProfile(id) else { return false }
+        guard !hasPendingScenarioSwitch else { return false }
         let original = profileLibrary
-        profileLibrary.profiles.removeAll { $0.id == id }
-        let fallback = profileLibrary.profiles[0]
-        if profileLibrary.editingProfileID == id { profileLibrary.editingProfileID = fallback.id }
-        if profileLibrary.activeProfileID == id { profileLibrary.activeProfileID = fallback.id }
+        do { profileLibrary = try profileLibrary.removingProfile(id) }
+        catch { profileOperationError = error.localizedDescription; return false }
         guard persistProfileLibrary() else { profileLibrary = original; return false }
-        if original.activeProfileID == id { profile = fallback.profile }
-        if browsedProfileID == id { browsedProfileID = fallback.id }
-        editorPositions.removeValue(forKey: id)
+        profile = profileLibrary.snapshot()
+        save()
         return true
+    }
+
+    func importSourceTemplates(_ id: String, replacing: Bool = false) {
+        let original = profileLibrary
+        do {
+            try profileLibrary.importTemplates(profileID: id, replacing: replacing)
+            guard persistProfileLibrary() else { profileLibrary = original; return }
+            profile = profileLibrary.snapshot()
+            save()
+        } catch { profileOperationError = error.localizedDescription }
+    }
+
+    func setGroupFollowsSource(_ id: String, enabled: Bool) {
+        let original = profileLibrary
+        do {
+            try profileLibrary.setGroupFollowsSource(id, enabled: enabled)
+            guard persistProfileLibrary() else { profileLibrary = original; return }
+            profile = profileLibrary.snapshot()
+            save()
+        } catch { profileOperationError = error.localizedDescription }
+    }
+
+    func lineSourceName(_ id: String) -> String {
+        configurationCatalog.lineSources[id] ?? tr("全局", "Global")
+    }
+
+    func ruleSourceName(_ id: String) -> String {
+        configurationCatalog.ruleSources[id] ?? ""
     }
 
     func copyEditingScenario(_ id: String) {
@@ -126,8 +167,26 @@ extension AppState {
         saveEditingProfile()
     }
 
+    func copyEditingLine(_ id: String) {
+        guard editingRecord.profile.lines.contains(where: { $0.id == id }) else { return }
+        var draft = editingProfile
+        guard let copyID = draft.copyLine(id, suffix: tr(" 副本", " Copy")) else { return }
+        editingProfile = draft
+        editorPosition.expandedLineIDs.insert(copyID)
+        saveEditingProfile()
+    }
+
+    func copyEditingRule(_ id: String) {
+        guard editingRecord.profile.ruleSets.contains(where: { $0.id == id }) else { return }
+        var draft = editingProfile
+        guard let copyID = draft.copyRule(id, suffix: tr(" 副本", " Copy")) else { return }
+        editingProfile = draft
+        editorPosition.expandedRuleIDs.insert(copyID)
+        saveEditingProfile()
+    }
+
     func buildEditingProfileJSON() -> String {
-        var snapshot = editingProfile
+        var snapshot = editingRecord.profile
         snapshot.profileID = editingRecord.id
         guard let data = try? JSONEncoder().encode(snapshot) else { return "{}" }
         return String(decoding: data, as: UTF8.self)

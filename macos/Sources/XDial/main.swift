@@ -1,5 +1,12 @@
 import AppKit
 
+#if DEBUG
+if let index = CommandLine.arguments.firstIndex(of: "--render-settings-preview"),
+   CommandLine.arguments.indices.contains(index + 1) {
+    MainActor.assumeIsolated { SettingsLayoutPreview.run(directory: CommandLine.arguments[index + 1]) }
+}
+#endif
+
 #if XDIAL_NEXT_IDENTITY
 // This entry point precedes all App/engine/installation initialization. The
 // read-only check works while Debug and Next run; the writer refuses a live
@@ -21,7 +28,7 @@ if CommandLine.arguments.contains("--import-xdial-debug") ||
         if !checkOnly {
             let store = ProfileLibraryStore()
             var library = try store.load() ?? ProfileLibrary()
-            library.profiles.append(ProfileRecord(id: id, name: "XDail Debug 导入", profile: profile))
+            try library.insert(ProfileRecord(id: id, name: "XDail Debug 导入", profile: profile))
             library.editingProfileID = id
             try store.save(library)
             guard try store.load() == library else { throw ProfileLibraryError.invalid("导入后的加密配置校验失败") }

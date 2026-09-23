@@ -23,8 +23,7 @@ private enum GeneralSettingsSection: CaseIterable, Hashable {
     }
 }
 
-/// Application preferences have their own window; presenting them never replaces
-/// the Profile editor or changes its selected object.
+/// Application preferences share the configuration window and do not change the selected source.
 struct GeneralSettingsView: View {
     @EnvironmentObject private var state: AppState
     @Environment(\.openWindow) private var openWindow
@@ -78,7 +77,7 @@ struct GeneralSettingsView: View {
         }
         .font(.system(size: 12))
         .controlSize(.small)
-        .frame(width: 620, height: 380)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(XDialPalette.canvas)
     }
 

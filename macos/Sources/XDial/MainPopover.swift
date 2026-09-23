@@ -41,7 +41,6 @@ struct MainPopover: View {
         VStack(spacing: 0) {
             header
             Divider()
-            profilePicker
             scenarioCarousel
             if needsSSIDAccess {
                 Divider()
@@ -183,7 +182,6 @@ struct MainPopover: View {
             Button {
                 ApplicationWindowLifecycleController.shared
                     .prepareToPresentSettingsWindow()
-                state.selectEditingProfile(state.browsingRecord.id)
                 openWindow(id: "settings")
                 NSApp.activate(ignoringOtherApps: true)
             } label: {
@@ -252,32 +250,6 @@ struct MainPopover: View {
             .prepareToPresentUpdateWindow()
         openWindow(id: "update")
         NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private var profilePicker: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Menu {
-                    ForEach(state.profileLibrary.profiles) { record in
-                        Button {
-                            state.browsedProfileID = record.id
-                        } label: {
-                            Label(record.name, systemImage: record.id == state.browsingRecord.id ? "checkmark" : "folder")
-                        }
-                    }
-                } label: { Text(state.browsingRecord.name) }
-                .menuStyle(.borderlessButton).fixedSize()
-                Spacer()
-                Text(state.browsingRecord.source == nil ? state.tr("本地", "Local") : state.tr("订阅", "Subscription"))
-                    .foregroundStyle(.secondary)
-            }
-            if state.isConnected, state.browsingRecord.id != state.profileLibrary.activeProfileID,
-               let active = state.profileLibrary.profiles.first(where: { $0.id == state.profileLibrary.activeProfileID }) {
-                Text(state.tr("正在使用：", "In use: ") + active.name + " · " + (state.engine.connectionReport?.scenario.name ?? ""))
-                    .foregroundStyle(XDialPalette.success)
-            }
-        }
-        .font(.caption).padding(.horizontal, 20).padding(.top, 12)
     }
 
     @ViewBuilder

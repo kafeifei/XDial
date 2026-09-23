@@ -14,6 +14,7 @@ struct ProfileRecord: Codable, Identifiable, Hashable {
     var profile: Profile
     var source: ProfileSource?
     var baseline: Profile?
+    var resourceIDs: [String: String]?
 
     static func empty(named name: String) -> ProfileRecord {
         var profile = Profile()
@@ -110,29 +111,72 @@ struct ProfileRecord: Codable, Identifiable, Hashable {
 }
 
 struct ProfileLibrary: Codable, Hashable {
-    // Older Next builds must refuse the library instead of ignoring Scenario
-    // match order / partial scopes and changing its routing on a downgrade.
-    var schemaVersion = 2
+    var schemaVersion = 3
     var profiles: [ProfileRecord]
     var activeProfileID: String
     var editingProfileID: String
+    var groups: [Line] = []
+    var scenarios: [Scenario] = []
+    var activeScenarioID = ""
+    var groupSources: [String: GlobalGroupSource] = [:]
+    var scenarioSources: [String: String] = [:]
+    static let configurationID = "global-configuration"
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion, profiles, activeProfileID, editingProfileID
+        case groups, scenarios, activeScenarioID, groupSources, scenarioSources
+    }
 
     init() {
-        let record = ProfileRecord.empty(named: "默认配置")
+        var record = ProfileRecord.empty(named: "默认配置")
+        scenarios = record.profile.scenarios
+        activeScenarioID = record.profile.activeScenarioID
+        record.profile.scenarios = []
+        record.profile.activeScenarioID = ""
         profiles = [record]
-        activeProfileID = record.id
+        activeProfileID = Self.configurationID
         editingProfileID = record.id
     }
 
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try c.decode(Int.self, forKey: .schemaVersion)
+        profiles = try c.decode([ProfileRecord].self, forKey: .profiles)
+        activeProfileID = try c.decode(String.self, forKey: .activeProfileID)
+        editingProfileID = try c.decode(String.self, forKey: .editingProfileID)
+        groups = try c.decodeIfPresent([Line].self, forKey: .groups) ?? []
+        scenarios = try c.decodeIfPresent([Scenario].self, forKey: .scenarios) ?? []
+        activeScenarioID = try c.decodeIfPresent(String.self, forKey: .activeScenarioID) ?? ""
+        groupSources = try c.decodeIfPresent([String: GlobalGroupSource].self, forKey: .groupSources) ?? [:]
+        scenarioSources = try c.decodeIfPresent([String: String].self, forKey: .scenarioSources) ?? [:]
+    }
+
     func validated() throws -> ProfileLibrary {
-        guard (1...2).contains(schemaVersion), !profiles.isEmpty,
+        guard (1...3).contains(schemaVersion), !profiles.isEmpty,
               Set(profiles.map(\.id)).count == profiles.count,
-              profiles.contains(where: { $0.id == activeProfileID }),
+              profiles.allSatisfy({ !$0.id.isEmpty && $0.id != Self.configurationID }),
               profiles.contains(where: { $0.id == editingProfileID }) else {
             throw ProfileLibraryError.invalid("配置库格式或配置引用无效")
         }
         var result = self
-        result.schemaVersion = 2
+        if schemaVersion < 3 {
+            guard profiles.contains(where: { $0.id == activeProfileID }) else {
+                throw ProfileLibraryError.invalid("原活动配置不存在，无法迁移")
+            }
+            try result.promoteEmbeddedObjects()
+        }
+        guard result.profiles.allSatisfy({ $0.profile.subscriptions.isEmpty && $0.profile.scenarios.isEmpty && !$0.profile.lines.contains(where: \.isGroup) }),
+              Set(result.groups.map(\.id)).count == result.groups.count,
+              Set(result.scenarios.map(\.id)).count == result.scenarios.count,
+              result.groups.allSatisfy(\.isGroup) else {
+            throw ProfileLibraryError.invalid("全局配置对象归属无效")
+        }
+        guard schemaVersion < 3 || activeProfileID == Self.configurationID else {
+            throw ProfileLibraryError.invalid("全局配置身份无效")
+        }
+        try result.validateReferences(allowEmptyGroups: true)
+        result.schemaVersion = 3
+        result.activeProfileID = Self.configurationID
         return result
     }
 }
@@ -147,13 +191,6 @@ enum ProfileLibraryError: LocalizedError {
         case let .keychain(status): return "无法访问配置钥匙串（\(status)），配置尚未保存"
         }
     }
-}
-
-struct ProfileEditorPosition {
-    var tab = 0
-    var expandedLineIDs: Set<String> = []
-    var expandedRuleIDs: Set<String> = []
-    var expandedScenarioID: String?
 }
 
 private func preservingProfileOrder<T: Identifiable>(_ incoming: [T], previous: [T]) -> [T] {

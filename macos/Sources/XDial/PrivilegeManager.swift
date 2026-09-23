@@ -169,14 +169,19 @@ enum PrivilegeManager {
             ))
         }
         if canConnectSocket() { return .unresponsive }
+        return registrationProcessPresence(excluding: [ProcessInfo.processInfo.processIdentifier])
+    }
+
+    private static func registrationProcessPresence(excluding ignoredPIDs: Set<Int32>) -> HelperRegistrationCoordinator.Runtime {
         guard case let .available(entries) = LocalProcessInventory.capture() else { return .unknown }
         var hasUnknown = false
-        for entry in entries where entry.pid != ProcessInfo.processInfo.processIdentifier {
+        for entry in entries where !ignoredPIDs.contains(entry.pid) {
             switch entry.belongsToProductBundle(
                 XDialBuildIdentity.applicationDestinationURL,
                 excludingSiblingBundleURLs:
                     XDialBuildIdentity.siblingApplicationDestinationURLs,
-                executableNames: ["xdial", "xdial-daemon"]
+                executableNames: ["xdial", "xdial-daemon"],
+                identifySibling: { SiblingProductProcessIdentity.contains($0) }
             ) {
             case .some(true): return .unresponsive
             case .some(false): continue
@@ -195,7 +200,8 @@ enum PrivilegeManager {
                 XDialBuildIdentity.applicationDestinationURL,
                 excludingSiblingBundleURLs:
                     XDialBuildIdentity.siblingApplicationDestinationURLs,
-                executableNames: ["xdial", "xdial-daemon"]
+                executableNames: ["xdial", "xdial-daemon"],
+                identifySibling: { SiblingProductProcessIdentity.contains($0) }
             ) == false
         }
     }
@@ -218,6 +224,12 @@ enum PrivilegeManager {
     ) async throws -> HelperRegistrationCoordinator.MaintenanceTarget {
         guard await MainActor.run(body: { GoEngine.shared.helperRegistrationMaintenanceAllowed }) else {
             throw HelperRegistrationCoordinator.Failure.serviceBusy
+        }
+        // Check the evidence needed after unregister before stopping a healthy
+        // daemon, so an unrelated ambiguous PID cannot strand the transaction.
+        let ignored = Set([ProcessInfo.processInfo.processIdentifier, daemon?.pid].compactMap { $0 })
+        guard registrationProcessPresence(excluding: ignored) == .absent else {
+            throw HelperRegistrationCoordinator.Failure.processStateUnknown
         }
         let targetIdentity = try registrationIdentity()
         let previousIntent = try HelperRegistrationMaintenanceIntent.read()

@@ -1,6 +1,9 @@
 import Foundation
 
 struct Line: Codable, Identifiable, Hashable {
+    // Runtime projection retains protocol identity ownership across global Scenarios.
+    var identityProfileID: String = ""
+    var identityHostname: String = ""
     var groupMembers: [String] = []
     var groupDefault: String = ""
     var groupURL: String = ""
@@ -57,6 +60,8 @@ struct Line: Codable, Identifiable, Hashable {
     var allowInsecure: Bool = false
 
     enum CodingKeys: String, CodingKey {
+        case identityProfileID = "identity_profile_id"
+        case identityHostname = "identity_hostname"
         case groupMembers = "group_members"
         case groupDefault = "group_default"
         case groupURL = "group_url"
@@ -129,6 +134,8 @@ struct Line: Codable, Identifiable, Hashable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        identityProfileID = try c.decodeIfPresent(String.self, forKey: .identityProfileID) ?? ""
+        identityHostname = try c.decodeIfPresent(String.self, forKey: .identityHostname) ?? ""
         groupMembers = try c.decodeIfPresent([String].self, forKey: .groupMembers) ?? []
         groupDefault = try c.decodeIfPresent(String.self, forKey: .groupDefault) ?? ""
         groupURL = try c.decodeIfPresent(String.self, forKey: .groupURL) ?? ""

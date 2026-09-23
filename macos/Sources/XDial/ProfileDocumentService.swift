@@ -81,6 +81,7 @@ enum ProfileDocumentService {
     }
 
     static func copy(_ profile: Profile, id: String) throws -> Profile {
+        try validate(profile)
         let data = try JSONEncoder().encode(profile)
         var error: NSError?
         let result = LibboxCloneProfile(String(decoding: data, as: UTF8.self), id, &error)
@@ -158,16 +159,16 @@ extension AppState {
                 let incoming = try await ProfileDocumentService.read(content: "", url: source.url, profileID: id, nodesOnly: source.nodesOnly)
                 guard let index = profileLibrary.profiles.firstIndex(where: { $0.id == id }),
                       profileLibrary.profiles[index].source == source else { return }
-                let latest = profileLibrary.profiles[index]
-                let updated = try latest.refreshed(with: incoming)
+                let previous = profileLibrary
+                let updated = try profileLibrary.refreshing(profileID: id, incoming: incoming)
+                // Native validation remains in Go; local drafts unrelated to this source
+                // may stay incomplete, but the global reference check already passed.
+                try ProfileDocumentService.validate(incoming)
+                profileLibrary = updated
+                guard persistProfileLibrary() else { profileLibrary = previous; return }
                 profileRefreshRetryAfter.removeValue(forKey: id)
-                try ProfileDocumentService.validate(updated.profile)
-                profileLibrary.profiles[index] = updated
-                guard persistProfileLibrary() else { profileLibrary.profiles[index] = latest; return }
-                if profileLibrary.activeProfileID == id {
-                    profile = updated.profile
-                    save()
-                }
+                profile = updated.snapshot()
+                save()
             } catch {
                 profileRefreshRetryAfter[id] = Date().addingTimeInterval(15 * 60)
                 profileOperationError = "「\(record.name)」更新失败：\(error.localizedDescription)"
