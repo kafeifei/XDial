@@ -678,6 +678,16 @@ final class DebugServer {
             return ("409 Conflict", json(["error": "Legacy per-Profile routing migrations are unavailable for the global configuration library"]))
         #endif
         case "open-settings":
+            // Editor navigation only: never select a runtime Scenario or save
+            // configuration while reproducing a settings layout problem.
+            if let scenarioID = obj["scenarioID"] as? String {
+                guard state.profileLibraryLoaded, state.profilePersistenceError == nil,
+                      state.editingProfile.scenarios.contains(where: { $0.id == scenarioID }) else {
+                    return ("400 Bad Request", json(["error": "unknown editor scenario"]))
+                }
+                state.editorPosition.tab = 2
+                state.editorPosition.expandedScenarioID = scenarioID
+            }
             ApplicationWindowLifecycleController.shared
                 .prepareToPresentSettingsWindow()
             NSApp.activate(ignoringOtherApps: true)

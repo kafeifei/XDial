@@ -631,9 +631,10 @@ final class AppState: ObservableObject {
             runtimeConfigurationSignature()
         )
         checkHelper()
-        // A fresh Next installation can manage Profiles before registering
-        // system components. Install/connect remains an explicit user action.
-        if PrivilegeManager.isInstalled { installation.start() }
+        // Fresh installations can edit Profiles before opting into system
+        // components. An upgrade must resume even though its outgoing helper
+        // was deliberately unregistered before the bundle replacement.
+        if installation.shouldPrepareAtLaunch { installation.start() }
         switch updateRelaunchDecision {
         case .reconnect:
             launchAutoConnectPending = true

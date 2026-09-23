@@ -58,5 +58,13 @@ make app-debug MACOS_DEBUG_XCODEBUILD_FLAGS=-allowProvisioningUpdates
 该脚本在新事务提交后执行一次 HTTPS 检查，目标由 `XDIAL_RESTART_PROBE_URL` 指定，
 未设置时为 `https://www.apple.com/`；这次访问仅反映该目标的当前路径结果。
 
+daemon plist 使用标准 `Program` 指向各通道的固定安装路径，保留 SMAppService 的
+注册、批准和签名检查。App 在注册前已完成 `/Applications` 定位，不使用依赖后台项目
+容器记录的 `BundleProgram` 路径解析。构建门禁校验这一路径与通道身份一致。
+
+不要另写临时脚本交换正在注册的 App 容器来代替产品安装事务。保留运行中的版本时，
+先保留已验证候选包，等允许升级时通过安装入口完成旧服务退出、文件替换及新服务验证。
+磁盘替换和签名通过均不能替代这笔事务；服务报告 ready 还需实际 PID 和运行 hash 匹配。
+
 候选包校验、磁盘安装、Host 进程与实际运行的 Provider 是不同状态。新扩展代码只有在
 系统激活对应扩展后才生效；安装报告与运行态字段见 [debug-server.md](debug-server.md)。

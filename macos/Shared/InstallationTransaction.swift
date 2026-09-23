@@ -254,6 +254,21 @@ enum SystemExtensionInstallationEvent: Equatable {
 }
 
 enum InstallationBuildMarker {
+    /// Replacement unregisters the outgoing helper before moving its bundle.
+    /// A missing helper is therefore not evidence of a fresh installation.
+    static func shouldPrepareAtLaunch(
+        serviceRegistered: Bool,
+        registrationRecoveryPending: Bool,
+        previousCompletedInstallation: String?,
+        bundleIdentifier: String
+    ) -> Bool {
+        if serviceRegistered || registrationRecoveryPending { return true }
+        guard let marker = previousCompletedInstallation else { return false }
+        let parts = marker.split(separator: ":", omittingEmptySubsequences: false)
+        return parts.count == 3 && parts[0] == bundleIdentifier
+            && !parts[1].isEmpty && parts[2].hasPrefix("installation-v")
+    }
+
     static func make(
         bundleIdentifier: String,
         bundleVersion: String

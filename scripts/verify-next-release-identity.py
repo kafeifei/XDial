@@ -61,6 +61,8 @@ def verify(bundle, tag):
             "Next distribution contains another channel's daemon")
     daemon = plistlib.loads((daemon_dir / (prefix + ".daemon.plist")).read_bytes())
     require(daemon.get("Label") == prefix + ".daemon", "wrong daemon label")
+    require(daemon.get("Program") == "/Applications/XDial Next.app/Contents/MacOS/xdial-daemon"
+            and "BundleProgram" not in daemon, "daemon must launch from the canonical installed path")
     require(daemon.get("AssociatedBundleIdentifiers") == [prefix], "wrong daemon owner")
     require(daemon.get("ProgramArguments") == ["xdial-daemon", "daemon", "--socket", "/tmp/xdial-next.sock"],
             "wrong daemon arguments")

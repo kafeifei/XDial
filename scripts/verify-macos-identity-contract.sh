@@ -186,4 +186,13 @@ assert value["AssociatedBundleIdentifiers"] == ["com.kafeifei.xdial.next"]
 assert value["StandardOutPath"] == value["StandardErrorPath"] == "/tmp/xdial-next.log"
 PYTHON
 
+python3 - <<'PYTHON'
+import pathlib, plistlib
+for channel, name in [("debug", "XDail Debug"), ("next", "XDial Next"), ("app", "XDial")]:
+    path = pathlib.Path(f"macos/com.kafeifei.xdial.{channel}.daemon.plist")
+    value = plistlib.loads(path.read_bytes())
+    assert value["Program"] == f"/Applications/{name}.app/Contents/MacOS/xdial-daemon", path
+    assert "BundleProgram" not in value, path
+PYTHON
+
 echo "macOS Next and development isolation, formal identity, and location-access contracts verified"

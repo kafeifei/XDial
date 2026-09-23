@@ -199,6 +199,36 @@ final class InstallationTransactionTests: XCTestCase {
         )
     }
 
+    func testUpgradeResumesAfterOutgoingHelperWasUnregistered() {
+        XCTAssertTrue(InstallationBuildMarker.shouldPrepareAtLaunch(
+            serviceRegistered: false, registrationRecoveryPending: false,
+            previousCompletedInstallation: "com.kafeifei.xdial.debug:78:installation-v3",
+            bundleIdentifier: "com.kafeifei.xdial.debug"
+        ))
+    }
+
+    func testFreshOrExplicitlyUninstalledApplicationDoesNotRegisterAutomatically() {
+        XCTAssertFalse(InstallationBuildMarker.shouldPrepareAtLaunch(
+            serviceRegistered: false, registrationRecoveryPending: false,
+            previousCompletedInstallation: nil, bundleIdentifier: "com.kafeifei.xdial.next"
+        ))
+    }
+
+    func testAnotherChannelsInstallationDoesNotAuthorizeRegistration() {
+        XCTAssertFalse(InstallationBuildMarker.shouldPrepareAtLaunch(
+            serviceRegistered: false, registrationRecoveryPending: false,
+            previousCompletedInstallation: "com.kafeifei.xdial.next:79:installation-v4",
+            bundleIdentifier: "com.kafeifei.xdial.debug"
+        ))
+    }
+
+    func testInterruptedRegistrationResumesBeforeFirstCompletedInstallation() {
+        XCTAssertTrue(InstallationBuildMarker.shouldPrepareAtLaunch(
+            serviceRegistered: false, registrationRecoveryPending: true,
+            previousCompletedInstallation: nil, bundleIdentifier: "com.kafeifei.xdial.debug"
+        ))
+    }
+
     func testSystemExtensionOnlyVerifiesCurrentEnabledVersion() {
         let expected = SystemExtensionPropertySnapshot(
             bundleIdentifier:

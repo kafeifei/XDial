@@ -36,6 +36,15 @@ final class InstallationCoordinator: ObservableObject {
     private var runTask: Task<Void, Never>?
     private let completionMarkerKey = "xdial.installation.ready"
 
+    var shouldPrepareAtLaunch: Bool {
+        InstallationBuildMarker.shouldPrepareAtLaunch(
+            serviceRegistered: PrivilegeManager.isInstalled,
+            registrationRecoveryPending: PrivilegeManager.hasPendingRegistrationRecovery,
+            previousCompletedInstallation: xdialDefaults.string(forKey: completionMarkerKey),
+            bundleIdentifier: XDialBuildIdentity.applicationIdentifier
+        )
+    }
+
     /// The release build has no debug server. Retain the same credential-free
     /// report shown by the UI so installation failures can be diagnosed without
     /// inferring state from separate log messages. PID and build distinguish a

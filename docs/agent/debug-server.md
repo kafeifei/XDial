@@ -34,6 +34,9 @@ curl -sS '127.0.0.1:19877/ax?depth=8'
 | `connect-with-failure` | 真实启动连接并在指定阶段注入失败，触发回滚 |
 | `fake-update`、`clear-update` | 注入更新 UI 候选；清除时还会丢弃已暂存更新并复位更新状态 |
 
+`open-settings` 可带 `scenarioID`，只展开当前编辑配置中的场景卡片；不修改运行选择、
+不保存配置、不连接网络。用于在真实窗口中复核布局问题，不能用 `select-scenario` 替代。
+
 路由探针参数与响应关联：
 
 ```sh

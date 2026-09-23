@@ -219,7 +219,7 @@ test-macos-transaction: test-release-contract macos-identity-contract
 	@rg -q 'probePreparedSwitchOutboundTLSCapabilities' macos/TransparentProxyExtension/EmbeddedSingBoxRuntime.swift
 	@rg -q 'directIPv6Available' core/config/generator.go core/libbox/configgen.go
 	@! rg -n 'xdial_reresolve_ipv(4|6)_flow_domains' core/config/generator.go
-	@test "$$(rg -l 'setActivationPolicy\(' macos/Sources/XDial macos/SettingsDockUI --glob '*.swift' | sort)" = "$$(printf '%s\n' macos/SettingsDockUI/main.swift macos/Sources/XDial/XDialApp.swift)"
+	@test "$$(rg -l 'setActivationPolicy\(' macos/Sources/XDial macos/SettingsDockUI --glob '*.swift' | sort)" = "$$(printf '%s\n' macos/SettingsDockUI/main.swift macos/Sources/XDial/SettingsLayoutPreview.swift macos/Sources/XDial/XDialApp.swift)"
 	@! rg -n 'NSApp\.setActivationPolicy\(\.regular\)' macos/Sources/XDial/XDialApp.swift
 	@rg -q 'NSApp\.setActivationPolicy\(\.accessory\)' macos/Sources/XDial/XDialApp.swift
 	@rg -q 'setActivationPolicy\(\.regular\)' macos/SettingsDockUI/main.swift

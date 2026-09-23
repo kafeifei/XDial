@@ -92,6 +92,8 @@ def main():
             "bundle contains unexpected launch daemons")
     daemon = plist(daemon_directory / (prefix + ".daemon.plist"))
     require(daemon["Label"] == prefix + ".daemon", "wrong daemon label")
+    require(daemon.get("Program") == f"/Applications/{product}.app/Contents/MacOS/xdial-daemon"
+            and "BundleProgram" not in daemon, "daemon must launch from the canonical installed path")
     require(daemon["AssociatedBundleIdentifiers"] == [prefix], "wrong daemon owner")
     require(daemon["ProgramArguments"] == ["xdial-daemon", "daemon", "--socket", f"/tmp/xdial-{flavor}.sock"],
             "wrong daemon socket or arguments")
