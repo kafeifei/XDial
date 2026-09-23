@@ -238,7 +238,7 @@ test-macos-transaction: test-release-contract macos-identity-contract
 	@! rg -n 'URLSession|ip-api\.com' macos/Sources/XDial/NetworkInfo.swift
 	@! rg -U -n '\.on(Appear|Disappear)[[:space:]]*\{[^}]{0,500}(probeNetwork|prepareTailscale|closeTailscaleSetup|URLSession|127\.0\.0\.1:9090)' macos/Sources/XDial/SettingsView.swift
 	@test "$$(rg -U -o 'AXUIElementCopyAttributeValue\([^)]*kAXValueAttribute' macos/Sources/XDial/DebugServer.swift | wc -l | tr -d ' ')" -eq 1
-	@rg -U -q 'private static func safeAXValue\([^}]+guard subrole != secureTextFieldSubrole else \{ return nil \}[^}]+AXUIElementCopyAttributeValue\([^)]*kAXValueAttribute' macos/Sources/XDial/DebugServer.swift
+	@rg -U -q 'private static func safeAXValue\([^}]+guard subrole != secureTextFieldSubrole else \{ return nil \}[^}]+guard role as\? String != kAXTextAreaRole else \{ return nil \}[^}]+AXUIElementCopyAttributeValue\([^)]*kAXValueAttribute' macos/Sources/XDial/DebugServer.swift
 	@rg -q 'safeAXValue\(el, subrole: subrole\)' macos/Sources/XDial/DebugServer.swift
 	@rg -q 'safeAXStringValue\(' macos/Sources/XDial/DebugServer.swift
 	@! rg -n 'str\([^)]*kAXValueAttribute' macos/Sources/XDial/DebugServer.swift
