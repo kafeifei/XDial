@@ -29,6 +29,11 @@ const (
 	outboundTLSFailureHandshake      = "tls-handshake-failed"
 	minimumOutboundTLSProbeTimeoutMS = 500
 	maximumOutboundTLSProbeTimeoutMS = 10_000
+	// Proxy servers intermittently fail a single handshake to the fixed
+	// targets. One failed sample must not decide a family, while the shared
+	// probe deadline still bounds a family that is genuinely unavailable.
+	outboundTLSProbeMaxAttemptsPerTarget = 3
+	outboundTLSProbeRetryDelay           = 250 * time.Millisecond
 )
 
 type outboundTLSProbeTarget struct {
@@ -86,8 +91,8 @@ type outboundTLSProbeJob struct {
 }
 
 type outboundTLSProbeJobResult struct {
-	family string
-	result outboundTLSAttemptResult
+	family  string
+	results []outboundTLSAttemptResult
 }
 
 type outboundTLSReadCountingConn struct {
@@ -235,8 +240,8 @@ func probeOutboundTLSCapabilitiesWithTargets(
 	targets outboundTLSProbeTargetSet,
 ) outboundTLSCapabilities {
 	capabilities := outboundTLSCapabilities{
-		IPv4: newOutboundTLSFamilyCapability(len(targets.ipv4)),
-		IPv6: newOutboundTLSFamilyCapability(len(targets.ipv6)),
+		IPv4: newOutboundTLSFamilyCapability(),
+		IPv6: newOutboundTLSFamilyCapability(),
 	}
 	jobs := make([]outboundTLSProbeJob, 0, len(targets.ipv4)+len(targets.ipv6))
 	for _, target := range targets.ipv4 {
@@ -249,26 +254,54 @@ func probeOutboundTLSCapabilitiesWithTargets(
 	for _, job := range jobs {
 		go func(job outboundTLSProbeJob) {
 			results <- outboundTLSProbeJobResult{
-				family: job.family,
-				result: probeOutboundTLSAttempt(ctx, outbound, job.target),
+				family:  job.family,
+				results: probeOutboundTLSTarget(ctx, outbound, job.target),
 			}
 		}(job)
 	}
 	for range jobs {
 		jobResult := <-results
+		capability := &capabilities.IPv6
 		if jobResult.family == "ipv4" {
-			addOutboundTLSAttemptResult(&capabilities.IPv4, jobResult.result)
-		} else {
-			addOutboundTLSAttemptResult(&capabilities.IPv6, jobResult.result)
+			capability = &capabilities.IPv4
+		}
+		for _, result := range jobResult.results {
+			addOutboundTLSAttemptResult(capability, result)
 		}
 	}
 	return capabilities
 }
 
-func newOutboundTLSFamilyCapability(attempts int) outboundTLSFamilyCapability {
+func newOutboundTLSFamilyCapability() outboundTLSFamilyCapability {
 	return outboundTLSFamilyCapability{
-		Attempts:     attempts,
 		FailureCodes: make(map[string]int),
+	}
+}
+
+// probeOutboundTLSTarget retries one target until it authenticates, the
+// attempt budget is spent, or the caller's deadline or cancellation ends the
+// probe. Every attempt is reported so the result keeps its evidence.
+func probeOutboundTLSTarget(
+	ctx context.Context,
+	outbound adapter.Outbound,
+	target outboundTLSProbeTarget,
+) []outboundTLSAttemptResult {
+	var results []outboundTLSAttemptResult
+	for attempt := 1; ; attempt++ {
+		result := probeOutboundTLSAttempt(ctx, outbound, target)
+		results = append(results, result)
+		if result.tlsAuthenticated ||
+			attempt >= outboundTLSProbeMaxAttemptsPerTarget ||
+			ctx.Err() != nil {
+			return results
+		}
+		timer := time.NewTimer(outboundTLSProbeRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return results
+		case <-timer.C:
+		}
 	}
 }
 
@@ -276,6 +309,7 @@ func addOutboundTLSAttemptResult(
 	capability *outboundTLSFamilyCapability,
 	result outboundTLSAttemptResult,
 ) {
+	capability.Attempts++
 	if result.tcpConnected {
 		capability.TCPConnected++
 	}

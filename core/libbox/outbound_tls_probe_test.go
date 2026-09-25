@@ -298,9 +298,112 @@ func TestOutboundTLSProbeDoesNotExposeDialError(t *testing.T) {
 		"ipv4": capabilities.IPv4,
 		"ipv6": capabilities.IPv6,
 	} {
-		if capability.FailureCodes[outboundTLSFailureTCPConnect] != 1 {
+		if capability.Available ||
+			capability.Attempts != outboundTLSProbeMaxAttemptsPerTarget ||
+			capability.FailureCodes[outboundTLSFailureTCPConnect] !=
+				outboundTLSProbeMaxAttemptsPerTarget {
 			t.Fatalf("%s capability = %+v", family, capability)
 		}
+	}
+}
+
+func TestOutboundTLSProbeRetriesTransientTargetFailure(t *testing.T) {
+	server, serverName, pool := newOutboundTLSProbeTestServer(t)
+	var mu sync.Mutex
+	dials := make(map[netip.Addr]int)
+	outbound := &outboundTLSProbeTestOutbound{
+		dial: func(
+			ctx context.Context,
+			network string,
+			destination M.Socksaddr,
+		) (net.Conn, error) {
+			mu.Lock()
+			dials[destination.Addr]++
+			first := dials[destination.Addr] == 1
+			mu.Unlock()
+			if first {
+				return nil, errors.New("transient upstream failure")
+			}
+			return (&net.Dialer{}).DialContext(
+				ctx,
+				network,
+				server.Listener.Addr().String(),
+			)
+		},
+	}
+	targets := outboundTLSProbeTargetSet{
+		ipv4: []outboundTLSProbeTarget{{
+			address:    netip.MustParseAddr("192.0.2.1"),
+			port:       443,
+			serverName: serverName,
+		}},
+		ipv6: []outboundTLSProbeTarget{{
+			address:    netip.MustParseAddr("2001:db8::1"),
+			port:       443,
+			serverName: serverName,
+		}},
+	}
+	ctx := service.ContextWith[adapter.CertificateStore](
+		context.Background(),
+		&outboundTLSProbeTestCertificateStore{pool: pool},
+	)
+	capabilities := probeOutboundTLSCapabilitiesWithTargets(ctx, outbound, targets)
+	for family, capability := range map[string]outboundTLSFamilyCapability{
+		"ipv4": capabilities.IPv4,
+		"ipv6": capabilities.IPv6,
+	} {
+		if !capability.Available || capability.Attempts != 2 ||
+			capability.TCPConnected != 1 || capability.TLSAuthenticated != 1 ||
+			capability.FailureCodes[outboundTLSFailureTCPConnect] != 1 {
+			t.Fatalf("%s capability = %+v", family, capability)
+		}
+	}
+	encoded, err := marshalOutboundTLSCapabilities(capabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded outboundTLSCapabilities
+	if err := json.Unmarshal([]byte(encoded), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, capability := range []outboundTLSFamilyCapability{
+		decoded.IPv4,
+		decoded.IPv6,
+	} {
+		failures := 0
+		for _, count := range capability.FailureCodes {
+			failures += count
+		}
+		if failures+capability.TLSAuthenticated != capability.Attempts {
+			t.Fatalf("attempt accounting = %+v", capability)
+		}
+	}
+}
+
+func TestOutboundTLSProbeStopsRetryingAfterDeadline(t *testing.T) {
+	outbound := &outboundTLSProbeTestOutbound{
+		dial: func(
+			ctx context.Context,
+			_ string,
+			_ M.Socksaddr,
+		) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		50*time.Millisecond,
+	)
+	defer cancel()
+	results := probeOutboundTLSTarget(ctx, outbound, outboundTLSProbeTarget{
+		address:    netip.MustParseAddr("192.0.2.1"),
+		port:       443,
+		serverName: "example.com",
+	})
+	if len(results) != 1 ||
+		results[0].failureCode != outboundTLSFailureTimeout {
+		t.Fatalf("deadline results = %+v", results)
 	}
 }
 
@@ -374,8 +477,8 @@ func TestProbeOutboundTLSCapabilitiesStopCancelsAndWaitsForLease(
 		close(cancelled)
 		<-release
 		return outboundTLSCapabilities{
-			IPv4: newOutboundTLSFamilyCapability(2),
-			IPv6: newOutboundTLSFamilyCapability(2),
+			IPv4: outboundTLSFamilyCapability{Attempts: 2, FailureCodes: make(map[string]int)},
+			IPv6: outboundTLSFamilyCapability{Attempts: 2, FailureCodes: make(map[string]int)},
 		}
 	}
 
@@ -436,8 +539,8 @@ func TestProbePreparedSwitchOutboundTLSCapabilitiesUsesCandidate(
 	}
 	defer instance.AbortPreparedSwitch()
 	want := outboundTLSCapabilities{
-		IPv4: newOutboundTLSFamilyCapability(2),
-		IPv6: newOutboundTLSFamilyCapability(2),
+		IPv4: outboundTLSFamilyCapability{Attempts: 2, FailureCodes: make(map[string]int)},
+		IPv6: outboundTLSFamilyCapability{Attempts: 2, FailureCodes: make(map[string]int)},
 	}
 	want.IPv6.Available = true
 	want.IPv6.TCPConnected = 2

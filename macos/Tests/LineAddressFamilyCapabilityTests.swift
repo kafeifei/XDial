@@ -131,23 +131,44 @@ final class LineAddressFamilyCapabilityTests: XCTestCase {
         )
     }
 
-    func testConvergenceRequiresExactSecondProbeMatch() {
-        let baseline = [
-            "tail": LineAddressFamilyCapability(
-                ipv4Available: true,
-                ipv6Available: false
-            ),
-        ]
+    func testConvergenceConfirmsOnlyFamiliesUsedByConstrainedConfig() {
+        let ipv4Only = LineAddressFamilyCapability(
+            ipv4Available: true,
+            ipv6Available: false
+        )
+        let ipv6Only = LineAddressFamilyCapability(
+            ipv4Available: false,
+            ipv6Available: true
+        )
+        let baseline = ["tail": ipv4Only, "proxy": .dualStack]
         XCTAssertTrue(
             LineAddressFamilyCapabilityConvergence.isStable(
                 baseline: baseline,
                 constrained: baseline
             )
         )
+        XCTAssertTrue(
+            LineAddressFamilyCapabilityConvergence.isStable(
+                baseline: baseline,
+                constrained: ["tail": .dualStack, "proxy": .dualStack]
+            )
+        )
         XCTAssertFalse(
             LineAddressFamilyCapabilityConvergence.isStable(
                 baseline: baseline,
-                constrained: ["tail": .dualStack]
+                constrained: ["tail": ipv6Only, "proxy": .dualStack]
+            )
+        )
+        XCTAssertFalse(
+            LineAddressFamilyCapabilityConvergence.isStable(
+                baseline: baseline,
+                constrained: ["tail": ipv4Only, "proxy": ipv4Only]
+            )
+        )
+        XCTAssertFalse(
+            LineAddressFamilyCapabilityConvergence.isStable(
+                baseline: baseline,
+                constrained: ["tail": ipv4Only]
             )
         )
     }

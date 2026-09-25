@@ -104,11 +104,22 @@ enum LineAddressFamilyCapabilityConvergence {
         }
     }
 
+    /// The constrained generation is compiled from the baseline measurement,
+    /// so its second probe only has to confirm every family that
+    /// configuration uses. A family the configuration already excluded may
+    /// recover without invalidating the transaction.
     static func isStable(
         baseline: [String: LineAddressFamilyCapability],
         constrained: [String: LineAddressFamilyCapability]
     ) -> Bool {
-        baseline == constrained
+        baseline.count == constrained.count &&
+            baseline.allSatisfy { lineID, used in
+                guard let confirmed = constrained[lineID] else {
+                    return false
+                }
+                return (!used.ipv4Available || confirmed.ipv4Available) &&
+                    (!used.ipv6Available || confirmed.ipv6Available)
+            }
     }
 }
 

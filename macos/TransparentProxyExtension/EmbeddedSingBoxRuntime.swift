@@ -549,7 +549,14 @@ final class EmbeddedSingBoxRuntime {
                 finalEnvelope = constrainedEnvelope
                 finalPort = constrainedPort
                 finalCredentials = constrainedCredentials
-                finalReadiness = constrainedReadiness
+                // The constrained configuration was compiled from the
+                // baseline facts; the second probe only confirmed them.
+                finalReadiness = GenerationReadiness(
+                    lineCapabilities:
+                        baselineReadiness.lineCapabilities,
+                    preparedTailscaleDNS:
+                        constrainedReadiness.preparedTailscaleDNS
+                )
                 logger.notice(
                     "line-address-family-config-converged degraded=true"
                 )
@@ -797,7 +804,14 @@ final class EmbeddedSingBoxRuntime {
                     matches: baselineReadiness
                 )
                 finalEnvelope = constrainedEnvelope
-                finalReadiness = constrainedReadiness
+                // The constrained configuration was compiled from the
+                // baseline facts; the second probe only confirmed them.
+                finalReadiness = GenerationReadiness(
+                    lineCapabilities:
+                        baselineReadiness.lineCapabilities,
+                    preparedTailscaleDNS:
+                        constrainedReadiness.preparedTailscaleDNS
+                )
                 finalPreparedGeneration =
                     constrainedPreparedGeneration
                 logger.notice(
