@@ -1,15 +1,15 @@
-# XDial Next 独立分支
+# XDial Next 测试通道
 
-远程分支 `xdial-next`，从本地已提交基线 `2eab57f` 开始维护。用户要求这一版长期独立，
-不合入 main；Next 发布不会替换正式版或 Debug 的组件。明确要求时可从同一源码构建 Debug 包。
+Next 的 Profile 配置库已合入 main，正式版、Debug 与 Next 使用同一份源码和共享配置库。
+Next 保留独立身份作为测试通道，从远程分支 `xdial-next` 发布；Next 发布不会替换正式版或 Debug 的组件。
 产品设计依据 [Profile v0.3](../plans/profile-subscriptions.md)，分发见 [Next 发布](next-releases.md)。
 
 ## 构建与隔离
 
-`make app MACOS_DEBUG_XCODEBUILD_FLAGS=-allowProvisioningUpdates` 生成 Apple Development
+`make app-next MACOS_DEBUG_XCODEBUILD_FLAGS=-allowProvisioningUpdates` 生成 Apple Development
 签名的 `build/XDial Next.app`。默认安装目的地为 `/Applications/XDial Next.app`。
 这是开发构建，不能公开分发。`NextRelease` 使用同一 Next 身份构建无调试服务的分发包；
-稳定发布入口和 `make restart` 在本分支禁用。
+`make restart` 只作用于 Debug。
 
 | 项目 | Next |
 |---|---|
@@ -132,7 +132,7 @@ Go 统一展开为现有的有序条件绑定，再交给原 sing-box 编译路�
 - 真正的跨 Profile 网络切换、企业 VPN 登录、在线订阅刷新仍需要运行验收。
   编译、单元测试或打开设置窗口不作为这些行为已验证的证据。
 
-Next 发布检查身份、数据升级、源码提交和更新目标；不得直接恢复本分支的稳定发布入口。
+Next 发布检查身份、数据升级、源码提交和更新目标；Next 发布入口不得指向稳定版 feed 或正式身份。
 
 订阅导入对 AnyTLS 的 `tfo=true` 做有界兼容：关闭 sing-box 不支持的 TCP Fast Open，
 保留节点、TLS/认证选项和路由内容，并在预览及管理页展示合并后的兼容说明。

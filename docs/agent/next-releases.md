@@ -8,8 +8,8 @@
 
 | 入口 | 应用 | 签名 | 调试服务 | 用途 |
 |---|---|---|---|---|
-| `make app-debug` | `XDail Debug.app` | Apple Development | 有 | 本机 Debug |
-| `make app` / `make app-next` | `XDial Next.app` | Apple Development | 有 | 本机 Next 调试 |
+| `make app` / `make app-debug` | `XDail Debug.app` | Apple Development | 有 | 本机 Debug |
+| `make app-next` | `XDial Next.app` | Apple Development | 有 | 本机 Next 调试 |
 | `make release-next` | `XDial Next.app` | Developer ID + 公证 | 无 | GitHub Next 分发 |
 
 Next 调试与分发使用同一组 `.next` 组件身份、socket 和运行目录；不能同时安装成两个 Next。

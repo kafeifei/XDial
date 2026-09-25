@@ -2,7 +2,7 @@ BUILD_DIR := build
 # $(abspath) 按空格拆分参数，带空格的 bundle 路径必须由无空格的绝对
 # BUILD_DIR 拼出，不能整体交给 abspath/realpath。
 BUILD_DIR_ABS := $(abspath $(BUILD_DIR))
-DEVELOPMENT_CHANNEL ?= next
+DEVELOPMENT_CHANNEL ?= debug
 ifeq ($(DEVELOPMENT_CHANNEL),next)
 DEVELOPMENT_CONFIGURATION := Next
 APP_BUNDLE_NAME := XDial Next.app
@@ -317,7 +317,6 @@ ci-macos-build: cli cli-debug cli-next libbox-macos-xcframework macos/AppIcon.ic
 # 单调递增的安装身份。release-app 只产生待公证的签名 app，不能分发；
 # 分发一律使用 make release 在所有门禁后产生的 zip。
 release-inputs:
-	@echo "XDial Next is maintained independently; stable release is disabled on this branch." >&2; exit 1
 	@$(RELEASE_CONTRACT) validate-inputs "$(RELEASE_TAG)" "$(RELEASE_BUILD_NUMBER)"
 	@$(RELEASE_CONTRACT) validate-notes "$(RELEASE_TAG)" "$(RELEASE_NOTES_FILE)"
 	@python3 -c 'import re,sys; sys.exit(0 if not sys.argv[1] or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,79}", sys.argv[1]) else "invalid update acceptance ID")' "$(RELEASE_UPDATE_ACCEPTANCE_ID)"
@@ -370,14 +369,13 @@ release: release-app
 # 显式公开已验收的 Release，再触发 saymiao/xdial-updates 的 Pages 部署。
 # 使用操作者现有 gh 登录；不把跨仓库凭据嵌入 App 或 Actions。
 publish:
-	@echo "XDial Next cannot publish to the stable channel." >&2; exit 1
 	@test -z "$(RELEASE_UPDATE_ACCEPTANCE_ID)" || { \
 		echo "error: an acceptance build cannot be published to stable" >&2; \
 		exit 1; \
 	}
 	python3 scripts/publish-release.py "$(RELEASE_TAG)"
 
-# Next has a dedicated branch, identity and GitHub prerelease. Stable remains disabled.
+# Next has a dedicated branch, identity and GitHub prerelease; it never publishes to stable.
 NEXT_RELEASE_CONTRACT = XDIAL_RELEASE_CHANNEL=next $(RELEASE_CONTRACT)
 NEXT_RELEASE_BUNDLE := $(BUILD_DIR)/next-release/XDial Next.app
 NEXT_RELEASE_VERSION = $(patsubst next-v%,%,$(RELEASE_TAG))
@@ -426,8 +424,9 @@ publish-next:
 # 不得在旧实例退出与新实例启动之间扩大断网窗口。
 # 构建失败不得影响正在运行的旧实例。
 restart:
-	@echo "XDial Next is independent. Build with make app and open it explicitly when ready."
-	@exit 1
+	@$(MAKE) app DEVELOPMENT_CHANNEL=debug DEBUG_BUILD_VERSION=$(DEBUG_BUILD_VERSION)
+	@bash scripts/restart-macos-app.sh "$(BUILD_DIR_ABS)/XDail Debug.app" \
+		"$(MACOS_APP_LAUNCHER_ABS)"
 
 inspector:
 	@mkdir -p $(BUILD_DIR)

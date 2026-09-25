@@ -1,11 +1,9 @@
 # macOS 构建与安装
 
-> 本独立分支默认 `make app` 构建 XDial Next 调试包；`make app-debug` 构建既有 Debug 身份。
-> Next 分发入口见 [next-releases.md](next-releases.md)。以下正式说明用于既有通道参考。
-
-日常 Debug 由 `make app-debug` 生成 `build/XDail Debug.app`，使用 Apple Development 签名，
+日常 Debug 由 `make app`（等同 `make app-debug`）生成 `build/XDail Debug.app`，使用 Apple Development 签名，
 不提交公证。`FormalDevelopment` 保留正式身份，仅用于该身份的专项验证。
 正式归档由 `make release` 生成，签名、公证与发布机制见 [updates.md](updates.md)。
+Next 测试通道由 `make app-next` 构建，分发见 [next-releases.md](next-releases.md)。
 
 ## 通道身份
 
@@ -46,10 +44,10 @@ make app-debug MACOS_DEBUG_XCODEBUILD_FLAGS=-allowProvisioningUpdates
 
 | 入口 | 实际效果 |
 |---|---|
-| `make app` / `make app-next` | 构建并校验 Next 开发候选包，不替换 `/Applications`，不启动 App |
-| `make app-debug` | 构建并校验 Debug 开发候选包，不替换 `/Applications`，不启动 App |
+| `make app` / `make app-debug` | 构建并校验 Debug 开发候选包，不替换 `/Applications`，不启动 App |
+| `make app-next` | 构建并校验 Next 开发候选包，不替换 `/Applications`，不启动 App |
 | 候选包的 `Contents/MacOS/XDial --install-only` | 安装到该通道的 `/Applications` 路径；替换时终止同通道旧 App，并维护旧 helper；不启动后继 App |
-| `make restart` | 本独立 Next 分支禁用；不会停止或启动 App |
+| `make restart` | 完整构建 Debug 后退出旧 Debug、安装、启动最终 App，等待安装与连接意图收敛 |
 | 从 `/Applications` 外正常启动 App | 自动定位、替换同通道安装并启动最终 App，不是隔离的源码运行 |
 
 `--install-only` 不提供保留旧进程或连接的安装能力。实现见
