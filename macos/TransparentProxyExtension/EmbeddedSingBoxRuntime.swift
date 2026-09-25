@@ -2541,9 +2541,7 @@ final class EmbeddedSingBoxRuntime {
             )
         }
         if let lastProbeError {
-            throw RuntimeError.tailscaleEgressUnavailable(
-                lastProbeError.localizedDescription
-            )
+            throw TailscaleEgressFailure.wrap(lastProbeError, taskID: taskID)
         }
         throw RuntimeError.tailscaleReadinessTimedOut(lastState)
     }
@@ -3005,7 +3003,6 @@ private enum RuntimeError: Error {
     case tailscaleDERPIdentityMismatch
     case tailscaleHomeDERPNotReady(String)
     case tailscalePeerHandshakeUnavailable
-    case tailscaleEgressUnavailable(String)
     case tailscaleUnavailable(String)
     case anyConnectRecoveryTimedOut
     case lineCapabilityUnavailable
@@ -3055,8 +3052,6 @@ extension RuntimeError: LocalizedError {
             "Home DERP 尚未完成本代协议注册（\(state)）"
         case .tailscalePeerHandshakeUnavailable:
             "所选 Tailscale Exit Node 已在线并进入节点地图，但没有完成握手（已发送数据，未收到回包）"
-        case let .tailscaleEgressUnavailable(reason):
-            "内置 Tailscale 出口无法承载真实流量（\(reason)）"
         case let .tailscaleUnavailable(state):
             "内置 Tailscale 不可用（\(state)）"
         case .anyConnectRecoveryTimedOut:

@@ -1932,6 +1932,11 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             activeScenarioSwitch = nil
         }
         scenarioSwitchLock.unlock()
+        if !response.ok {
+            logger.notice(
+                "scenario-switch-failed source=\(operation.request.expectedTransactionID, privacy: .public) candidate=\(operation.request.targetTransactionID ?? "", privacy: .public) code=\(response.code ?? "unknown", privacy: .public)"
+            )
+        }
         originalCompletion(Self.encodeScenarioSwitchResponse(response))
     }
 
