@@ -18,11 +18,22 @@ enum ProfileManagementAction: String, Identifiable {
     }
 }
 
+enum ProfileSheet: Identifiable {
+    case manage(ProfileRecord)
+    case action(ProfileManagementAction, ProfileRecord)
+
+    var id: String {
+        switch self {
+        case .manage(let record): return "manage-\(record.id)"
+        case .action(let action, let record): return "\(action.id)-\(record.id)"
+        }
+    }
+}
+
 struct ProfileNavigation: View {
     @EnvironmentObject var state: AppState
+    @Binding var sheet: ProfileSheet?
     @State private var showingPicker = false
-    @State private var action: ProfileManagementAction?
-    @State private var managedProfile: ProfileRecord?
 
     private var pickerWidth: CGFloat {
         let nameFont = NSFont.systemFont(ofSize: 13)
@@ -64,7 +75,7 @@ struct ProfileNavigation: View {
                                 showingPicker = false
                             } edit: {
                                 showingPicker = false
-                                managedProfile = record
+                                sheet = .manage(record)
                             }
                         }
                     }
@@ -81,18 +92,12 @@ struct ProfileNavigation: View {
             }
             .padding(6).frame(width: pickerWidth)
         }
-        .sheet(item: $managedProfile) { record in
-            ProfileDetailSheet(record: record)
-        }
-        .sheet(item: $action) { action in
-            ProfileManagementSheet(action: action, record: state.editingRecord)
-        }
     }
 
     private func addButton(_ value: ProfileManagementAction, title: String, icon: String) -> some View {
         Button {
             showingPicker = false
-            action = value
+            sheet = .action(value, state.editingRecord)
         } label: {
             Label(title, systemImage: icon)
                 .font(.system(size: 13))
@@ -161,6 +166,7 @@ struct ProfileDetailSheet: View {
     @State private var interval: Double = 86400
     @State private var error: String?
     @State private var action: ProfileManagementAction?
+    @State private var closesAfterAction = false
     @State private var confirmingRegenerate = false
 
     private var current: ProfileRecord {
@@ -257,9 +263,11 @@ struct ProfileDetailSheet: View {
             interval = current.source?.refreshInterval ?? 86400
         }
         .sheet(item: $action, onDismiss: {
-            if !state.profileLibrary.profiles.contains(where: { $0.id == record.id }) { dismiss() }
+            if closesAfterAction { dismiss() }
         }) { action in
-            ProfileManagementSheet(action: action, record: current)
+            ProfileManagementSheet(action: action, record: current) {
+                closesAfterAction = action == .copy || action == .delete
+            }
         }
     }
 
@@ -284,6 +292,7 @@ struct ProfileDetailSheet: View {
 struct ProfileManagementSheet: View {
     let action: ProfileManagementAction
     let record: ProfileRecord
+    var onComplete: () -> Void = {}
     @EnvironmentObject var state: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
@@ -475,6 +484,7 @@ struct ProfileManagementSheet: View {
             } catch { self.error = error.localizedDescription; return }
         }
         if let persistenceError = state.profilePersistenceError { error = persistenceError; return }
+        onComplete()
         dismiss()
     }
 }

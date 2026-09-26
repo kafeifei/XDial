@@ -174,6 +174,7 @@ private func reorder<Item>(
 struct SettingsView: View {
     @EnvironmentObject var state: AppState
     @State private var hoveredTab: Int?
+    @State private var profileSheet: ProfileSheet?
     private var tab: Int { state.editorPosition.tab }
 
     var body: some View {
@@ -199,6 +200,16 @@ struct SettingsView: View {
         .toolbar {
             navigationToolbarItem.withoutSharedBackground()
         }
+        // Keep presentation attached to the window content while the toolbar
+        // and resource pages update for a newly selected or deleted Profile.
+        .sheet(item: $profileSheet) { sheet in
+            switch sheet {
+            case .manage(let record):
+                ProfileDetailSheet(record: record)
+            case .action(let action, let record):
+                ProfileManagementSheet(action: action, record: record)
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .xdialSettingsSelectTab)) { notification in
             guard let index = notification.userInfo?["index"] as? Int, (0 ... 4).contains(index) else { return }
             state.editorPosition.tab = index
@@ -209,7 +220,7 @@ struct SettingsView: View {
         ToolbarItem(placement: .principal) {
             HStack(spacing: 10) {
                 navigationGroup {
-                    ProfileNavigation()
+                    ProfileNavigation(sheet: $profileSheet)
                         .padding(.leading, 6)
                         .padding(.trailing, 4)
                     Rectangle()
