@@ -48,7 +48,7 @@ extension AppState {
     func selectEditingProfile(_ id: String) {
         guard profileLibrary.profiles.contains(where: { $0.id == id }) else { return }
         profileLibrary.editingProfileID = id
-        editorPosition.tab = 0
+        editorPosition.showProfileSection()
         persistProfileLibrary()
     }
 
@@ -98,7 +98,7 @@ extension AppState {
         do { try profileLibrary.insert(record) }
         catch { profileOperationError = error.localizedDescription; return false }
         guard persistProfileLibrary() else { profileLibrary = original; return false }
-        editorPosition.tab = 0
+        editorPosition.showProfileSection()
         profile = profileLibrary.snapshot()
         save()
         return true
@@ -128,7 +128,7 @@ extension AppState {
         catch { profileOperationError = error.localizedDescription; return false }
         guard persistProfileLibrary() else { profileLibrary = original; return false }
         if original.editingProfileID != profileLibrary.editingProfileID {
-            editorPosition.tab = 0
+            editorPosition.showProfileSection()
         }
         profile = profileLibrary.snapshot()
         save()

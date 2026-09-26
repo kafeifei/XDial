@@ -27,6 +27,13 @@ final class EditorExpansionSet {
     let expandedLineIDs = EditorExpansionSet()
     let expandedRuleIDs = EditorExpansionSet()
     var expandedScenarioID: String?
+
+    func showProfileSection() {
+        switch tab {
+        case 0, 1: return // Lines and Rules are the Profile section.
+        default: tab = 0
+        }
+    }
 }
 
 /// Disposable indexes for the current library revision. No persisted copy and
