@@ -2,8 +2,20 @@
 
 macOS 菜单栏网络分流工具；iOS / tvOS 共用 Go 核心。
 
-修改完成后合入最新 main，验证后直接覆盖安装并重启 Debug。
-XDial Next 是独立身份的测试通道，从远程 `xdial-next` 分支发布 GitHub prerelease，见 [Next 发布](docs/agent/next-releases.md)。
+修改完成后合入最新 main，再合进 `xdial-debug`，在 `xdial-debug` 上验证后直接覆盖安装并重启 Debug。
+
+## 分支
+
+| 分支 | 用途 | 规则 |
+|---|---|---|
+| `main` | 正式版基线，`vX.Y.Z` 从这里发布 | 只经 PR 合入；新工作都从这里拉出 |
+| 工作分支：`claude/*`、`codex/*`、`cindy/*`、`feature/*`、`jev/*` | 单个修复或功能；`jev/*` 由 [jev 闭环](docs/agent/jev-loop.md) 自动创建 | 从 main 拉出，PR 只开向 main；开工和提 PR 前先合入最新 main |
+| `xdial-debug` | 本机 Debug 的唯一构建来源：main 加上暂时进不了 main 的工作分支（实验功能、待审修复） | 只接收合并，不从它拉分支，不合回 main；推送前先合入最新 `origin/xdial-debug` |
+| `xdial-next` | Next 测试通道的独立产品源码，按 `next-v…` 标签发布 GitHub prerelease | 见 [Next 发布](docs/agent/next-releases.md) |
+
+工作分支要在 Debug 上验证时，合进 `xdial-debug`，在 `xdial-debug` 上跑与 CI 相同的测试，再 `make restart`。
+main 有新提交时也合进 `xdial-debug`。main 回滚过的功能若要留在 Debug，先在 `xdial-debug` 上撤销那次回滚，再合入该功能分支。
+不要用只含 main 的工作区构建 Debug 覆盖安装：这会回退 `xdial-debug` 里尚未进 main 的提交。
 
 ## 核心边界
 
