@@ -424,6 +424,7 @@ targets:
       - Sources/XDial/ProfileLibrary.swift
       - Sources/XDial/GlobalConfiguration.swift
       - Sources/XDial/ConfigurationEditorState.swift
+      - Sources/XDial/FeedbackAssistant.swift
       - Sources/XDial/ConnectionConfigurationReadiness.swift
       - Sources/XDial/SettingsLineTable.swift
       - Sources/XDial/SettingsReadOnlyText.swift

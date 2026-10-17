@@ -18,6 +18,7 @@ final class AppState: ObservableObject {
     var configurationCatalogCache: ConfigurationCatalog?
     @Published var browsedProfileID = ""
     let editorPosition = ProfileEditorPosition()
+    let feedback: FeedbackCoordinator
     @Published var profilePersistenceError: String?
     @Published var profileOperationError: String?
     @Published var refreshingProfileIDs: Set<String> = []
@@ -188,6 +189,19 @@ final class AppState: ObservableObject {
 
     func tr(_ zh: String, _ en: String) -> String {
         language == .zh ? zh : en
+    }
+
+    func refreshFeedbackSnapshot() {
+        if isLayoutPreview {
+            feedback.snapshot = FeedbackRuntimeSnapshot(connectionStatus: "disconnected", installationState: .ready,
+                hasUnappliedChanges: false, connection: nil, scenarioSwitch: nil)
+            return
+        }
+        feedback.snapshot = FeedbackRuntimeSnapshot(
+            connectionStatus: engine.status, installationState: installation.report.state,
+            hasUnappliedChanges: configDirty, connection: presentedConnectionReport,
+            scenarioSwitch: engine.scenarioSwitchProjection
+        )
     }
 
     var isConnected: Bool { engine.isConnected }
@@ -530,11 +544,13 @@ final class AppState: ObservableObject {
         return profile.subscriptions.filter { ids.contains($0.id) && $0.enabled }
     }
 
-    init(previewLibrary: ProfileLibrary? = nil) {
+    init(previewLibrary: ProfileLibrary? = nil, previewLanguage: Lang = .zh,
+         feedbackCoordinator: FeedbackCoordinator? = nil) {
+        self.feedback = feedbackCoordinator ?? FeedbackCoordinator()
         if let previewLibrary {
             self.profile = previewLibrary.snapshot()
             self.profileLibrary = previewLibrary
-            self.language = .zh
+            self.language = previewLanguage
             self.appearance = .light
             self.launchAtLogin = false
             self.autoConnect = false

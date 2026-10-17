@@ -24,7 +24,7 @@ final class EditorExpansionSet {
 
 /// “通用”页左侧的分类。
 enum GeneralSettingsSection: CaseIterable, Hashable {
-    case startup, appearance, system, about
+    case startup, appearance, system, feedback, about
 }
 
 @Observable final class ProfileEditorPosition {

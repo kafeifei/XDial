@@ -132,7 +132,10 @@ enum SettingsLayoutPreview {
         library.groups = [group]
         library.scenarios = [Scenario(id: "daily", name: "日常", bindings: [RuleBinding(ruleSetID: "media", lineID: "shared")], defaultLineID: "direct"), Scenario(id: "work-scene", name: "办公", bindings: [RuleBinding(ruleSetID: "work", lineID: "company-line")], defaultLineID: "shared")]
         library.activeScenarioID = "daily"
-        state = AppState(previewLibrary: library)
+        let emptyAssistants = CommandLine.arguments.contains("--feedback-empty")
+            ? FeedbackCoordinator(discover: { [] }) : nil
+        let language: Lang = CommandLine.arguments.contains("--preview-english") ? .en : .zh
+        state = AppState(previewLibrary: library, previewLanguage: language, feedbackCoordinator: emptyAssistants)
         state.editorPosition.expandedLineIDs.insert("shared")
         state.editorPosition.expandedScenarioID = "work-scene"
         SettingsLayoutPreviewApp.main()
@@ -145,8 +148,31 @@ enum SettingsLayoutPreview {
             try await Task.sleep(for: .milliseconds(700))
             let window = try NSApp.windows.first(where: { $0.contentView != nil }).unwrap()
             let initialWindow = window.windowNumber
-            for (tab, name) in [(0, "lines"), (3, "groups"), (1, "rules"), (2, "scenarios"), (4, "general")] {
+            for (tab, name) in [(0, "lines"), (3, "groups"), (1, "rules"), (2, "scenarios"), (4, "general"),
+                                (4, "feedback"), (4, "feedback-connection-failure"), (4, "feedback-switch-failure"),
+                                (4, "feedback-configuration"), (4, "feedback-suggestion")] {
                 state.editorPosition.tab = tab
+                if name.hasPrefix("feedback") { state.editorPosition.showGeneral(.feedback) }
+                if name == "feedback-connection-failure" || name == "feedback-switch-failure" {
+                    let plan = ConnectionPlan(schemaVersion: 3, scenario: .init(id: "preview-target", name: "预览目标场景"),
+                        configurationFingerprint: "preview", tasks: [
+                            ConnectionPlanTask(id: "preview-line", kind: "line", name: "预览线路", detail: "", preparation: "", resourceID: "preview-line", resourceType: "line")
+                        ])
+                    var report = ConnectionReport(transactionID: "preview-target", plan: plan)
+                    report.fail(code: "engine-start-failed", message: "lookup preview.invalid: SERVFAIL", taskID: "preview-line")
+                    report.setState(.failed)
+                    if name == "feedback-connection-failure" {
+                        state.feedback.begin(context: .connectionFailure(report))
+                    } else {
+                        let projection = HostScenarioSwitchProjection(status: "failed", fromScenarioID: "preview-source",
+                            toScenarioID: "preview-target", sourceCommittedTransactionID: "preview-source", candidateTransactionID: "preview-target",
+                            activeCommittedTransactionID: "preview-source", inFlight: false, candidateReport: report,
+                            reusedLineIDs: [], code: "switch-failed", message: "")
+                        state.feedback.begin(context: .scenarioSwitchFailure(projection))
+                    }
+                }
+                if name == "feedback-configuration" { state.feedback.kind = .configuration }
+                if name == "feedback-suggestion" { state.feedback.kind = .suggestion }
                 try await Task.sleep(for: .milliseconds(400))
                 guard window.windowNumber == initialWindow else { throw CocoaError(.validationMissingMandatoryProperty) }
                 let view = try window.contentView?.superview.unwrap()
@@ -156,8 +182,16 @@ enum SettingsLayoutPreview {
                 view.cacheDisplay(in: view.bounds, to: bitmap)
                 let png = try bitmap.representation(using: .png, properties: [:]).unwrap()
                 try png.write(to: URL(fileURLWithPath: outputDirectory).appendingPathComponent(name + ".png"))
+                if name.hasPrefix("feedback") {
+                    let package = state.feedback.package()
+                    let english = state.language == .en
+                    let directory = URL(fileURLWithPath: outputDirectory)
+                    try package.text(english: english).write(to: directory.appendingPathComponent(name + ".txt"), atomically: true, encoding: .utf8)
+                    try package.openingPrompt(english: english).write(to: directory.appendingPathComponent(name + ".prompt.txt"), atomically: true, encoding: .utf8)
+                }
             }
-            print("Rendered five settings pages in one native window: \(outputDirectory)")
+            print("Detected feedback assistants: \(state.feedback.assistants.map(\.id).joined(separator: ", "))")
+            print("Rendered settings pages in one native window: \(outputDirectory)")
             exit(0)
         } catch {
             fputs("Layout preview failed: \(error)\n", stderr)
