@@ -123,6 +123,18 @@ final class FeedbackPackageTests: XCTestCase {
         XCTAssertTrue(text.contains("switch-failed"))
     }
 
+    func testOpeningPromptKeepsEvidenceInTheFile() {
+        let package = FeedbackPackage(kind: .diagnosis, description: "PRIVATE_USER_TEXT", runtime: snapshot(),
+                                      context: .connectionFailure(failureReport()))
+        for english in [false, true] {
+            let prompt = package.openingPrompt(english: english)
+            XCTAssertLessThan(prompt.count, 150)
+            XCTAssertTrue(prompt.contains("XDial-feedback.txt"))
+            XCTAssertFalse(prompt.contains("PRIVATE"))
+            XCTAssertFalse(prompt.contains("rollback"))
+        }
+    }
+
     func testUnknownActiveConnectionDoesNotClaimOldConnectionWasRetained() throws {
         let projection = HostScenarioSwitchProjection(status: "failed", fromScenarioID: "source-scenario",
             toScenarioID: "target-scenario", sourceCommittedTransactionID: "source", candidateTransactionID: "target",

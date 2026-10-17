@@ -237,27 +237,25 @@ struct FeedbackPackage {
 
     /// A short, contextual invitation for clients that can prefill a composer.
     /// User text and runtime evidence stay in the private file, not the URL.
-    func openingPrompt(english: Bool) -> String {
+    func openingPrompt(english: Bool, file: URL? = nil) -> String {
+        let request: String
         switch context.origin {
         case .connectionFailure:
-            return english ? "XDial failed to connect. Read XDial-feedback.txt and help investigate from the known action, result and expectation. Ask only for missing information."
-                : "XDial 建立连接时出错了。请先读取 XDial-feedback.txt，从已知操作、结果和预期接着排查，只问缺少的信息。"
+            request = english ? "Help investigate an XDial connection failure." : "请帮我排查 XDial 连接失败的问题。"
         case .scenarioSwitchFailure:
-            return english ? "XDial failed to switch Scenarios. Read XDial-feedback.txt and help investigate from the known action, result and expectation. Ask only for missing information."
-                : "XDial 场景切换时出错了。请先读取 XDial-feedback.txt，从已知操作、结果和预期接着排查，只问缺少的信息。"
+            request = english ? "Help investigate an XDial Scenario switch failure." : "请帮我排查 XDial 场景切换失败的问题。"
         case .general:
             switch kind {
             case .configuration:
-                return english ? "Help me configure XDial. Read XDial-feedback.txt; respond to my goal, or ask what traffic behavior I want if I have not described it."
-                    : "我想调整 XDial 的配置。请先读取 XDial-feedback.txt；已有目标就接着帮我，否则先问我想实现怎样的分流效果。"
+                request = english ? "Help me configure XDial." : "请帮我调整 XDial 配置。"
             case .suggestion:
-                return english ? "I would like to discuss an XDial product suggestion. Read XDial-feedback.txt; respond to my idea, or ask what I would like to improve."
-                    : "我想聊聊 XDial 的产品建议。请先读取 XDial-feedback.txt；已有建议就接着聊，否则先问我希望改进什么。"
+                request = english ? "Help me discuss an XDial product suggestion." : "我想聊聊 XDial 的产品建议。"
             case .problem, .diagnosis:
-                return english ? "Help me with XDial. Read XDial-feedback.txt; respond to my request, or ask what I need help with. You can troubleshoot, help configure it, or discuss product suggestions."
-                    : "请帮我使用 XDial。先读取 XDial-feedback.txt；已有描述就接着帮我，否则先问我遇到了什么麻烦，也可以聊配置调整或产品建议。"
+                request = english ? "Help me with XDial." : "请帮我使用 XDial。"
             }
         }
+        let reference = file?.lastPathComponent ?? "XDial-feedback.txt"
+        return request + (english ? " Read the attached file: " : "请先读取附件：") + reference
     }
 
     private func conversationGuidance(english: Bool) -> String {
@@ -360,7 +358,7 @@ struct FeedbackPackage {
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try fm.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-        let file = directory.appendingPathComponent("XDial-feedback.txt")
+        let file = directory.appendingPathComponent("XDial-feedback-" + String(directory.lastPathComponent.prefix(8)) + ".txt")
         try Data(text.utf8).write(to: file, options: .atomic)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         return file

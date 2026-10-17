@@ -123,16 +123,16 @@
     "feedback.intro": {
       "extractionState": "manual",
       "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "What would you like help with in XDial? Your AI assistant can troubleshoot, help configure it, or discuss product suggestions."
-          }
-        },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "使用 XDial 遇到什么麻烦了？让 AI 助手帮你解决，也可以一起调整配置、聊聊产品建议。"
+            "value": "选择支持原生文件交接的 AI 助手，带上诊断文件聊。"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choose an AI assistant with native file handoff support."
           }
         }
       }
@@ -228,13 +228,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Describe your problem or idea"
+            "value": "What would you like help with? (optional)"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "描述你的问题或想法"
+            "value": "想聊什么（可选）"
           }
         }
       }
@@ -245,13 +245,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Tell us what you need help with, or leave this blank and start a conversation with your assistant."
+            "value": "Describe a problem or idea, or start a conversation directly."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "说说你遇到的麻烦，也可以留空，到 AI 助手中直接聊。"
+            "value": "描述问题或想法，也可以直接开始对话。"
           }
         }
       }
@@ -347,13 +347,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Preview handoff contents"
+            "value": "Review the file to be shared"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "预览交接内容"
+            "value": "查看将分享的文件"
           }
         }
       }
@@ -395,33 +395,16 @@
     "feedback.noAssistant": {
       "extractionState": "manual",
       "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "No supported AI assistant was detected. Download Cindy, then return here to continue. Your draft will be kept."
-          }
-        },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "尚未检测到支持的 AI 助手。下载 Cindy 后回到这里继续，已填写的内容会保留。"
+            "value": "未发现已安装的 AI 软件。"
           }
-        }
-      }
-    },
-    "feedback.download": {
-      "extractionState": "manual",
-      "localizations": {
+        },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Download Cindy…"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "下载 Cindy…"
+            "value": "No installed AI apps found."
           }
         }
       }
@@ -432,13 +415,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Copy and continue in %@"
+            "value": "Continue in %@"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "复制并在 %@ 中继续"
+            "value": "在 %@ 中继续"
           }
         }
       }
@@ -449,13 +432,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Copies the feedback text and a text file, then opens the assistant. Paste into a new conversation and send, or attach the file manually. Configuration help uses the assistant’s existing permissions."
+            "value": "Paste and send after opening. Attach the diagnostic file if the assistant cannot read local files."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "会复制反馈文字及文本文件并打开助手。请在新对话中粘贴发送；也可手动添加文件。配置修改由助手在已有权限内协助完成。"
+            "value": "打开后粘贴并发送。若助手无法读取本地文件，请添加诊断文件。"
           }
         }
       }
@@ -483,13 +466,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Show text file"
+            "value": "Show diagnostic file…"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "查看文本文件"
+            "value": "查看诊断文件…"
           }
         }
       }
@@ -500,30 +483,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Feedback text and file copied. Paste into an AI conversation. Nothing has been submitted to the developer."
+            "value": "Diagnostic file and short prompt copied. Paste into an AI conversation."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "反馈文字和文本文件已复制，可以粘贴到 AI 对话。尚未向开发者提交。"
-          }
-        }
-      }
-    },
-    "feedback.opened": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ opened. Paste into a new conversation and send. Nothing has been submitted to the developer."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "已打开 %@。请在新对话中粘贴发送，尚未提交给开发者。"
+            "value": "诊断文件和简短说明已复制，可粘贴到 AI 对话。"
           }
         }
       }
@@ -531,16 +497,16 @@
     "feedback.openFailed": {
       "extractionState": "manual",
       "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Could not open the selected assistant. Select it again and retry, or copy the feedback and send it manually."
-          }
-        },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "未能打开所选助手。请重新选择后重试，或复制反馈内容手动发送。"
+            "value": "未能发起文件交接。请检查助手是否可用后重试。"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Could not request file handoff. Check the assistant and retry."
           }
         }
       }
@@ -558,23 +524,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "未能生成或复制反馈文件。请重试；仍未成功时，可先复制你填写的描述。"
-          }
-        }
-      }
-    },
-    "feedback.downloadFailed": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Could not open the download page. Visit cindy.app/download/ in your browser."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "未能打开下载页。请在浏览器访问 cindy.app/download/。"
           }
         }
       }
@@ -636,13 +585,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Opens a new conversation in this diagnostic directory, where the text file is saved. Paste the copied contents into the new conversation and send."
+            "value": "Paste and send in the new conversation. Details are saved in the file."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "将打开本次诊断目录并进入新对话，文本文件已放在该目录中。请在新对话中粘贴已复制的内容后发送。"
+            "value": "打开新对话后，粘贴并发送。详细资料保存在文件中。"
           }
         }
       }
@@ -653,47 +602,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Opens a new conversation with an instruction to read the diagnostic file. Review it and send. The feedback text and file are also copied for manual use."
+            "value": "The new conversation has a short prompt; the AI reads the details from the file."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "将打开新对话并预填读取诊断文件的说明，确认后点击发送。反馈文字与文件也会复制，便于手动使用。"
-          }
-        }
-      }
-    },
-    "feedback.folderRequested": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Requested a new conversation in %@ with this diagnostic directory. Paste the copied contents and send."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "已请求在 %@ 中新建对话，并打开本次诊断目录。请粘贴已复制的内容后发送。"
-          }
-        }
-      }
-    },
-    "feedback.codexRequested": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Requested a new conversation in %@. Review the prefilled instruction and send; if it did not appear, paste the copied contents."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "已请求在 %@ 中新建对话。请检查预填说明后发送；若未出现，可粘贴已复制的内容。"
+            "value": "新对话只预填简短说明，详细资料由 AI 从文件读取。"
           }
         }
       }
@@ -704,13 +619,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The connection failure and expected behavior are included. Add any other observations if you wish."
+            "value": "This connection failure is included."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "已带入连接失败的现场与预期，AI 会接着排查。你可以补充其他现象。"
+            "value": "已附带这次连接失败的现场。"
           }
         }
       }
@@ -721,13 +636,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The Scenario switch failure and expected behavior are included. Add any other observations if you wish."
+            "value": "This Scenario switch failure is included."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "已带入场景切换失败的现场与预期，AI 会接着排查。你可以补充其他现象。"
+            "value": "已附带这次场景切换失败的现场。"
           }
         }
       }
@@ -784,18 +699,17 @@
       }
     },
     "feedback.context.omitted": {
-      "extractionState": "manual",
       "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Automatic diagnostics are off. The error context will not be shared with the assistant; add any details you want to discuss below."
-          }
-        },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "已关闭自动诊断资料，错误现场不会交给 AI；请在下方补充你想聊的内容。"
+            "value": "已关闭诊断信息，错误现场不会交给 AI。"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostics are off. The error context will not be shared."
           }
         }
       }
@@ -830,6 +744,56 @@
           "stringUnit": {
             "state": "translated",
             "value": "让 AI 助手接着排查这次场景切换失败，帮你让目标场景正常生效。"
+          }
+        }
+      }
+    },
+    "feedback.askAI": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "找 AI 帮忙"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ask AI"
+          }
+        }
+      }
+    },
+    "feedback.unsupported": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "不支持原生文件交接"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Native file handoff unsupported"
+          }
+        }
+      }
+    },
+    "feedback.requested": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已向 %@ 发起文件交接，请在应用中确认。"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "File handoff requested in %@. Confirm in the app."
           }
         }
       }
