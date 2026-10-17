@@ -10,15 +10,12 @@ import (
 
 // Request is a command from client to daemon.
 type Request struct {
-	ID         string `json:"id"`
-	Cmd        string `json:"cmd"`
-	Profile    string `json:"profile,omitempty"`
-	SubURL     string `json:"sub_url,omitempty"`
-	SubContent string `json:"sub_content,omitempty"`
-	SubFormat  string `json:"sub_format,omitempty"`
-	LineID     string `json:"line_id,omitempty"`
-	AuthKey    string `json:"auth_key,omitempty"`
-	Reason     string `json:"reason,omitempty"`
+	ID      string `json:"id"`
+	Cmd     string `json:"cmd"`
+	Profile string `json:"profile,omitempty"`
+	LineID  string `json:"line_id,omitempty"`
+	AuthKey string `json:"auth_key,omitempty"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // Response is a direct reply to a Request (carries the same ID).

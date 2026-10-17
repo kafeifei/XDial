@@ -1,7 +1,7 @@
 import Foundation
 
 // 日志放到用户私有目录并以 0600 创建；之前写 /tmp/xdial-app.log（世界可读），
-// 会把 parse-sub 响应里的节点密码等敏感内容暴露给同机任意用户。
+// 会把 helper 响应等敏感内容暴露给同机任意用户。
 func appLogPath() -> String {
     let dir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs")
@@ -394,39 +394,6 @@ final class GoEngine: ObservableObject {
         )
     }
 
-    func parseSubscription(url: String, content: String = "", format: String = "auto",
-                           completion: @escaping (Result<ParseResult, Error>) -> Void) {
-        Task { [weak self] in
-            let ok = await self?.ensureHelperAsync() ?? false
-            guard let self, ok else {
-                completion(.failure(NSError(
-                    domain: "XDial",
-                    code: -1,
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            InstallationCoordinator.shared
-                            .blockingMessage,
-                    ]
-                )))
-                return
-            }
-            guard self.ensureSocket() else {
-                completion(.failure(NSError(
-                    domain: "XDial",
-                    code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "Socket not available"]
-                )))
-                return
-            }
-            self.sendSubRequest(
-                url: url,
-                content: content,
-                format: format,
-                completion: completion
-            )
-        }
-    }
-
     func syncStatus(completion: (() -> Void)? = nil) {
         if let completion {
             pendingStatusSyncCompletions.append(completion)
@@ -694,39 +661,6 @@ final class GoEngine: ObservableObject {
         )
     }
 
-    private func sendSubRequest(url: String, content: String, format: String,
-                                completion: @escaping (Result<ParseResult, Error>) -> Void) {
-        guard fd >= 0 else { return }
-        let reqID = nextID()
-        var obj: [String: String] = [
-            "id": reqID,
-            "cmd": "parse-sub",
-            "sub_url": url,
-            "sub_format": format,
-        ]
-        if !content.isEmpty {
-            obj["sub_content"] = content
-        }
-        guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return }
-        data.append(UInt8(ascii: "\n"))
-
-        pendingCallbacks[reqID] = { resp in
-            if resp.ok == true, let raw = resp.data?.data(using: .utf8),
-               let result = try? JSONDecoder().decode(ParseResult.self, from: raw) {
-                completion(.success(result))
-            } else {
-                let msg = resp.message ?? "parse failed"
-                completion(.failure(NSError(
-                    domain: "XDial",
-                    code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: msg]
-                )))
-            }
-        }
-
-        data.withUnsafeBytes { _ = write(fd, $0.baseAddress!, data.count) }
-    }
-
     // MARK: - Helper lifecycle
 
     /// Registration maintenance must preserve both the Provider transaction
@@ -872,7 +806,7 @@ final class GoEngine: ObservableObject {
     }
 
     private func handleResponse(id: String, msg: DaemonResponse) {
-        // 不记录 data 正文：parse-sub 等响应含节点明文密码/订阅 token，只记长度
+        // 不记录 data 正文：响应可能含 Tailscale 登录 URL 等敏感内容，只记长度
         appLog("response: id=\(id) ok=\(String(describing: msg.ok)) dataLen=\(msg.data?.count ?? 0)")
         if let callback = pendingCallbacks.removeValue(forKey: id) {
             callback(msg)

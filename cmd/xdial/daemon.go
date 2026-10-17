@@ -14,7 +14,6 @@ import (
 
 	"github.com/kafeifei/xdial/core/config"
 	"github.com/kafeifei/xdial/core/engine"
-	"github.com/kafeifei/xdial/core/subscription"
 	"github.com/kafeifei/xdial/core/tailscalesetup"
 )
 
@@ -88,8 +87,6 @@ func runDaemon(socketPath string) {
 	initDaemonExeHash()
 
 	identity := currentRuntimeIdentity()
-	basePath := identity.engineBasePath
-	os.MkdirAll(basePath, 0700) // 内含明文节点密码的 sing-box.json，收紧目录权限
 	statePath := identity.rootStatePath
 	if err := os.MkdirAll(statePath, 0700); err != nil {
 		slog.Error("create state directory failed", "path", statePath, "err", err)
@@ -98,7 +95,9 @@ func runDaemon(socketPath string) {
 
 	clients := NewClientSet()
 	cb := &daemonCallback{clients: clients}
-	eng := engine.New(basePath, statePath, cb)
+	// daemon 不再启动旧数据面（见 retiredDaemonCommands），engine 只用来恢复历史版本
+	// 留下的系统 DNS 接管残留，所以既不创建 engineBasePath，也不打开 DNS 接管。
+	eng := engine.New(identity.engineBasePath, statePath, cb)
 	networkStatePath := networkExtensionStatePath(statePath)
 	if err := tailscalesetup.PreparePersistentState(
 		statePath,
@@ -117,9 +116,6 @@ func runDaemon(socketPath string) {
 	resolverRefresh := newResolverRefresher()
 	var networkRuntimeMu sync.Mutex
 	registrationGate := &daemonRegistrationGate{intentPresent: currentRegistrationIntentPresent}
-	// daemon 是唯一有资格接管系统 DNS 的宿主：它由 launchd KeepAlive 托管，被
-	// SIGKILL 后会被拉起并立刻跑下面的 RestoreLeftoverDNS 自愈。
-	eng.AllowSystemDNSTakeover(true)
 
 	// 上次没恢复干净的系统 DNS 会让整机解析停在死 tun 上。必须在开始 accept 之前
 	// 自愈：这条路径就是 launchd KeepAlive 把被 SIGKILL 的 daemon 拉起来后的补救。
@@ -145,10 +141,11 @@ func runDaemon(socketPath string) {
 		slog.Error("listen failed", "path", socketPath, "err", err)
 		os.Exit(1)
 	}
-	// 之前 0666 且无任何校验：任意本地用户/进程都能指挥这个 root daemon（含 parse-sub
-	// 让 root 抓取任意 URL）。授权改由每个连接的对端凭据决定（peerAllowed），只放行 root
-	// 和当前登录用户；用文件权限做校验会碰上"开机 daemon 先于登录启动、此刻拿不到 console
-	// 用户"的时序问题，而 peerAllowed 在连接发生时（已登录）才判断，天然避开该竞态。
+	// 授权由每个连接的对端凭据决定（peerAllowed），只放行 root 和当前登录用户；用文件
+	// 权限做校验会碰上"开机 daemon 先于登录启动、此刻拿不到 console 用户"的时序问题，
+	// 而 peerAllowed 在连接发生时（已登录）才判断，天然避开该竞态。peerAllowed 拦不住
+	// 当前用户下的任意进程，所以 root 能力只能通过 App 仍在使用的命令暴露，
+	// 退役命令一律拒绝（retiredDaemonCommands）。
 	os.Chmod(socketPath, 0666)
 
 	slog.Info("daemon started", "socket", socketPath, "pid", os.Getpid(), "exe_sha256", shortDaemonExeHash())
@@ -190,6 +187,18 @@ func runDaemon(socketPath string) {
 	os.Remove(socketPath)
 }
 
+// retiredDaemonCommands 是 App 已不再发送、daemon 也不再受理的命令。旧原生 TUN
+// 数据面（start/stop/kill-session/runtime-lines）自 v0.7.0 起没有 App 调用方，
+// parse-sub 自 v0.9.0 起没有。继续受理就等于让当前用户下的任意进程以 root 启动
+// 外置 sing-box（候选路径在用户可写的 Homebrew 目录）或抓取任意 URL。
+var retiredDaemonCommands = map[string]bool{
+	"start":         true,
+	"stop":          true,
+	"kill-session":  true,
+	"runtime-lines": true,
+	"parse-sub":     true,
+}
+
 func isAlreadyRunning(socketPath string) bool {
 	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
@@ -223,6 +232,11 @@ func handleClient(
 	go ReadRequests(conn, reqCh)
 
 	for req := range reqCh {
+		if retiredDaemonCommands[req.Cmd] {
+			slog.Warn("rejected retired daemon command", "cmd", req.Cmd)
+			client.SendResponse(Response{ID: req.ID, OK: false, Message: "retired command: " + req.Cmd})
+			continue
+		}
 		switch req.Cmd {
 		case "registration-commit", "registration-abort", "registration-finalize":
 			var accepted bool
@@ -278,50 +292,6 @@ func handleClient(
 				defer registrationGate.endWork()
 			}
 			switch req.Cmd {
-			case "start":
-				projected, err := config.ProfileWithTailscaleChannel(req.Profile, buildFlavor)
-				if err != nil {
-					client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile"})
-					return
-				}
-				req.Profile = projected
-				profile, err := config.ParseProfile([]byte(req.Profile))
-				if err != nil {
-					client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
-					return
-				}
-				networkRuntimeMu.Lock()
-				setupErr := tailscaleSetup.Stop()
-				var startErr error
-				if setupErr == nil {
-					startErr = preflightTailscale(profile, req.Profile, tailscaleSetup)
-				}
-				if setupErr == nil && startErr == nil {
-					startErr = eng.Start(profile)
-				}
-				networkRuntimeMu.Unlock()
-				if setupErr != nil {
-					client.SendResponse(Response{ID: req.ID, OK: false, Message: setupErr.Error()})
-				} else if startErr != nil {
-					client.SendResponse(Response{ID: req.ID, OK: false, Message: startErr.Error()})
-				} else {
-					client.SendResponse(Response{ID: req.ID, OK: true})
-				}
-
-			case "stop":
-				networkRuntimeMu.Lock()
-				err := eng.Stop()
-				networkRuntimeMu.Unlock()
-				if err != nil {
-					client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-				} else {
-					client.SendResponse(Response{ID: req.ID, OK: true})
-				}
-
-			case "kill-session":
-				eng.KillSession()
-				client.SendResponse(Response{ID: req.ID, OK: true})
-
 			case "status":
 				client.SendResponse(Response{ID: req.ID, OK: true, Data: eng.Status()})
 
@@ -348,25 +318,6 @@ func handleClient(
 						OK:   true,
 						Data: string(data),
 					})
-				}
-
-			case "parse-sub":
-				result, err := subscription.Parse(req.SubURL, req.SubContent, req.SubFormat)
-				if err != nil {
-					client.SendResponse(Response{ID: req.ID, OK: false, Message: err.Error()})
-				} else {
-					subscription.ExpandRulesets(result)
-					data, _ := json.Marshal(result)
-					client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
-				}
-
-			case "runtime-lines":
-				profile, err := config.ParseProfile([]byte(req.Profile))
-				if err != nil {
-					client.SendResponse(Response{ID: req.ID, OK: false, Message: "invalid profile: " + err.Error()})
-				} else {
-					data, _ := json.Marshal(config.BuildLineRuntimeCatalog(profile))
-					client.SendResponse(Response{ID: req.ID, OK: true, Data: string(data)})
 				}
 
 			case "tailscale-prepare":
@@ -455,57 +406,4 @@ func engineStatus(eng *engine.Engine) string {
 		return "unknown"
 	}
 	return status.Status
-}
-
-func preflightTailscale(
-	profile *config.Profile,
-	profileJSON string,
-	setup *tailscalesetup.Manager,
-) error {
-	line, err := config.ActiveTailscaleLine(profile)
-	if err != nil || line == nil {
-		return err
-	}
-	rawStatus, err := setup.Prepare(profileJSON, line.ID, "")
-	if err != nil {
-		return err
-	}
-	statusErr := validateTailscalePreflightStatus(line, rawStatus)
-	stopErr := setup.Stop()
-	if statusErr != nil {
-		return statusErr
-	}
-	if stopErr != nil {
-		return fmt.Errorf("Tailscale setup could not stop: %w", stopErr)
-	}
-	return nil
-}
-
-func validateTailscalePreflightStatus(line *config.Line, rawStatus string) error {
-	var status struct {
-		BackendState string `json:"backend_state"`
-		ExitNodes    []struct {
-			IP     string `json:"ip"`
-			Online bool   `json:"online"`
-		} `json:"exit_nodes"`
-	}
-	if err := json.Unmarshal([]byte(rawStatus), &status); err != nil {
-		return fmt.Errorf("Tailscale status is invalid")
-	}
-	if status.BackendState != "Running" {
-		return fmt.Errorf("Tailscale sign-in is required")
-	}
-	if line.TailscaleExitNode == "" {
-		return nil
-	}
-	for _, node := range status.ExitNodes {
-		if node.IP != line.TailscaleExitNode {
-			continue
-		}
-		if !node.Online {
-			return fmt.Errorf("selected Tailscale exit node is offline")
-		}
-		return nil
-	}
-	return fmt.Errorf("selected Tailscale exit node is unavailable")
 }

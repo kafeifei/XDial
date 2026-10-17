@@ -350,8 +350,9 @@ UI 显示权限状态，手动切换仍可用。
 
 - macOS 全流量 Packet Tunnel 会与既有 Enterprise Tunnel 互相取代，因此不作桌面入口；
   此限制不适用于 iOS / tvOS 当前入口。
-- 旧原生 TUN 保留在 helper / CLI 与恢复路径。默认接口只能来自启动前系统路由；
-  `RTF_GLOBAL` Underlay 在建立 Line、获取规则或接管流量前被拒绝，避免入口绕过。
+- 旧原生 TUN 只保留在 CLI；helper 拒绝数据面命令，只恢复历史版本留下的 DNS 接管残留。
+  默认接口只能来自启动前系统路由；`RTF_GLOBAL` Underlay 在建立 Line、获取规则或接管
+  流量前被拒绝，避免入口绕过。
 - 旧 DNS 接管地址为 TUN 地址 +1；原地址是本机 `RTF_LOCAL`，不能把查询送进 TUN。
   DNS 接管路径未就绪即连接失败。已记录地址与保留网段共同识别历史残留，清理能力仍保留。
 - 旧 TUN 崩溃语义为清理接管、恢复 Underlay 并强通知；不能据此推断 Transparent Proxy
