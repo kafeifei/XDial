@@ -87,3 +87,30 @@ enum HostUnderlayCaptureDiagnosticClassifier {
         )
     }
 }
+
+/// One host Underlay capture resolves exactly once: with the first usable
+/// path, or with the evidence held when its deadline fires. A deadline that
+/// fires after the capture already resolved is not a timeout.
+struct HostUnderlayCaptureResolution {
+    private(set) var isResolved = false
+    private var latestEvidence: HostUnderlayCaptureEvidence?
+
+    mutating func observe(_ evidence: HostUnderlayCaptureEvidence) {
+        guard !isResolved else { return }
+        latestEvidence = evidence
+    }
+
+    /// True only for the call that resolves the capture.
+    mutating func resolve() -> Bool {
+        guard !isResolved else { return false }
+        isResolved = true
+        return true
+    }
+
+    /// Timeout evidence when the deadline resolves the capture; nil when a
+    /// path or an earlier failure already did.
+    mutating func expire() -> HostUnderlayCaptureEvidence? {
+        guard resolve() else { return nil }
+        return latestEvidence ?? .missingPathUpdate
+    }
+}

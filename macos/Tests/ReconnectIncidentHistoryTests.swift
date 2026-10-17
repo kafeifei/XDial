@@ -47,6 +47,73 @@ final class ReconnectIncidentHistoryTests: XCTestCase {
         )
     }
 
+    func testRetryScheduleRecordsEachFailedAttemptsStructuredCode() throws {
+        var history = ReconnectIncidentHistory()
+        let incidentID = history.begin(
+            at: Date(timeIntervalSince1970: 100),
+            trigger: .automaticConnection,
+            report: report(),
+            reasonCode: "line-address-family-unavailable",
+            reasonMessage: "线路 IPv4 / IPv6 出口均不可用"
+        )
+        history.recordRetryScheduled(
+            incidentID: incidentID,
+            attempt: 1,
+            failedTransactionID: "original-transaction",
+            failureCode: "line-address-family-unavailable",
+            delay: 2
+        )
+        history.recordRetryScheduled(
+            incidentID: incidentID,
+            attempt: 2,
+            failedTransactionID: "retry-transaction-1",
+            failureCode: "underlay-egress-unavailable",
+            delay: 5
+        )
+
+        let scheduled = try XCTUnwrap(history.incidents.first)
+            .events.filter { $0.type == "retry-scheduled" }
+        XCTAssertEqual(
+            scheduled.map(\.code),
+            [
+                "line-address-family-unavailable",
+                "underlay-egress-unavailable",
+            ]
+        )
+        XCTAssertEqual(
+            scheduled.map(\.transactionID),
+            ["original-transaction", "retry-transaction-1"]
+        )
+        XCTAssertEqual(scheduled.map(\.attempt), [1, 2])
+        XCTAssertEqual(
+            scheduled.map(\.message),
+            ["Retry scheduled after 2.0s", "Retry scheduled after 5.0s"]
+        )
+    }
+
+    func testRecordedFailureCodeNeverCarriesFreeText() {
+        XCTAssertEqual(
+            ReconnectIncidentFailureCode.recordable(
+                "anyconnect-tls-dpd-timeout"
+            ),
+            "anyconnect-tls-dpd-timeout"
+        )
+        XCTAssertEqual(ReconnectIncidentFailureCode.recordable(nil), "")
+        XCTAssertEqual(ReconnectIncidentFailureCode.recordable(""), "")
+        for raw in [
+            "dial tcp4 192.0.2.1:8443: connect: network is unreachable",
+            "vpn.example.com",
+            "Bearer token",
+            String(repeating: "a", count: 65),
+        ] {
+            XCTAssertEqual(
+                ReconnectIncidentFailureCode.recordable(raw),
+                ReconnectIncidentFailureCode.unstructured,
+                raw
+            )
+        }
+    }
+
     func testHistoryIsBounded() {
         var history = ReconnectIncidentHistory()
         for index in 0 ..< 4 {

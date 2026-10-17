@@ -102,4 +102,35 @@ final class HostUnderlayCaptureDiagnosticsTests: XCTestCase {
             failureEvidence
         )
     }
+
+    func testDeadlineAfterSuccessfulCaptureIsNotATimeout() {
+        var resolution = HostUnderlayCaptureResolution()
+
+        XCTAssertTrue(resolution.resolve())
+        XCTAssertNil(resolution.expire())
+        XCTAssertFalse(resolution.resolve())
+    }
+
+    func testDeadlineReportsLatestEvidenceWhenCaptureIsOpen() {
+        var resolution = HostUnderlayCaptureResolution()
+        let unsatisfied = HostUnderlayCaptureDiagnosticClassifier.classify(
+            pathStatus: "unsatisfied",
+            routeInterface: "",
+            routeError: "",
+            candidateInterfaces: ["en0"],
+            indexedInterfaces: ["en0"]
+        )!
+        resolution.observe(unsatisfied)
+
+        XCTAssertEqual(resolution.expire(), unsatisfied)
+        // The deadline resolved the capture; a late path cannot deliver.
+        XCTAssertFalse(resolution.resolve())
+        XCTAssertNil(resolution.expire())
+    }
+
+    func testDeadlineWithoutAnyPathReportsMissingPathUpdate() {
+        var resolution = HostUnderlayCaptureResolution()
+
+        XCTAssertEqual(resolution.expire(), .missingPathUpdate)
+    }
 }

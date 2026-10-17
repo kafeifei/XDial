@@ -445,6 +445,7 @@ targets:
       - Sources/XDial/ScenarioIconCatalog.swift
       - Sources/XDial/ScenarioGridLayout.swift
       - Sources/XDial/WiFiSSIDAccessPolicy.swift
+      - Sources/XDial/WiFiLinkState.swift
       - Sources/XDial/XDialBrandPalette.swift
       - Sources/XDial/XDialPalette.swift
       - TransparentProxyExtension/ConnectionTransactionReporter.swift

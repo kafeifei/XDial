@@ -3142,6 +3142,12 @@ extension RuntimeError: LocalizedError {
         switch self {
         case .underlayEgressUnavailable:
             ConnectionFailureCode.underlayEgressUnavailable
+        case .tailscaleLoginRequired:
+            "tailscale-login-required"
+        case .tailscaleUnavailable:
+            "tailscale-unavailable"
+        case .invalidTailscaleStatus:
+            "tailscale-status-invalid"
         case .tailscaleExitNodeUnavailable:
             "tailscale-exit-node-unavailable"
         case .tailscaleMagicDNSUnavailable:

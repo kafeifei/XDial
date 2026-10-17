@@ -140,6 +140,9 @@ final class AppState: ObservableObject {
     private let networkEpochIDPrefix =
         "host-" + UUID().uuidString.lowercased()
     private var ssidScenarioSelection = SSIDScenarioSelectionState()
+    /// Sampled together with `currentSSID`; it never enters UI, Debug or the
+    /// network epoch fingerprint.
+    private var currentWiFiLink: WiFiLinkState = .unknown
     private var networkEpochSSIDSelectionReason = "ssid-unavailable"
     private var automaticReconnectPreparation:
         ((AutomaticReconnectPreparation?) -> Void)?
@@ -154,13 +157,14 @@ final class AppState: ObservableObject {
                 self?.handleWiFiSSIDSettling()
             }
         },
-        onUpdate: { [weak self] ssid, accessState, revision in
+        onUpdate: { [weak self] ssid, accessState, link, revision in
             Task { @MainActor [weak self] in
                 guard let self,
                       self.wifiSSIDMonitor.isCurrentUpdate(revision) else { return }
                 self.handleWiFiSSIDUpdate(
                     ssid: ssid,
-                    accessState: accessState
+                    accessState: accessState,
+                    link: link
                 )
             }
         }
@@ -2055,9 +2059,11 @@ final class AppState: ObservableObject {
 
     private func handleWiFiSSIDUpdate(
         ssid: String?,
-        accessState: WiFiSSIDAccessState
+        accessState: WiFiSSIDAccessState,
+        link: WiFiLinkState
     ) {
         currentSSID = ssid
+        currentWiFiLink = link
         wifiSSIDAccessState = accessState
         if initialSSIDAccessCheck.shouldPresent(
             accessState: accessState, requiresSSIDAccess: requiresSSIDAccess
@@ -2112,13 +2118,17 @@ final class AppState: ObservableObject {
             ?? connectionDesired.scenarioID
             ?? engine.connectionReport?.scenario.id
             ?? profile.activeScenarioID
-        let matchedScenarioID = ssidScenarioSelection.resolve(
+        // Behind the sleep gate: a Wi-Fi drop during sleep is a power
+        // lifecycle boundary, not the user leaving that Wi-Fi.
+        let matchedScenarioID = ssidScenarioSelection.observe(
             ssid: currentSSID,
+            link: currentWiFiLink,
             matchedScenarioID: rawMatch,
             forceMatching: forceMatching
         )
         recordSSIDSelectionReason(
             ssid: currentSSID,
+            link: currentWiFiLink,
             rawMatch: rawMatch,
             allowedMatch: matchedScenarioID
         )
@@ -2250,6 +2260,7 @@ final class AppState: ObservableObject {
                     .sampleCurrentForNetworkEpoch() {
                     ssidIsStable = self.currentSSID == wifi.ssid
                     self.currentSSID = wifi.ssid
+                    self.currentWiFiLink = wifi.link
                     self.wifiSSIDAccessState = wifi.accessState
                     let rawMatch = wifi.ssid.flatMap {
                         self.profile.scenario(matchingSSID: $0)?.id
@@ -2264,12 +2275,14 @@ final class AppState: ObservableObject {
                         ?? self.connectionDesired.scenarioID
                         ?? self.engine.connectionReport?.scenario.id
                         ?? self.profile.activeScenarioID
-                    let matchedScenarioID = self.ssidScenarioSelection.resolve(
+                    let matchedScenarioID = self.ssidScenarioSelection.observe(
                         ssid: wifi.ssid,
+                        link: wifi.link,
                         matchedScenarioID: rawMatch
                     )
                     self.recordSSIDSelectionReason(
                         ssid: wifi.ssid,
+                        link: wifi.link,
                         rawMatch: rawMatch,
                         allowedMatch: matchedScenarioID
                     )
@@ -2413,11 +2426,13 @@ final class AppState: ObservableObject {
 
     private func recordSSIDSelectionReason(
         ssid: String?,
+        link: WiFiLinkState,
         rawMatch: String?,
         allowedMatch: String?
     ) {
         if ssid == nil {
-            networkEpochSSIDSelectionReason = "ssid-unavailable"
+            networkEpochSSIDSelectionReason = link == .disconnected
+                ? "wifi-disconnected" : "ssid-unavailable"
         } else if allowedMatch != nil {
             networkEpochSSIDSelectionReason = "ssid-match"
         } else if rawMatch != nil {

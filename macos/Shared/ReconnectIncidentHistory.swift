@@ -1,5 +1,27 @@
 import Foundation
 
+/// Per-attempt failure facts are recorded by code only. Failure messages can
+/// name a Line's server, address or domain; a structured code is a lowercase
+/// kebab identifier, and anything else is withheld rather than persisted.
+enum ReconnectIncidentFailureCode {
+    static let unstructured = "unstructured-failure"
+
+    static func recordable(_ code: String?) -> String {
+        guard let code, !code.isEmpty else { return "" }
+        guard
+            code.count <= 64,
+            code.unicodeScalars.allSatisfy({
+                ($0.value >= 97 && $0.value <= 122) ||
+                    ($0.value >= 48 && $0.value <= 57) ||
+                    $0.value == 45
+            })
+        else {
+            return unstructured
+        }
+        return code
+    }
+}
+
 struct ReconnectIncidentEvent: Codable, Equatable, Identifiable {
     let sequence: Int
     let timestamp: Date
@@ -197,6 +219,27 @@ struct ReconnectIncidentHistory: Codable, Equatable {
         )
     }
 
+    /// The scheduled retry exists because `failedTransactionID` failed; keep
+    /// that transaction's code so an incident shows why each attempt ended.
+    mutating func recordRetryScheduled(
+        incidentID: String,
+        at timestamp: Date = Date(),
+        attempt: Int,
+        failedTransactionID: String,
+        failureCode: String?,
+        delay: TimeInterval
+    ) {
+        append(
+            incidentID: incidentID,
+            type: "retry-scheduled",
+            at: timestamp,
+            attempt: attempt,
+            transactionID: failedTransactionID,
+            code: ReconnectIncidentFailureCode.recordable(failureCode),
+            message: "Retry scheduled after \(delay)s"
+        )
+    }
+
     mutating func recordSystemDisconnectReason(
         incidentID: String,
         code: String,
@@ -296,6 +339,24 @@ enum ReconnectIncidentJournal {
                 transactionID: transactionID,
                 code: code,
                 message: message
+            )
+        }
+    }
+
+    static func recordRetryScheduled(
+        incidentID: String,
+        attempt: Int,
+        failedTransactionID: String,
+        failureCode: String?,
+        delay: TimeInterval
+    ) {
+        _ = mutate { history in
+            history.recordRetryScheduled(
+                incidentID: incidentID,
+                attempt: attempt,
+                failedTransactionID: failedTransactionID,
+                failureCode: failureCode,
+                delay: delay
             )
         }
     }
