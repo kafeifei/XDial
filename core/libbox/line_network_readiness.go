@@ -32,6 +32,39 @@ type lineNetworkContext struct {
 	SystemDNS    []string           `json:"system_dns,omitempty"`
 }
 
+// lineNetworkUnderlay is the part of an epoch's Underlay that decides whether
+// an unbound protocol socket established earlier can still be alive. The
+// default route is the interface such a socket followed when it connected;
+// the interface set says whether that interface still exists.
+type lineNetworkUnderlay struct {
+	defaultInterface string
+	interfaces       map[string]bool
+}
+
+func lineNetworkInterfaceKey(index int, name string) string {
+	return fmt.Sprintf("%d:%s", index, name)
+}
+
+// decodeLineNetworkUnderlay returns an empty identity when the snapshot cannot
+// be read; an unknown interface set never proves a transport dead.
+func decodeLineNetworkUnderlay(network *lineNetworkContext) lineNetworkUnderlay {
+	var snapshots []platformNetworkInterfaceSnapshot
+	if err := stdjson.Unmarshal(network.Interfaces, &snapshots); err != nil || len(snapshots) == 0 {
+		return lineNetworkUnderlay{}
+	}
+	interfaces := make(map[string]bool, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot.Name == "" || snapshot.Index <= 0 {
+			return lineNetworkUnderlay{}
+		}
+		interfaces[lineNetworkInterfaceKey(snapshot.Index, snapshot.Name)] = true
+	}
+	return lineNetworkUnderlay{
+		defaultInterface: lineNetworkInterfaceKey(network.DefaultIndex, network.DefaultName),
+		interfaces:       interfaces,
+	}
+}
+
 type lineNetworkProof struct {
 	capabilities outboundTLSCapabilities
 	revision     uint64
@@ -56,6 +89,7 @@ type lineNetworkGeneration struct {
 	mu             sync.Mutex
 	libbox         *Libbox
 	epoch          string
+	underlay       lineNetworkUnderlay
 	generation     uint64
 	requirements   []lineNetworkRequirement
 	proofs         map[string]lineNetworkProof
@@ -120,7 +154,7 @@ func (g *lineNetworkGeneration) install(generation uint64, vpn *anyConnectRuntim
 	g.mu.Unlock()
 	if vpn != nil {
 		vpn.attachOwner(g.libbox, true)
-		vpn.observeNetwork(g.epoch, nil)
+		vpn.observeNetwork(g.epoch, g.underlay, nil)
 	}
 	if tailscale != nil {
 		if platform := tailscale.platformInterface(); platform != nil {
@@ -148,6 +182,7 @@ func (l *Libbox) decodeNetworkSession(sessionJSON, contextJSON string) (*transpa
 	if network.Epoch == "" || network.DefaultName == "" || network.DefaultIndex <= 0 || len(network.Interfaces) == 0 {
 		return nil, nil, g, fmt.Errorf("network context is incomplete")
 	}
+	g.underlay = decodeLineNetworkUnderlay(&network)
 	if err := stdjson.Unmarshal([]byte(sessionJSON), &envelope); err != nil {
 		return nil, nil, g, err
 	}

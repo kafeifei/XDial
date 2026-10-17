@@ -478,7 +478,7 @@ func TestNetworkReadinessOwnerFailureBudgetSurvivesSceneWaiters(t *testing.T) {
 	l.anyConnectRetryDelays = []time.Duration{0, 0, 0}
 	c := &anyConnectRuntimeCapability{vpn: vpn, line: newAnyConnectLineRuntime(nil, nil)}
 	c.attachOwner(l, true)
-	c.observeNetwork("A", nil)
+	c.observeNetwork("A", lineNetworkUnderlay{}, nil)
 	defer c.stop()
 	for i := 0; i < 3; i++ {
 		if err := c.ensureTransport(context.Background(), false); !errors.Is(err, syscall.ECONNRESET) {
@@ -488,7 +488,7 @@ func TestNetworkReadinessOwnerFailureBudgetSurvivesSceneWaiters(t *testing.T) {
 	if vpn.count() != 3 {
 		t.Fatalf("Scene waiters reset owner budget: %d", vpn.count())
 	}
-	c.observeNetwork("B", nil)
+	c.observeNetwork("B", lineNetworkUnderlay{}, nil)
 	if err := c.ensureTransport(context.Background(), false); !errors.Is(err, syscall.ECONNRESET) {
 		t.Fatal(err)
 	}
@@ -563,7 +563,7 @@ func TestNetworkReadinessFinalLeaseCancelsRecoveryOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.attachOwner(l, true)
-	c.observeNetwork("A", nil)
+	c.observeNetwork("A", lineNetworkUnderlay{}, nil)
 	var pool lineRuntimePool
 	if err = pool.beginCandidate(1); err != nil {
 		t.Fatal(err)
@@ -712,7 +712,7 @@ func TestNetworkReadinessUnknownAuthenticationFailureDoesNotRetry(t *testing.T) 
 	l.anyConnectRetryDelays = []time.Duration{0, 0, 0}
 	c := &anyConnectRuntimeCapability{vpn: vpn, line: newAnyConnectLineRuntime(nil, nil)}
 	c.attachOwner(l, true)
-	c.observeNetwork("A", nil)
+	c.observeNetwork("A", lineNetworkUnderlay{}, nil)
 	defer c.stop()
 	for i := 0; i < 3; i++ {
 		err := c.ensureTransport(context.Background(), false)

@@ -1,13 +1,17 @@
 import CoreLocation
 import CoreWLAN
 import Foundation
+import SystemConfiguration
 
 /// SSID 只是宿主控制面的场景触发事实。它不进入 ConnectionPlan，
-/// 不参与 DNS、路由或 Underlay 接口选择。
+/// 不参与 DNS、路由或 Underlay 接口选择。Wi-Fi 链路状态与 SSID 同次采样，
+/// 只用于区分“确认离开 Wi-Fi”与“暂时读不到 SSID”。
 final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     CWEventDelegate
 {
-    typealias UpdateHandler = (String?, WiFiSSIDAccessState, UInt64) -> Void
+    typealias UpdateHandler = (
+        String?, WiFiSSIDAccessState, WiFiLinkState, UInt64
+    ) -> Void
     typealias SettlingHandler = () -> Void
 
     private let client = CWWiFiClient.shared()
@@ -18,6 +22,7 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     private var refreshWorkItem: DispatchWorkItem?
     private var lastSSID: String?
     private var lastAccessState: WiFiSSIDAccessState?
+    private var lastLink: WiFiLinkState = .unknown
     private var accessLifecycle = WiFiSSIDAccessLifecycle()
 
     init(
@@ -56,6 +61,7 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     func stop() {
         accessLifecycle.invalidatePendingUpdates()
         lastAccessState = nil
+        lastLink = .unknown
         refreshWorkItem?.cancel()
         refreshWorkItem = nil
         guard monitoring else { return }
@@ -98,7 +104,8 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
     /// the same value cannot create a second epoch after settlement.
     func sampleCurrentForNetworkEpoch() -> (
         ssid: String?,
-        accessState: WiFiSSIDAccessState
+        accessState: WiFiSSIDAccessState,
+        link: WiFiLinkState
     )? {
         guard accessLifecycle.accessState(
             for: locationManager.authorizationStatus
@@ -108,10 +115,13 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
         let normalizedSSID = readCurrentSSID().flatMap {
             $0.isEmpty ? nil : $0
         }
+        let link = readCurrentLinkState()
+        logLinkChange(link)
         lastSSID = normalizedSSID
         lastAccessState = .ready
+        lastLink = link
         accessLifecycle.invalidatePendingUpdates()
-        return (normalizedSSID, .ready)
+        return (normalizedSSID, .ready, link)
     }
 
     func locationManagerDidChangeAuthorization(
@@ -169,7 +179,8 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
         }
         emit(
             ssid: readCurrentSSID(),
-            accessState: .ready
+            accessState: .ready,
+            link: readCurrentLinkState()
         )
     }
 
@@ -183,24 +194,74 @@ final class WiFiSSIDMonitor: NSObject, CLLocationManagerDelegate,
             )
     }
 
+    /// Link facts are read only alongside a ready SSID sample; every other
+    /// access state reports `.unknown` and therefore never confirms a
+    /// disconnect.
+    private func readCurrentLinkState() -> WiFiLinkState {
+        WiFiLinkStatePolicy.state(
+            for: (CWWiFiClient.interfaceNames() ?? []).sorted().map {
+                Self.linkFacts(interfaceName: $0)
+            }
+        )
+    }
+
+    private static func linkFacts(
+        interfaceName: String
+    ) -> WiFiInterfaceLinkFacts {
+        let link = SCDynamicStoreCopyValue(
+            nil,
+            SCDynamicStoreKeyCreateNetworkInterfaceEntity(
+                nil,
+                kSCDynamicStoreDomainState,
+                interfaceName as CFString,
+                kSCEntNetLink
+            )
+        ) as? [String: Any]
+        // The Wi-Fi daemon publishes its power state under the AirPort
+        // entity; SystemConfiguration has no public constant for it.
+        let airPort = SCDynamicStoreCopyValue(
+            nil,
+            SCDynamicStoreKeyCreateNetworkInterfaceEntity(
+                nil,
+                kSCDynamicStoreDomainState,
+                interfaceName as CFString,
+                kSCEntNetAirPort
+            )
+        ) as? [String: Any]
+        return WiFiInterfaceLinkFacts(
+            powerOn: airPort?["Power Status"] as? Bool,
+            linkActive: link?[kSCPropNetLinkActive as String] as? Bool
+        )
+    }
+
+    private func logLinkChange(_ link: WiFiLinkState) {
+        guard link != lastLink else { return }
+        appLog("Wi-Fi link state=\(link.logValue)")
+    }
+
     private func emit(
         ssid: String?,
-        accessState: WiFiSSIDAccessState
+        accessState: WiFiSSIDAccessState,
+        link: WiFiLinkState = .unknown
     ) {
         let normalizedSSID = ssid.flatMap { $0.isEmpty ? nil : $0 }
         let accessStateChanged = accessState != lastAccessState
-        guard normalizedSSID != lastSSID || accessState != lastAccessState else {
+        guard normalizedSSID != lastSSID
+                || accessState != lastAccessState
+                || link != lastLink else {
             return
         }
+        logLinkChange(link)
         lastSSID = normalizedSSID
         lastAccessState = accessState
+        lastLink = link
         if accessStateChanged {
             appLog("Wi-Fi SSID access state=\(accessState.logValue)")
         }
         let revision = accessLifecycle.invalidatePendingUpdates()
         DispatchQueue.main.async { [weak self] in
             guard let self, self.isCurrentUpdate(revision) else { return }
-            self.onUpdate(normalizedSSID, accessState, revision)
+            self.onUpdate(normalizedSSID, accessState, link, revision)
         }
     }
 

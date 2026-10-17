@@ -47,6 +47,73 @@ final class ReconnectIncidentHistoryTests: XCTestCase {
         )
     }
 
+    func testRetryScheduleRecordsEachFailedAttemptsStructuredCode() throws {
+        var history = ReconnectIncidentHistory()
+        let incidentID = history.begin(
+            at: Date(timeIntervalSince1970: 100),
+            trigger: .automaticConnection,
+            report: report(),
+            reasonCode: "line-address-family-unavailable",
+            reasonMessage: "线路 IPv4 / IPv6 出口均不可用"
+        )
+        history.recordRetryScheduled(
+            incidentID: incidentID,
+            attempt: 1,
+            failedTransactionID: "original-transaction",
+            failureCode: "line-address-family-unavailable",
+            delay: 2
+        )
+        history.recordRetryScheduled(
+            incidentID: incidentID,
+            attempt: 2,
+            failedTransactionID: "retry-transaction-1",
+            failureCode: "underlay-egress-unavailable",
+            delay: 5
+        )
+
+        let scheduled = try XCTUnwrap(history.incidents.first)
+            .events.filter { $0.type == "retry-scheduled" }
+        XCTAssertEqual(
+            scheduled.map(\.code),
+            [
+                "line-address-family-unavailable",
+                "underlay-egress-unavailable",
+            ]
+        )
+        XCTAssertEqual(
+            scheduled.map(\.transactionID),
+            ["original-transaction", "retry-transaction-1"]
+        )
+        XCTAssertEqual(scheduled.map(\.attempt), [1, 2])
+        XCTAssertEqual(
+            scheduled.map(\.message),
+            ["Retry scheduled after 2.0s", "Retry scheduled after 5.0s"]
+        )
+    }
+
+    func testRecordedFailureCodeNeverCarriesFreeText() {
+        XCTAssertEqual(
+            ReconnectIncidentFailureCode.recordable(
+                "anyconnect-tls-dpd-timeout"
+            ),
+            "anyconnect-tls-dpd-timeout"
+        )
+        XCTAssertEqual(ReconnectIncidentFailureCode.recordable(nil), "")
+        XCTAssertEqual(ReconnectIncidentFailureCode.recordable(""), "")
+        for raw in [
+            "dial tcp4 192.0.2.1:8443: connect: network is unreachable",
+            "vpn.example.com",
+            "Bearer token",
+            String(repeating: "a", count: 65),
+        ] {
+            XCTAssertEqual(
+                ReconnectIncidentFailureCode.recordable(raw),
+                ReconnectIncidentFailureCode.unstructured,
+                raw
+            )
+        }
+    }
+
     func testHistoryIsBounded() {
         var history = ReconnectIncidentHistory()
         for index in 0 ..< 4 {
@@ -140,6 +207,149 @@ final class ReconnectIncidentHistoryTests: XCTestCase {
         XCTAssertNil(
             decoded.incidents.first?.systemDisconnectCode
         )
+    }
+
+    func testParkedIncidentStaysOpenThroughGrantsDeferralsAndSingleAttempts()
+        throws
+    {
+        var history = ReconnectIncidentHistory()
+        let incidentID = history.begin(
+            at: Date(timeIntervalSince1970: 100),
+            trigger: .automaticConnection,
+            report: report(),
+            reasonCode: "line-address-family-unavailable",
+            reasonMessage: "线路 IPv4 / IPv6 出口均不可用"
+        )
+        history.recordParked(
+            incidentID: incidentID,
+            attemptsUsed: 5,
+            transactionID: "t5",
+            failureCode: "line-address-family-unavailable"
+        )
+        XCTAssertEqual(
+            history.incidents.first?.outcome,
+            ReconnectIncidentOutcome.parked
+        )
+        history.recordGrantDeferred(
+            incidentID: incidentID,
+            reason: .connectivityRestored,
+            until: Date(timeIntervalSince1970: 400)
+        )
+        history.recordSingleAttemptStarted(
+            incidentID: incidentID,
+            kind: .tail(1),
+            transactionID: "tail-1"
+        )
+        history.recordAttemptFailed(
+            incidentID: incidentID,
+            attempt: 1,
+            transactionID: "tail-1",
+            failureCode: "server 203.0.113.5 timed out"
+        )
+        XCTAssertEqual(
+            history.incidents.first?.outcome,
+            ReconnectIncidentOutcome.parked
+        )
+        history.recordBudgetGranted(
+            incidentID: incidentID,
+            reason: .underlayChanged
+        )
+
+        let incident = try XCTUnwrap(history.incidents.first)
+        XCTAssertEqual(incident.outcome, ReconnectIncidentOutcome.recovering)
+        XCTAssertEqual(
+            incident.events.map(\.type),
+            [
+                "disconnected",
+                "parked",
+                "grant-deferred",
+                "tail-attempt-started",
+                "attempt-failed",
+                "budget-granted",
+            ]
+        )
+        XCTAssertEqual(incident.events[1].attempt, 5)
+        XCTAssertEqual(incident.events[2].code, "connectivity-restored")
+        XCTAssertEqual(incident.events[3].attempt, 1)
+        // Failure text never reaches the journal.
+        XCTAssertEqual(
+            incident.events[4].code,
+            ReconnectIncidentFailureCode.unstructured
+        )
+        XCTAssertEqual(incident.events[5].code, "underlay-changed")
+        XCTAssertFalse(incident.events.contains { $0.type == "exhausted" })
+    }
+
+    func testParkedEventsRoundTripAndLegacyRecordsDecode() throws {
+        var history = ReconnectIncidentHistory()
+        let incidentID = history.begin(
+            at: Date(timeIntervalSince1970: 100),
+            trigger: .underlayChange,
+            report: report(),
+            reasonCode: "provider-session-lost",
+            reasonMessage: "Provider session lost"
+        )
+        history.recordParked(
+            incidentID: incidentID,
+            attemptsUsed: 5,
+            transactionID: "t5",
+            failureCode: "provider-session-lost"
+        )
+        let data = try JSONEncoder().encode(history)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                ReconnectIncidentHistory.self,
+                from: data
+            ),
+            history
+        )
+
+        // Written before parking existed (and before 2026-08-16, when
+        // "underlay-change" named the removed rebuild path). Unknown future
+        // event types and outcomes are plain strings and decode too.
+        let legacy = """
+        {"schema_version":1,"incidents":[{"id":"legacy",
+        "disconnected_at":0,"trigger":"underlay-change",
+        "original_transaction_id":"t0","reason_code":"underlay-egress-unavailable",
+        "reason_message":"m","outcome":"exhausted","events":[
+        {"sequence":1,"timestamp":0,"type":"disconnected","attempt":0,
+        "transaction_id":"t0","code":"","message":""},
+        {"sequence":2,"timestamp":1,"type":"some-future-event","attempt":0,
+        "transaction_id":"","code":"","message":""}]}]}
+        """
+        let decoded = try JSONDecoder().decode(
+            ReconnectIncidentHistory.self,
+            from: Data(legacy.utf8)
+        )
+        let incident = try XCTUnwrap(decoded.incidents.first)
+        XCTAssertEqual(incident.trigger, .underlayChange)
+        XCTAssertEqual(incident.scenarioID, "")
+        XCTAssertEqual(incident.events.last?.type, "some-future-event")
+    }
+
+    func testLongParkedIncidentKeepsOpeningEventAndBoundsHistory() throws {
+        var history = ReconnectIncidentHistory()
+        let incidentID = history.begin(
+            at: Date(timeIntervalSince1970: 100),
+            trigger: .automaticConnection,
+            report: report(),
+            reasonCode: "line-address-family-unavailable",
+            reasonMessage: "m"
+        )
+        for attempt in 0 ..< 400 {
+            history.recordAttemptFailed(
+                incidentID: incidentID,
+                attempt: 0,
+                transactionID: "wake-\(attempt)",
+                failureCode: "line-address-family-unavailable"
+            )
+        }
+
+        let events = try XCTUnwrap(history.incidents.first).events
+        XCTAssertEqual(events.count, ReconnectIncident.eventLimit)
+        XCTAssertEqual(events.first?.type, "disconnected")
+        XCTAssertEqual(events.last?.transactionID, "wake-399")
+        XCTAssertEqual(events.last?.sequence, 401)
     }
 
     private func report() -> ConnectionReport {

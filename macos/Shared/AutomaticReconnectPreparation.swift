@@ -5,6 +5,9 @@ import Foundation
 struct AutomaticReconnectPreparation {
     let profileJSON: String
     let underlayFingerprint: String
+    /// The desired Scenario the settled epoch selected; a parked recovery's
+    /// wake and slow-tail attempts compare it with the parked epoch.
+    var scenarioID = ""
 }
 
 /// Owns one asynchronous recovery preparation. Cancellation and successful

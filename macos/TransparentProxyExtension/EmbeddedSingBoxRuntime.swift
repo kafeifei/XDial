@@ -348,13 +348,16 @@ final class EmbeddedSingBoxRuntime {
         let anyConnectTaskID: String?
     }
     private var preparedSwitchState: PreparedSwitchState?
+    private let lineRecoveryConditions: LineRecoveryConditionsRelay?
 
     init(
         logger: Logger,
+        lineRecoveryConditions: LineRecoveryConditionsRelay? = nil,
         onFatalError:
             @escaping @Sendable (ConnectionRuntimeFailure) -> Void
     ) {
         self.logger = logger
+        self.lineRecoveryConditions = lineRecoveryConditions
         callback = EngineCallback(
             logger: logger,
             onFatalError: onFatalError
@@ -429,6 +432,17 @@ final class EmbeddedSingBoxRuntime {
         try checkCancellation(cancellation)
         guard let instance = LibboxNew(callback) else {
             throw RuntimeError.unavailable
+        }
+        // Before any Line can start its local recovery, so a sleep report that
+        // arrived during preparation already gates it.
+        lineRecoveryConditions?.attach { [weak instance, logger = self.logger] json in
+            do {
+                try instance?.setLineRecoveryConditions(json)
+            } catch {
+                logger.error(
+                    "line-recovery-conditions-rejected error=\(error.localizedDescription, privacy: .public)"
+                )
+            }
         }
         let anyConnectTaskID = envelope.plan.tasks.first {
             $0.kind == "line" && $0.resourceType == "vpn"
@@ -2101,6 +2115,7 @@ final class EmbeddedSingBoxRuntime {
 
     func stop() throws {
         callback.markStopped()
+        lineRecoveryConditions?.detach()
         engineLock.lock()
         let current = engine
         let currentAcquisition = acquisitionEngine
@@ -2976,6 +2991,18 @@ private final class EngineCallback: NSObject, LibboxCallbackProtocol {
                     message: "AnyConnect 线路已恢复，其他线路未重启",
                     taskID: currentTaskID
                 )
+            case .waiting:
+                currentReporter.setTask(
+                    id: currentTaskID,
+                    state: .running
+                )
+                currentReporter.note(
+                    code: "anyconnect-line-waiting-for-network",
+                    message: lineStatus.reason == "system-asleep"
+                        ? "AnyConnect 线路等待系统完整唤醒后重连，不消耗重试次数"
+                        : "AnyConnect 线路等待可用网络后重连，不消耗重试次数",
+                    taskID: currentTaskID
+                )
             }
         }
         logger.notice(
@@ -3142,6 +3169,12 @@ extension RuntimeError: LocalizedError {
         switch self {
         case .underlayEgressUnavailable:
             ConnectionFailureCode.underlayEgressUnavailable
+        case .tailscaleLoginRequired:
+            "tailscale-login-required"
+        case .tailscaleUnavailable:
+            "tailscale-unavailable"
+        case .invalidTailscaleStatus:
+            "tailscale-status-invalid"
         case .tailscaleExitNodeUnavailable:
             "tailscale-exit-node-unavailable"
         case .tailscaleMagicDNSUnavailable:

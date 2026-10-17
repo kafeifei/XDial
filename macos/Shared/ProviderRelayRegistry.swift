@@ -81,6 +81,14 @@ final class ProviderRelayHandle: @unchecked Sendable {
         completionGroup.wait(timeout: deadline) == .success
     }
 
+    /// Non-blocking completion observation for long-lived retained relays.
+    fileprivate func notifyWhenFinished(
+        queue: DispatchQueue,
+        execute work: @escaping () -> Void
+    ) {
+        completionGroup.notify(queue: queue, execute: work)
+    }
+
     private func markFinished() {
         lock.lock()
         guard case .running = state else {
@@ -93,17 +101,37 @@ final class ProviderRelayHandle: @unchecked Sendable {
     }
 }
 
+/// What one registry entry owns; see `ProviderRelayRegistry.handoff`.
+enum ProviderRelayOwnership: Equatable, Sendable {
+    /// The entry owns the application's connection (system TCP flow or a
+    /// local SOCKS5 client). Cancelling it ends that connection.
+    case flow
+    /// The entry owns one SOCKS association of a longer-lived UDP flow.
+    /// Cancelling it re-associates the flow with the active generation.
+    case association
+}
+
 struct ProviderRelayDrain: @unchecked Sendable {
-    fileprivate let handles: [ProviderRelayHandle]
+    fileprivate struct Member {
+        let handle: ProviderRelayHandle
+        let ownership: ProviderRelayOwnership
+    }
+
+    fileprivate let members: [Member]
     let generation: String?
 
     static let empty = ProviderRelayDrain(
-        handles: [],
+        members: [],
         generation: nil
     )
 
     var count: Int {
-        handles.count
+        members.count
+    }
+
+    /// Members that have not completed yet; for bounded evidence only.
+    var unfinishedCount: Int {
+        members.filter { !$0.handle.wait(until: .now()) }.count
     }
 
     static func merged(
@@ -111,21 +139,50 @@ struct ProviderRelayDrain: @unchecked Sendable {
     ) -> ProviderRelayDrain {
         let generations = Set(drains.compactMap(\.generation))
         return ProviderRelayDrain(
-            handles: drains.flatMap(\.handles),
+            members: drains.flatMap(\.members),
             generation: generations.count == 1
                 ? generations.first
                 : nil
         )
     }
 
+    /// The subset owning `ownership`, for the same generation.
+    func subset(
+        owning ownership: ProviderRelayOwnership
+    ) -> ProviderRelayDrain {
+        ProviderRelayDrain(
+            members: members.filter { $0.ownership == ownership },
+            generation: generation
+        )
+    }
+
     func wait(timeout: TimeInterval) -> Bool {
         let deadline = DispatchTime.now() + timeout
-        for handle in handles {
-            guard handle.wait(until: deadline) else {
+        for member in members {
+            guard member.handle.wait(until: deadline) else {
                 return false
             }
         }
         return true
+    }
+
+    /// Calls `work` once on `queue` after every member has finished, without
+    /// blocking a thread for the retained relays' lifetime. An empty drain
+    /// completes immediately.
+    func notifyWhenFinished(
+        queue: DispatchQueue,
+        execute work: @escaping () -> Void
+    ) {
+        let group = DispatchGroup()
+        for member in members {
+            group.enter()
+            member.handle.notifyWhenFinished(
+                queue: .global(qos: .utility)
+            ) {
+                group.leave()
+            }
+        }
+        group.notify(queue: queue, execute: work)
     }
 
     /// Ends relays which did not finish inside the handoff grace period.
@@ -134,7 +191,7 @@ struct ProviderRelayDrain: @unchecked Sendable {
     func cancel(
         with error: Error = AppProxyFlowCloseError.aborted
     ) {
-        handles.forEach { $0.cancel(with: error) }
+        members.forEach { $0.handle.cancel(with: error) }
     }
 }
 
@@ -161,16 +218,27 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
         case reserved(generation: String)
         case attached(
             generation: String,
-            handle: ProviderRelayHandle
+            handle: ProviderRelayHandle,
+            ownership: ProviderRelayOwnership
         )
 
         var generation: String {
             switch self {
             case let .reserved(generation):
                 return generation
-            case let .attached(generation, _):
+            case let .attached(generation, _, _):
                 return generation
             }
+        }
+
+        var drainMember: ProviderRelayDrain.Member? {
+            guard case let .attached(_, handle, ownership) = self else {
+                return nil
+            }
+            return ProviderRelayDrain.Member(
+                handle: handle,
+                ownership: ownership
+            )
         }
     }
 
@@ -194,23 +262,17 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
              let .rejecting(generation):
             replacedGeneration = generation
         }
-        let staleHandles: [ProviderRelayHandle] =
-            entries.values.compactMap { entry in
-            guard case let .attached(_, handle) = entry else {
-                return nil
-            }
-            return handle
-        }
+        let staleMembers = entries.values.compactMap(\.drainMember)
         entries.removeAll()
         state = .active(generation: generation, endpoint: endpoint)
         lock.unlock()
 
-        let error = AppProxyFlowCloseError.aborted
-        staleHandles.forEach { $0.cancel(with: error) }
-        return ProviderRelayDrain(
-            handles: staleHandles,
+        let drain = ProviderRelayDrain(
+            members: staleMembers,
             generation: replacedGeneration
         )
+        drain.cancel()
+        return drain
     }
 
     /// Atomically publishes a new endpoint for future flows while allowing
@@ -229,7 +291,9 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
     /// Reservations which have not attached yet lose the race and are removed;
     /// their caller observes `attach == false` and closes that claimed flow
     /// fail-closed. Attached handles stay registered until they finish, or until
-    /// the caller cancels the returned bounded drain.
+    /// the caller cancels the returned drain. Each member keeps the ownership
+    /// it attached with, so the caller can bound associations and flows
+    /// separately; the registry itself never decides how long either lives.
     @discardableResult
     func handoff(
         generation: String,
@@ -245,17 +309,16 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
             replacedGeneration = currentGeneration
         }
 
-        var drainingHandles: [ProviderRelayHandle] = []
+        var drainingMembers: [ProviderRelayDrain.Member] = []
         var unattachedReservationIDs: [UUID] = []
         for (id, entry) in entries {
             guard entry.generation == replacedGeneration else {
                 continue
             }
-            switch entry {
-            case .reserved:
+            if let member = entry.drainMember {
+                drainingMembers.append(member)
+            } else {
                 unattachedReservationIDs.append(id)
-            case let .attached(_, handle):
-                drainingHandles.append(handle)
             }
         }
         for id in unattachedReservationIDs {
@@ -265,7 +328,7 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
         lock.unlock()
 
         return ProviderRelayDrain(
-            handles: drainingHandles,
+            members: drainingMembers,
             generation: replacedGeneration
         )
     }
@@ -300,7 +363,8 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
 
     func attach(
         _ handle: ProviderRelayHandle,
-        to reservation: Reservation
+        to reservation: Reservation,
+        owning ownership: ProviderRelayOwnership = .flow
     ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -314,7 +378,8 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
         }
         entries[reservation.id] = .attached(
             generation: reservation.generation,
-            handle: handle
+            handle: handle,
+            ownership: ownership
         )
         return true
     }
@@ -342,7 +407,7 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
             generation = activeGeneration
         case let .rejecting(activeGeneration):
             let drain = ProviderRelayDrain(
-                handles: [],
+                members: [],
                 generation: activeGeneration
             )
             lock.unlock()
@@ -358,22 +423,16 @@ final class ProviderRelayRegistry<Endpoint>: @unchecked Sendable {
         // A stop during Switch drain owns every relay still registered, not
         // only the newest generation. Leaving an older generation alive after
         // the system takeover is removed would leak both its Box and its flow.
-        let matchingEntries = entries
+        let members = entries.values.compactMap(\.drainMember)
         entries.removeAll()
-        let handles: [ProviderRelayHandle] =
-            matchingEntries.values.compactMap { entry in
-            guard case let .attached(_, handle) = entry else {
-                return nil
-            }
-            return handle
-        }
         lock.unlock()
 
-        handles.forEach { $0.cancel(with: error) }
-        return ProviderRelayDrain(
-            handles: handles,
+        let drain = ProviderRelayDrain(
+            members: members,
             generation: generation
         )
+        drain.cancel(with: error)
+        return drain
     }
 
     func markInactive(generation: String) {

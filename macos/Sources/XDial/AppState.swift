@@ -140,6 +140,9 @@ final class AppState: ObservableObject {
     private let networkEpochIDPrefix =
         "host-" + UUID().uuidString.lowercased()
     private var ssidScenarioSelection = SSIDScenarioSelectionState()
+    /// Sampled together with `currentSSID`; it never enters UI, Debug or the
+    /// network epoch fingerprint.
+    private var currentWiFiLink: WiFiLinkState = .unknown
     private var networkEpochSSIDSelectionReason = "ssid-unavailable"
     private var automaticReconnectPreparation:
         ((AutomaticReconnectPreparation?) -> Void)?
@@ -154,13 +157,14 @@ final class AppState: ObservableObject {
                 self?.handleWiFiSSIDSettling()
             }
         },
-        onUpdate: { [weak self] ssid, accessState, revision in
+        onUpdate: { [weak self] ssid, accessState, link, revision in
             Task { @MainActor [weak self] in
                 guard let self,
                       self.wifiSSIDMonitor.isCurrentUpdate(revision) else { return }
                 self.handleWiFiSSIDUpdate(
                     ssid: ssid,
-                    accessState: accessState
+                    accessState: accessState,
+                    link: link
                 )
             }
         }
@@ -208,6 +212,12 @@ final class AppState: ObservableObject {
     }
     var automaticReconnectState: AutomaticReconnectRuntimeState {
         engine.automaticReconnectState
+    }
+
+    /// Full recovery exhausted its budget and waits for a network change;
+    /// the Popover offers an immediate retry with a fresh budget.
+    var showsParkedRecoveryNotice: Bool {
+        engine.isAutomaticRecoveryParked && !isConnected && !isBusy
     }
 
     var presentedConnectionReport: ConnectionReport? {
@@ -1140,6 +1150,17 @@ final class AppState: ObservableObject {
             appLog("wake signal \(trigger): reconcile already in progress")
             return
         }
+        if engine.isAutomaticRecoveryParked,
+           engine.parkedRecoveryScenarioID == connectionDesired.scenarioID {
+            // Parked recovery owns the disconnected runtime. A wake keeps its
+            // one attempt there (upgraded to a full budget only if the
+            // settled network changed) instead of starting a manual-style
+            // connection that would immediately "exhaust" again.
+            if engine.resumeParkedRecoveryAfterWake() {
+                appLog("wake signal \(trigger): parked recovery attempt")
+            }
+            return
+        }
 
         let action = DesiredConnectionReconcilePolicy.decide(
             desired: connectionDesired,
@@ -1802,6 +1823,10 @@ final class AppState: ObservableObject {
                     automaticIntent,
                     outcome: .terminalFailure
                 )
+                escalateStaleCommittedGenerationIfNeeded(
+                    after: automaticIntent,
+                    committedTransactionID: inFlight.sourceTransactionID
+                )
             } else if let automaticIntent = inFlight.automaticIntent {
                 finishAutomaticScenarioSwitchIntent(
                     automaticIntent,
@@ -1840,6 +1865,50 @@ final class AppState: ObservableObject {
         guard persistActiveScenario(targetScenarioID) else { return }
         appLog("Scenario switch to \(targetScenarioID) needs a full reconnect: \(reason)")
         connect()
+    }
+
+    /// An automatic network epoch's Switch finally failed, so the committed
+    /// generation keeps running on its old Underlay. When that Underlay's
+    /// default interface is gone the generation cannot be healthy: roll it
+    /// back with a full automatic recovery toward the epoch's Scenario,
+    /// which may itself end parked. While the old default interface still
+    /// exists nothing escalates.
+    private func escalateStaleCommittedGenerationIfNeeded(
+        after intent: NetworkEpochSwitchCoordinator.Intent,
+        committedTransactionID: String
+    ) {
+        let targetScenarioID = intent.desiredScenarioID
+        engine.committedDefaultInterfaceIsAbsent(
+            expectedUnderlayFingerprint: intent.underlayFingerprint
+        ) { [weak self] absent in
+            guard let self, absent else { return }
+            guard
+                self.engine.status == "connected",
+                self.engine.connectionReport?.transactionID
+                    == committedTransactionID,
+                self.scenarioSwitchTargetID == nil,
+                self.scenarioSwitchInFlight == nil,
+                !self.networkEpochSwitchCoordinator.hasPendingIntent,
+                !self.networkEpochPowerGate.defersNetworkWork,
+                self.automaticScenarioChangeKeepsConnection,
+                self.profile.scenarios.contains(where: {
+                    $0.id == targetScenarioID
+                })
+            else {
+                return
+            }
+            if targetScenarioID != self.profile.activeScenarioID,
+               !self.persistActiveScenario(targetScenarioID) {
+                return
+            }
+            appLog(
+                "Network epoch \(intent.epoch) Switch failed and the "
+                    + "committed generation's default interface is gone; "
+                    + "escalating to full automatic recovery Scenario "
+                    + targetScenarioID
+            )
+            self.connectAutomatically(expectedScenarioID: targetScenarioID)
+        }
     }
 
     private func scheduleAutomaticScenarioSwitchRetry(
@@ -2055,9 +2124,11 @@ final class AppState: ObservableObject {
 
     private func handleWiFiSSIDUpdate(
         ssid: String?,
-        accessState: WiFiSSIDAccessState
+        accessState: WiFiSSIDAccessState,
+        link: WiFiLinkState
     ) {
         currentSSID = ssid
+        currentWiFiLink = link
         wifiSSIDAccessState = accessState
         if initialSSIDAccessCheck.shouldPresent(
             accessState: accessState, requiresSSIDAccess: requiresSSIDAccess
@@ -2112,13 +2183,17 @@ final class AppState: ObservableObject {
             ?? connectionDesired.scenarioID
             ?? engine.connectionReport?.scenario.id
             ?? profile.activeScenarioID
-        let matchedScenarioID = ssidScenarioSelection.resolve(
+        // Behind the sleep gate: a Wi-Fi drop during sleep is a power
+        // lifecycle boundary, not the user leaving that Wi-Fi.
+        let matchedScenarioID = ssidScenarioSelection.observe(
             ssid: currentSSID,
+            link: currentWiFiLink,
             matchedScenarioID: rawMatch,
             forceMatching: forceMatching
         )
         recordSSIDSelectionReason(
             ssid: currentSSID,
+            link: currentWiFiLink,
             rawMatch: rawMatch,
             allowedMatch: matchedScenarioID
         )
@@ -2170,7 +2245,11 @@ final class AppState: ObservableObject {
             networkEpochSwitchCoordinator.observeUnderlayChange(
                 currentDesiredScenarioID: desiredScenarioID,
                 underlayFingerprint: underlayFingerprint,
-                forceNewEpoch: forceNewEpoch
+                forceNewEpoch: forceNewEpoch,
+                // The host monitor forces a new epoch only for a real
+                // unsatisfied -> satisfied edge (or a wake re-sample whose
+                // snapshot is not the committed / parked one).
+                connectivityRestored: forceNewEpoch
             ) else {
             return
         }
@@ -2250,6 +2329,7 @@ final class AppState: ObservableObject {
                     .sampleCurrentForNetworkEpoch() {
                     ssidIsStable = self.currentSSID == wifi.ssid
                     self.currentSSID = wifi.ssid
+                    self.currentWiFiLink = wifi.link
                     self.wifiSSIDAccessState = wifi.accessState
                     let rawMatch = wifi.ssid.flatMap {
                         self.profile.scenario(matchingSSID: $0)?.id
@@ -2264,12 +2344,14 @@ final class AppState: ObservableObject {
                         ?? self.connectionDesired.scenarioID
                         ?? self.engine.connectionReport?.scenario.id
                         ?? self.profile.activeScenarioID
-                    let matchedScenarioID = self.ssidScenarioSelection.resolve(
+                    let matchedScenarioID = self.ssidScenarioSelection.observe(
                         ssid: wifi.ssid,
+                        link: wifi.link,
                         matchedScenarioID: rawMatch
                     )
                     self.recordSSIDSelectionReason(
                         ssid: wifi.ssid,
+                        link: wifi.link,
                         rawMatch: rawMatch,
                         allowedMatch: matchedScenarioID
                     )
@@ -2337,7 +2419,8 @@ final class AppState: ObservableObject {
                 profileJSON: buildProfileJSON(
                     activeScenarioID: intent.desiredScenarioID
                 ),
-                underlayFingerprint: intent.underlayFingerprint
+                underlayFingerprint: intent.underlayFingerprint,
+                scenarioID: intent.desiredScenarioID
             )
             appLog(
                 "Network epoch \(intent.epoch) prepared automatic recovery Scenario "
@@ -2368,7 +2451,8 @@ final class AppState: ObservableObject {
             runtimeStatus: engine.status,
             hasPendingScenarioSwitch:
                 scenarioSwitchTargetID != nil
-                    || scenarioSwitchInFlight != nil
+                    || scenarioSwitchInFlight != nil,
+            automaticRecoveryParked: engine.isAutomaticRecoveryParked
         )
         switch action {
         case .none:
@@ -2377,6 +2461,8 @@ final class AppState: ObservableObject {
                 outcome: .succeeded
             )
             return
+        case .resumeParkedRecovery:
+            resumeParkedRecovery(for: intent)
         case let .switchScenario(requiresUnderlayRefresh):
             appLog(
                 "Network epoch \(intent.epoch) selected Scenario "
@@ -2411,13 +2497,65 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// A settled epoch while full recovery is parked. An SSID that selected
+    /// another Scenario becomes the recovery target and keeps the automatic
+    /// intent; the manager's ledger decides whether the epoch earns a new
+    /// budget. This is never a manual `connect()`, so failures stay bounded
+    /// automatic attempts.
+    private func resumeParkedRecovery(
+        for intent: NetworkEpochSwitchCoordinator.Intent
+    ) {
+        let targetScenarioID = intent.desiredScenarioID
+        if targetScenarioID != profile.activeScenarioID,
+           !persistActiveScenario(targetScenarioID) {
+            _ = networkEpochSwitchCoordinator.complete(
+                intent,
+                outcome: .terminalFailure
+            )
+            return
+        }
+        _ = networkEpochSwitchCoordinator.complete(
+            intent,
+            outcome: .succeeded
+        )
+        guard connectionDesired.automaticConnectionRequested(
+            scenarioID: targetScenarioID
+        ) else {
+            return
+        }
+        appLog(
+            "Network epoch \(intent.epoch) offered to parked recovery "
+                + "Scenario " + targetScenarioID
+                + " reason=" + networkEpochSSIDSelectionReason
+                + " underlay-changed=\(intent.underlayChanged)"
+                + " connectivity-restored=\(intent.connectivityRestored)"
+        )
+        engine.resumeParkedRecovery(
+            scenarioID: targetScenarioID,
+            underlayFingerprint: intent.underlayFingerprint,
+            connectivityRestored: intent.connectivityRestored
+        )
+    }
+
+    /// Ends a parked recovery whose target Scenario no longer exists.
+    private func endParkedRecoveryIfTargetScenarioRemoved() {
+        guard let scenarioID = engine.parkedRecoveryScenarioID,
+              !profile.scenarios.contains(where: { $0.id == scenarioID })
+        else {
+            return
+        }
+        engine.endParkedRecovery(code: "scenario-removed")
+    }
+
     private func recordSSIDSelectionReason(
         ssid: String?,
+        link: WiFiLinkState,
         rawMatch: String?,
         allowedMatch: String?
     ) {
         if ssid == nil {
-            networkEpochSSIDSelectionReason = "ssid-unavailable"
+            networkEpochSSIDSelectionReason = link == .disconnected
+                ? "wifi-disconnected" : "ssid-unavailable"
         } else if allowedMatch != nil {
             networkEpochSSIDSelectionReason = "ssid-match"
         } else if rawMatch != nil {
@@ -2656,6 +2794,7 @@ final class AppState: ObservableObject {
             status: engine.status,
             report: engine.connectionReport
         )
+        endParkedRecoveryIfTargetScenarioRemoved()
     }
 
     /// Visual order shares the encrypted library's atomic writer.

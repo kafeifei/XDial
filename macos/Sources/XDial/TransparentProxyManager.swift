@@ -104,18 +104,40 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     private var networkExtensionSessionTransactionID: String?
     private let automaticReconnectRetryPolicy =
         AutomaticReconnectRetryPolicy()
-    private lazy var automaticReconnectAttemptBudget =
-        AutomaticReconnectAttemptBudget(
+    /// Full-recovery budgets keyed by recovery epoch, parking, grants and
+    /// the slow tail. The manager owns its timers and Underlay snapshots.
+    private lazy var automaticRecoveryLedger = AutomaticRecoveryLedger(
+        policy: AutomaticRecoveryLedger.Policy(
             maxAttempts: automaticReconnectRetryPolicy.maxAttempts
         )
+    )
     private var automaticReconnectPreparationGate =
         AutomaticReconnectPreparationGate()
     private var automaticReconnectRetryWorkItem: DispatchWorkItem?
     private var automaticReconnectRetryToken: UUID?
     private var automaticReconnectRetryAt: Date?
-    private var automaticReconnectRetryAttempt: Int?
+    /// The scheduled (not yet started) attempt.
+    private var automaticReconnectRetryKind: AutomaticRecoveryAttemptKind?
+    /// The attempt whose connection transaction is running; nil while the
+    /// failure that opened the recovery episode is being handled.
+    private var automaticReconnectAttemptKind: AutomaticRecoveryAttemptKind?
     private var automaticReconnectRetryFailedTransactionID: String?
+    /// Only the transaction the current recovery step waits for may decide
+    /// it; stray status callbacks re-reading an older journal report cannot.
+    private var automaticRecoveryOutcomeGate = AutomaticRecoveryOutcomeGate()
+    /// Parked recovery keeps a read-only Underlay observer. It is separate
+    /// from the committed session's monitor: Network Extension status
+    /// callbacks stop that one, and XDial's own attempts stop this one.
+    private var parkedUnderlayMonitor: HostUnderlayMonitor?
+    /// The Underlay the parked epoch was decided on.
+    private var parkedUnderlay: HostUnderlaySnapshot?
+    private var parkedRecoveryTrigger: AutomaticReconnectTrigger?
+    private var parkedUnderlayCaptureToken: UUID?
+    private var parkedTailWorkItem: DispatchWorkItem?
+    private var parkedTailAt: Date?
+    private var deferredGrantWorkItem: DispatchWorkItem?
     private var powerLifecycleGate = SystemSleepNetworkEpochGate()
+    private let lineRecoveryConditions = LineRecoveryConditionsPublisher()
     private var automaticReconnectUnderlayWaitEvidence:
         HostUnderlayCaptureEvidence?
     private var stableConnectionResetWorkItem: DispatchWorkItem?
@@ -137,20 +159,55 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
 
     private override init() {
         super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationWillTerminate(_:)),
+            name: NSApplication.willTerminateNotification,
+            object: nil
+        )
+        lineRecoveryConditions.start { [weak self] conditions, completion in
+            guard let self else { return completion(.providerNotConnected) }
+            self.sendLineRecoveryConditions(conditions, completion: completion)
+        }
     }
 
     var automaticReconnectState: AutomaticReconnectRuntimeState {
-        AutomaticReconnectRuntimeState(
+        let retryAttempt: Int?
+        if case let .budget(number)? = automaticReconnectRetryKind {
+            retryAttempt = number
+        } else {
+            retryAttempt = nil
+        }
+        return AutomaticReconnectRuntimeState(
             inProgress: automaticReconnectInProgress,
             trigger: automaticReconnectTrigger,
-            attemptsUsed: automaticReconnectAttemptBudget.attemptsUsed,
+            attemptsUsed: automaticRecoveryLedger.attemptsUsed,
             maxAttempts: automaticReconnectRetryPolicy.maxAttempts,
             stableResetAt: stableConnectionResetAt,
             retryAt: automaticReconnectRetryAt,
-            retryAttempt: automaticReconnectRetryAttempt,
+            retryAttempt: retryAttempt,
             underlayWaitEvidence:
-                automaticReconnectUnderlayWaitEvidence
+                automaticReconnectUnderlayWaitEvidence,
+            parked: isAutomaticRecoveryParked,
+            attemptKind: (
+                automaticReconnectRetryKind
+                    ?? automaticReconnectAttemptKind
+            )?.name,
+            tailAttemptAt: parkedTailAt,
+            recovery: automaticRecoveryLedger.projection(at: Date())
         )
+    }
+
+    /// Recovery exhausted its budget with a network-related failure and is
+    /// waiting for a settled network change, a wake, its slow tail or the
+    /// user. The runtime is disconnected with takeover removed.
+    var isAutomaticRecoveryParked: Bool {
+        automaticRecoveryLedger.isParked && !automaticReconnectInProgress
+    }
+
+    var parkedRecoveryScenarioID: String? {
+        guard automaticRecoveryLedger.isParked else { return nil }
+        return automaticRecoveryLedger.parking?.epoch.scenarioID
     }
 
     var scenarioSwitchProjection: HostScenarioSwitchProjection? {
@@ -216,6 +273,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         reportPollTimer?.invalidate()
         underlayMonitor?.cancel()
+        parkedUnderlayMonitor?.cancel()
+        parkedTailWorkItem?.cancel()
+        deferredGrantWorkItem?.cancel()
         automaticReconnectRetryWorkItem?.cancel()
         stableConnectionResetWorkItem?.cancel()
         activeScenarioSwitch?.timeoutWorkItem?.cancel()
@@ -246,10 +306,27 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         let failureStage: String? = nil
 #endif
         let intentID = UUID()
+        // A new connection supersedes a parked recovery. A user connection is
+        // also a new intent with a fresh budget; an automatic one keeps the
+        // budget of whatever epoch its failure will be decided in.
+        if let incidentID = activeReconnectIncidentID {
+            ReconnectIncidentJournal.finish(
+                incidentID: incidentID,
+                outcome: "superseded",
+                code: automaticRetryTrigger == nil
+                    ? AutomaticRecoveryGrantReason.userConnect.rawValue
+                    : AutomaticReconnectTrigger.automaticConnection.rawValue
+            )
+        }
+        clearParkedRecovery()
+        if automaticRetryTrigger == nil {
+            automaticRecoveryLedger.noteUserConnection(at: Date())
+        }
         startIntentID = intentID
         requestedProfileJSON = profileJSON
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        automaticReconnectAttemptKind = nil
         pendingInitialRetryTrigger = automaticRetryTrigger
         automaticReconnectTransactionID = nil
         automaticReconnectUnderlayWaitEvidence = nil
@@ -270,6 +347,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             guard self.startIntentID == intentID else { return }
             switch snapshotResult {
             case let .success(snapshot):
+                self.latestCapturedUnderlay = snapshot
                 self.updateReport(transactionID: transactionID) {
                     $0.updateTask(id: "underlay:system", state: .ready)
                     $0.setState(.preparing)
@@ -583,7 +661,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             underlayDefaultIndex: underlay.defaultInterface.index,
             systemDNSJSON: underlay.systemDNSJSON,
             refreshLineRuntimes: active.refreshLineRuntimes,
-            networkEpochID: active.networkEpochID
+            networkEpochID: active.networkEpochID,
+            underlayPathIdentity: underlay.pathIdentity
         )
         sendScenarioSwitchMessage(request) { [weak self] switchResult in
             self?.finishScenarioSwitch(
@@ -916,11 +995,15 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         latestCapturedUnderlay = nil
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        automaticReconnectAttemptKind = nil
         pendingInitialRetryTrigger = nil
         automaticReconnectTransactionID = nil
         automaticReconnectUnderlayWaitEvidence = nil
         networkExtensionSessionTransactionID = nil
         connectedSessionTransactionID = nil
+        // Explicit disconnect (and quit, which stops through here) ends a
+        // parked recovery immediately together with its observer and timers.
+        clearParkedRecovery()
         if let incidentID = activeReconnectIncidentID {
             ReconnectIncidentJournal.finish(
                 incidentID: incidentID,
@@ -1026,15 +1109,27 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
 
     func noteSystemWake() {
         powerLifecycleGate.noteSystemDidWake()
+        lineRecoveryConditions.noteSystemDidWake()
         underlayMonitor?.noteSystemWake()
+        parkedUnderlayMonitor?.noteSystemWake()
         resumeAutomaticReconnectRetryAfterWake()
+        armParkedTailTimer()
+        scheduleDeferredGrantIfNeeded()
     }
 
     func noteSystemSleep() {
         powerLifecycleGate.noteSystemWillSleep()
+        lineRecoveryConditions.noteSystemWillSleep()
         underlayMonitor?.noteSystemSleep()
+        parkedUnderlayMonitor?.noteSystemSleep()
         automaticReconnectRetryWorkItem?.cancel()
         automaticReconnectRetryWorkItem = nil
+        // Parked timers keep their due dates; no grant or attempt is made
+        // while asleep, and the full wake re-arms them.
+        parkedTailWorkItem?.cancel()
+        parkedTailWorkItem = nil
+        deferredGrantWorkItem?.cancel()
+        deferredGrantWorkItem = nil
     }
 
     private func checkExtensionReadiness(
@@ -1328,6 +1423,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                     "underlay_default_index":
                         NSNumber(value: underlay.defaultInterface.index),
                     "system_dns": underlay.systemDNSJSON as NSString,
+                    "underlay_path_identity":
+                        underlay.pathIdentity as NSString,
                     "transaction_id": transactionID as NSString,
                     "connection_report": connectionReport as NSString,
                 ]
@@ -2084,6 +2181,48 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
     }
 
+    /// 电源与 Underlay 条件不属于某笔事务，只发给当前已连接的 Provider；结果区分未连接
+    /// 与未确认，由发布者重发或续约。Provider 据此决定 Line 局部恢复能否消耗预算。
+    private func sendLineRecoveryConditions(
+        _ conditions: ProviderLineRecoveryConditions,
+        completion: @escaping (LineRecoveryConditionsDeliveryResult) -> Void
+    ) {
+        guard conditions.isValid,
+              let data = try? JSONEncoder().encode(conditions) else {
+            completion(.unacknowledged); return
+        }
+        if let manager, manager.connection.status != .connected {
+            completion(.providerNotConnected); return
+        }
+        let gate = HostCompletionGate<LineRecoveryConditionsDeliveryResult> { result in
+            completion((try? result.get()) ?? .unacknowledged)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            gate.finish(.success(.unacknowledged))
+        }
+        withExistingManager(purpose: .diagnostics) { result in
+            guard case let .success(manager?) = result,
+                  manager.connection.status == .connected,
+                  let session = manager.connection as? NETunnelProviderSession else {
+                gate.finish(.success(.providerNotConnected)); return
+            }
+            do {
+                try session.sendProviderMessage(data) { raw in
+                    guard let raw,
+                          raw.count <= ProviderLineRecoveryConditions.maxMessageBytes,
+                          let response = try? JSONDecoder().decode(
+                            ProviderLineRecoveryConditionsResponse.self, from: raw),
+                          response.source == conditions.source,
+                          response.sequence == conditions.sequence,
+                          response.delivered else {
+                        gate.finish(.success(.unacknowledged)); return
+                    }
+                    gate.finish(.success(.acknowledged))
+                }
+            } catch { gate.finish(.success(.unacknowledged)) }
+        }
+    }
+
     private func sendProviderDiagnostics(
         _ request: ProviderDiagnosticsRequest,
         timeout: TimeInterval,
@@ -2263,6 +2402,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     }
 
     private func publishStatus(for manager: NETransparentProxyManager) {
+        lineRecoveryConditions.noteProviderConnected(
+            manager.connection.status == .connected
+        )
         publishLatestReport()
         switch manager.connection.status {
         case .invalid, .disconnected:
@@ -2511,7 +2653,16 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         pendingInitialRetryTrigger = nil
         automaticReconnectInProgress = true
         automaticReconnectTrigger = .automaticConnection
+        automaticReconnectAttemptKind = nil
         automaticReconnectTransactionID = report.transactionID
+        automaticRecoveryOutcomeGate.await(report.transactionID)
+        automaticRecoveryLedger.beginEpisode(
+            in: recoveryEpoch(
+                scenarioID: report.scenario.id,
+                underlay: latestCapturedUnderlay ?? activeUnderlay
+            ),
+            at: Date()
+        )
         let reasonCode = report.error?.code ?? "launch-auto-connect-failed"
         let reasonMessage = report.error?.message
             ?? "Launch auto-connect failed"
@@ -2526,8 +2677,9 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             ? nil
             : incidentID
         appLog(
-            "Transparent Proxy launch auto-connect failed; "
-                + "entering bounded retry code=\(reasonCode)"
+            "Transparent Proxy launch auto-connect failed "
+                + "transaction=\(report.transactionID) code="
+                + ReconnectIncidentFailureCode.recordable(reasonCode)
         )
         return true
     }
@@ -2539,7 +2691,19 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     ) {
         automaticReconnectInProgress = true
         automaticReconnectTrigger = .unexpectedDisconnect
+        automaticReconnectAttemptKind = nil
         automaticReconnectTransactionID = nil
+        // The lost committed transaction's settled report opens the episode.
+        automaticRecoveryOutcomeGate.await(
+            report?.transactionID ?? currentTransactionID
+        )
+        automaticRecoveryLedger.beginEpisode(
+            in: recoveryEpoch(
+                scenarioID: report?.scenario.id ?? "",
+                underlay: activeUnderlay
+            ),
+            at: disconnectedAt
+        )
         let reasonCode = report?.error?.code
             ?? ConnectionFailureCode.providerSessionLost
         let reasonMessage = report?.error?.message
@@ -2782,10 +2946,14 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        automaticReconnectAttemptKind = nil
         pendingInitialRetryTrigger = nil
         automaticReconnectTransactionID = nil
         automaticReconnectUnderlayWaitEvidence = nil
         cancelAutomaticReconnectRetry(resetAttempts: false)
+        // A wake or slow-tail attempt that connected ends the parked epoch;
+        // its budget still needs five stable minutes to reset.
+        clearParkedRecovery()
         if isNewSession || stableConnectionResetWorkItem == nil {
             scheduleStableConnectionReset(
                 transactionID: report.transactionID
@@ -2798,7 +2966,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         transactionID: String
     ) {
         cancelStableConnectionReset(clearIncident: false)
-        guard automaticReconnectAttemptBudget.attemptsUsed > 0 else {
+        guard automaticRecoveryLedger.attemptsUsed > 0 else {
             stableResetIncidentID = nil
             return
         }
@@ -2819,7 +2987,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             else {
                 return
             }
-            self.automaticReconnectAttemptBudget.reset()
+            self.automaticRecoveryLedger.stableReset()
             if let incidentID {
                 ReconnectIncidentJournal.append(
                     incidentID: incidentID,
@@ -3024,18 +3192,30 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         else {
             return
         }
-        startUnderlayMonitoring(baseline: baseline)
+        startUnderlayMonitoring(
+            baseline: baseline,
+            committedBaseline: baseline
+        )
     }
 
+    /// `baseline` is the newest snapshot already handed to the epoch
+    /// pipeline, so the same sample is not reported twice. `committedBaseline`
+    /// is what the committed generation actually runs on; only it may prove
+    /// after a wake that the running state is still current. The two differ
+    /// while a candidate prepares and after an epoch failed to commit.
     private func startUnderlayMonitoring(
-        baseline: HostUnderlaySnapshot
+        baseline: HostUnderlaySnapshot,
+        committedBaseline: HostUnderlaySnapshot
     ) {
         guard underlayMonitor == nil,
               requestedProfileJSON != nil,
               startIntentID != nil else {
             return
         }
-        let monitor = HostUnderlayMonitor(baseline: baseline) {
+        let monitor = HostUnderlayMonitor(
+            baseline: baseline,
+            committedBaseline: committedBaseline
+        ) {
             [weak self] snapshot, connectivityRestored in
             self?.handleUnderlayChange(
                 snapshot,
@@ -3078,35 +3258,720 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         )
         // HostUnderlayMonitor has already stopped itself at this point. Start
         // a fresh observer from the newest sample so another physical change
-        // can supersede a candidate that is still preparing.
+        // can supersede a candidate that is still preparing. The committed
+        // generation keeps its own Underlay until a Switch commits; if this
+        // epoch fails, a full wake must not mistake the uncommitted sample
+        // for proof that the committed generation is current.
         underlayMonitor = nil
-        startUnderlayMonitoring(baseline: underlay)
+        startUnderlayMonitoring(
+            baseline: underlay,
+            committedBaseline: activeUnderlay ?? underlay
+        )
         underlayChangeHandler?(
             underlay.epochFingerprint,
             connectivityRestored
         )
     }
 
+    // MARK: - Parked automatic recovery
+
+    private func recoveryEpoch(
+        scenarioID: String,
+        underlay: HostUnderlaySnapshot?
+    ) -> AutomaticRecoveryEpoch {
+        AutomaticRecoveryEpoch(
+            scenarioID: scenarioID,
+            underlayFingerprint: underlay?.epochFingerprint ?? "",
+            connectivityGeneration:
+                automaticRecoveryLedger.connectivityGeneration
+        )
+    }
+
+    private var hostHoldsConnectionIntent: Bool {
+        requestedProfileJSON != nil && startIntentID != nil
+    }
+
+    /// The budget of this epoch ended with a network-related failure, or a
+    /// wake / slow-tail attempt inside the parked epoch failed again. The
+    /// runtime stays disconnected with takeover removed; the connection
+    /// intent and the open incident are kept.
+    private func enterParkedRecovery(
+        report: ConnectionReport,
+        failedAttempt: AutomaticRecoveryAttemptKind?,
+        originalTrigger: AutomaticReconnectTrigger?,
+        message: String?
+    ) -> Bool {
+        let now = Date()
+        let fallbackUnderlay = latestCapturedUnderlay ?? activeUnderlay
+        let singleAttempt = failedAttempt?.isSingleParkedAttempt == true
+        let epoch = singleAttempt
+            ? automaticRecoveryLedger.parking?.epoch
+                ?? recoveryEpoch(
+                    scenarioID: report.scenario.id,
+                    underlay: fallbackUnderlay
+                )
+            : recoveryEpoch(
+                scenarioID: report.scenario.id,
+                underlay: fallbackUnderlay
+            )
+        guard automaticRecoveryLedger.park(
+            epoch: epoch,
+            failure: report.error,
+            at: now
+        ) else {
+            return false
+        }
+        if !singleAttempt {
+            parkedRecoveryTrigger = originalTrigger ?? .automaticConnection
+            parkedUnderlay = fallbackUnderlay
+        }
+        if let incidentID = activeReconnectIncidentID {
+            switch failedAttempt {
+            case .wake?, .tail?:
+                let attempt: Int
+                if case let .tail(number)? = failedAttempt {
+                    attempt = number
+                } else {
+                    attempt = 0
+                }
+                ReconnectIncidentJournal.recordAttemptFailed(
+                    incidentID: incidentID,
+                    attempt: attempt,
+                    transactionID: report.transactionID,
+                    failureCode: report.error?.code
+                )
+            case .budget?, nil:
+                ReconnectIncidentJournal.recordParked(
+                    incidentID: incidentID,
+                    attemptsUsed: automaticRecoveryLedger.attemptsUsed,
+                    transactionID: report.transactionID,
+                    failureCode: report.error?.code
+                )
+            }
+        }
+        appLog(
+            "Transparent Proxy automatic reconnect parked "
+                + "after=\(failedAttempt?.name ?? "budget") "
+                + "attempts=\(automaticRecoveryLedger.attemptsUsed) "
+                + "tail=\(automaticRecoveryLedger.parking?.tailAttemptsUsed ?? 0) "
+                + "transaction=\(report.transactionID) code="
+                + ReconnectIncidentFailureCode.recordable(report.error?.code)
+        )
+        publishRuntimeStatus("disconnected", error: message)
+        captureParkedUnderlay(fallback: fallbackUnderlay)
+        return true
+    }
+
+    /// Re-sample after XDial's own attempt has rolled back, so the observer
+    /// and the parked epoch start from facts the attempt can no longer touch.
+    private func captureParkedUnderlay(
+        fallback: HostUnderlaySnapshot?
+    ) {
+        let token = UUID()
+        parkedUnderlayCaptureToken = token
+        HostUnderlayCapture.start { [weak self] result in
+            guard let self,
+                  self.parkedUnderlayCaptureToken == token,
+                  self.isAutomaticRecoveryParked else {
+                return
+            }
+            self.parkedUnderlayCaptureToken = nil
+            var baseline = fallback
+            if case let .success(snapshot) = result {
+                self.latestCapturedUnderlay = snapshot
+                self.automaticRecoveryLedger.absorbParkedUnderlay(
+                    fingerprint: snapshot.epochFingerprint
+                )
+                baseline = snapshot
+            }
+            if let baseline {
+                self.parkedUnderlay = baseline
+                self.startParkedUnderlayMonitoring(baseline: baseline)
+            }
+            self.scheduleParkedTail()
+            self.scheduleDeferredGrantIfNeeded()
+        }
+    }
+
+    private func startParkedUnderlayMonitoring(
+        baseline: HostUnderlaySnapshot
+    ) {
+        stopParkedUnderlayMonitoring()
+        guard isAutomaticRecoveryParked, hostHoldsConnectionIntent else {
+            return
+        }
+        let monitor = HostUnderlayMonitor(
+            baseline: baseline,
+            committedBaseline: parkedUnderlay ?? baseline
+        ) { [weak self] snapshot, connectivityRestored in
+            self?.handleParkedUnderlayChange(
+                snapshot,
+                connectivityRestored: connectivityRestored
+            )
+        }
+        parkedUnderlayMonitor = monitor
+        if powerLifecycleGate.defersNetworkWork {
+            monitor.noteSystemSleep()
+        }
+        monitor.start()
+    }
+
+    private func stopParkedUnderlayMonitoring() {
+        parkedUnderlayMonitor?.cancel()
+        parkedUnderlayMonitor = nil
+    }
+
+    /// The parked observer only reports host facts. AppState settles them in
+    /// the same quiet window as SSID and hands the epoch back through
+    /// `resumeParkedRecovery`, where the ledger decides.
+    private func handleParkedUnderlayChange(
+        _ underlay: HostUnderlaySnapshot,
+        connectivityRestored: Bool
+    ) {
+        guard isAutomaticRecoveryParked, hostHoldsConnectionIntent else {
+            return
+        }
+        latestCapturedUnderlay = underlay
+        var changeKinds = parkedUnderlay?
+            .differenceKinds(comparedTo: underlay)
+            ?? []
+        if connectivityRestored {
+            changeKinds.append("connectivity-restored")
+        }
+        appLog(
+            "Transparent Proxy underlay changed while automatic reconnect "
+                + "is parked "
+                + "\(parkedUnderlay?.defaultInterface.name ?? "unknown")"
+                + " -> \(underlay.defaultInterface.name) "
+                + "kinds=\(changeKinds.joined(separator: ",")); "
+                + "scheduling network epoch"
+        )
+        parkedUnderlayMonitor = nil
+        startParkedUnderlayMonitoring(baseline: underlay)
+        underlayChangeHandler?(
+            underlay.epochFingerprint,
+            connectivityRestored
+        )
+    }
+
+    /// A settled host network epoch while parked. Returns false when there
+    /// is no parked recovery to hand it to.
+    @discardableResult
+    func resumeParkedRecovery(
+        scenarioID: String,
+        underlayFingerprint: String,
+        connectivityRestored: Bool
+    ) -> Bool {
+        guard isAutomaticRecoveryParked else { return false }
+        let decision = automaticRecoveryLedger.resume(
+            .networkEpoch(connectivityRestored: connectivityRestored),
+            observed: AutomaticRecoveryObservation(
+                scenarioID: scenarioID,
+                underlayFingerprint: underlayFingerprint
+            ),
+            systemAsleep: powerLifecycleGate.defersNetworkWork,
+            at: Date()
+        )
+        applyParkedRecoveryDecision(decision, source: "network-epoch")
+        return true
+    }
+
+    /// A wake keeps exactly one attempt for an unchanged parked epoch; the
+    /// attempt's preparation upgrades it to a full budget when the settled
+    /// network turns out to have changed.
+    @discardableResult
+    func resumeParkedRecoveryAfterWake() -> Bool {
+        startParkedSingleAttempt(.wake)
+    }
+
+    /// Ends parking without an attempt, e.g. when the target Scenario was
+    /// removed from the Profile.
+    func endParkedRecovery(code: String) {
+        guard automaticRecoveryLedger.isParked else { return }
+        let wasAttempting = automaticReconnectInProgress
+        if wasAttempting {
+            automaticReconnectInProgress = false
+            automaticReconnectTrigger = nil
+            automaticReconnectAttemptKind = nil
+            automaticReconnectTransactionID = nil
+            automaticReconnectUnderlayWaitEvidence = nil
+            cancelAutomaticReconnectRetry(resetAttempts: false)
+        }
+        clearParkedRecovery()
+        if let incidentID = activeReconnectIncidentID {
+            ReconnectIncidentJournal.finish(
+                incidentID: incidentID,
+                outcome: "cancelled",
+                code: code
+            )
+        }
+        activeReconnectIncidentID = nil
+        appLog("Transparent Proxy parked automatic reconnect ended code=\(code)")
+        if wasAttempting || lastPublishedRuntimeStatus != "disconnected" {
+            publishRuntimeStatus("disconnected", error: nil)
+        }
+    }
+
+    private func applyParkedRecoveryDecision(
+        _ decision: AutomaticRecoveryDecision,
+        source: String
+    ) {
+        switch decision {
+        case let .grant(reason):
+            beginGrantedRecovery(reason)
+        case let .deferred(reason, notBefore):
+            if let incidentID = activeReconnectIncidentID {
+                ReconnectIncidentJournal.recordGrantDeferred(
+                    incidentID: incidentID,
+                    reason: reason,
+                    until: notBefore
+                )
+            }
+            appLog(
+                "Transparent Proxy parked reconnect grant deferred "
+                    + "source=\(source) reason=\(reason.rawValue) "
+                    + "until=\(ISO8601DateFormatter().string(from: notBefore))"
+            )
+            scheduleDeferredGrantIfNeeded()
+        case let .singleAttempt(kind):
+            appLog(
+                "Transparent Proxy parked reconnect ignored single "
+                    + "\(kind.name) attempt from source=\(source)"
+            )
+        case let .rejected(rejection):
+            appLog(
+                "Transparent Proxy parked reconnect not resumed "
+                    + "source=\(source) reason=\(rejection.rawValue)"
+            )
+        }
+    }
+
+    /// Leaves parking with a fresh budget. The attempts reuse the ordinary
+    /// retry path, including its Underlay wait and settled preparation.
+    private func beginGrantedRecovery(
+        _ reason: AutomaticRecoveryGrantReason
+    ) {
+        stopParkedUnderlayMonitoring()
+        cancelParkedTimers()
+        parkedUnderlayCaptureToken = nil
+        guard let failedTransactionID = currentTransactionID,
+              hostHoldsConnectionIntent,
+              manager != nil else {
+            appLog(
+                "Transparent Proxy granted reconnect budget has no "
+                    + "recoverable transaction reason=\(reason.rawValue)"
+            )
+            return
+        }
+        automaticReconnectInProgress = true
+        automaticReconnectTrigger = reason == .userRetry
+            ? parkedRecoveryTrigger ?? .automaticConnection
+            : .underlayChange
+        automaticReconnectAttemptKind = nil
+        parkedUnderlay = nil
+        if let incidentID = activeReconnectIncidentID {
+            ReconnectIncidentJournal.recordBudgetGranted(
+                incidentID: incidentID,
+                reason: reason
+            )
+        }
+        appLog(
+            "Transparent Proxy automatic reconnect budget granted "
+                + "reason=\(reason.rawValue) "
+                + "automatic-grants-last-hour="
+                + "\(automaticRecoveryLedger.rateLimitedGrantCount(at: Date()))"
+        )
+        publishRuntimeStatus("reconnecting", error: nil)
+        scheduleAutomaticReconnectRetry(
+            failedTransactionID: failedTransactionID,
+            failureCode: ConnectionReportJournal.read()?.error?.code,
+            delay: reason == .userRetry
+                ? 0
+                : automaticReconnectRetryPolicy.delayForNextAttempt(
+                    attemptsUsed: 0
+                ) ?? automaticReconnectRetryPolicy.underlayWaitRetryDelay
+        )
+    }
+
+    /// Starts a wake or slow-tail attempt inside the parked epoch. Its kind
+    /// is provisional until preparation compares the settled facts with the
+    /// parked epoch.
+    @discardableResult
+    private func startParkedSingleAttempt(
+        _ trigger: AutomaticRecoveryResumeTrigger
+    ) -> Bool {
+        guard isAutomaticRecoveryParked,
+              !powerLifecycleGate.defersNetworkWork,
+              automaticReconnectRetryToken == nil,
+              automaticReconnectPreparationGate.token == nil,
+              let failedTransactionID = currentTransactionID,
+              hostHoldsConnectionIntent,
+              manager != nil else {
+            return false
+        }
+        let kind: AutomaticRecoveryAttemptKind
+        switch trigger {
+        case .wake:
+            kind = .wake
+        case .slowTail:
+            guard automaticRecoveryLedger.nextTailDelay != nil else {
+                return false
+            }
+            kind = .tail(
+                (automaticRecoveryLedger.parking?.tailAttemptsUsed ?? 0) + 1
+            )
+        case .networkEpoch:
+            return false
+        }
+        stopParkedUnderlayMonitoring()
+        parkedTailWorkItem?.cancel()
+        parkedTailWorkItem = nil
+        parkedTailAt = nil
+        parkedUnderlayCaptureToken = nil
+        automaticReconnectInProgress = true
+        automaticReconnectTrigger =
+            parkedRecoveryTrigger ?? .automaticConnection
+        automaticReconnectAttemptKind = nil
+        appLog(
+            "Transparent Proxy parked automatic reconnect "
+                + "\(kind.name) attempt preparing"
+        )
+        publishRuntimeStatus("reconnecting", error: nil)
+        scheduleAutomaticReconnectRetry(
+            failedTransactionID: failedTransactionID,
+            delay: 0,
+            recordSchedule: false,
+            kind: kind
+        )
+        return true
+    }
+
+    /// Resolves the attempt kind once its preparation settled. A changed
+    /// epoch upgrades a wake / tail attempt to budget attempt 1; a rejected
+    /// one returns to parking without starting a transaction.
+    private func resolvePreparedAttemptKind(
+        _ kind: AutomaticRecoveryAttemptKind,
+        prepared: AutomaticReconnectPreparation
+    ) -> AutomaticRecoveryAttemptKind? {
+        guard kind.isSingleParkedAttempt else { return kind }
+        let deferredBefore = automaticRecoveryLedger.parking?.deferredGrant
+        let decision = automaticRecoveryLedger.resume(
+            kind == .wake ? .wake : .slowTail,
+            observed: AutomaticRecoveryObservation(
+                scenarioID: prepared.scenarioID,
+                underlayFingerprint: prepared.underlayFingerprint
+            ),
+            systemAsleep: powerLifecycleGate.defersNetworkWork,
+            at: Date()
+        )
+        switch decision {
+        case let .grant(reason):
+            cancelParkedTimers()
+            automaticReconnectTrigger = .underlayChange
+            parkedUnderlay = nil
+            if let incidentID = activeReconnectIncidentID {
+                ReconnectIncidentJournal.recordBudgetGranted(
+                    incidentID: incidentID,
+                    reason: reason
+                )
+            }
+            appLog(
+                "Transparent Proxy parked \(kind.name) attempt found a new "
+                    + "epoch; budget granted reason=\(reason.rawValue)"
+            )
+            return automaticRecoveryLedger.nextAttempt.map {
+                AutomaticRecoveryAttemptKind.budget($0)
+            }
+        case let .singleAttempt(resolved):
+            if let deferred = automaticRecoveryLedger.parking?.deferredGrant,
+               deferred != deferredBefore {
+                if let incidentID = activeReconnectIncidentID {
+                    ReconnectIncidentJournal.recordGrantDeferred(
+                        incidentID: incidentID,
+                        reason: deferred.reason,
+                        until: deferred.notBefore
+                    )
+                }
+            }
+            return resolved
+        case .deferred:
+            return kind
+        case let .rejected(rejection):
+            appLog(
+                "Transparent Proxy parked \(kind.name) attempt not started "
+                    + "reason=\(rejection.rawValue)"
+            )
+            returnToParkingWithoutAttempt()
+            return nil
+        }
+    }
+
+    /// A scheduled attempt cannot start because the host's current
+    /// transaction is no longer the one it was scheduled after. A wake /
+    /// tail attempt simply returns to parking; a budget step is decided by
+    /// the transaction that is current now, so recovery cannot hang waiting
+    /// for an attempt that never gets its own transaction.
+    private func abandonScheduledAttempt(
+        _ kind: AutomaticRecoveryAttemptKind
+    ) {
+        guard automaticReconnectInProgress else { return }
+        appLog(
+            "Transparent Proxy automatic reconnect \(kind.name) attempt "
+                + "abandoned before its transaction; current="
+                + (currentTransactionID ?? "none")
+        )
+        if kind.isSingleParkedAttempt, automaticRecoveryLedger.isParked {
+            returnToParkingWithoutAttempt()
+            return
+        }
+        automaticRecoveryOutcomeGate.await(currentTransactionID)
+        handleAutomaticReconnectAfterDisconnect(
+            report: ConnectionReportJournal.read()
+        )
+    }
+
+    /// The attempt failed on the host before its transaction existed (its
+    /// plan or journal could not be created). No report describes it, so
+    /// the previous attempt's failed report must not decide; a plan that
+    /// cannot be built is a configuration-class stop.
+    private func failAutomaticRecoveryBeforeTransaction(
+        _ error: Error,
+        attempt: AutomaticRecoveryAttemptKind
+    ) {
+        appLog(
+            "Transparent Proxy automatic reconnect \(attempt.name) attempt "
+                + "could not create its transaction: "
+                + error.localizedDescription
+        )
+        automaticReconnectInProgress = false
+        automaticReconnectTrigger = nil
+        automaticReconnectAttemptKind = nil
+        automaticReconnectTransactionID = nil
+        automaticReconnectUnderlayWaitEvidence = nil
+        networkExtensionSessionTransactionID = nil
+        cancelAutomaticReconnectRetry(resetAttempts: false)
+        clearParkedRecovery()
+        if let incidentID = activeReconnectIncidentID {
+            ReconnectIncidentJournal.finish(
+                incidentID: incidentID,
+                outcome: "failed",
+                code: "host-start-failed",
+                message: error.localizedDescription
+            )
+        }
+        activeReconnectIncidentID = nil
+        publishRuntimeStatus(
+            "disconnected",
+            error: error.localizedDescription
+        )
+    }
+
+    private func returnToParkingWithoutAttempt() {
+        automaticReconnectInProgress = false
+        automaticReconnectTrigger = nil
+        automaticReconnectAttemptKind = nil
+        automaticReconnectTransactionID = nil
+        automaticReconnectUnderlayWaitEvidence = nil
+        cancelAutomaticReconnectRetry(resetAttempts: false)
+        guard automaticRecoveryLedger.isParked else {
+            publishRuntimeStatus("disconnected", error: nil)
+            return
+        }
+        publishRuntimeStatus(
+            "disconnected",
+            error: ConnectionReportJournal.read()?.error?.message
+        )
+        // No transaction ran, so there is nothing of XDial's to absorb.
+        // Resume observing from the parked epoch's own Underlay: a network
+        // that changed meanwhile (for example across sleep) is then reported
+        // as a host epoch and earns its full budget.
+        guard let parkedUnderlay else {
+            captureParkedUnderlay(fallback: nil)
+            return
+        }
+        startParkedUnderlayMonitoring(baseline: parkedUnderlay)
+        scheduleParkedTail()
+        scheduleDeferredGrantIfNeeded()
+    }
+
+    private func scheduleParkedTail() {
+        parkedTailWorkItem?.cancel()
+        parkedTailWorkItem = nil
+        guard isAutomaticRecoveryParked,
+              let delay = automaticRecoveryLedger.nextTailDelay else {
+            parkedTailAt = nil
+            return
+        }
+        parkedTailAt = Date().addingTimeInterval(delay)
+        armParkedTailTimer()
+    }
+
+    private func armParkedTailTimer() {
+        parkedTailWorkItem?.cancel()
+        parkedTailWorkItem = nil
+        guard let parkedTailAt,
+              isAutomaticRecoveryParked,
+              !powerLifecycleGate.defersNetworkWork else {
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.parkedTailWorkItem = nil
+            guard self.parkedTailAt == parkedTailAt else { return }
+            if !self.startParkedSingleAttempt(.slowTail) {
+                // Busy with another attempt; re-parking reschedules.
+                self.parkedTailAt = nil
+            }
+        }
+        parkedTailWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0, parkedTailAt.timeIntervalSinceNow),
+            execute: work
+        )
+    }
+
+    private func scheduleDeferredGrantIfNeeded() {
+        deferredGrantWorkItem?.cancel()
+        deferredGrantWorkItem = nil
+        guard isAutomaticRecoveryParked,
+              !powerLifecycleGate.defersNetworkWork,
+              let deferred = automaticRecoveryLedger.parking?.deferredGrant
+        else {
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.deferredGrantWorkItem = nil
+            guard self.isAutomaticRecoveryParked else { return }
+            self.applyParkedRecoveryDecision(
+                self.automaticRecoveryLedger.reevaluateDeferredGrant(
+                    systemAsleep: self.powerLifecycleGate.defersNetworkWork,
+                    at: Date()
+                ),
+                source: "deferred-grant"
+            )
+        }
+        deferredGrantWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now()
+                + max(0, deferred.notBefore.timeIntervalSinceNow),
+            execute: work
+        )
+    }
+
+    private func cancelParkedTimers() {
+        parkedTailWorkItem?.cancel()
+        parkedTailWorkItem = nil
+        parkedTailAt = nil
+        deferredGrantWorkItem?.cancel()
+        deferredGrantWorkItem = nil
+    }
+
+    private func clearParkedRecovery() {
+        stopParkedUnderlayMonitoring()
+        cancelParkedTimers()
+        parkedUnderlayCaptureToken = nil
+        parkedUnderlay = nil
+        parkedRecoveryTrigger = nil
+        automaticRecoveryLedger.endParking()
+    }
+
+    /// Quitting ends a parked recovery; close its incident so the journal
+    /// does not keep an open "parked" record for a process that is gone.
+    @objc private func applicationWillTerminate(_ notification: Notification) {
+        guard automaticRecoveryLedger.isParked else { return }
+        clearParkedRecovery()
+        if let incidentID = activeReconnectIncidentID {
+            ReconnectIncidentJournal.finish(
+                incidentID: incidentID,
+                outcome: "cancelled",
+                code: "application-quit"
+            )
+        }
+        activeReconnectIncidentID = nil
+    }
+
+    // MARK: - Stale committed generation
+
+    /// After an automatic network epoch's Switch finally failed, reports
+    /// whether the still-committed generation's default interface is absent
+    /// from the current Underlay. Only a successful capture of the same
+    /// settled epoch counts as evidence.
+    func committedDefaultInterfaceIsAbsent(
+        expectedUnderlayFingerprint: String,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard manager?.connection.status == .connected,
+              let committed = activeUnderlay,
+              let transactionID = currentTransactionID,
+              activeScenarioSwitch == nil,
+              !automaticReconnectInProgress else {
+            completion(false)
+            return
+        }
+        HostUnderlayCapture.start { [weak self] result in
+            guard let self,
+                  case let .success(snapshot) = result,
+                  snapshot.epochFingerprint == expectedUnderlayFingerprint,
+                  self.currentTransactionID == transactionID,
+                  self.manager?.connection.status == .connected,
+                  self.activeScenarioSwitch == nil,
+                  !self.automaticReconnectInProgress else {
+                completion(false)
+                return
+            }
+            self.latestCapturedUnderlay = snapshot
+            let absent = StaleCommittedGenerationPolicy.shouldEscalate(
+                switchFinallyFailed: true,
+                automaticEpoch: true,
+                committedDefaultInterface: .init(
+                    name: committed.defaultInterface.name,
+                    index: committed.defaultInterface.index
+                ),
+                currentInterfaces: snapshot.interfaces.map {
+                    .init(name: $0.name, index: $0.index)
+                }
+            )
+            if absent {
+                appLog(
+                    "Transparent Proxy committed generation default "
+                        + committed.defaultInterface.name
+                        + " is absent from the current Underlay "
+                        + "(default \(snapshot.defaultInterface.name)) "
+                        + "transaction=\(transactionID)"
+                )
+            }
+            completion(absent)
+        }
+    }
+
+    /// An attempt is scheduled (possibly held across sleep) or its Underlay
+    /// capture / settled preparation is running; it has no transaction yet.
+    private var automaticRecoveryAttemptPending: Bool {
+        automaticReconnectRetryToken != nil
+            || automaticReconnectPreparationGate.token != nil
+    }
+
     private func handleAutomaticReconnectAfterDisconnect(
         report: ConnectionReport?
     ) {
-        guard automaticReconnectInProgress else { return }
-        guard
-            let report,
-            report.transactionID == currentTransactionID
-        else {
+        switch automaticRecoveryOutcomeGate.decide(
+            recoveryInProgress: automaticReconnectInProgress,
+            attemptPending: automaticRecoveryAttemptPending,
+            report: report,
+            currentTransactionID: currentTransactionID
+        ) {
+        case .notRecovering:
+            return
+        case .awaitOutcome:
             publishRuntimeStatus("reconnecting", error: nil)
             return
+        case .attemptOutcome:
+            break
         }
-        guard [.failed, .cancelled].contains(report.state) else {
-            publishRuntimeStatus("reconnecting", error: nil)
-            return
-        }
-        guard report.rollbackComplete,
-              report.systemTakeoverRemoved else {
-            publishRuntimeStatus("reconnecting", error: nil)
-            return
-        }
+        guard let report else { return }
+        // Consumed: a duplicate of this report decides nothing further.
+        automaticRecoveryOutcomeGate.reset()
         guard let trigger = automaticReconnectTrigger else {
             finishAutomaticReconnect(
                 report: report,
@@ -3114,14 +3979,19 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             )
             return
         }
-        if let delay = automaticReconnectRetryPolicy.delay(
+        // A wake or slow-tail attempt is a single attempt inside the parked
+        // epoch; its failure re-parks instead of opening budget retries.
+        if automaticReconnectAttemptKind?.isSingleParkedAttempt != true,
+           let delay = automaticReconnectRetryPolicy.delay(
             after: report,
-            attemptsUsed: automaticReconnectAttemptBudget.attemptsUsed,
+            attemptsUsed: automaticRecoveryLedger.attemptsUsed,
             trigger: trigger
         ) {
             scheduleAutomaticReconnectRetry(
                 failedTransactionID: report.transactionID,
-                delay: delay
+                failureCode: report.error?.code,
+                delay: delay,
+                outcomeReport: report
             )
             publishRuntimeStatus("reconnecting", error: nil)
             return
@@ -3133,43 +4003,62 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         )
     }
 
+    /// Schedules the next attempt. Without an explicit `kind` it is the next
+    /// budget attempt; an Underlay wait reschedules the same kind, so waiting
+    /// never consumes budget nor turns a wake / tail attempt into a budget one.
     private func scheduleAutomaticReconnectRetry(
         failedTransactionID: String,
+        failureCode: String? = nil,
         delay: TimeInterval,
-        recordSchedule: Bool = true
+        recordSchedule: Bool = true,
+        kind requestedKind: AutomaticRecoveryAttemptKind? = nil,
+        outcomeReport: ConnectionReport? = nil
     ) {
         guard automaticReconnectRetryWorkItem == nil,
               automaticReconnectRetryToken == nil,
               automaticReconnectPreparationGate.token == nil else {
             return
         }
-        guard let retryNumber =
-            automaticReconnectAttemptBudget.nextAttempt else {
-            finishAutomaticReconnect(
-                report: ConnectionReportJournal.read(),
-                message: ConnectionReportJournal.read()?.error?.message
-            )
-            return
+        let kind: AutomaticRecoveryAttemptKind
+        if let requestedKind {
+            kind = requestedKind
+        } else {
+            guard let retryNumber =
+                automaticRecoveryLedger.nextAttempt else {
+                // No budget left for the failure just decided (or for the
+                // episode that just opened in an exhausted epoch).
+                let report = outcomeReport ?? ConnectionReportJournal.read()
+                finishAutomaticReconnect(
+                    report: report,
+                    message: report?.error?.message
+                )
+                return
+            }
+            kind = .budget(retryNumber)
         }
-        if recordSchedule, let incidentID = activeReconnectIncidentID {
-            ReconnectIncidentJournal.append(
-                incidentID: incidentID,
-                type: "retry-scheduled",
-                attempt: retryNumber,
-                transactionID: failedTransactionID,
-                message: "Retry scheduled after \(delay)s"
-            )
-        }
-        if recordSchedule {
+        automaticRecoveryOutcomeGate.attemptScheduled()
+        if recordSchedule,
+           case let .budget(retryNumber) = kind {
+            if let incidentID = activeReconnectIncidentID {
+                ReconnectIncidentJournal.recordRetryScheduled(
+                    incidentID: incidentID,
+                    attempt: retryNumber,
+                    failedTransactionID: failedTransactionID,
+                    failureCode: failureCode,
+                    delay: delay
+                )
+            }
             appLog(
                 "Transparent Proxy automatic reconnect retry "
-                    + "\(retryNumber) scheduled after \(delay)s"
+                    + "\(retryNumber) scheduled after \(delay)s "
+                    + "failed-transaction=\(failedTransactionID) code="
+                    + ReconnectIncidentFailureCode.recordable(failureCode)
             )
         }
         let token = UUID()
         automaticReconnectRetryToken = token
         automaticReconnectRetryAt = Date().addingTimeInterval(delay)
-        automaticReconnectRetryAttempt = retryNumber
+        automaticReconnectRetryKind = kind
         automaticReconnectRetryFailedTransactionID =
             failedTransactionID
         let work = DispatchWorkItem { [weak self] in
@@ -3185,13 +4074,20 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         )
     }
 
+    /// "Retry now": runs a scheduled retry immediately, or — while parked —
+    /// grants a fresh user budget and starts its first attempt at once.
     @discardableResult
     func retryAutomaticReconnectNow() -> Bool {
-        guard !powerLifecycleGate.defersNetworkWork,
-              let token = automaticReconnectRetryToken else {
-            return false
+        guard !powerLifecycleGate.defersNetworkWork else { return false }
+        if let token = automaticReconnectRetryToken {
+            performScheduledAutomaticReconnectRetry(token: token)
+            return true
         }
-        performScheduledAutomaticReconnectRetry(token: token)
+        guard isAutomaticRecoveryParked else { return false }
+        applyParkedRecoveryDecision(
+            automaticRecoveryLedger.userRetry(at: Date()),
+            source: "user"
+        )
         return true
     }
 
@@ -3202,7 +4098,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             automaticReconnectRetryToken == token,
             let failedTransactionID =
                 automaticReconnectRetryFailedTransactionID,
-            let retryNumber = automaticReconnectRetryAttempt
+            let scheduledKind = automaticReconnectRetryKind
         else {
             return
         }
@@ -3213,15 +4109,19 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         }
         automaticReconnectRetryToken = nil
         automaticReconnectRetryAt = nil
-        automaticReconnectRetryAttempt = nil
+        automaticReconnectRetryKind = nil
         automaticReconnectRetryFailedTransactionID = nil
+        guard automaticReconnectInProgress else { return }
         guard
-            automaticReconnectInProgress,
             currentTransactionID == failedTransactionID,
             requestedProfileJSON != nil,
             let manager,
-            startIntentID != nil,
-            let preparationID = automaticReconnectPreparationGate.begin()
+            startIntentID != nil
+        else {
+            abandonScheduledAttempt(scheduledKind)
+            return
+        }
+        guard let preparationID = automaticReconnectPreparationGate.begin()
         else {
             return
         }
@@ -3244,7 +4144,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                       let handler = self.automaticReconnectPreparationHandler else {
                     self.rescheduleAutomaticReconnectPreparation(
                         preparationID: preparationID,
-                        failedTransactionID: failedTransactionID
+                        failedTransactionID: failedTransactionID,
+                        kind: scheduledKind
                     )
                     return
                 }
@@ -3254,8 +4155,14 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                           self.automaticReconnectPreparationGate
                             .isCurrent(preparationID),
                           self.startIntentID == intentID,
-                          self.currentTransactionID == failedTransactionID,
                           self.automaticReconnectInProgress else {
+                        return
+                    }
+                    guard self.currentTransactionID == failedTransactionID
+                    else {
+                        _ = self.automaticReconnectPreparationGate
+                            .finish(preparationID)
+                        self.abandonScheduledAttempt(scheduledKind)
                         return
                     }
                     guard !self.powerLifecycleGate.defersNetworkWork,
@@ -3265,7 +4172,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                             == prepared.underlayFingerprint else {
                         self.rescheduleAutomaticReconnectPreparation(
                             preparationID: preparationID,
-                            failedTransactionID: failedTransactionID
+                            failedTransactionID: failedTransactionID,
+                            kind: scheduledKind
                         )
                         return
                     }
@@ -3274,11 +4182,26 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                     guard self.automaticReconnectPreparationGate
                         .finish(preparationID) else { return }
                     self.automaticReconnectUnderlayWaitEvidence = nil
-                    self.requestedProfileJSON = prepared.profileJSON
-                    guard self.automaticReconnectAttemptBudget.recordStarted(
-                        retryNumber
+                    guard let attemptKind = self.resolvePreparedAttemptKind(
+                        scheduledKind,
+                        prepared: prepared
                     ) else {
                         return
+                    }
+                    self.requestedProfileJSON = prepared.profileJSON
+                    switch attemptKind {
+                    case let .budget(retryNumber):
+                        guard self.automaticRecoveryLedger.recordStarted(
+                            retryNumber
+                        ) else {
+                            self.abandonScheduledAttempt(attemptKind)
+                            return
+                        }
+                    case .tail:
+                        self.automaticRecoveryLedger
+                            .recordTailAttemptStarted()
+                    case .wake:
+                        break
                     }
                     do {
                         let transactionID = try self.beginTransaction(
@@ -3286,13 +4209,26 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                         )
                         self.automaticReconnectTransactionID =
                             transactionID
+                        self.automaticReconnectAttemptKind = attemptKind
+                        // From here only this transaction's settled report
+                        // is the attempt's outcome.
+                        self.automaticRecoveryOutcomeGate.await(transactionID)
                         if let incidentID = self.activeReconnectIncidentID {
-                            ReconnectIncidentJournal.append(
-                                incidentID: incidentID,
-                                type: "retry-started",
-                                attempt: retryNumber,
-                                transactionID: transactionID
-                            )
+                            if case let .budget(retryNumber) = attemptKind {
+                                ReconnectIncidentJournal.append(
+                                    incidentID: incidentID,
+                                    type: "retry-started",
+                                    attempt: retryNumber,
+                                    transactionID: transactionID
+                                )
+                            } else {
+                                ReconnectIncidentJournal
+                                    .recordSingleAttemptStarted(
+                                        incidentID: incidentID,
+                                        kind: attemptKind,
+                                        transactionID: transactionID
+                                    )
+                            }
                         }
                         self.updateReport(transactionID: transactionID) {
                             $0.updateTask(
@@ -3302,12 +4238,16 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                             $0.setState(.preparing)
                         }
                     } catch {
-                        self.publishFailure(error)
+                        self.failAutomaticRecoveryBeforeTransaction(
+                            error,
+                            attempt: attemptKind
+                        )
                         return
                     }
                     appLog(
-                        "Transparent Proxy automatic reconnect retry "
-                            + "\(retryNumber) captured default="
+                        "Transparent Proxy automatic reconnect "
+                            + "\(attemptKind.name) attempt "
+                            + "\(Self.attemptNumber(attemptKind)) captured default="
                             + stableSnapshot.defaultInterface.name
                     )
                     self.publishRuntimeStatus("reconnecting", error: nil)
@@ -3334,9 +4274,19 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                     failedTransactionID: failedTransactionID,
                     delay: self.automaticReconnectRetryPolicy
                         .underlayWaitRetryDelay,
-                    recordSchedule: false
+                    recordSchedule: false,
+                    kind: scheduledKind
                 )
             }
+        }
+    }
+
+    private static func attemptNumber(
+        _ kind: AutomaticRecoveryAttemptKind
+    ) -> Int {
+        switch kind {
+        case let .budget(number), let .tail(number): number
+        case .wake: 0
         }
     }
 
@@ -3361,7 +4311,8 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
 
     private func rescheduleAutomaticReconnectPreparation(
         preparationID: UUID,
-        failedTransactionID: String
+        failedTransactionID: String,
+        kind: AutomaticRecoveryAttemptKind
     ) {
         guard automaticReconnectPreparationGate.finish(preparationID) else {
             return
@@ -3369,14 +4320,15 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         scheduleAutomaticReconnectRetry(
             failedTransactionID: failedTransactionID,
             delay: automaticReconnectRetryPolicy.underlayWaitRetryDelay,
-            recordSchedule: false
+            recordSchedule: false,
+            kind: kind
         )
     }
 
     private func resumeAutomaticReconnectRetryAfterWake() {
         guard automaticReconnectRetryWorkItem == nil,
               let token = automaticReconnectRetryToken,
-              automaticReconnectRetryAttempt != nil,
+              automaticReconnectRetryKind != nil,
               automaticReconnectRetryFailedTransactionID != nil else {
             return
         }
@@ -3398,21 +4350,64 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         report: ConnectionReport?,
         message: String?
     ) {
+        // Exhausted only when the last failure would still have qualified; a
+        // terminal or unknown code stops the recovery even on the last attempt.
+        let failureQualified = report.map { report in
+            automaticReconnectTrigger.map {
+                automaticReconnectRetryPolicy.qualifies(report, trigger: $0)
+            } ?? false
+        } ?? true
+        let failedAttempt = automaticReconnectAttemptKind
+        let singleParkedAttempt =
+            failedAttempt?.isSingleParkedAttempt == true
         let exhausted =
-            automaticReconnectAttemptBudget.attemptsUsed
-                >= automaticReconnectRetryPolicy.maxAttempts
+            automaticRecoveryLedger.isExhausted
+                && failureQualified
+                && !singleParkedAttempt
+        let originalTrigger = automaticReconnectTrigger
+        let failureCode = report?.error?.code ?? ""
+        appLog(
+            "Transparent Proxy automatic reconnect "
+                + (exhausted
+                    ? "exhausted"
+                    : singleParkedAttempt
+                        ? "\(failedAttempt?.name ?? "single") attempt failed"
+                        : "stopped")
+                + " attempts=\(automaticRecoveryLedger.attemptsUsed)"
+                + " transaction=\(report?.transactionID ?? "")"
+                + " code="
+                + ReconnectIncidentFailureCode.recordable(failureCode)
+        )
         automaticReconnectInProgress = false
         automaticReconnectTrigger = nil
+        automaticReconnectAttemptKind = nil
         automaticReconnectTransactionID = nil
         automaticReconnectUnderlayWaitEvidence = nil
         networkExtensionSessionTransactionID = nil
         cancelAutomaticReconnectRetry(resetAttempts: false)
+        // A network-related failure that used up the epoch's budget, or that
+        // ended a wake / tail attempt inside the parked epoch, parks with the
+        // intent kept. Identity, configuration and unclassified failures stop
+        // here with their own error and end any parking.
+        if failureQualified,
+           exhausted || singleParkedAttempt,
+           hostHoldsConnectionIntent,
+           let report,
+           enterParkedRecovery(
+               report: report,
+               failedAttempt: failedAttempt,
+               originalTrigger: originalTrigger,
+               message: message
+           ) {
+            return
+        }
+        clearParkedRecovery()
         if let incidentID = activeReconnectIncidentID {
             ReconnectIncidentJournal.finish(
                 incidentID: incidentID,
                 outcome: exhausted ? "exhausted" : "failed",
                 transactionID: report?.transactionID ?? "",
-                code: report?.error?.code ?? "",
+                code: failureCode,
                 message: message ?? ""
             )
         }
@@ -3431,10 +4426,11 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         automaticReconnectRetryWorkItem = nil
         automaticReconnectRetryToken = nil
         automaticReconnectRetryAt = nil
-        automaticReconnectRetryAttempt = nil
+        automaticReconnectRetryKind = nil
         automaticReconnectRetryFailedTransactionID = nil
+        automaticRecoveryOutcomeGate.reset()
         if resetAttempts {
-            automaticReconnectAttemptBudget.reset()
+            automaticRecoveryLedger.stableReset()
         }
     }
 
@@ -3579,45 +4575,31 @@ private struct HostUnderlaySnapshot {
     let interfaces: [HostPathInterfaceSnapshot]
     let interfacesJSON: String
     let systemDNSJSON: String
+    /// Comparison facts sampled together with the snapshot above. The
+    /// Provider receives only the opaque `pathIdentity`, never these facts.
+    let identity: HostUnderlayIdentity
 
     /// Exact canonical identity for coalescing host notifications. This value
     /// is never logged, persisted, sent to Provider, or exposed by Debug.
     var epochFingerprint: String {
-        ([
-            "\(defaultInterface.index):\(defaultInterface.name)",
-            canonicalInterfaceKeys.joined(separator: ","),
-            systemDNSJSON,
-        ]).joined(separator: "\u{1F}")
+        identity.epochFingerprint
+    }
+
+    /// Opaque equality token for the default path (interface, its IPv4
+    /// addresses, default routers). The Provider compares it across
+    /// generations to decide whether established TCP flows remain valid.
+    var pathIdentity: String {
+        identity.pathIdentity
     }
 
     func isEquivalent(to other: HostUnderlaySnapshot) -> Bool {
-        defaultInterface.name == other.defaultInterface.name
-            && defaultInterface.index == other.defaultInterface.index
-            && canonicalInterfaceKeys == other.canonicalInterfaceKeys
-            && systemDNSJSON == other.systemDNSJSON
+        identity == other.identity
     }
 
     func differenceKinds(
         comparedTo other: HostUnderlaySnapshot
     ) -> [String] {
-        var kinds: [String] = []
-        if defaultInterface.name != other.defaultInterface.name
-            || defaultInterface.index != other.defaultInterface.index {
-            kinds.append("default-interface")
-        }
-        if canonicalInterfaceKeys != other.canonicalInterfaceKeys {
-            kinds.append("interface-set")
-        }
-        if systemDNSJSON != other.systemDNSJSON {
-            kinds.append("system-dns")
-        }
-        return kinds
-    }
-
-    private var canonicalInterfaceKeys: [String] {
-        interfaces.map {
-            "\($0.index):\($0.name):\($0.type)"
-        }.sorted()
+        identity.differenceKinds(comparedTo: other.identity)
     }
 }
 
@@ -3637,8 +4619,7 @@ private struct HostUnderlayCaptureError: LocalizedError {
 private final class HostUnderlayCapture {
     private let monitor = NWPathMonitor()
     private let completion: (Result<HostUnderlaySnapshot, Error>) -> Void
-    private var finished = false
-    private var latestEvidence: HostUnderlayCaptureEvidence?
+    private var resolution = HostUnderlayCaptureResolution()
 
     private init(
         completion: @escaping (
@@ -3665,12 +4646,12 @@ private final class HostUnderlayCapture {
         }
         monitor.start(queue: .global(qos: .userInitiated))
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [self] in
-            let evidence = latestEvidence ?? .missingPathUpdate
+            guard let evidence = resolution.expire() else { return }
             appLog(
                 "Transparent Proxy host Underlay capture timed out "
                     + evidence.logSummary
             )
-            finish(.failure(HostUnderlayCaptureError(
+            deliver(.failure(HostUnderlayCaptureError(
                 evidence: evidence
             )))
         }
@@ -3679,7 +4660,7 @@ private final class HostUnderlayCapture {
     private func consume(_ path: Network.NWPath) {
         let evaluation = Self.evaluateSnapshot(for: path)
         if let evidence = evaluation.evidence {
-            latestEvidence = evidence
+            resolution.observe(evidence)
         }
         guard let result = evaluation.result else { return }
         finish(result)
@@ -3767,20 +4748,156 @@ private final class HostUnderlayCapture {
                 )
             )
         }
+        guard let interfaceAddresses = Self.captureInterfaceAddresses() else {
+            // 地址快照缺失不能当作“默认接口没有地址”，否则会伪造一次换网。
+            return HostUnderlaySnapshotEvaluation(
+                result: nil,
+                evidence: HostUnderlayCaptureEvidence(
+                    schemaVersion: 1,
+                    reason: .snapshotEncodingFailed,
+                    pathStatus: pathStatus,
+                    routeInterface: routeInterfaceName,
+                    candidateInterfaces: candidateNames,
+                    invalidCandidateInterfaces: [],
+                    routeError: "interface address snapshot failed"
+                )
+            )
+        }
         guard let systemDNSJSON = Self.captureSystemDNSJSON() else {
             return HostUnderlaySnapshotEvaluation(
                 result: .failure(ManagerError.systemDNSUnavailable),
                 evidence: nil
             )
         }
+        let identity = HostUnderlayIdentity(
+            defaultInterface: HostUnderlayIdentity.Interface(
+                name: defaultInterface.name,
+                index: defaultInterface.index,
+                type: defaultInterface.type
+            ),
+            interfaces: interfaces.map {
+                HostUnderlayIdentity.Interface(
+                    name: $0.name,
+                    index: $0.index,
+                    type: $0.type
+                )
+            },
+            systemDNSJSON: systemDNSJSON,
+            interfaceAddresses: interfaceAddresses,
+            routers: Self.captureDefaultRouters()
+        )
         return HostUnderlaySnapshotEvaluation(
             result: .success(HostUnderlaySnapshot(
                 defaultInterface: defaultInterface,
                 interfaces: interfaces,
                 interfacesJSON: interfacesJSON,
-                systemDNSJSON: systemDNSJSON
+                systemDNSJSON: systemDNSJSON,
+                identity: identity
             )),
             evidence: nil
+        )
+    }
+
+    /// Kernel interface addresses at the same sampling point as the default
+    /// route and NWPath. `HostUnderlayIdentity` keeps only what identifies the
+    /// default path; this reader does not filter by interface name or type.
+    private static func captureInterfaceAddresses()
+        -> [HostInterfaceAddressFact]?
+    {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0 else {
+            return nil
+        }
+        guard let first = head else {
+            return []
+        }
+        defer { freeifaddrs(head) }
+        var facts: [HostInterfaceAddressFact] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor {
+            defer { cursor = entry.pointee.ifa_next }
+            guard let socketAddress = entry.pointee.ifa_addr else {
+                continue
+            }
+            let name = String(cString: entry.pointee.ifa_name)
+            switch Int32(socketAddress.pointee.sa_family) {
+            case AF_INET:
+                var buffer = [CChar](
+                    repeating: 0,
+                    count: Int(INET_ADDRSTRLEN)
+                )
+                let rendered = socketAddress.withMemoryRebound(
+                    to: sockaddr_in.self,
+                    capacity: 1
+                ) { pointer -> Bool in
+                    var address = pointer.pointee.sin_addr
+                    return inet_ntop(
+                        AF_INET,
+                        &address,
+                        &buffer,
+                        socklen_t(buffer.count)
+                    ) != nil
+                }
+                if rendered {
+                    facts.append(HostInterfaceAddressFact(
+                        interfaceName: name,
+                        family: .ipv4,
+                        address: String(cString: buffer)
+                    ))
+                }
+            case AF_INET6:
+                var buffer = [CChar](
+                    repeating: 0,
+                    count: Int(INET6_ADDRSTRLEN)
+                )
+                let rendered = socketAddress.withMemoryRebound(
+                    to: sockaddr_in6.self,
+                    capacity: 1
+                ) { pointer -> Bool in
+                    var address = pointer.pointee.sin6_addr
+                    return inet_ntop(
+                        AF_INET6,
+                        &address,
+                        &buffer,
+                        socklen_t(buffer.count)
+                    ) != nil
+                }
+                if rendered {
+                    facts.append(HostInterfaceAddressFact(
+                        interfaceName: name,
+                        family: .ipv6,
+                        address: String(cString: buffer)
+                    ))
+                }
+            default:
+                continue
+            }
+        }
+        return facts
+    }
+
+    /// The primary service's default routers as configd publishes them. A
+    /// missing key is a fact (for example an IPv6-only or link-local network),
+    /// not a failed capture.
+    private static func captureDefaultRouters() -> HostDefaultRouterFacts {
+        func router(_ key: String, _ property: CFString) -> String? {
+            guard let state = SCDynamicStoreCopyValue(
+                nil,
+                key as CFString
+            ) as? [String: Any] else {
+                return nil
+            }
+            return state[property as String] as? String
+        }
+        return HostDefaultRouterFacts(
+            ipv4: router(
+                "State:/Network/Global/IPv4",
+                kSCPropNetIPv4Router
+            ),
+            ipv6: router(
+                "State:/Network/Global/IPv6",
+                kSCPropNetIPv6Router
+            )
         )
     }
 
@@ -3802,10 +4919,15 @@ private final class HostUnderlayCapture {
     private func finish(
         _ result: Result<HostUnderlaySnapshot, Error>
     ) {
-        guard !finished else {
+        guard resolution.resolve() else {
             return
         }
-        finished = true
+        deliver(result)
+    }
+
+    private func deliver(
+        _ result: Result<HostUnderlaySnapshot, Error>
+    ) {
         monitor.pathUpdateHandler = nil
         monitor.cancel()
         completion(result)
@@ -3881,20 +5003,42 @@ private final class HostUnderlayCapture {
 /// 抖动；该情况继续由已提交事务及 Line 局部恢复负责。
 private final class HostUnderlayMonitor {
     private let monitor = NWPathMonitor()
+    /// The newest snapshot already reported; equivalent samples are not
+    /// reported again.
     private let baseline: HostUnderlaySnapshot
+    /// What the running state was decided on: the committed generation's
+    /// Underlay, or the parked epoch's. Only this proves after a wake that
+    /// nothing changed.
+    private let committedBaseline: HostUnderlaySnapshot
     private let onChange: (HostUnderlaySnapshot, Bool) -> Void
     private var pathTransition = UnderlayPathTransitionState()
     private var pendingChange: DispatchWorkItem?
     private var lastSystemWakeAt: Date?
     private var systemSleepGate = SystemSleepNetworkEpochGate()
     private var cancelled = false
+    private var factStore: SCDynamicStore?
+
+    /// Weak bridge for configd's C callback; owned by the store's context.
+    private final class FactObserver {
+        weak var monitor: HostUnderlayMonitor?
+
+        init(_ monitor: HostUnderlayMonitor) {
+            self.monitor = monitor
+        }
+    }
 
     init(
         baseline: HostUnderlaySnapshot,
+        committedBaseline: HostUnderlaySnapshot,
         onChange: @escaping (HostUnderlaySnapshot, Bool) -> Void
     ) {
         self.baseline = baseline
+        self.committedBaseline = committedBaseline
         self.onChange = onChange
+    }
+
+    deinit {
+        stopFactNotifications()
     }
 
     func start() {
@@ -3904,6 +5048,7 @@ private final class HostUnderlayMonitor {
             }
         }
         monitor.start(queue: .global(qos: .utility))
+        startFactNotifications()
     }
 
     func cancel() {
@@ -3912,6 +5057,84 @@ private final class HostUnderlayMonitor {
         pendingChange = nil
         monitor.pathUpdateHandler = nil
         monitor.cancel()
+        stopFactNotifications()
+    }
+
+    /// NWPath does not promise a callback when only the default router, the
+    /// system resolvers or a configd-managed interface address change on an
+    /// unchanged interface. configd publishes each of those facts; watching
+    /// the same keys the snapshot reads gives every fingerprint fact a change
+    /// source. Read-only: nothing is written to the dynamic store.
+    private func startFactNotifications() {
+        guard factStore == nil, !cancelled else { return }
+        let observer = Unmanaged.passRetained(FactObserver(self))
+        var context = SCDynamicStoreContext(
+            version: 0,
+            info: observer.toOpaque(),
+            retain: nil,
+            release: { info in
+                Unmanaged<FactObserver>.fromOpaque(info).release()
+            },
+            copyDescription: nil
+        )
+        guard let store = SCDynamicStoreCreate(
+            nil,
+            "XDial host Underlay" as CFString,
+            { _, _, info in
+                guard let info else { return }
+                Unmanaged<FactObserver>.fromOpaque(info)
+                    .takeUnretainedValue()
+                    .monitor?
+                    .factsChanged()
+            },
+            &context
+        ) else {
+            observer.release()
+            return
+        }
+        let keys = [
+            "State:/Network/Global/IPv4",
+            "State:/Network/Global/IPv6",
+            "State:/Network/Global/DNS",
+        ] as CFArray
+        let patterns = ["State:/Network/Interface/[^/]+/IPv4"] as CFArray
+        guard
+            SCDynamicStoreSetNotificationKeys(store, keys, patterns),
+            SCDynamicStoreSetDispatchQueue(store, .main)
+        else {
+            return
+        }
+        factStore = store
+    }
+
+    private func stopFactNotifications() {
+        if let factStore {
+            SCDynamicStoreSetDispatchQueue(factStore, nil)
+        }
+        factStore = nil
+    }
+
+    /// Only re-samples. It never cancels a pending change and never feeds the
+    /// path transition state, so NWPath edges (unsatisfied / restored) keep
+    /// their meaning; an equivalent snapshot is ignored here.
+    private func factsChanged() {
+        guard
+            !cancelled,
+            pendingChange == nil,
+            systemSleepGate.observeNetworkSignal() == .evaluateCurrentPath
+        else {
+            return
+        }
+        let path = monitor.currentPath
+        guard
+            path.status == .satisfied,
+            let result = HostUnderlayCapture.snapshotResult(for: path),
+            case let .success(snapshot) = result,
+            !snapshot.isEquivalent(to: baseline)
+        else {
+            return
+        }
+        scheduleChange(allowEquivalentSnapshot: false)
     }
 
     func noteSystemWake(at date: Date = Date()) {
@@ -4009,7 +5232,9 @@ private final class HostUnderlayMonitor {
             }
             if SystemWakeUnderlayPolicy.suppressesEquivalentRestoration(
                 connectivityRestored: allowEquivalentSnapshot,
-                snapshotMatchesBaseline: snapshotMatchesBaseline,
+                snapshotMatchesBaseline: snapshot.isEquivalent(
+                    to: self.committedBaseline
+                ),
                 secondsSinceSystemWake: secondsSinceSystemWake
             ) {
                 self.lastSystemWakeAt = nil
@@ -4028,6 +5253,7 @@ private final class HostUnderlayMonitor {
             self.cancelled = true
             self.monitor.pathUpdateHandler = nil
             self.monitor.cancel()
+            self.stopFactNotifications()
             self.onChange(snapshot, allowEquivalentSnapshot)
         }
         pendingChange = work

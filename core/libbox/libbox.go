@@ -166,6 +166,7 @@ type Libbox struct {
 	switchRetireInProgress      bool
 	switchRetireDone            chan struct{}
 	anyConnectRetryDelays       []time.Duration
+	recoveryGate                lineRecoveryGate
 	probeOutboundAddressFunc    func(
 		context.Context,
 		adapter.Outbound,
@@ -1926,7 +1927,7 @@ func (l *Libbox) prepareSwitch(
 			if err == nil {
 				if network := firstLineNetworkGeneration(networkGenerations); network != nil {
 					candidateAnyConnect.attachOwner(l, true)
-					candidateAnyConnect.observeNetwork(network.epoch, targetAnyConnectConfig)
+					candidateAnyConnect.observeNetwork(network.epoch, network.underlay, targetAnyConnectConfig)
 				}
 			}
 		}
@@ -2840,9 +2841,18 @@ func (l *Libbox) reconnectAnyConnect(
 	capability *anyConnectRuntimeCapability,
 	config engine.VPNConfig,
 ) bool {
-	for attempt := 1; attempt <= maxAnyConnectReconnectAttempts; attempt++ {
-		delay := l.anyConnectReconnectDelay(attempt)
-		if !waitForAnyConnectReconnect(runtimeCtx, delay) {
+	// Same gate as the capability owner: attempts are made and counted only on
+	// a network the host reports usable.
+	budget := l.newAnyConnectRecoveryBudget(func(reason string, used int) {
+		l.notifyStatus(anyConnectLineWaitingStatusJSON(
+			reason,
+			used,
+			maxAnyConnectReconnectAttempts,
+		))
+	}, nil)
+	for {
+		attempt, err := budget.next(runtimeCtx)
+		if err != nil {
 			return false
 		}
 		l.notifyStatus(anyConnectLineStatusJSON(
@@ -2854,22 +2864,26 @@ func (l *Libbox) reconnectAnyConnect(
 		vpnInfo, err := l.vpn.Connect(config)
 		if err != nil {
 			l.vpn.Disconnect()
+			budget.settle()
 			continue
 		}
 		dnsServers := anyConnectDNSServers(vpnInfo.DNS)
 		if len(dnsServers) == 0 {
 			l.vpn.Disconnect()
+			budget.settle()
 			continue
 		}
 		bridge, err := engine.NewVPNBridge(vpnInfo.VPNAddress, vpnInfo.MTU)
 		if err != nil {
 			l.vpn.Disconnect()
+			budget.settle()
 			continue
 		}
 		cSess := l.vpn.Session()
 		if cSess == nil {
 			bridge.Close()
 			l.vpn.Disconnect()
+			budget.settle()
 			continue
 		}
 		bridge.Start(cSess)
@@ -2918,7 +2932,6 @@ func (l *Libbox) reconnectAnyConnect(
 		go l.monitorSession(generation, cSess)
 		return true
 	}
-	return false
 }
 
 func (l *Libbox) anyConnectReconnectDelay(attempt int) time.Duration {
@@ -2963,6 +2976,33 @@ func anyConnectLineStatusJSON(
 	})
 	if err != nil {
 		return `{"status":"line_reconnecting","line_type":"vpn"}`
+	}
+	return string(data)
+}
+
+// anyConnectLineWaitingStatusJSON reports that local recovery is suspended
+// because the host reports the system asleep or no usable Underlay. attempt is
+// the number of attempts already counted on a usable network.
+func anyConnectLineWaitingStatusJSON(
+	reason string,
+	attempt,
+	maxAttempts int,
+) string {
+	data, err := stdjson.Marshal(struct {
+		Status      string `json:"status"`
+		LineType    string `json:"line_type"`
+		Attempt     int    `json:"attempt"`
+		MaxAttempts int    `json:"max_attempts"`
+		Reason      string `json:"reason"`
+	}{
+		Status:      "line_waiting",
+		LineType:    "vpn",
+		Attempt:     attempt,
+		MaxAttempts: maxAttempts,
+		Reason:      reason,
+	})
+	if err != nil {
+		return `{"status":"line_waiting","line_type":"vpn"}`
 	}
 	return string(data)
 }

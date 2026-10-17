@@ -49,6 +49,71 @@ final class ScenarioSwitchIPCTests: XCTestCase {
         }
     }
 
+    func testUnderlayPathIdentityIsOptionalOpaqueToken() throws {
+        let token = HostUnderlayIdentity(
+            defaultInterface: .init(name: "en0", index: 7, type: "wifi"),
+            interfaces: [.init(name: "en0", index: 7, type: "wifi")],
+            systemDNSJSON: "[\"192.0.2.53\"]",
+            interfaceAddresses: [],
+            routers: .none
+        ).pathIdentity
+        func request(
+            _ pathIdentity: String?
+        ) -> ProviderScenarioSwitchRequest {
+            .switchScenario(
+                requestID: "request-1",
+                expectedTransactionID: "source-1",
+                targetTransactionID: "target-1",
+                profileJSON: "{}",
+                connectionReportJSON: "{}",
+                underlayInterfacesJSON: "[]",
+                underlayDefaultName: "en0",
+                underlayDefaultIndex: 7,
+                systemDNSJSON: "[]",
+                refreshLineRuntimes: true,
+                networkEpochID: "host-session.epoch-7",
+                underlayPathIdentity: pathIdentity
+            )
+        }
+
+        let decoded = try ProviderScenarioSwitchCodec.decodeRequest(
+            ProviderScenarioSwitchCodec.encodeRequest(request(token))
+        )
+        XCTAssertEqual(decoded.underlayPathIdentity, token)
+        XCTAssertNil(try ProviderScenarioSwitchCodec.decodeRequest(
+            ProviderScenarioSwitchCodec.encodeRequest(request(nil))
+        ).underlayPathIdentity)
+        for invalid in ["", "en0|192.168.1.1", token + "0"] {
+            XCTAssertThrowsError(try ProviderScenarioSwitchCodec.decodeRequest(
+                ProviderScenarioSwitchCodec.encodeRequest(request(invalid))
+            ), invalid)
+        }
+    }
+
+    func testCancelAndReconcileCannotCarryUnderlayPathIdentity() throws {
+        for json in [
+            """
+            {"v":1,"cmd":"cancel-switch","request_id":"request-1",\
+            "expected_transaction_id":"source-1",\
+            "underlay_path_identity":"underlay-path-v1:\
+            \(String(repeating: "a", count: 64))"}
+            """,
+            """
+            {"v":1,"cmd":"reconcile-switch","request_id":"request-1",\
+            "expected_transaction_id":"source-1",\
+            "target_transaction_id":"target-1",\
+            "underlay_path_identity":"underlay-path-v1:\
+            \(String(repeating: "a", count: 64))"}
+            """,
+        ] {
+            XCTAssertThrowsError(
+                try ProviderScenarioSwitchCodec.decodeRequest(
+                    Data(json.utf8)
+                )
+            )
+        }
+    }
+
     func testOlderHostWithoutNetworkEpochRemainsDecodable() throws {
         let request = ProviderScenarioSwitchRequest.switchScenario(
             requestID: "request-1",

@@ -266,18 +266,23 @@ struct AnyConnectLineRuntimeStatus: Decodable, Equatable {
     enum State: String, Decodable {
         case reconnecting = "line_reconnecting"
         case connected = "line_connected"
+        /// 宿主报告系统休眠或没有可用 Underlay，局部恢复暂停且不计次。
+        case waiting = "line_waiting"
     }
 
     let state: State
     let lineType: String
     let attempt: Int
     let maxAttempts: Int
+    /// 仅 `waiting` 携带：`system-asleep` 或 `underlay-unavailable`。
+    let reason: String?
 
     enum CodingKeys: String, CodingKey {
         case state = "status"
         case lineType = "line_type"
         case attempt
         case maxAttempts = "max_attempts"
+        case reason
     }
 
     var isAnyConnect: Bool {

@@ -78,6 +78,10 @@ struct NetworkEpochSwitchCoordinator {
         let desiredScenarioID: String
         let underlayFingerprint: String
         let underlayChanged: Bool
+        /// The host observed an unsatisfied -> satisfied path edge inside
+        /// this epoch. A parked recovery treats it as a connectivity
+        /// generation, not as a new Underlay fingerprint.
+        var connectivityRestored = false
     }
 
     private struct Pending {
@@ -86,6 +90,7 @@ struct NetworkEpochSwitchCoordinator {
         var underlayFingerprint: String?
         var underlayChanged: Bool
         var permitsRepeatedTuple: Bool
+        var connectivityRestored = false
         var revision: UInt64
     }
 
@@ -108,10 +113,14 @@ struct NetworkEpochSwitchCoordinator {
         pending?.underlayFingerprint == fingerprint
     }
 
+    /// `connectivityRestored` marks a host-observed path restoration edge.
+    /// Recovery preparation re-samples with `forceNewEpoch` but is not such
+    /// an edge, so the two facts stay separate.
     mutating func observeUnderlayChange(
         currentDesiredScenarioID: String,
         underlayFingerprint: String,
-        forceNewEpoch: Bool = false
+        forceNewEpoch: Bool = false,
+        connectivityRestored: Bool = false
     ) -> QuietToken? {
         guard !currentDesiredScenarioID.isEmpty,
               !underlayFingerprint.isEmpty else {
@@ -127,18 +136,22 @@ struct NetworkEpochSwitchCoordinator {
                 || activeIntent.map({ tuple(for: $0) }) == observedTuple {
                 return nil
             }
-            let created = makePending(
+            var created = makePending(
                 desiredScenarioID: currentDesiredScenarioID,
                 underlayFingerprint: underlayFingerprint,
                 underlayChanged: true,
                 permitsRepeatedTuple: forceNewEpoch
             )
+            created.connectivityRestored = connectivityRestored
             pending = created
         } else {
             pending?.underlayFingerprint = underlayFingerprint
             pending?.underlayChanged = true
             if forceNewEpoch {
                 pending?.permitsRepeatedTuple = true
+            }
+            if connectivityRestored {
+                pending?.connectivityRestored = true
             }
             bumpRevision()
         }
@@ -246,7 +259,8 @@ struct NetworkEpochSwitchCoordinator {
             epoch: pending.epoch,
             desiredScenarioID: pending.desiredScenarioID,
             underlayFingerprint: underlayFingerprint,
-            underlayChanged: pending.underlayChanged
+            underlayChanged: pending.underlayChanged,
+            connectivityRestored: pending.connectivityRestored
         )
         activeIntent = intent
         return intent
@@ -366,6 +380,11 @@ struct UnderlayPathTransitionState {
 /// its Line-local recovery remain authoritative. A materially changed snapshot
 /// still proceeds, and a later real connectivity restoration is outside this
 /// bounded coalescing window.
+///
+/// `snapshotMatchesBaseline` must compare with the Underlay the committed
+/// generation actually runs on (or a parked recovery was decided on), never
+/// with a newer snapshot whose epoch failed to commit: only the former proves
+/// the running state is still current after the wake.
 struct SystemWakeUnderlayPolicy {
     static let equivalentRestorationWindow: TimeInterval = 30
 
@@ -416,6 +435,10 @@ enum NetworkEpochTransitionAction: Equatable {
     case none
     case switchScenario(requiresUnderlayRefresh: Bool)
     case persistScenario
+    /// Full recovery is parked after exhausting its budget. The settled epoch
+    /// goes to the recovery ledger, which decides whether it earns a new
+    /// budget; it never becomes a manual connection.
+    case resumeParkedRecovery
 }
 
 /// A network epoch can carry two independent facts: the host Underlay changed,
@@ -430,8 +453,22 @@ struct NetworkEpochTransitionPolicy {
         underlayChanged: Bool,
         keepsConnection: Bool,
         runtimeStatus: String,
-        hasPendingScenarioSwitch: Bool
+        hasPendingScenarioSwitch: Bool,
+        automaticRecoveryParked: Bool = false
     ) -> NetworkEpochTransitionAction {
+        if automaticRecoveryParked {
+            // Explicit disconnect withdraws the intent and ends parking; an
+            // SSID-only repeat of the current choice carries no new fact.
+            guard keepsConnection,
+                  runtimeStatus == "disconnected",
+                  !hasPendingScenarioSwitch,
+                  underlayChanged
+                    || desiredScenarioID != currentDesiredScenarioID else {
+                return .none
+            }
+            return .resumeParkedRecovery
+        }
+
         let unchangedCommittedScenario =
             !desiredScenarioID.isEmpty
             && desiredScenarioID == currentDesiredScenarioID
@@ -456,5 +493,36 @@ struct NetworkEpochTransitionPolicy {
                 requiresUnderlayRefresh: underlayChanged
             )
             : .persistScenario
+    }
+}
+
+/// A committed generation whose network epoch could not be switched keeps
+/// running on the Underlay it was started with. When that Underlay's default
+/// interface no longer exists the generation cannot be proven healthy, so an
+/// automatic epoch whose Switch has finally failed escalates to a full
+/// rollback and automatic recovery. While the old default interface still
+/// exists the old generation remains authoritative.
+enum StaleCommittedGenerationPolicy {
+    struct Interface: Equatable {
+        let name: String
+        let index: Int
+    }
+
+    static func shouldEscalate(
+        switchFinallyFailed: Bool,
+        automaticEpoch: Bool,
+        committedDefaultInterface: Interface?,
+        currentInterfaces: [Interface]
+    ) -> Bool {
+        guard switchFinallyFailed,
+              automaticEpoch,
+              let committedDefaultInterface,
+              !committedDefaultInterface.name.isEmpty,
+              !currentInterfaces.isEmpty else {
+            return false
+        }
+        // The generation was built with this exact interface identity; a
+        // same-named interface with a new index is a different interface.
+        return !currentInterfaces.contains(committedDefaultInterface)
     }
 }

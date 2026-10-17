@@ -61,7 +61,9 @@ Transparent Proxy 不接管 ICMP。link-local、multicast、limited broadcast �
 RFC1918、IPv6 ULA、Tailnet 与企业单播地址仍由 Scenario 裁决，排除集合不按应用或产品扩展。
 
 Underlay 来自宿主请求连接前同一时刻的内核默认接口、完整 `NWPath.availableInterfaces`
-与系统 DNS。Provider 内的 `NWPath` 可能隐藏既有全流量 VPN，只用于诊断。
+与系统 DNS；同一样本另取默认接口的 IPv4 地址与主服务 IPv4 / IPv6 默认路由器，只用于比较。
+IPv6 接口地址（临时地址在稳定网络上轮换）不进入比较；Provider 只收到默认路径的不透明身份，
+不收到这些地址。Provider 内的 `NWPath` 可能隐藏既有全流量 VPN，只用于诊断。
 `route.default_interface` 原样采用内核结果；接口快照仅补齐系统 MTU、标志与地址，
 只排除当前 XDial 会话自己登记的接口，不按名称前缀筛选、不取首候选、不生成 outbound
 `bind_interface`。缺失或不一致的快照不能启动连接。
@@ -142,7 +144,22 @@ sslcon 是进程级单例；active Scenario 的有效依赖中至多有一条 An
 不同配置的单例不能并发准备：Switch 候选拒绝后，宿主断开旧连接并完整连接目标场景，
 期间短暂断流，不伪装成无中断切换。
 
-入口：[AnyConnect 运行能力](core/libbox/anyconnect_runtime.go)。
+局部恢复的三次预算只计宿主报告“已完整唤醒且 Underlay 可用”时的尝试。系统休眠
+（含 Dark Wake）或宿主 NWPath 不可用期间，线路保持不可用（REJECT / SERVFAIL）并等待，
+不尝试、不计次、不提升为完整恢复；跨越关闭期的尝试不计次，其失败也不按终止错误归类。
+门由宿主经 Provider IPC 报告，Provider 不自行判断；关闭态是有界租约（休眠 15 分钟、
+无 Underlay 5 分钟，按不计休眠的单调时钟），宿主在条件持续期间续约，宿主消失则租约
+到期后恢复正常计数。宿主报告重新可用或新 epoch 是新的网络条件，重新获得预算；
+可用网络上耗尽预算或凭据、配置等终止错误仍提升为完整恢复。
+
+sslcon 的 socket 不绑定接口，停留在连接时内核默认路由所在的接口上。只有该接口已不在
+新 epoch 的接口集合中，会话才必然失效，就绪证明经同一恢复 owner 立即重建，不等探测
+超时或 DPD。该接口仍在时（默认路由移到新接口，或同名同序号接口换了地址），候选准备
+期间旧会话继续承载已提交事务，不主动重连；仍只由经现有会话的就绪探测在结构化瞬态失败
+时强制重连。门关闭时也不替换会话。
+
+入口：[AnyConnect 运行能力](core/libbox/anyconnect_runtime.go)、
+[恢复门](core/libbox/line_recovery_gate.go)、[宿主报告](macos/Shared/LineRecoveryConditionsIPC.swift)。
 
 ## 4. DNS
 
@@ -249,8 +266,12 @@ journal 无法可靠写入时不能 Commit。入口：[事务处置](macos/Share
   或旧 Box 退役只释放自己的租约，最后一个租约释放才停止能力，不并发创建第二个握手任务。
 - 当前 epoch、revision 与 generation 的就绪证明有效后才 Commit。迟到成功不能恢复旧
   ready；同一 Line 的新成功不能清除其他 Line 的失败或 Box 结构错误。
-- 提交原子切换新 flow 的 relay generation 与完整 DNS / route 配置；旧 flow 有界排空。
-  规则、DNS 和默认出口不能分成多个可见提交。
+- 提交原子切换新 flow 的 relay generation 与完整 DNS / route 配置；旧 flow 有界排空，
+  默认 1 秒后关闭。仅当 network epoch 重编译同一 Scenario 与配置指纹、默认路径身份
+  （默认接口、其 IPv4 地址与默认路由器）也未变时，旧 generation 已接入的 TCP flow 留在
+  旧 Box 直至结束，最长 10 分钟；下一候选开始准备（路径变化即下一 epoch）或停止先使其
+  退役，UDP association 仍 1 秒换代。保留期间租约仍只属于 committed 与另一个 generation
+  ——候选或保留的旧源，二者不并存。规则、DNS 和默认出口不能分成多个可见提交。
 - 候选失败只清理候选，保留旧场景、网络设置和连接时长；提交中失败恢复旧 relay。
   无法证明旧 generation 健康时才进入全局回滚。报告同时保留 from、to、候选与仍承载流量的事务。
 - 任意时刻最多一个候选，latest-wins；相同目标与配置指纹为 no-op。显式断开优先取消候选
@@ -264,20 +285,45 @@ journal 无法可靠写入时不能 Commit。入口：[事务处置](macos/Share
 
 NWPath、默认路由、DNS 与 SSID 的同次物理变化合并为一个不含 SSID 的 network epoch；
 稳定样本只形成最终 `(epoch, desired Scenario, Underlay fingerprint)` 的一笔 Switch。
+Underlay fingerprint 由默认接口、接口集合、系统 DNS、默认接口 IPv4 地址与默认路由器组成，
+NWPath 更新与 configd 对相应键的只读通知都触发重新采样；日志分别标注 `default-interface`、
+`interface-set`、`system-dns`、`gateway`、`address`；
+同一接口、同一 DNS 地址的两个网络也因网关或地址不同而换代。XDial 的 Provider 不创建接口、
+不发布 IPv4 / IPv6 服务状态或 DNS 设置，其启停不改变指纹。
 旧 epoch 的候选和退避回调失效，网络稳定不等于 Line 登录、握手或真实出口已恢复。
 
 休眠至完整 `didWake` 之间只积累变化，Dark Wake 不停止已提交事务或创建候选。
-唤醒后等价 Underlay 保留旧 generation；真实指纹变化才换代。Provider 仍 connected 时，
+唤醒后与 committed generation 实际所用 Underlay 等价才保留旧 generation；未能提交的
+新样本不证明旧 generation 仍是当前事实，真实指纹变化才换代。Provider 仍 connected 时，
 Line 自己处理协议恢复，不能仅凭路径不可用 / 恢复边沿重复连接。
 
 同代 Line 局部恢复保持其他 Line、Ingress、Box 与 transaction ID 不变；局部预算耗尽、
-Provider 掉线或共享组件失败才提升为完整恢复。完整恢复在 Rollback 与系统接管移除后进行，
-共享五次预算；短暂连上不重置，同一事务稳定五分钟后才清零。
-自动场景意图的瞬态失败保留 desired Scenario，按 2 / 5 / 10 秒最多重试三次，同 epoch
-重复事件不重置。显式连接 / 切换失败、凭据 / 证书 / 配置等终止错误不自动循环；显式断开
-立即取消所有恢复。重试进度、原始失败与断线历史均为结构化事实。
+Provider 掉线或共享组件失败才提升为完整恢复。休眠或无可用 Underlay 期间局部恢复只等待，
+不消耗预算、不提升（见 [AnyConnect](#33-anyconnectd30)）。完整恢复在 Rollback 与系统接管移除后进行，
+预算属于恢复 epoch `(desired Scenario, Underlay 指纹, 连通性代数)`：每个 epoch 按
+2 / 5 / 10 / 20 / 30 秒最多五次，等待可用 Underlay 不计次；短暂连上不重置，同一事务
+稳定五分钟后才清零。只看结构化失败码：凭据、登录、认证、配置引用与未分类错误立即结束。
 
-入口：[epoch 协调](macos/Shared/NetworkEpochSwitchCoordinator.swift)。
+网络相关失败耗尽预算后进入停泊：运行状态是已报告的断开，系统接管已移除，连接意图保留，
+宿主从耗尽后重新捕获的 Underlay 起只读观察，不建数据面、不发网络请求。经沉降的新
+epoch 交给恢复账本，不变成手动连接：指纹或 Scenario 变化立即授予新预算；同指纹仅有
+连通性恢复边沿时，距该指纹上次授予满五分钟才授予，否则延后而不丢弃；自动授予每小时
+最多六次，休眠期间不授予。XDial 自己的尝试与重复通知不产生授予；完整唤醒后 epoch 未变
+只保留一次尝试；同一 epoch 另有 +2 / +5 / +10 / +20 / +30 分钟的单次慢尾，至多五次，
+新 epoch 以完整预算取代它。每一步只由它等待的 transaction（开启恢复的失败或该尝试自己的
+事务）落定的报告裁决；尝试排队、采样 Underlay 或准备期间，状态回调重读到的旧失败报告
+不能结束或重新停泊它。用户连接或重试是新意图并获得新预算；显式断开、退出或删除
+目标 Scenario 立即结束停泊。
+
+自动场景意图的瞬态失败保留 desired Scenario，按 2 / 5 / 10 秒最多重试三次，同 epoch
+重复事件不重置。自动 epoch 的 Switch 最终失败后，若 committed generation 的默认接口
+（名称与 index）已不在当前 Underlay 中，它无法被证明健康，升级为完整回滚与自动恢复，
+结果可能是停泊；旧默认接口仍在时保留旧 generation。显式连接 / 切换失败与终止错误
+不自动循环；显式断开立即取消所有恢复。重试进度、停泊、授予、延后、原始失败与断线历史
+均为结构化事实，Underlay 指纹不对外暴露。
+
+入口：[epoch 协调](macos/Shared/NetworkEpochSwitchCoordinator.swift)、
+[恢复账本](macos/Shared/AutomaticRecoveryLedger.swift)。
 
 ## 6. 安装与更新（D37）
 

@@ -43,6 +43,10 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
     let systemDNSJSON: String?
     let refreshLineRuntimes: Bool?
     var networkEpochID: String? = nil
+    /// Opaque `HostUnderlayIdentity.pathIdentity` of the snapshot above. The
+    /// Provider only compares it with the committed generation's token; an
+    /// absent token (older host) never proves an unchanged path.
+    var underlayPathIdentity: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case v
@@ -58,6 +62,7 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
         case systemDNSJSON = "system_dns"
         case refreshLineRuntimes = "refresh_line_runtimes"
         case networkEpochID = "network_epoch_id"
+        case underlayPathIdentity = "underlay_path_identity"
     }
 
     static func switchScenario(
@@ -71,7 +76,8 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
         underlayDefaultIndex: Int,
         systemDNSJSON: String,
         refreshLineRuntimes: Bool,
-        networkEpochID: String? = nil
+        networkEpochID: String? = nil,
+        underlayPathIdentity: String? = nil
     ) -> ProviderScenarioSwitchRequest {
         ProviderScenarioSwitchRequest(
             v: ProviderScenarioSwitchCodec.version,
@@ -86,7 +92,8 @@ struct ProviderScenarioSwitchRequest: Codable, Equatable {
             underlayDefaultIndex: underlayDefaultIndex,
             systemDNSJSON: systemDNSJSON,
             refreshLineRuntimes: refreshLineRuntimes,
-            networkEpochID: networkEpochID
+            networkEpochID: networkEpochID,
+            underlayPathIdentity: underlayPathIdentity
         )
     }
 
@@ -277,6 +284,11 @@ enum ProviderScenarioSwitchCodec {
         if command == .switchScenario, object["network_epoch_id"] != nil {
             allowedKeys.insert("network_epoch_id")
         }
+        // Same compatibility rule for the opaque default-path identity.
+        if command == .switchScenario,
+           object["underlay_path_identity"] != nil {
+            allowedKeys.insert("underlay_path_identity")
+        }
         guard Set(object.keys) == allowedKeys else {
             throw ProviderScenarioSwitchCodecError.malformed
         }
@@ -313,7 +325,10 @@ enum ProviderScenarioSwitchCodec {
                 let systemDNSJSON = request.systemDNSJSON,
                 isJSONArray(systemDNSJSON),
                 request.refreshLineRuntimes != nil,
-                request.networkEpochID.map(isSafeIdentifier) ?? true
+                request.networkEpochID.map(isSafeIdentifier) ?? true,
+                request.underlayPathIdentity.map(
+                    HostUnderlayIdentity.isValidPathIdentity
+                ) ?? true
             else {
                 throw ProviderScenarioSwitchCodecError.malformed
             }

@@ -54,6 +54,10 @@ struct MainPopover: View {
                 Divider()
                 connectionBlockerBand(blocker)
             }
+            if state.showsParkedRecoveryNotice {
+                Divider()
+                parkedRecoveryBand
+            }
             if let failure = scenarioSwitchFailureProjection {
                 Divider()
                 scenarioSwitchFailureBand(failure)
@@ -665,6 +669,48 @@ struct MainPopover: View {
                 endPoint: .trailing
             )
         }
+    }
+
+    /// Automatic reconnect used up its budget on a network-related failure.
+    /// The failure itself stays in the details below; this band only states
+    /// that recovery is waiting for a network change and offers a retry with
+    /// a fresh budget.
+    private var parkedRecoveryBand: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "pause.circle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(warningColor)
+                .padding(.top, 1)
+            Text(state.tr(
+                "自动重连已暂停，网络变化时会再试",
+                "Automatic reconnect paused; it will retry when the network changes"
+            ))
+            .font(.system(size: 11.5, weight: .medium))
+            .foregroundStyle(.primary.opacity(0.82))
+            .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 6)
+            Button(state.tr("立即重试", "Retry Now")) {
+                state.retryAutomaticReconnectNow()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .fixedSize()
+        }
+        .padding(.leading, 20)
+        .padding(.trailing, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            LinearGradient(
+                colors: [
+                    warningColor.opacity(0.075),
+                    warningColor.opacity(0.025),
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        }
+        .accessibilityElement(children: .contain)
     }
 
     private var ssidAccessWarningBand: some View {

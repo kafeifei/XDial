@@ -232,6 +232,9 @@ enum LocalSOCKSShareRelay {
                         logger.debug(
                             "local-socks-share closed trial=\(trialID, privacy: .public) stage=\(stage, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
                         )
+                        if answered {
+                            await lingerAfterReply(client)
+                        }
                         shutdown.finish(with: answered ? nil : error)
                     }
                 } onCancel: {
@@ -239,6 +242,27 @@ enum LocalSOCKSShareRelay {
                 }
             }
         )
+    }
+
+    /// 失败应答发出后先半关闭（FIN），再读掉客户端已经发出的剩余字节。拒绝发生在
+    /// 请求读完之前时（例如主机名非法、端口字节未读），带着未读数据关闭 TCP 会让
+    /// 内核回 RST，客户端可能在读到应答前就看到连接被重置。等待有上限，客户端不关
+    /// 也不会占住这条连接。
+    static func lingerAfterReply(
+        _ client: NWConnection,
+        timeout: TimeInterval = 2
+    ) async {
+        try? await TCPFlowSOCKSRelay.finishSending(to: client)
+        let deadline = DispatchWorkItem { client.cancel() }
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + timeout,
+            execute: deadline
+        )
+        defer { deadline.cancel() }
+        while let result = try? await TCPFlowSOCKSRelay.receive(from: client),
+              result.error == nil,
+              !result.isComplete,
+              !result.data.isEmpty {}
     }
 
     private static func diagnosticCode(_ error: Error) -> String {

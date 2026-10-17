@@ -127,6 +127,118 @@ final class ProviderRelayRegistryTests: XCTestCase {
         XCTAssertEqual(current.shutdownCount, 1)
     }
 
+    /// A same-path network-epoch commit keeps TCP flows on the source Box
+    /// while UDP associations still re-associate with the new generation.
+    func testHandoffDrainSeparatesFlowsFromAssociations() async {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let flowCompletion = RegistryAsyncGate()
+        let flow = RelayFixture(cleanupGate: flowCompletion)
+        let flowReservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertTrue(registry.attach(flow.handle, to: flowReservation))
+        XCTAssertTrue(flow.handle.start {
+            registry.finish(flowReservation)
+        })
+        let association = RelayFixture()
+        let associationReservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertTrue(registry.attach(
+            association.handle,
+            to: associationReservation,
+            owning: .association
+        ))
+        XCTAssertTrue(association.handle.start {
+            registry.finish(associationReservation)
+        })
+        await flow.waitUntilStarted()
+        await association.waitUntilStarted()
+
+        let drain = registry.handoff(
+            generation: "B",
+            endpoint: "endpoint-B"
+        )
+        let associations = drain.subset(owning: .association)
+        let flows = drain.subset(owning: .flow)
+
+        XCTAssertEqual(drain.count, 2)
+        XCTAssertEqual(associations.count, 1)
+        XCTAssertEqual(associations.generation, "A")
+        XCTAssertEqual(flows.count, 1)
+        XCTAssertEqual(flows.generation, "A")
+
+        associations.cancel()
+        XCTAssertTrue(associations.wait(timeout: 1))
+        XCTAssertEqual(association.shutdownCount, 1)
+        XCTAssertEqual(flow.shutdownCount, 0)
+        XCTAssertEqual(flows.unfinishedCount, 1)
+
+        flowCompletion.open()
+        XCTAssertTrue(flows.wait(timeout: 1))
+        XCTAssertEqual(flows.unfinishedCount, 0)
+        XCTAssertEqual(flow.shutdownCount, 0)
+        XCTAssertEqual(registry.registeredCount, 0)
+    }
+
+    func testRetainedFlowsNotifyOnceWhenTheyAllFinish() async {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let completion = RegistryAsyncGate()
+        let flow = RelayFixture(cleanupGate: completion)
+        let reservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertTrue(registry.attach(flow.handle, to: reservation))
+        XCTAssertTrue(flow.handle.start {
+            registry.finish(reservation)
+        })
+        await flow.waitUntilStarted()
+        let flows = registry.handoff(
+            generation: "B",
+            endpoint: "endpoint-B"
+        ).subset(owning: .flow)
+        let notified = expectation(description: "retained flows finished")
+        let queue = DispatchQueue(label: "relay-registry-notify-test")
+
+        flows.notifyWhenFinished(queue: queue) {
+            notified.fulfill()
+        }
+        XCTAssertFalse(flows.wait(timeout: 0.05))
+        completion.open()
+
+        await fulfillment(of: [notified], timeout: 1)
+        let empty = expectation(description: "empty drain completes")
+        ProviderRelayDrain.empty.notifyWhenFinished(queue: queue) {
+            empty.fulfill()
+        }
+        await fulfillment(of: [empty], timeout: 1)
+    }
+
+    /// Stop owns every registered relay, including flows still retained on an
+    /// older generation after a same-path Switch.
+    func testStopCancelsFlowsRetainedOnAnOlderGeneration() async {
+        let registry = ProviderRelayRegistry<String>()
+        registry.activate(generation: "A", endpoint: "endpoint-A")
+        let retained = RelayFixture()
+        let retainedReservation = try! XCTUnwrap(registry.reserve())
+        XCTAssertTrue(
+            registry.attach(retained.handle, to: retainedReservation)
+        )
+        XCTAssertTrue(retained.handle.start {
+            registry.finish(retainedReservation)
+        })
+        await retained.waitUntilStarted()
+        let sourceFlows = registry.handoff(
+            generation: "B",
+            endpoint: "endpoint-B"
+        ).subset(owning: .flow)
+        XCTAssertEqual(sourceFlows.count, 1)
+
+        let drain = registry.deactivateCurrent()
+
+        XCTAssertEqual(drain.count, 1)
+        XCTAssertTrue(drain.wait(timeout: 1))
+        XCTAssertEqual(retained.shutdownCount, 1)
+        XCTAssertEqual(sourceFlows.unfinishedCount, 0)
+        XCTAssertEqual(registry.registeredCount, 0)
+    }
+
     func testRollbackHandoffDrainsCandidateWithoutTouchingSourceFlows() async {
         let registry = ProviderRelayRegistry<String>()
         registry.activate(generation: "A", endpoint: "endpoint-A")

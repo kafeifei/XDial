@@ -270,6 +270,49 @@ final class GoEngine: ObservableObject {
         transparentProxy.retryAutomaticReconnectNow()
     }
 
+    var isAutomaticRecoveryParked: Bool {
+        transparentProxy.isAutomaticRecoveryParked
+    }
+
+    var parkedRecoveryScenarioID: String? {
+        transparentProxy.parkedRecoveryScenarioID
+    }
+
+    @discardableResult
+    func resumeParkedRecovery(
+        scenarioID: String,
+        underlayFingerprint: String,
+        connectivityRestored: Bool
+    ) -> Bool {
+        transparentProxy.resumeParkedRecovery(
+            scenarioID: scenarioID,
+            underlayFingerprint: underlayFingerprint,
+            connectivityRestored: connectivityRestored
+        )
+    }
+
+    @discardableResult
+    func resumeParkedRecoveryAfterWake() -> Bool {
+        transparentProxy.resumeParkedRecoveryAfterWake()
+    }
+
+    func endParkedRecovery(code: String) {
+        transparentProxy.endParkedRecovery(code: code)
+    }
+
+    func committedDefaultInterfaceIsAbsent(
+        expectedUnderlayFingerprint: String,
+        completion: @escaping (Bool) -> Void
+    ) {
+        transparentProxy.committedDefaultInterfaceIsAbsent(
+            expectedUnderlayFingerprint: expectedUnderlayFingerprint
+        ) { absent in
+            Task { @MainActor in
+                completion(absent)
+            }
+        }
+    }
+
 #if DEBUG
     func injectFailureOnNextStart(_ stage: String) -> Bool {
         transparentProxy.injectFailureOnNextStart(stage)

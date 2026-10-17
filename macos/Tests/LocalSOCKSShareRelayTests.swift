@@ -53,6 +53,62 @@ final class LocalSOCKSShareRelayTests: XCTestCase {
         XCTAssertEqual(upstream.connectionCount, 0)
     }
 
+    /// A rejection can happen before the client's request is fully read, and a
+    /// client may already have pipelined data. Closing with unread bytes makes
+    /// the kernel answer RST, which can reach the client before the reply.
+    func testRejectedRequestWithUnreadBytesStillDeliversReply() async throws {
+        let upstream = try await FakeSessionEntry.start(credentials: credentials)
+        defer { upstream.stop() }
+        let (share, port) = try await startShare(upstreamPort: upstream.port)
+        defer { share.stop() }
+
+        for _ in 0..<3 {
+            let client = try await connect(port)
+            defer { client.forceCancel() }
+            try await TCPFlowSOCKSRelay.send(Data([0x05, 0x01, 0x00]), to: client)
+            _ = try await TCPFlowSOCKSRelay.receiveExactly(2, from: client)
+            let invalidName: [UInt8] = [0x00, 0x01, 0x02]
+            let pipelined = [UInt8](repeating: 0x41, count: 64 * 1024)
+            try await TCPFlowSOCKSRelay.send(
+                Data([0x05, 0x01, 0x00, 0x03, UInt8(invalidName.count)]
+                    + invalidName + [0x00, 0x50] + pipelined),
+                to: client
+            )
+            // Read late, as a slow client would: by then a reset close has
+            // already discarded the reply waiting in the receive buffer.
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let reply = try await TCPFlowSOCKSRelay.receiveExactly(10, from: client)
+            XCTAssertEqual(reply, LocalSOCKSHandshake.reply(0x01))
+        }
+        XCTAssertEqual(upstream.connectionCount, 0)
+    }
+
+    func testLingerAfterReplyIsBoundedWhenClientStaysOpen() async throws {
+        let listener = try NWListener(using: .tcp, on: .any)
+        let accepted = expectation(description: "accepted")
+        let serverSide = LockedBox<NWConnection>()
+        listener.newConnectionHandler = { connection in
+            serverSide.set(connection)
+            accepted.fulfill()
+        }
+        let ready = expectation(description: "listening")
+        listener.stateUpdateHandler = { if case .ready = $0 { ready.fulfill() } }
+        listener.start(queue: .global())
+        defer { listener.cancel() }
+        await fulfillment(of: [ready], timeout: 5)
+
+        let client = try await connect(listener.port!.rawValue)
+        defer { client.forceCancel() }
+        await fulfillment(of: [accepted], timeout: 5)
+        let server = try XCTUnwrap(serverSide.get())
+        try await TCPFlowSOCKSRelay.start(server)
+        defer { server.forceCancel() }
+
+        let started = Date()
+        await LocalSOCKSShareRelay.lingerAfterReply(server, timeout: 0.3)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+    }
+
     func testOccupiedPortIsReportedInsteadOfShared() async throws {
         let upstream = try await FakeSessionEntry.start(credentials: credentials)
         defer { upstream.stop() }
@@ -200,5 +256,22 @@ private final class ResumeOnce: @unchecked Sendable {
         guard !taken else { return false }
         taken = true
         return true
+    }
+}
+
+private final class LockedBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value?
+
+    func set(_ newValue: Value) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+
+    func get() -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
