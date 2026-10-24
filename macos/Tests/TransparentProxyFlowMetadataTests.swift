@@ -300,35 +300,51 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
         )
     }
 
-    func testEncodesBoundUDPAssociationWithoutFakeDestination() throws {
-        let encoded = try XCTUnwrap(
-            TransparentProxyFlowMetadata.encodeBoundAssociation(
-                boundInterface: "en0"
+    func testEncodesUDPAssociationSocketFacts() throws {
+        let bound = try XCTUnwrap(
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: "en0",
+                sourcePort: 5901
             )
         )
-
         XCTAssertEqual(
-            Array(encoded),
-            [0x00, 0x58, 0x44, 0x02, 0x04, 0x03, 0x65, 0x6e, 0x30]
+            Array(bound),
+            [0x00, 0x58, 0x44, 0x03, 0x0c, 0x03, 0x65, 0x6e, 0x30, 0x17, 0x0d]
+        )
+
+        let unbound = try XCTUnwrap(
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: nil,
+                sourcePort: 5900
+            )
+        )
+        XCTAssertEqual(
+            Array(unbound),
+            [0x00, 0x58, 0x44, 0x03, 0x08, 0x17, 0x0c]
         )
     }
 
-    func testRejectsInvalidBoundInterfaceMetadata() {
+    func testRejectsInvalidUDPAssociationMetadata() {
         XCTAssertNil(
-            TransparentProxyFlowMetadata.encodeBoundAssociation(
-                boundInterface: ""
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: nil,
+                sourcePort: nil
             )
         )
         XCTAssertNil(
-            TransparentProxyFlowMetadata.encodeBoundAssociation(
-                boundInterface: String(repeating: "a", count: 16)
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: nil,
+                sourcePort: 0
             )
         )
-        XCTAssertNil(
-            TransparentProxyFlowMetadata.encodeBoundAssociation(
-                boundInterface: "无线"
+        for boundInterface in ["", String(repeating: "a", count: 16), "无线"] {
+            XCTAssertNil(
+                TransparentProxyFlowMetadata.encodeUDPAssociation(
+                    boundInterface: boundInterface,
+                    sourcePort: 5901
+                )
             )
-        )
+        }
     }
 
     func testDatagramSOCKSHostUsesTrustedConnectByNameHostname() throws {

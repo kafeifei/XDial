@@ -388,10 +388,12 @@ enum UDPFlowSOCKSRelay {
             } else {
                 boundInterface = nil
             }
+            let sourcePort = localPort(of: channel.flow)
             let relayEndpoint = try await associateUDP(
                 control,
                 credentials: ticket.credentials,
-                boundInterface: boundInterface
+                boundInterface: boundInterface,
+                sourcePort: sourcePort
             )
             stage = "relay-connect"
             let datagramConnection = NWConnection(
@@ -405,7 +407,7 @@ enum UDPFlowSOCKSRelay {
             }
             healthClock.markReady()
             logger.debug(
-                "udp-relay-started trial=\(ticket.generation, privacy: .public) endpoint=\(String(describing: relayEndpoint), privacy: .public)"
+                "udp-relay-started trial=\(ticket.generation, privacy: .public) endpoint=\(String(describing: relayEndpoint), privacy: .public) source-port=\(sourcePort.map(String.init) ?? "none", privacy: .public)"
             )
             stage = "relay"
             try await RelayTaskGroup.run(
@@ -539,10 +541,23 @@ enum UDPFlowSOCKSRelay {
         }
     }
 
+    /// The application socket's own local port, which macOS reports once the
+    /// flow is open. Zero means the socket has none yet.
+    private static func localPort(of flow: NEAppProxyUDPFlow) -> UInt16? {
+        guard
+            case let .hostPort(_, port) = flow.localFlowEndpoint,
+            port.rawValue != 0
+        else {
+            return nil
+        }
+        return port.rawValue
+    }
+
     private static func associateUDP(
         _ connection: NWConnection,
         credentials: SOCKSCredentials?,
-        boundInterface: String?
+        boundInterface: String?,
+        sourcePort: UInt16?
     ) async throws -> Network.NWEndpoint {
         let method: UInt8 = credentials == nil ? 0x00 : 0x02
         try await send(Data([0x05, 0x01, method]), to: connection)
@@ -555,13 +570,15 @@ enum UDPFlowSOCKSRelay {
         }
 
         // UDP ASSOCIATE with 0.0.0.0:0 asks the server to select its relay.
-        // A bound flow uses the authenticated domain envelope to preserve the
-        // interface macOS already selected; it is not a routing destination.
+        // When the application socket has a bound interface or a local port,
+        // the authenticated domain envelope states those socket facts instead;
+        // it is not a routing destination.
         var request = Data([0x05, 0x03, 0x00])
-        if let boundInterface {
+        if boundInterface != nil || sourcePort != nil {
             guard let metadata =
-                    TransparentProxyFlowMetadata.encodeBoundAssociation(
-                        boundInterface: boundInterface
+                    TransparentProxyFlowMetadata.encodeUDPAssociation(
+                        boundInterface: boundInterface,
+                        sourcePort: sourcePort
                     )
             else {
                 throw RelayError.invalidEndpoint
