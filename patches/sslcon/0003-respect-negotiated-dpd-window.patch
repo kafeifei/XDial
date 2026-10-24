@@ -1,0 +1,112 @@
+diff --git a/session/xdial_liveness.go b/session/xdial_liveness.go
+--- a/session/xdial_liveness.go
++++ b/session/xdial_liveness.go
+@@ -28,0 +29 @@
++	deadPeerTimeout     time.Duration
+@@ -86,0 +88 @@
++	DeadPeerTimeoutSeconds  int    `json:"dead_peer_timeout_seconds"`
+@@ -131,0 +134,8 @@
++	tlsDeadPeerTimeout := effectiveXDialDeadPeerTimeout(
++		tlsDPD,
++		cSess.TLSDpdTime,
++	)
++	dtlsDeadPeerTimeout := effectiveXDialDeadPeerTimeout(
++		dtlsDPD,
++		cSess.DTLSDpdTime,
++	)
+@@ -167,0 +178 @@
++			deadPeerTimeout:     tlsDeadPeerTimeout,
+@@ -175,0 +187 @@
++			deadPeerTimeout:     dtlsDeadPeerTimeout,
+@@ -218,0 +231,16 @@
++}
++
++// effectiveXDialDeadPeerTimeout keeps force-DPD as an early probe interval,
++// but does not let it shorten the server's negotiated DPD window. This keeps
++// fast failure detection on ordinary links without tearing down a healthy
++// session after a brief high-latency or lossy-network stall.
++func effectiveXDialDeadPeerTimeout(
++	probe time.Duration,
++	negotiatedSeconds int,
++) time.Duration {
++	timeout := 2 * probe
++	negotiated := time.Duration(negotiatedSeconds) * time.Second
++	if negotiated > timeout {
++		return negotiated
++	}
++	return timeout
+@@ -298 +326 @@
+-	if sinceFrame >= 2*state.effectiveDPD {
++	if state.deadPeerTimeout > 0 && sinceFrame >= state.deadPeerTimeout {
+@@ -545,0 +574 @@
++		DeadPeerTimeoutSeconds:  int(state.deadPeerTimeout / time.Second),
+diff --git a/session/xdial_liveness_test.go b/session/xdial_liveness_test.go
+--- a/session/xdial_liveness_test.go
++++ b/session/xdial_liveness_test.go
+@@ -27 +27 @@
+-func TestXDialForceDPDUsesIdleAndRetryWindows(t *testing.T) {
++func TestXDialForceDPDProbesEarlyButRespectsNegotiatedDeadPeerWindow(t *testing.T) {
+@@ -51,2 +51,21 @@
+-	if result := liveness.step(started.Add(10 * time.Second)); !result.tlsDead {
+-		t.Fatalf("peer not declared dead after two DPD intervals: %#v", result)
++	if result := liveness.step(started.Add(10 * time.Second)); result.tlsDead {
++		t.Fatalf("peer declared dead before negotiated DPD window: %#v", result)
++	}
++	if result := liveness.step(started.Add(119 * time.Second)); result.tlsDead {
++		t.Fatalf("peer declared dead before negotiated DPD window: %#v", result)
++	}
++	if result := liveness.step(started.Add(120 * time.Second)); !result.tlsDead {
++		t.Fatalf("peer not declared dead at negotiated DPD window: %#v", result)
++	}
++}
++
++func TestXDialForceDPDFallsBackToTwoProbeIntervalsWithoutNegotiatedDPD(t *testing.T) {
++	base.Cfg.SetXDialForceDPD(5)
++	cSess := (&Session{}).NewConnSession(&http.Header{})
++	started := cSess.xdial.tls.lastFrame
++
++	if result := cSess.xdial.step(started.Add(9 * time.Second)); result.tlsDead {
++		t.Fatalf("peer declared dead before fallback window: %#v", result)
++	}
++	if result := cSess.xdial.step(started.Add(10 * time.Second)); !result.tlsDead {
++		t.Fatalf("peer not declared dead after fallback window: %#v", result)
+@@ -95,0 +115,3 @@
++	}
++	if snapshot.TLS.DeadPeerTimeoutSeconds != 120 {
++		t.Fatalf("dead-peer timeout = %d, want 120", snapshot.TLS.DeadPeerTimeoutSeconds)
+@@ -376,0 +399,35 @@
++
++func TestXDialAirplaneNegotiatedSixtySecondWindow(t *testing.T) {
++	base.Cfg.SetXDialForceDPD(5)
++	header := http.Header{}
++	header.Set("X-CSTP-DPD", "60")
++	cSess := (&Session{}).NewConnSession(&header)
++	started := cSess.xdial.tls.lastFrame
++	for _, elapsed := range []time.Duration{10 * time.Second, 10400 * time.Millisecond, 59 * time.Second} {
++		if cSess.xdial.step(started.Add(elapsed)).tlsDead {
++			t.Fatalf("false disconnect after %s with a negotiated 60s window", elapsed)
++		}
++	}
++	if !cSess.xdial.step(started.Add(60 * time.Second)).tlsDead {
++		t.Fatal("dead session exceeded its negotiated timeout")
++	}
++}
++
++func TestXDialTwoSecondDPDResponseRestartsNegotiatedWindow(t *testing.T) {
++	base.Cfg.SetXDialForceDPD(5)
++	header := http.Header{}
++	header.Set("X-CSTP-DPD", "60")
++	cSess := (&Session{}).NewConnSession(&header)
++	started := cSess.xdial.tls.lastFrame
++	if result := cSess.xdial.step(started.Add(5 * time.Second)); result.tlsDead || len(result.actions) != 1 {
++		t.Fatalf("fast probe was lost: %#v", result)
++	}
++	cSess.xdial.now = func() time.Time { return started.Add(7 * time.Second) }
++	cSess.XDialRecordFrame(xdialTLS, 0x04)
++	if cSess.xdial.step(started.Add(66 * time.Second)).tlsDead {
++		t.Fatal("two-second DPD reply did not refresh the negotiated window")
++	}
++	if !cSess.xdial.step(started.Add(67 * time.Second)).tlsDead {
++		t.Fatal("refreshed window failed to expire")
++	}
++}
