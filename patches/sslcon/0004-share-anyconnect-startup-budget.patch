@@ -1,0 +1,86 @@
+diff --git a/auth/auth.go b/auth/auth.go
+--- a/auth/auth.go
++++ b/auth/auth.go
+@@ -93 +93,5 @@
+-	Conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 6 * time.Second}, "tcp4", dialTarget, &config)
++	// TCP/TLS establishment and authentication share one bounded startup
++	// budget. A separate 6s TLS deadline can reject a usable high-latency
++	// connection before authentication has even begun.
++	deadline := time.Now().Add(DefaultHandshakeBudget)
++	Conn, err = tls.DialWithDialer(&net.Dialer{Deadline: deadline}, "tcp4", dialTarget, &config)
+@@ -97 +101,2 @@
+-	if err = BeginHandshake(DefaultHandshakeBudget); err != nil {
++	handshakeDeadline = deadline
++	if err = Conn.SetDeadline(handshakeDeadline); err != nil {
+diff --git a/auth/xdial_airplane_startup_test.go b/auth/xdial_airplane_startup_test.go
+--- /dev/null
++++ b/auth/xdial_airplane_startup_test.go
+@@ -0,0 +1,68 @@
++package auth
++
++import (
++	"crypto/tls"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"sslcon/base"
++)
++
++func TestInitAuthAllowsSlowTLSWithinSharedStartupBudget(t *testing.T) {
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "text/xml")
++		_, _ = w.Write([]byte(`<config-auth type="auth-request"><auth><form action="/next"/></auth></config-auth>`))
++	}))
++	server.TLS = &tls.Config{GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
++		time.Sleep(6250 * time.Millisecond)
++		return nil, nil
++	}}
++	server.StartTLS()
++	defer server.Close()
++	prepareAirplaneAuthTest(t, strings.TrimPrefix(server.URL, "https://"), true)
++
++	started := time.Now()
++	if err := InitAuth(); err != nil {
++		t.Fatalf("TLS delay longer than 6s but within startup budget must succeed: %v", err)
++	}
++	if Prof.AuthPath != "/next" {
++		t.Fatalf("authentication response was not processed: %q", Prof.AuthPath)
++	}
++	if handshakeDeadline.After(started.Add(DefaultHandshakeBudget + time.Second)) {
++		t.Fatal("TCP/TLS time was excluded from the total startup budget")
++	}
++}
++
++func TestInitAuthStillRejectsUntrustedServer(t *testing.T) {
++	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		t.Error("untrusted TLS peer must not receive an authentication request")
++	}))
++	defer server.Close()
++	prepareAirplaneAuthTest(t, strings.TrimPrefix(server.URL, "https://"), false)
++	err := InitAuth()
++	var untrusted *tls.CertificateVerificationError
++	if !errors.As(err, &untrusted) {
++		t.Fatalf("expected certificate rejection, got %v", err)
++	}
++}
++
++func prepareAirplaneAuthTest(t *testing.T, endpoint string, allowInsecure bool) {
++	t.Helper()
++	oldProf, oldConn, oldBufR := Prof, Conn, BufR
++	oldDeadline, oldCookie := handshakeDeadline, WebVpnCookie
++	oldInsecure := base.Cfg.InsecureSkipVerify
++	Prof = &Profile{HostWithPort: endpoint, TLSServerName: "localhost", Scheme: "https://"}
++	Conn, BufR = nil, nil
++	handshakeDeadline = time.Time{}
++	base.Cfg.InsecureSkipVerify = allowInsecure
++	t.Cleanup(func() {
++		AbortHandshake()
++		Prof, Conn, BufR = oldProf, oldConn, oldBufR
++		handshakeDeadline, WebVpnCookie = oldDeadline, oldCookie
++		base.Cfg.InsecureSkipVerify = oldInsecure
++	})
++}
