@@ -251,25 +251,7 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     }
 
     private func publishScenarioSwitchProjection() {
-        let projection = scenarioSwitchProjection
-        scenarioSwitchHandler?(projection)
-        guard let projection else { return }
-        ScenarioSwitchFeedbackRecorder.shared.record(ScenarioSwitchFeedback(
-            id: projection.candidateTransactionID,
-            startedAt: projection.candidateReport.startedAt,
-            status: projection.status,
-            inFlight: projection.inFlight,
-            sourceTransactionID: projection.sourceCommittedTransactionID,
-            targetTransactionID: projection.candidateTransactionID,
-            activeTransactionID: projection.activeCommittedTransactionID,
-            candidate: projection.candidateReport,
-            sameScenario: projection.fromScenarioID == projection.toScenarioID,
-            cancellationRequested: activeScenarioSwitch?.cancellationRequested
-                ?? (projection.status == "cancelled"),
-            timedOut: activeScenarioSwitch?.timedOut
-                ?? (projection.status == "timed-out"),
-            code: projection.code
-        ))
+        scenarioSwitchHandler?(scenarioSwitchProjection)
     }
 
     deinit {
@@ -393,7 +375,6 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         completion: @escaping (Result<ConnectionReport, Error>) -> Void
     ) {
         guard activeScenarioSwitch == nil else {
-            recordRejectedScenarioSwitch(code: "switch-in-progress")
             completion(.failure(ManagerError.scenarioSwitchInProgress))
             return
         }
@@ -407,7 +388,6 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             connectedSessionTransactionID == sourceReport.transactionID,
             manager?.connection.status == .connected
         else {
-            recordRejectedScenarioSwitch(code: "switch-unavailable")
             completion(.failure(ManagerError.scenarioSwitchUnavailable))
             return
         }
@@ -416,7 +396,6 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
         do {
             plan = try generateConnectionPlan(profileJSON: profileJSON)
         } catch {
-            recordRejectedScenarioSwitch(code: "switch-plan-invalid")
             completion(.failure(error))
             return
         }
@@ -425,7 +404,6 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             !plan.scenario.id.isEmpty,
             !plan.configurationFingerprint.isEmpty
         else {
-            recordRejectedScenarioSwitch(code: "switch-plan-invalid")
             completion(.failure(ManagerError.invalidConnectionPlan))
             return
         }
@@ -446,7 +424,6 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
             }
             targetReportJSON = encoded
         } catch {
-            recordRejectedScenarioSwitch(code: "switch-plan-invalid")
             completion(.failure(error))
             return
         }
@@ -482,14 +459,6 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 result: result
             )
         }
-    }
-
-    private func recordRejectedScenarioSwitch(code: String) {
-        ScenarioSwitchFeedbackRecorder.shared.record(ScenarioSwitchFeedback(
-            id: UUID().uuidString, startedAt: Date(), status: "rejected",
-            inFlight: false, sourceTransactionID: "", targetTransactionID: "",
-            activeTransactionID: "", candidate: nil, sameScenario: nil, code: code
-        ))
     }
 
     /// Cancellation is scoped to the staged switch. It must not stop the

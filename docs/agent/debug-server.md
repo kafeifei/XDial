@@ -4,9 +4,6 @@
 当前 `FormalDevelopment` 与 `Release` 不包含 Debug Server。端口不是安装或 Provider 版本。
 实现入口：[DebugServer.swift](../../macos/Sources/XDial/DebugServer.swift)。
 
-场景切换的白名单观察与自动问题卡片使用独立的本地记录，不读取完整诊断响应，见
-[jev 改进闭环](jev-loop.md)。
-
 ## HTTP 接口
 
 ```sh

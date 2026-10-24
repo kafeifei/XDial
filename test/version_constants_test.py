@@ -22,7 +22,6 @@
 - 随同一构建打包的输入：RuleSetPresetCatalog 的 schema_version；
 - 上游依赖补丁里的字段：sslcon 诊断快照的 SchemaVersion 已由
   scripts/prepare-patched-go-mod.sh 校验，且属于 D22 的依赖版本门禁；
-- 只由仓库内工具自产自读的：jev 的验收标准文件和 issue card；
 - iOS / tvOS：仍是草稿平台。
 
 新增属于同一类的版本号时，把它加进 PINS。
@@ -244,17 +243,6 @@ PINS = [
                  r"HostUnderlayCaptureEvidence\(\s*schemaVersion:\s*(\d+),", minimum=2),
             site("Swift", "macos/Sources/XDial/TransparentProxyManager.swift",
                  r"HostUnderlayCaptureEvidence\(\s*schemaVersion:\s*(\d+),"),
-        ],
-    },
-    {
-        "name": "场景切换观测 scenario-switch-observations.json schemaVersion",
-        "value": "1",
-        "shared": "已安装的 App 写入日志目录，仓库里的 jev 闭环脚本读取",
-        "sites": [
-            site("Swift", "macos/Shared/ScenarioSwitchFeedback.swift",
-                 r"struct ScenarioSwitchFeedbackHistory: Codable, Equatable \{\s*var schemaVersion = (\d+)"),
-            site("Python", "scripts/jev_loop.py", r'document\.get\("schemaVersion"\) != (\d+)'),
-            site("Python", "scripts/jev_loop.py", r'\{"schemaVersion": (\d+), "observations": \[\]\}'),
         ],
     },
     {

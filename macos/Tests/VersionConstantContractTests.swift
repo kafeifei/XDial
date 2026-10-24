@@ -159,8 +159,6 @@ final class VersionConstantContractTests: XCTestCase {
                 candidateInterfaces: [], indexedInterfaces: []
             )?.schemaVersion, 1, policy
         )
-        // scripts/jev_loop.py reads this exact key and value.
-        XCTAssertEqual(try jsonObject(ScenarioSwitchFeedbackHistory())["schemaVersion"] as? Int, 1, policy)
     }
 
     func testHostExtensionIPCVersionsArePinned() throws {

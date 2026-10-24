@@ -162,13 +162,6 @@ prepare-patched-go: $(PATCHED_WORKFILE)
 public-content-gate:
 	bash scripts/check-public-content.sh
 
-.PHONY: test-jev-loop jev-loop
-test-jev-loop:
-	python3 -m unittest discover -s test -p 'jev_loop_test.py'
-
-jev-loop:
-	python3 scripts/jev_loop.py --watch --publish --repair
-
 # 正式版、beta 与 Debug 共享的持久格式和跨进程协议版本只能经 main 演进（D22）。
 # 作为 make test 的前置，CI 的 Go job 在 "go test" 一步执行。make test 的 go test 只覆盖
 # ./core/...，cmd/xdial 里的契约单测在这里单独跑。

@@ -35,8 +35,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: jev feedback loop tests (offline)
-        run: make test-jev-loop
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod

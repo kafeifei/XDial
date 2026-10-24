@@ -9,7 +9,7 @@ macOS 菜单栏网络分流工具；iOS / tvOS 共用 Go 核心。
 | 分支 | 用途 | 规则 |
 |---|---|---|
 | `main` | 正式版基线，`vX.Y.Z` 从这里发布 | 只经 PR 合入；新工作从这里拉出 |
-| 工作分支：`claude/*`、`codex/*`、`cindy/*`、`feature/*`、`jev/*` | 单个修复或功能；`jev/*` 由 [jev 闭环](docs/agent/jev-loop.md) 自动创建 | 从 main 拉出，PR 只开向 main；修复直接进 main，实验功能另合进 `xdial-beta` |
+| 工作分支：`claude/*`、`codex/*`、`cindy/*`、`feature/*` | 单个修复或功能 | 从 main 拉出，PR 只开向 main；修复直接进 main，实验功能另合进 `xdial-beta` |
 | `xdial-beta` | beta 线：main 加上实验功能，与正式版同一身份、靠更新源区分 | 只接收 main 和工作分支的合并，不从它拉分支、不合回 main；打 `vX.Y.Z-beta.N` 标签由 CI 构建 prerelease，`make publish RELEASE_CHANNEL=beta` 写入 beta.json，见[更新与发布](docs/agent/updates.md#beta-发布机制) |
 
 Debug 从正在验证的工作分支构建（已合入最新 main），没有 Debug 专用分支；确需回退已装 Debug 时设 `ALLOW_DEBUG_ROLLBACK=1`。
