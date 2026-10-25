@@ -185,6 +185,20 @@ final class ReconnectIncidentHistoryTests: XCTestCase {
             incident.events.last?.type,
             "system-disconnect-reason"
         )
+        let decoded = try JSONDecoder().decode(
+            ReconnectIncidentHistory.self,
+            from: JSONEncoder().encode(history)
+        )
+        XCTAssertEqual(
+            decoded.incidents.first?.evidence?.anyConnect?
+                .tls.deadPeerTimeoutSeconds,
+            60
+        )
+        XCTAssertEqual(
+            decoded.incidents.first?.evidence?.anyConnect?
+                .tls.effectiveDPDSeconds,
+            5
+        )
     }
 
     func testIncidentWithoutEvidenceRoundTripsForOldReports() throws {
@@ -371,13 +385,14 @@ final class ReconnectIncidentHistoryTests: XCTestCase {
           "schema_version": 1,
           "force_dpd_seconds": 5,
           "negotiated": {
-            "tls_dpd_seconds": 30,
+            "tls_dpd_seconds": 60,
             "tls_keepalive_seconds": 20,
             "dtls_dpd_seconds": 30,
             "dtls_keepalive_seconds": 20
           },
           "tls": {
             "effective_dpd_seconds": 5,
+            "dead_peer_timeout_seconds": 60,
             "dpd_requests_queued": 1,
             "dpd_requests_dropped": 0,
             "dpd_requests_written": 1,

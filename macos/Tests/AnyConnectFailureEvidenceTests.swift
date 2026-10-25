@@ -1,11 +1,46 @@
 import XCTest
 
 final class AnyConnectFailureEvidenceTests: XCTestCase {
+    func testProbeCadenceAndNegotiatedDeadPeerWindowRoundTripSeparately()
+        throws {
+        let legacy = try decodeEvidence()
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy))
+                as? [String: Any]
+        )
+        var negotiated = try XCTUnwrap(object["negotiated"] as? [String: Any])
+        negotiated["tls_dpd_seconds"] = 60
+        negotiated["dtls_dpd_seconds"] = 60
+        object["negotiated"] = negotiated
+        for channel in ["tls", "dtls"] {
+            var value = try XCTUnwrap(object[channel] as? [String: Any])
+            value["dead_peer_timeout_seconds"] = 60
+            object[channel] = value
+        }
+        let evidence = try JSONDecoder().decode(
+            AnyConnectFailureEvidence.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertEqual(evidence.forceDPDSeconds, 5)
+        XCTAssertEqual(evidence.tls.effectiveDPDSeconds, 5)
+        XCTAssertEqual(evidence.tls.deadPeerTimeoutSeconds, 60)
+        XCTAssertEqual(evidence.dtls.deadPeerTimeoutSeconds, 60)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                AnyConnectFailureEvidence.self,
+                from: JSONEncoder().encode(evidence)
+            ),
+            evidence
+        )
+    }
+
     func testDecodesAllowListedDiagnosticsShape() throws {
         let evidence = try decodeEvidence()
 
         XCTAssertEqual(evidence.schemaVersion, 1)
         XCTAssertEqual(evidence.forceDPDSeconds, 5)
+        XCTAssertNil(evidence.tls.deadPeerTimeoutSeconds)
+        XCTAssertNil(evidence.dtls.deadPeerTimeoutSeconds)
         XCTAssertNil(evidence.sessionAgeMS)
         XCTAssertEqual(evidence.negotiated.tlsDPDSeconds, 30)
         XCTAssertNil(evidence.negotiated.cstpRekeySeconds)

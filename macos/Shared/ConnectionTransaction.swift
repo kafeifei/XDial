@@ -410,6 +410,7 @@ struct AnyConnectNegotiatedEvidence: Codable, Equatable {
 
 struct AnyConnectTLSChannelEvidence: Codable, Equatable {
     let effectiveDPDSeconds: Int
+    let deadPeerTimeoutSeconds: Int?
     let dpdRequestsQueued: UInt64
     let dpdRequestsDropped: UInt64
     let dpdRequestsWritten: UInt64
@@ -426,6 +427,7 @@ struct AnyConnectTLSChannelEvidence: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case effectiveDPDSeconds = "effective_dpd_seconds"
+        case deadPeerTimeoutSeconds = "dead_peer_timeout_seconds"
         case dpdRequestsQueued = "dpd_requests_queued"
         case dpdRequestsDropped = "dpd_requests_dropped"
         case dpdRequestsWritten = "dpd_requests_written"
@@ -446,6 +448,7 @@ struct AnyConnectTLSChannelEvidence: Codable, Equatable {
 
 struct AnyConnectDTLSChannelEvidence: Codable, Equatable {
     let effectiveDPDSeconds: Int
+    let deadPeerTimeoutSeconds: Int?
     let dpdRequestsQueued: UInt64
     let dpdRequestsDropped: UInt64
     let dpdRequestsWritten: UInt64
@@ -464,6 +467,7 @@ struct AnyConnectDTLSChannelEvidence: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case effectiveDPDSeconds = "effective_dpd_seconds"
+        case deadPeerTimeoutSeconds = "dead_peer_timeout_seconds"
         case dpdRequestsQueued = "dpd_requests_queued"
         case dpdRequestsDropped = "dpd_requests_dropped"
         case dpdRequestsWritten = "dpd_requests_written"
