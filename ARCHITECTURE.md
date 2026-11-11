@@ -70,6 +70,14 @@ IPv6 接口地址（临时地址在稳定网络上轮换）不进入比较；Pro
 
 macOS 已绑定 flow 的接口是系统既有裁决，经认证且有长度上限的 metadata 传给 sing-box；
 Scenario 先选 Line，仅最终属于 Direct 的 flow 恢复该绑定，其他 Line 不继承它。
+UDP flow 的绑定接口与本地端口是 App socket 的事实，经 UDP ASSOCIATE 请求地址传入，
+不是路由目标。Tailscale Line 在 tailnet 上为该 flow 自己的连接绑定同一端口，被占用时退回临时端口；
+Direct 以 `SO_REUSEPORT` 加入 App 自己的端口，App 独占通配端口时退回临时端口。被 Transparent Proxy
+接管的 socket 不再直接收包，按协商端口回送、不回送观察源端口的对端（如屏幕共享高性能模式）
+因此由这一端口接住，再回到原 flow；两端都运行 XDial 时同样成立。
+UDP 关联随其 SOCKS 控制连接立即结束，端口不等空闲超时即释放，App 重开同端口 socket 时可再次取得。
+UDP 下行写回 App 期间继续接收，下一次写回交出期间排队的全部数据报；队列有界，满时丢弃新到数据报，
+不把积压变成延迟。
 
 本机 SOCKS5 由 Provider 持有 `127.0.0.1:<port>`，只接受本机无认证 TCP CONNECT，不设置
 系统代理、不监听其他地址。每条连接在接入时取得当前 generation 的会话入口，与系统 flow
