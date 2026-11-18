@@ -200,9 +200,12 @@ enum TransparentProxyApplicationCredentialDecision: Equatable {
 enum TransparentProxyFlowMetadata {
     private static let addressMetadataMagic = Data([0x00, 0x58, 0x44, 0x01])
     private static let boundFlowMetadataMagic = Data([0x00, 0x58, 0x44, 0x02])
+    private static let udpAssociationMetadataMagic =
+        Data([0x00, 0x58, 0x44, 0x03])
     private static let hasEndpointFlag: UInt8 = 1 << 0
     private static let hasHostnameFlag: UInt8 = 1 << 1
     private static let hasBoundInterfaceFlag: UInt8 = 1 << 2
+    private static let hasSourcePortFlag: UInt8 = 1 << 3
 
     /// A connect-by-name UDP flow must stay a name at the SOCKS boundary.
     /// That lets the resolver selected by the matched App/Line rule choose the
@@ -298,23 +301,44 @@ enum TransparentProxyFlowMetadata {
         )
     }
 
-    /// UDP ASSOCIATE has no single remote endpoint, but its socket still owns
-    /// the original bound-interface fact for every datagram in the flow.
-    static func encodeBoundAssociation(
-        boundInterface: String
+    /// UDP ASSOCIATE has no single remote endpoint. Its request address
+    /// instead states the facts of the application socket behind every
+    /// datagram: the interface macOS bound it to, and its local port. A
+    /// Tailscale Line binds that port on the tailnet, because peers such as
+    /// Screen Sharing's High Performance mode send to the port they
+    /// negotiated rather than to the source port they observed.
+    static func encodeUDPAssociation(
+        boundInterface: String?,
+        sourcePort: UInt16?
     ) -> Data? {
-        encodeBoundMetadata(
-            endpoint: nil,
-            hostname: nil,
-            boundInterface: boundInterface
-        )
+        guard boundInterface != nil || sourcePort != nil else {
+            return nil
+        }
+        var flags: UInt8 = 0
+        var fields = Data()
+        if let boundInterface {
+            guard let interfaceBytes = interfaceBytes(boundInterface) else {
+                return nil
+            }
+            flags |= hasBoundInterfaceFlag
+            fields.append(UInt8(interfaceBytes.count))
+            fields.append(interfaceBytes)
+        }
+        if let sourcePort {
+            guard sourcePort != 0 else {
+                return nil
+            }
+            flags |= hasSourcePortFlag
+            fields.append(UInt8(sourcePort >> 8))
+            fields.append(UInt8(sourcePort & 0xff))
+        }
+        var encoded = udpAssociationMetadataMagic
+        encoded.append(flags)
+        encoded.append(fields)
+        return encoded
     }
 
-    private static func encodeBoundMetadata(
-        endpoint: (family: UInt8, address: Data)?,
-        hostname: String?,
-        boundInterface: String
-    ) -> Data? {
+    private static func interfaceBytes(_ boundInterface: String) -> Data? {
         let interfaceBytes = Data(boundInterface.utf8)
         guard
             !interfaceBytes.isEmpty,
@@ -322,6 +346,17 @@ enum TransparentProxyFlowMetadata {
             !interfaceBytes.contains(0),
             interfaceBytes.allSatisfy({ $0 < 0x80 })
         else {
+            return nil
+        }
+        return interfaceBytes
+    }
+
+    private static func encodeBoundMetadata(
+        endpoint: (family: UInt8, address: Data),
+        hostname: String?,
+        boundInterface: String
+    ) -> Data? {
+        guard let interfaceBytes = interfaceBytes(boundInterface) else {
             return nil
         }
 
@@ -340,20 +375,15 @@ enum TransparentProxyFlowMetadata {
             hostnameBytes = nil
         }
 
-        var flags = hasBoundInterfaceFlag
-        if endpoint != nil {
-            flags |= hasEndpointFlag
-        }
+        var flags = hasBoundInterfaceFlag | hasEndpointFlag
         if hostnameBytes != nil {
             flags |= hasHostnameFlag
         }
 
         var encoded = boundFlowMetadataMagic
         encoded.append(flags)
-        if let endpoint {
-            encoded.append(endpoint.family)
-            encoded.append(endpoint.address)
-        }
+        encoded.append(endpoint.family)
+        encoded.append(endpoint.address)
         if let hostnameBytes {
             encoded.append(UInt8(hostnameBytes.count))
             encoded.append(hostnameBytes)
