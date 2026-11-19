@@ -1535,6 +1535,7 @@ func (l *Libbox) createAnyConnectRuntimeCapability(
 		)
 	}
 	bridge.Start(cSess)
+	rememberAnyConnectServerAddress(config, vpnInfo)
 	capability := &anyConnectRuntimeCapability{
 		vpn:      l.vpn,
 		line:     newAnyConnectLineRuntime(bridge, dnsServers),
@@ -2906,6 +2907,7 @@ func (l *Libbox) reconnectAnyConnect(
 			continue
 		}
 		bridge.Start(cSess)
+		rememberAnyConnectServerAddress(config, vpnInfo)
 
 		l.mu.Lock()
 		if !l.running || l.cleaning ||

@@ -238,6 +238,7 @@ func (c *anyConnectRuntimeCapability) runRecovery(work *anyConnectRecovery) {
 			continue
 		}
 		bridge.Start(sess)
+		rememberAnyConnectServerAddress(config, info)
 		encoded, _ := stdjson.Marshal(dns)
 		if ctx.Err() != nil || !c.activate(bridge, sess, string(encoded), dns) {
 			bridge.Close()

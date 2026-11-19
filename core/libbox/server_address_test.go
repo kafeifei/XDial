@@ -5,8 +5,13 @@ package libbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/kafeifei/xdial/core/engine"
 )
 
 type stubServerIPResolver struct {
@@ -67,4 +72,124 @@ func TestServerHostnameRejectsIPv6BecauseControlPathIsTCP4(t *testing.T) {
 	if err == nil || err.Error() != "server endpoint is not IPv4" {
 		t.Fatalf("error = %v, want IPv4-only error", err)
 	}
+}
+
+func TestServerAddressFallbackUsesVerifiedTunnelAfterDNSFailure(t *testing.T) {
+	var cache serverAddressCache
+	now := time.Unix(100, 0)
+	config := engine.VPNConfig{Server: "gateway.example:8443"}
+	cache.remember(config, &engine.VPNInfo{ServerAddr: "203.0.113.8"}, now)
+	resolver := &stubServerIPResolver{err: context.DeadlineExceeded}
+	got, err := resolveServerIPv4WithFallback(context.Background(), resolver, config.Server, &cache, func() time.Time { return now })
+	if err != nil || got != "203.0.113.8" {
+		t.Fatalf("DNS outage recovery = %q, %v", got, err)
+	}
+	if resolver.host != "gateway.example" || config.Server != "gateway.example:8443" {
+		t.Fatal("fallback changed the hostname/certificate identity")
+	}
+}
+
+func TestServerAddressFallbackNeverSeedsFromAnInsecureOrInvalidTunnel(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		insecure bool
+		address  string
+	}{
+		{"insecure", true, "203.0.113.8"},
+		{"empty", false, ""},
+		{"ipv6", false, "2001:db8::1"},
+		{"invalid", false, "not an address"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var cache serverAddressCache
+			now := time.Unix(100, 0)
+			config := engine.VPNConfig{Server: "gateway.example:8443", AllowInsecure: test.insecure}
+			cache.remember(config, &engine.VPNInfo{ServerAddr: test.address}, now)
+			_, err := resolveServerIPv4WithFallback(context.Background(), &stubServerIPResolver{err: errors.New("DNS unavailable")}, config.Server, &cache, func() time.Time { return now })
+			if !errors.Is(err, errServerIPv4Lookup) {
+				t.Fatalf("unverified cache entry used: %v", err)
+			}
+		})
+	}
+}
+
+func TestServerAddressFallbackExpiresWithoutExtendingItsLifetime(t *testing.T) {
+	var cache serverAddressCache
+	start := time.Unix(100, 0)
+	cache.remember(engine.VPNConfig{Server: "gateway.example"}, &engine.VPNInfo{ServerAddr: "203.0.113.8"}, start)
+	if _, ok := cache.lookup("gateway.example", start.Add(rememberedServerAddressLifetime-time.Second)); !ok {
+		t.Fatal("entry expired too early")
+	}
+	if _, ok := cache.lookup("gateway.example", start.Add(rememberedServerAddressLifetime)); ok {
+		t.Fatal("fallback read extended the expiry")
+	}
+}
+
+func TestServerAddressFallbackIsScopedToHostnameAndPort(t *testing.T) {
+	var cache serverAddressCache
+	now := time.Unix(100, 0)
+	cache.remember(engine.VPNConfig{Server: "https://Gateway.example:8443/path"}, &engine.VPNInfo{ServerAddr: "203.0.113.8"}, now)
+	if _, ok := cache.lookup("gateway.example:8443", now); !ok {
+		t.Fatal("equivalent endpoint did not match")
+	}
+	for _, server := range []string{"other.example:8443", "gateway.example:443", "gateway.example"} {
+		if _, ok := cache.lookup(server, now); ok {
+			t.Fatalf("reused another endpoint's address: %s", server)
+		}
+	}
+}
+
+func TestFreshDNSWinsButCannotPoisonVerifiedFallback(t *testing.T) {
+	var cache serverAddressCache
+	now := time.Unix(100, 0)
+	server := "gateway.example"
+	cache.remember(engine.VPNConfig{Server: server}, &engine.VPNInfo{ServerAddr: "203.0.113.8"}, now)
+	clock := func() time.Time { return now }
+	fresh := &stubServerIPResolver{addresses: []net.IP{net.ParseIP("203.0.113.9")}}
+	if got, err := resolveServerIPv4WithFallback(context.Background(), fresh, server, &cache, clock); got != "203.0.113.9" || err != nil {
+		t.Fatalf("fresh DNS ignored: %q, %v", got, err)
+	}
+	failed := &stubServerIPResolver{err: errors.New("DNS unavailable")}
+	if got, err := resolveServerIPv4WithFallback(context.Background(), failed, server, &cache, clock); got != "203.0.113.8" || err != nil {
+		t.Fatalf("unverified DNS result replaced tunnel evidence: %q, %v", got, err)
+	}
+}
+
+func TestServerAddressFallbackRespectsCancellationAndIPv4Policy(t *testing.T) {
+	var cache serverAddressCache
+	now := time.Unix(100, 0)
+	server := "gateway.example"
+	cache.remember(engine.VPNConfig{Server: server}, &engine.VPNInfo{ServerAddr: "203.0.113.8"}, now)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := resolveServerIPv4WithFallback(ctx, &stubServerIPResolver{err: context.Canceled}, server, &cache, func() time.Time { return now }); err == nil {
+		t.Fatal("canceled operation resumed through fallback")
+	}
+	if _, err := resolveServerIPv4WithFallback(context.Background(), &stubServerIPResolver{}, server, &cache, func() time.Time { return now }); err == nil {
+		t.Fatal("successful DNS with no IPv4 silently used a stale address")
+	}
+}
+
+func TestServerAddressCacheIsBoundedAndConcurrent(t *testing.T) {
+	var cache serverAddressCache
+	now := time.Unix(100, 0)
+	for i := 0; i < rememberedServerAddressLimit+1; i++ {
+		cache.remember(engine.VPNConfig{Server: fmt.Sprintf("gateway-%d.example", i)}, &engine.VPNInfo{ServerAddr: "203.0.113.8"}, now.Add(time.Duration(i)*time.Second))
+	}
+	if len(cache.entries) != rememberedServerAddressLimit {
+		t.Fatalf("cache size = %d", len(cache.entries))
+	}
+	if _, ok := cache.lookup("gateway-0.example", now); ok {
+		t.Fatal("oldest entry was not evicted")
+	}
+	var group sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			cache.remember(engine.VPNConfig{Server: "gateway.example"}, &engine.VPNInfo{ServerAddr: "203.0.113.8"}, now)
+			cache.lookup("gateway.example", now)
+		}()
+	}
+	group.Wait()
 }
