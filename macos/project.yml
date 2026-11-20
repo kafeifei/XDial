@@ -370,6 +370,8 @@ targets:
       - Sources/XDial/GlobalConfiguration.swift
       - Sources/XDial/ConfigurationEditorState.swift
       - Sources/XDial/ConnectionConfigurationReadiness.swift
+      - Sources/XDial/ScenarioConnectionPresentation.swift
+      - Sources/XDial/ScenarioConnectionViews.swift
       - Sources/XDial/SettingsLineTable.swift
       - Sources/XDial/SettingsReadOnlyText.swift
       - Sources/XDial/LineGroupMemberTable.swift
