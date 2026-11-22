@@ -24,6 +24,10 @@ RELEASE_NOTES_FILE ?= $(if $(filter beta,$(RELEASE_CHANNEL)),BETA_RELEASE_NOTES.
 # 发 stable 时，若 beta.json 的条目会让开着 beta 的用户报 build_not_newer，
 # publish 要求写明同批的后续动作：republish 或 withdraw。
 RELEASE_BETA_FOLLOWUP ?=
+# publish 默认在本机派发更新仓库的 publish.yml；release.yml 用 follow：只公开 Release，
+# 由更新仓库的 follow.yml 轮询到后发布，这边等清单读到新版本。
+RELEASE_PAGES ?= dispatch
+RELEASE_PAGES_TIMEOUT ?=
 RELEASE_CONTRACT_SCRIPT ?= scripts/release-contract.sh
 RELEASE_CONTRACT := XDIAL_RELEASE_CHANNEL=$(RELEASE_CHANNEL) $(RELEASE_CONTRACT_SCRIPT)
 # 版本号与源分支都由合约按通道给出；stable 的版本号仍是去掉 v 的标签。
@@ -408,8 +412,8 @@ publish:
 		echo "error: an acceptance build cannot be published to $(RELEASE_CHANNEL)" >&2; \
 		exit 1; \
 	}
-	python3 scripts/publish-release.py --channel "$(RELEASE_CHANNEL)" \
-		$(if $(RELEASE_BETA_FOLLOWUP),--beta-followup "$(RELEASE_BETA_FOLLOWUP)" )"$(RELEASE_TAG)"
+	python3 scripts/publish-release.py --channel "$(RELEASE_CHANNEL)" --pages "$(RELEASE_PAGES)" \
+		$(if $(RELEASE_PAGES_TIMEOUT),--pages-timeout "$(RELEASE_PAGES_TIMEOUT)" )$(if $(RELEASE_BETA_FOLLOWUP),--beta-followup "$(RELEASE_BETA_FOLLOWUP)" )"$(RELEASE_TAG)"
 
 # 一键重启：先完整构建并签名新版本，成功后才让旧实例完成网络回滚并退出。
 # 构建目录中的进程紧接着执行无 UI 的原子安装，然后只启动
