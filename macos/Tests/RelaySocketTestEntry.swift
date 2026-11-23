@@ -147,8 +147,11 @@ final class RelaySocketTestEntry: @unchecked Sendable {
         directory = String(cString: created)
         path = directory + "/relay"
 
-        listener = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard listener >= 0 else {
+        // One local name for the descriptor throughout: the closures below
+        // must not see the property under a name a later local would shadow.
+        let listening = socket(AF_UNIX, SOCK_STREAM, 0)
+        listener = listening
+        guard listening >= 0 else {
             throw POSIXError(.init(rawValue: errno) ?? .EIO)
         }
         var address = sockaddr_un()
@@ -161,20 +164,19 @@ final class RelaySocketTestEntry: @unchecked Sendable {
         let bound = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.bind(
-                    listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size)
+                    listening, $0, socklen_t(MemoryLayout<sockaddr_un>.size)
                 )
             }
         }
-        guard bound == 0, Darwin.listen(listener, 16) == 0 else {
+        guard bound == 0, Darwin.listen(listening, 16) == 0 else {
             let failure = POSIXError(.init(rawValue: errno) ?? .EIO)
-            Darwin.close(listener)
+            Darwin.close(listening)
             throw failure
         }
 
-        let listener = self.listener
         Thread.detachNewThread { [weak self] in
             while true {
-                let descriptor = Darwin.accept(listener, nil, nil)
+                let descriptor = Darwin.accept(listening, nil, nil)
                 guard descriptor >= 0 else {
                     return
                 }
