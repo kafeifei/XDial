@@ -99,6 +99,58 @@ final class RelayStreamConnectionTests: XCTestCase {
         }
     }
 
+    /// sing-box closes its socket as soon as both directions are done, often
+    /// before the Provider has read the last bytes. Network.framework reports
+    /// a closed Unix peer as a failed connection, and that must not cost the
+    /// bytes and the FIN frame already in the socket — whenever they are read.
+    func testBytesAndFinishSentJustBeforeTheEntryClosesAreNotLost() async throws {
+        let tail = Data((0..<6_000).map { UInt8(truncatingIfNeeded: $0) })
+        for delay in [0.0, 0.05, 0.5] {
+            let entry = try RelaySocketTestEntry { peer in
+                peer.writeData(tail)
+                peer.writeFinish()
+                peer.close()
+            }
+            defer { entry.stop() }
+
+            let connection = RelayStreamConnection(socketPath: entry.path)
+            defer { connection.cancel(with: CancellationError()) }
+            try await connection.start()
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            var received = Data()
+            while let bytes = try await connection.receive() {
+                received.append(bytes)
+            }
+            XCTAssertEqual(received, tail, "read \(delay)s after the close")
+        }
+    }
+
+    /// The same late read of a stream that was cut must still say reset, not
+    /// whatever error the failed connection carries.
+    func testACutStreamReadLateIsStillAReset() async throws {
+        for delay in [0.0, 0.05, 0.5] {
+            let entry = try RelaySocketTestEntry { peer in
+                peer.writeData(Data("partial".utf8))
+                peer.close()
+            }
+            defer { entry.stop() }
+
+            let connection = RelayStreamConnection(socketPath: entry.path)
+            defer { connection.cancel(with: CancellationError()) }
+            try await connection.start()
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            do {
+                var received = Data()
+                while let bytes = try await connection.receive() {
+                    received.append(bytes)
+                }
+                XCTFail("a cut stream ended cleanly, read \(delay)s late")
+            } catch let error as NWError {
+                XCTAssertEqual(error, .posix(.ECONNRESET), "read \(delay)s late")
+            }
+        }
+    }
+
     func testMalformedStreamIsAnErrorNotAnEnd() async throws {
         let entry = try RelaySocketTestEntry { peer in
             peer.writeRaw(Data([0x05, 0x00, 0x00, 0x00]))
