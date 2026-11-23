@@ -271,7 +271,7 @@ enum TransparentProxyFlowMetadata {
     }
 
     /// Carries the interface choice macOS already attached to a bound flow.
-    /// The authenticated loopback relay is only a transport envelope: the
+    /// The authenticated relay socket is only a transport envelope: the
     /// active Scenario still selects the outbound, and only Direct restores
     /// this interface when it is the selected Line.
     static func encodeBoundFlow(

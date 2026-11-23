@@ -7,7 +7,7 @@ struct TransparentProxyRemoteNetwork: Equatable, Sendable {
 
 enum TransparentProxyNetworkRulePlan {
     /// Addresses whose meaning depends on the originating interface or local
-    /// broadcast domain cannot retain that meaning after loopback SOCKS relay.
+    /// broadcast domain cannot retain that meaning after the SOCKS relay.
     /// Routable private, ULA, Tailnet and enterprise unicast stay inside XDial.
     static let interfaceScopedRemoteNetworks = [
         TransparentProxyRemoteNetwork(

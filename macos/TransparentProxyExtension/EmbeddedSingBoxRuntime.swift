@@ -28,7 +28,9 @@ final class EmbeddedSingBoxRuntime {
 
     struct Session {
         let networkEpochID: String
-        let port: UInt16
+        /// The socket file this generation's sing-box entry listens on. The
+        /// entry takes no port; see `RelayStreamFrame`.
+        let relaySocketPath: String
         let credentials: SOCKSCredentials
         /// Active Surge-style process selectors in Scenario binding order, each
         /// paired with its per-session SOCKS credentials. This list is never
@@ -350,6 +352,7 @@ final class EmbeddedSingBoxRuntime {
     }
     private var preparedSwitchState: PreparedSwitchState?
     private let lineRecoveryConditions: LineRecoveryConditionsRelay?
+    private let relaySockets: RelaySocketDirectory?
 
     init(
         logger: Logger,
@@ -359,6 +362,9 @@ final class EmbeddedSingBoxRuntime {
     ) {
         self.logger = logger
         self.lineRecoveryConditions = lineRecoveryConditions
+        relaySockets = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: Self.networkStateGroup
+        ).map { RelaySocketDirectory(container: $0) }
         callback = EngineCallback(
             logger: logger,
             onFatalError: onFatalError
@@ -376,7 +382,7 @@ final class EmbeddedSingBoxRuntime {
             throw RuntimeError.alreadyRunning
         }
 
-        let port = UInt16.random(in: 20_000 ... 60_000)
+        let relaySocketPath = try makeRelaySocketPath()
         let credentials = SOCKSCredentials(
             username: UUID().uuidString,
             password: UUID().uuidString + UUID().uuidString
@@ -392,14 +398,10 @@ final class EmbeddedSingBoxRuntime {
             reporter: reporter,
             cancellation: cancellation
         )
-        var bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
-        while bootstrapPort == port {
-            bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
-        }
         let bootstrap = try generateRuleSetBootstrap(
             profileJSON: profileJSON,
             basePath: basePath,
-            port: bootstrapPort,
+            relaySocketPath: try makeRelaySocketPath(),
             networkSnapshot: networkSnapshot,
             directIPv6Available: directIPv6Available
         )
@@ -417,7 +419,7 @@ final class EmbeddedSingBoxRuntime {
         let envelope = try generateSessionEnvelope(
             profileJSON: profileJSON,
             basePath: basePath,
-            port: port,
+            relaySocketPath: relaySocketPath,
             credentials: credentials,
             networkSnapshot: networkSnapshot,
             directIPv6Available: directIPv6Available,
@@ -491,7 +493,7 @@ final class EmbeddedSingBoxRuntime {
                 generation: .active
             )
             var finalEnvelope = envelope
-            var finalPort = port
+            var finalRelaySocketPath = relaySocketPath
             var finalCredentials = credentials
             var finalReadiness = baselineReadiness
             if requiresConstrainedRegeneration(
@@ -502,16 +504,10 @@ final class EmbeddedSingBoxRuntime {
                     LineAddressFamilyCapabilityCodec.encodeSnapshot(
                         baselineReadiness.lineCapabilities
                     )
-                var constrainedPort = UInt16.random(
-                    in: 20_000 ... 60_000
-                )
-                while constrainedPort == port ||
-                    constrainedPort == bootstrapPort
-                {
-                    constrainedPort = UInt16.random(
-                        in: 20_000 ... 60_000
-                    )
-                }
+                // Both generations listen until the switch commits, so the
+                // constrained one needs a socket of its own.
+                let constrainedRelaySocketPath =
+                    try makeRelaySocketPath()
                 let constrainedCredentials = SOCKSCredentials(
                     username: UUID().uuidString,
                     password:
@@ -520,7 +516,7 @@ final class EmbeddedSingBoxRuntime {
                 let constrainedEnvelope = try generateSessionEnvelope(
                     profileJSON: profileJSON,
                     basePath: basePath,
-                    port: constrainedPort,
+                    relaySocketPath: constrainedRelaySocketPath,
                     credentials: constrainedCredentials,
                     networkSnapshot: networkSnapshot,
                     directIPv6Available: directIPv6Available,
@@ -563,7 +559,7 @@ final class EmbeddedSingBoxRuntime {
                 try instance.commitPreparedSwitch()
                 try instance.retireCommittedSwitch()
                 finalEnvelope = constrainedEnvelope
-                finalPort = constrainedPort
+                finalRelaySocketPath = constrainedRelaySocketPath
                 finalCredentials = constrainedCredentials
                 // The constrained configuration was compiled from the
                 // baseline facts; the second probe only confirmed them.
@@ -618,10 +614,12 @@ final class EmbeddedSingBoxRuntime {
                 id: "data-plane:sing-box",
                 state: .ready
             )
-            logger.notice("sing-box-started port=\(finalPort)")
+            logger.notice(
+                "sing-box-started entry=relay-socket path-bytes=\(finalRelaySocketPath.utf8.count)"
+            )
             return Session(
                 networkEpochID: networkEpochID,
-                port: finalPort,
+                relaySocketPath: finalRelaySocketPath,
                 credentials: finalCredentials,
                 applicationProcessCredentials:
                     (finalEnvelope.applicationProcessCredentials ?? []).map { entry in
@@ -694,10 +692,9 @@ final class EmbeddedSingBoxRuntime {
             forceNew: refreshLineRuntimes
         )
 
-        var port = UInt16.random(in: 20_000 ... 60_000)
-        while port == sourceSession.port {
-            port = UInt16.random(in: 20_000 ... 60_000)
-        }
+        // The committed generation keeps listening while this candidate is
+        // prepared, so the candidate gets a socket of its own.
+        var relaySocketPath = try makeRelaySocketPath()
         let credentials = SOCKSCredentials(
             username: UUID().uuidString,
             password: UUID().uuidString + UUID().uuidString
@@ -710,14 +707,10 @@ final class EmbeddedSingBoxRuntime {
             reporter: reporter,
             cancellation: cancellation
         )
-        var bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
-        while bootstrapPort == port || bootstrapPort == sourceSession.port {
-            bootstrapPort = UInt16.random(in: 20_000 ... 60_000)
-        }
         let bootstrap = try generateRuleSetBootstrap(
             profileJSON: profileJSON,
             basePath: basePath,
-            port: bootstrapPort,
+            relaySocketPath: try makeRelaySocketPath(),
             networkSnapshot: networkSnapshot,
             directIPv6Available: directIPv6Available
         )
@@ -733,7 +726,7 @@ final class EmbeddedSingBoxRuntime {
         let envelope = try generateSessionEnvelope(
             profileJSON: profileJSON,
             basePath: basePath,
-            port: port,
+            relaySocketPath: relaySocketPath,
             credentials: credentials,
             networkSnapshot: networkSnapshot,
             directIPv6Available: directIPv6Available,
@@ -779,10 +772,14 @@ final class EmbeddedSingBoxRuntime {
                     )
                 try instance.abortPreparedSwitch()
                 try checkCancellation(cancellation)
+                // Never reuse the aborted generation's path: a listener
+                // removes its socket file when it closes, and that must not
+                // be the file a newer listener just bound.
+                relaySocketPath = try makeRelaySocketPath()
                 let constrainedEnvelope = try generateSessionEnvelope(
                     profileJSON: profileJSON,
                     basePath: basePath,
-                    port: port,
+                    relaySocketPath: relaySocketPath,
                     credentials: credentials,
                     networkSnapshot: networkSnapshot,
                     directIPv6Available: directIPv6Available,
@@ -874,7 +871,7 @@ final class EmbeddedSingBoxRuntime {
             let preparedID = UUID()
             let candidateSession = Session(
                 networkEpochID: networkEpochID,
-                port: port,
+                relaySocketPath: relaySocketPath,
                 credentials: credentials,
                 applicationProcessCredentials:
                     (finalEnvelope.applicationProcessCredentials ?? []).map { entry in
@@ -1197,7 +1194,7 @@ final class EmbeddedSingBoxRuntime {
     private func generateSessionEnvelope(
         profileJSON: String,
         basePath: URL,
-        port: UInt16,
+        relaySocketPath: String,
         credentials: SOCKSCredentials,
         networkSnapshot: InterfaceSnapshot,
         directIPv6Available: Bool,
@@ -1211,7 +1208,7 @@ final class EmbeddedSingBoxRuntime {
                 LibboxGenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
                     profileJSON,
                     basePath.path,
-                    Int(port),
+                    relaySocketPath,
                     credentials.username,
                     credentials.password,
                     networkSnapshot.defaultInterface.name,
@@ -1226,7 +1223,7 @@ final class EmbeddedSingBoxRuntime {
                 LibboxGenerateTransparentProxySessionWithCapabilitiesAndCallback(
                     profileJSON,
                     basePath.path,
-                    Int(port),
+                    relaySocketPath,
                     credentials.username,
                     credentials.password,
                     networkSnapshot.defaultInterface.name,
@@ -1245,7 +1242,7 @@ final class EmbeddedSingBoxRuntime {
     private func generateRuleSetBootstrap(
         profileJSON: String,
         basePath: URL,
-        port: UInt16,
+        relaySocketPath: String,
         networkSnapshot: InterfaceSnapshot,
         directIPv6Available: Bool
     ) throws -> RuleSetBootstrapEnvelope {
@@ -1256,7 +1253,7 @@ final class EmbeddedSingBoxRuntime {
             LibboxGenerateTransparentProxyRuleSetBootstrapWithCapabilities(
                 profileJSON,
                 basePath.path,
-                Int(port),
+                relaySocketPath,
                 username,
                 password,
                 networkSnapshot.defaultInterface.name,
@@ -2142,6 +2139,16 @@ final class EmbeddedSingBoxRuntime {
         let current = engine
         engineLock.unlock()
         return current
+    }
+
+    /// Reserves the socket file one sing-box generation listens on. Paths are
+    /// never reused within a process, and the first call clears whatever a
+    /// previous Provider process left in the directory.
+    private func makeRelaySocketPath() throws -> String {
+        guard let relaySockets else {
+            throw RuntimeError.storageUnavailable
+        }
+        return try relaySockets.makeSocketPath()
     }
 
     private func runtimeDirectory(profileJSON: String) throws -> URL {

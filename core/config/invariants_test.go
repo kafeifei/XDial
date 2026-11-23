@@ -949,7 +949,7 @@ func TestINV4_ApplicationRuleIsTraceableToActiveScenarioBinding(t *testing.T) {
 		ActiveScenarioID: "scenario",
 	}
 	raw, err := GenerateSingBoxTransparentProxy(
-		profile, invSocksPort, "session-user", "session-password", t.TempDir(), invUnderlay, []string{"1.1.1.1"},
+		profile, testRelaySocketPath, "session-user", "session-password", t.TempDir(), invUnderlay, []string{"1.1.1.1"},
 	)
 	if err != nil {
 		t.Fatalf("GenerateSingBoxTransparentProxy: %v", err)
@@ -1292,7 +1292,7 @@ func TestINV1e_TransparentProxyMagicDNSIsMemoryOnlyAndExplicit(t *testing.T) {
 		t.Helper()
 		data, err := GenerateSingBoxTransparentProxy(
 			profile,
-			29876,
+			testRelaySocketPath,
 			"session-user",
 			"session-password",
 			invBasePath,
@@ -1414,7 +1414,7 @@ func TestINVUnderlay_DesktopForwardsSystemSnapshot(t *testing.T) {
 func TestINVUnderlay_TransparentProxyForwardsSystemSnapshot(t *testing.T) {
 	data, err := GenerateSingBoxTransparentProxy(
 		invBaseProfile(),
-		29876,
+		testRelaySocketPath,
 		"session-user",
 		"session-password",
 		invBasePath,
@@ -1461,7 +1461,7 @@ func TestINVUnderlay_DesktopRejectsMissingSystemSnapshot(t *testing.T) {
 	}
 	_, err = GenerateSingBoxTransparentProxy(
 		invBaseProfile(),
-		29876,
+		testRelaySocketPath,
 		"session-user",
 		"session-password",
 		invBasePath,
@@ -1488,7 +1488,7 @@ func TestINVScenarioWithoutDefaultOutboundCannotConnect(t *testing.T) {
 	}
 	if cfg, err := GenerateSingBoxTransparentProxy(
 		profile,
-		29876,
+		testRelaySocketPath,
 		"session-user",
 		"session-password",
 		invBasePath,

@@ -32,7 +32,7 @@ func TestGroupedRuleSetsKeepExactCompiledRoutingAndDNS(t *testing.T) {
 	}
 	base := t.TempDir()
 	generate := func(p *Profile) []byte {
-		raw, err := GenerateSingBoxTransparentProxy(p, 29876, "session-user", "session-password", base, "utun-underlay", []string{"192.0.2.53"})
+		raw, err := GenerateSingBoxTransparentProxy(p, testRelaySocketPath, "session-user", "session-password", base, "utun-underlay", []string{"192.0.2.53"})
 		if err != nil {
 			t.Fatal(err)
 		}

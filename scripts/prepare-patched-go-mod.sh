@@ -283,6 +283,14 @@ grep -Fq 'func xdialCloseFailedRelay(' \
 	"${patched_sing_box_dir}/route/xdial_relay_close.go"
 grep -Fq 'func TestXDialRelayForwardsUpstreamResetAsReset(' \
 	"${patched_sing_box_dir}/route/xdial_relay_close_test.go"
+grep -Eq 'XDialRelaySocket[[:space:]]+string' \
+	"${patched_sing_box_dir}/option/simple.go"
+grep -Fq 'func listenXDialRelaySocket(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_relay_socket.go"
+grep -Fq 'func TestXDialRelaySocketReportsStreamWithoutFinishAsReset(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_relay_socket_test.go"
+grep -Fq 'func TestXDialRelaySocketInboundRelaysUDPOnItsControlConnection(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_relay_socket_test.go"
 
 patched_module_dir="${staging_dir}/tailscale"
 cp -R "${source_dir}" "${patched_module_dir}"

@@ -45,8 +45,8 @@ struct HostDefaultRouterFacts: Equatable {
 ///
 /// Nothing here names a product, SSID or service, and nothing is produced by
 /// XDial itself: a Transparent Proxy creates no interface, publishes no IPv4 /
-/// IPv6 service state and sets no DNS settings, and its loopback SOCKS
-/// listener adds no address to any interface in the set.
+/// IPv6 service state and sets no DNS settings, and its SOCKS entry is a
+/// socket file that adds no address to any interface in the set.
 struct HostUnderlayIdentity: Equatable {
     struct Interface: Equatable {
         let name: String

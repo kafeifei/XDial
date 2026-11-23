@@ -327,7 +327,7 @@ func TestNetworkReadinessAcceptsPureSubscriptionClosure(t *testing.T) {
 	// Use the production generator rather than manufacturing a Line for the
 	// subscription: active subscription nodes are their own task closure.
 	var envelope transparentProxySession
-	encoded, err := GenerateTransparentProxySession(string(profileData), t.TempDir(), 18081, "user", "pass", "test0", `["192.0.2.53"]`)
+	encoded, err := GenerateTransparentProxySession(string(profileData), t.TempDir(), testRelaySocketPath(t), "user", "pass", "test0", `["192.0.2.53"]`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -731,7 +731,7 @@ func TestNetworkReadinessBuiltinDirectDisabledRowRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	envelope, err := GenerateTransparentProxySession(string(encodedProfile), t.TempDir(), 18082, "user", "pass", "test0", `["192.0.2.53"]`)
+	envelope, err := GenerateTransparentProxySession(string(encodedProfile), t.TempDir(), testRelaySocketPath(t), "user", "pass", "test0", `["192.0.2.53"]`)
 	if err != nil {
 		t.Fatal(err)
 	}

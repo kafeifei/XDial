@@ -440,6 +440,21 @@ test-profile-document-bridge: libbox-macos-xcframework
 		-o $(BUILD_DIR)/profile-document-check
 	$(BUILD_DIR)/profile-document-check docs/examples/profile-next-company.json
 
+# Provider 的真实 relay socket 客户端对接 Libbox 里真实的 sing-box 入口：两端各自的单元
+# 测试都只面对对方的替身，这里是它们在系统扩展之外唯一会合的地方。
+.PHONY: test-relay-socket-bridge
+test-relay-socket-bridge: libbox-macos-xcframework
+	swiftc -target arm64-apple-macos15.0 \
+		-F $(BUILD_DIR)/frameworks/macos/Libbox.xcframework/macos-arm64_x86_64 \
+		-framework Libbox -framework Foundation -framework Security \
+		-framework SystemConfiguration -framework IOKit -framework Network \
+		-lresolv -lz -lc++ macos/Shared/RelayStreamFrame.swift \
+		macos/Shared/RelayStreamConnection.swift macos/Shared/RelaySocketDirectory.swift \
+		macos/Shared/RelayConnectionCancellation.swift macos/Shared/RelayPendingOperation.swift \
+		tools/relay-socket-check.swift \
+		-o $(BUILD_DIR)/relay-socket-check
+	$(BUILD_DIR)/relay-socket-check
+
 # 把 core/libbox(sslcon + gVisor + sing-box,进程内 tvOS 引擎)编译成
 # Swift 可直接 import 的 xcframework。需要 SagerNet fork 的 gomobile/gobind:
 #   go install github.com/sagernet/gomobile/cmd/gomobile@latest

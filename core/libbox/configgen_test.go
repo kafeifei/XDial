@@ -521,7 +521,7 @@ func TestGenerateTransparentProxyRuleSetBootstrapSeparatesColdAndWarmRefresh(t *
 			t.Fatal(err)
 		}
 		raw, err := GenerateTransparentProxyRuleSetBootstrap(
-			string(profileJSON), basePath, 29877, "user", "password",
+			string(profileJSON), basePath, testRelaySocketPath(t), "user", "password",
 			"utun-underlay", `["100.100.100.100"]`,
 		)
 		if err != nil {
@@ -612,7 +612,7 @@ func TestGenerateTransparentProxyRuleSetBootstrapDefaultsToDirect(t *testing.T) 
 		t.Fatal(err)
 	}
 	raw, err := GenerateTransparentProxyRuleSetBootstrap(
-		string(profileJSON), basePath, 29877, "user", "password",
+		string(profileJSON), basePath, testRelaySocketPath(t), "user", "password",
 		"utun-underlay", `["100.100.100.100"]`,
 	)
 	if err != nil {
@@ -985,7 +985,7 @@ func TestGenerateTransparentProxySessionCarriesActiveAnyConnectOnlyInEnvelope(t 
 	sessionJSON, err := GenerateTransparentProxySession(
 		string(profileData),
 		t.TempDir(),
-		29876,
+		testRelaySocketPath(t),
 		"session-user",
 		"session-password",
 		"utun-underlay",
@@ -1031,8 +1031,12 @@ func TestGenerateTransparentProxySessionCarriesActiveAnyConnectOnlyInEnvelope(t 
 		t.Fatal(err)
 	}
 	inbound := document["inbounds"].([]interface{})[0].(map[string]interface{})
-	if inbound["type"] != "socks" || inbound["listen"] != "127.0.0.1" {
+	relaySocket, _ := inbound["xdial_relay_socket"].(string)
+	if inbound["type"] != "socks" || !filepath.IsAbs(relaySocket) {
 		t.Fatalf("unexpected Transparent Proxy config: %v", inbound)
+	}
+	if _, present := inbound["listen_port"]; present {
+		t.Fatalf("Transparent Proxy entry takes a TCP port: %v", inbound)
 	}
 	outbounds := document["outbounds"].([]interface{})
 	foundVPN := false
@@ -1182,7 +1186,7 @@ func TestGenerateTransparentProxySessionCarriesOnlyActiveApplicationCredentials(
 		t.Fatal(err)
 	}
 	sessionJSON, err := GenerateTransparentProxySession(
-		string(profileData), t.TempDir(), 29876, "session-user", "session-password",
+		string(profileData), t.TempDir(), testRelaySocketPath(t), "session-user", "session-password",
 		"utun-underlay", `["100.100.100.100"]`,
 	)
 	if err != nil {
@@ -1449,7 +1453,7 @@ func TestGenerateTransparentProxySessionCarriesActiveSubscriptionOutbound(t *tes
 	sessionJSON, err := GenerateTransparentProxySession(
 		string(profileData),
 		t.TempDir(),
-		29876,
+		testRelaySocketPath(t),
 		"session-user",
 		"session-password",
 		"utun-underlay",
@@ -1612,7 +1616,7 @@ func TestGenerateTransparentProxySessionCarriesActiveTailscaleReadinessTarget(t 
 	sessionJSON, err := GenerateTransparentProxySession(
 		string(profileData),
 		t.TempDir(),
-		29876,
+		testRelaySocketPath(t),
 		"session-user",
 		"session-password",
 		"utun-underlay",
@@ -1660,7 +1664,7 @@ func TestGenerateTransparentProxySessionCarriesMagicDNSToggle(t *testing.T) {
 	sessionJSON, err := GenerateTransparentProxySession(
 		string(profileData),
 		t.TempDir(),
-		29876,
+		testRelaySocketPath(t),
 		"session-user",
 		"session-password",
 		"utun-underlay",
@@ -1698,7 +1702,7 @@ func TestGenerateTransparentProxySessionStillRequiresExitNodeWithMagicDNS(t *tes
 	if _, err := GenerateTransparentProxySession(
 		string(profileData),
 		t.TempDir(),
-		29876,
+		testRelaySocketPath(t),
 		"session-user",
 		"session-password",
 		"utun-underlay",
@@ -1737,7 +1741,7 @@ func TestGenerateTransparentProxySessionWithLineCapabilitiesValidatesJSONContrac
 		_, err := GenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
 			profileJSON,
 			t.TempDir(),
-			29876,
+			testRelaySocketPath(t),
 			"session-user",
 			"session-password",
 			"utun-underlay",
@@ -1786,7 +1790,7 @@ func TestGenerateTransparentProxySessionWithLineCapabilitiesAcceptsAllSupportedM
 			sessionJSON, err := GenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
 				transparentProxyLineCapabilityAPIProfile(t, true),
 				t.TempDir(),
-				29876,
+				testRelaySocketPath(t),
 				"session-user",
 				"session-password",
 				"utun-underlay",
@@ -1820,7 +1824,7 @@ func TestGenerateTransparentProxySessionWithLineCapabilitiesAcceptsAllSupportedM
 	if _, err := GenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
 		transparentProxyLineCapabilityAPIProfile(t, false),
 		t.TempDir(),
-		29876,
+		testRelaySocketPath(t),
 		"session-user",
 		"session-password",
 		"utun-underlay",

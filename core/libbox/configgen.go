@@ -56,7 +56,7 @@ type transparentProxyCapabilityInput struct {
 
 func (input transparentProxyCapabilityInput) generateConfig(
 	profile *config.Profile,
-	listenPort int,
+	relaySocketPath string,
 	socksUsername string,
 	socksPassword string,
 	basePath string,
@@ -66,7 +66,7 @@ func (input transparentProxyCapabilityInput) generateConfig(
 	if input.lineCapabilities != nil {
 		return config.GenerateSingBoxTransparentProxyWithLineCapabilities(
 			profile,
-			listenPort,
+			relaySocketPath,
 			socksUsername,
 			socksPassword,
 			basePath,
@@ -77,7 +77,7 @@ func (input transparentProxyCapabilityInput) generateConfig(
 	}
 	return config.GenerateSingBoxTransparentProxyWithCapabilities(
 		profile,
-		listenPort,
+		relaySocketPath,
 		socksUsername,
 		socksPassword,
 		basePath,
@@ -247,7 +247,7 @@ func GenerateNEConfig(profileJSON string, vpnServerIP string, basePath string) (
 func GenerateTransparentProxySession(
 	profileJSON string,
 	basePath string,
-	listenPort int,
+	relaySocketPath string,
 	socksUsername string,
 	socksPassword string,
 	underlayInterface string,
@@ -256,7 +256,7 @@ func GenerateTransparentProxySession(
 	return generateTransparentProxySession(
 		profileJSON,
 		basePath,
-		listenPort,
+		relaySocketPath,
 		socksUsername,
 		socksPassword,
 		underlayInterface,
@@ -272,7 +272,7 @@ func GenerateTransparentProxySession(
 func GenerateTransparentProxySessionWithCallback(
 	profileJSON string,
 	basePath string,
-	listenPort int,
+	relaySocketPath string,
 	socksUsername string,
 	socksPassword string,
 	underlayInterface string,
@@ -282,7 +282,7 @@ func GenerateTransparentProxySessionWithCallback(
 	return GenerateTransparentProxySessionWithCapabilitiesAndCallback(
 		profileJSON,
 		basePath,
-		listenPort,
+		relaySocketPath,
 		socksUsername,
 		socksPassword,
 		underlayInterface,
@@ -298,7 +298,7 @@ func GenerateTransparentProxySessionWithCallback(
 func GenerateTransparentProxySessionWithCapabilitiesAndCallback(
 	profileJSON string,
 	basePath string,
-	listenPort int,
+	relaySocketPath string,
 	socksUsername string,
 	socksPassword string,
 	underlayInterface string,
@@ -309,7 +309,7 @@ func GenerateTransparentProxySessionWithCapabilitiesAndCallback(
 	return generateTransparentProxySessionWithCallback(
 		profileJSON,
 		basePath,
-		listenPort,
+		relaySocketPath,
 		socksUsername,
 		socksPassword,
 		underlayInterface,
@@ -328,7 +328,7 @@ func GenerateTransparentProxySessionWithCapabilitiesAndCallback(
 func GenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
 	profileJSON string,
 	basePath string,
-	listenPort int,
+	relaySocketPath string,
 	socksUsername string,
 	socksPassword string,
 	underlayInterface string,
@@ -347,7 +347,7 @@ func GenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
 	return generateTransparentProxySessionWithCallback(
 		profileJSON,
 		basePath,
-		listenPort,
+		relaySocketPath,
 		socksUsername,
 		socksPassword,
 		underlayInterface,
@@ -360,7 +360,7 @@ func GenerateTransparentProxySessionWithLineCapabilitiesAndCallback(
 func generateTransparentProxySessionWithCallback(
 	profileJSON string,
 	basePath string,
-	listenPort int,
+	relaySocketPath string,
 	socksUsername string,
 	socksPassword string,
 	underlayInterface string,
@@ -380,7 +380,7 @@ func generateTransparentProxySessionWithCallback(
 	return generateTransparentProxySession(
 		profileJSON,
 		basePath,
-		listenPort,
+		relaySocketPath,
 		socksUsername,
 		socksPassword,
 		underlayInterface,
@@ -398,7 +398,7 @@ func generateTransparentProxySessionWithCallback(
 func GenerateTransparentProxyRuleSetBootstrap(
 	profileJSON string,
 	basePath string,
-	listenPort int,
+	relaySocketPath string,
 	socksUsername string,
 	socksPassword string,
 	underlayInterface string,
@@ -407,7 +407,7 @@ func GenerateTransparentProxyRuleSetBootstrap(
 	return GenerateTransparentProxyRuleSetBootstrapWithCapabilities(
 		profileJSON,
 		basePath,
-		listenPort,
+		relaySocketPath,
 		socksUsername,
 		socksPassword,
 		underlayInterface,
@@ -422,7 +422,7 @@ func GenerateTransparentProxyRuleSetBootstrap(
 func GenerateTransparentProxyRuleSetBootstrapWithCapabilities(
 	profileJSON string,
 	basePath string,
-	listenPort int,
+	relaySocketPath string,
 	socksUsername string,
 	socksPassword string,
 	underlayInterface string,
@@ -533,7 +533,7 @@ func GenerateTransparentProxyRuleSetBootstrapWithCapabilities(
 		}
 		data, err := config.GenerateSingBoxTransparentProxyWithCapabilities(
 			&isolated,
-			listenPort,
+			relaySocketPath,
 			socksUsername,
 			socksPassword,
 			basePath,
@@ -642,7 +642,7 @@ func removeTransparentProxyBootstrapIngress(data []byte) ([]byte, error) {
 func generateTransparentProxySession(
 	profileJSON string,
 	basePath string,
-	listenPort int,
+	relaySocketPath string,
 	socksUsername string,
 	socksPassword string,
 	underlayInterface string,
@@ -677,7 +677,7 @@ func generateTransparentProxySession(
 	}
 	data, err := capabilities.generateConfig(
 		profile,
-		listenPort,
+		relaySocketPath,
 		socksUsername,
 		socksPassword,
 		basePath,

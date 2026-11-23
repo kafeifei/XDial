@@ -132,19 +132,17 @@ final class LocalSOCKSShareListener: @unchecked Sendable {
 enum LocalSOCKSShareRelay {
     static func makeHandle(
         client: NWConnection,
-        socksPort: UInt16,
+        relaySocketPath: String,
         credentials: SOCKSCredentials,
         trialID: String,
         traffic: ProviderTrafficLedger,
         logger: Logger
     ) -> ProviderRelayHandle {
-        let upstream = NWConnection(
-            host: .ipv4(IPv4Address.loopback),
-            port: Network.NWEndpoint.Port(rawValue: socksPort)!,
-            using: .tcp
-        )
+        // 对外的监听仍是本机 TCP 端口；接入 sing-box 的这一跳走 relay socket，
+        // 不再为每条客户端连接多占一个本机端口。
+        let upstream = RelayStreamConnection(socketPath: relaySocketPath)
         let shutdown = RelayTaskShutdown { error in
-            RelayConnectionCancellation.cancel(upstream, error: error)
+            upstream.cancel(with: error)
             RelayConnectionCancellation.cancel(client, error: error)
         }
         return ProviderRelayHandle(
@@ -191,7 +189,7 @@ enum LocalSOCKSShareRelay {
                         }
                         stage = "control-connect"
                         do {
-                            try await TCPFlowSOCKSRelay.start(upstream)
+                            try await upstream.start()
                             stage = "socks-negotiate"
                             try await TCPFlowSOCKSRelay.negotiateSOCKS(
                                 upstream,
@@ -284,19 +282,19 @@ enum LocalSOCKSShareRelay {
 
     private static func relay(
         client: NWConnection,
-        upstream: NWConnection,
+        upstream: RelayStreamConnection,
         shutdown: RelayTaskShutdown,
         transactionID: String,
         traffic: ProviderTrafficLedger
     ) async throws {
         try await RelayTaskPair.run(
             first: {
-                try await pump(from: client, to: upstream) {
+                try await pumpUpload(from: client, to: upstream) {
                     traffic.recordUpload($0, transactionID: transactionID)
                 }
             },
             second: {
-                try await pump(from: upstream, to: client) {
+                try await pumpDownload(from: upstream, to: client) {
                     traffic.recordDownload($0, transactionID: transactionID)
                 }
             },
@@ -304,28 +302,45 @@ enum LocalSOCKSShareRelay {
         )
     }
 
-    /// 单向转发到 EOF，再把 FIN 传给对端；另一方向继续工作，保留 TCP 半关闭。
-    private static func pump(
-        from source: NWConnection,
-        to destination: NWConnection,
+    /// 客户端 → 入口：转发到 EOF，再向入口发结束帧；另一方向继续工作，保留半关闭。
+    private static func pumpUpload(
+        from client: NWConnection,
+        to upstream: RelayStreamConnection,
         record: @escaping @Sendable (Int) -> Void
     ) async throws {
         while !Task.isCancelled {
-            let result = try await TCPFlowSOCKSRelay.receive(from: source)
+            let result = try await TCPFlowSOCKSRelay.receive(from: client)
             if !result.data.isEmpty {
-                try await TCPFlowSOCKSRelay.send(result.data, to: destination)
+                try await upstream.send(result.data)
                 record(result.data.count)
             }
             if let error = result.error {
                 throw error
             }
             if result.isComplete {
-                try await TCPFlowSOCKSRelay.finishSending(to: destination)
+                try await upstream.finishSending()
                 return
             }
             guard !result.data.isEmpty else {
                 throw TCPFlowSOCKSRelay.RelayError.socksUnavailable
             }
+        }
+    }
+
+    /// 入口 → 客户端：收到结束帧才是上游正常结束，这时把 FIN 传给客户端；没有结束帧
+    /// 就断开的流会抛出重置，由 shutdown 把客户端连接按重置关闭。
+    private static func pumpDownload(
+        from upstream: RelayStreamConnection,
+        to client: NWConnection,
+        record: @escaping @Sendable (Int) -> Void
+    ) async throws {
+        while !Task.isCancelled {
+            guard let data = try await upstream.receive() else {
+                try await TCPFlowSOCKSRelay.finishSending(to: client)
+                return
+            }
+            try await TCPFlowSOCKSRelay.send(data, to: client)
+            record(data.count)
         }
     }
 }
