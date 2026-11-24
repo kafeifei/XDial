@@ -5,7 +5,7 @@ import Network
 import OSLog
 
 private struct ProviderRelayEndpoint: Sendable {
-    let port: UInt16
+    let relaySocketPath: String
     let credentials: SOCKSCredentials
     let applicationProcessCredentials: [ApplicationProcessCredential]
 }
@@ -424,7 +424,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 let replacedRelays = self.relayRegistry.activate(
                     generation: generation,
                     endpoint: ProviderRelayEndpoint(
-                        port: session.port,
+                        relaySocketPath: session.relaySocketPath,
                         credentials: session.credentials,
                         applicationProcessCredentials:
                             session.applicationProcessCredentials
@@ -750,7 +750,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         }
         let handle = LocalSOCKSShareRelay.makeHandle(
             client: connection,
-            socksPort: reservation.endpoint.port,
+            relaySocketPath: reservation.endpoint.relaySocketPath,
             credentials: reservation.endpoint.credentials,
             trialID: reservation.generation,
             traffic: traffic,
@@ -1527,7 +1527,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
 
         let candidateSession = prepared.session
         let candidateEndpoint = ProviderRelayEndpoint(
-            port: candidateSession.port,
+            relaySocketPath: candidateSession.relaySocketPath,
             credentials: candidateSession.credentials,
             applicationProcessCredentials:
                 candidateSession.applicationProcessCredentials
@@ -2262,7 +2262,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         if let tcpFlow = flow as? NEAppProxyTCPFlow {
             handle = TCPFlowSOCKSRelay.makeHandle(
                 flow: tcpFlow,
-                socksPort: reservation.endpoint.port,
+                relaySocketPath: reservation.endpoint.relaySocketPath,
                 credentials: credentials,
                 trialID: reservation.generation,
                 traffic: traffic,
@@ -2314,7 +2314,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         credentials: SOCKSCredentials
     ) -> UDPFlowSOCKSRelay.AssociationTicket {
         UDPFlowSOCKSRelay.AssociationTicket(
-            socksPort: reservation.endpoint.port,
+            relaySocketPath: reservation.endpoint.relaySocketPath,
             credentials: credentials,
             generation: reservation.generation,
             attach: { [weak self] handle in

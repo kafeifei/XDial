@@ -55,8 +55,12 @@ TUN、系统代理、系统 DNS、默认路由或持久状态；不启动未连�
 
 ### 3.1 macOS 与 Underlay（D31–D35、D-UNDERLAY、D-INGRESS）
 
-macOS 主入口为 `NETransparentProxyProvider`，以随机凭据保护的回环 SOCKS 将 TCP/UDP
-flow 交给同进程 sing-box。iOS / tvOS 使用 Packet Tunnel；系统 HTTP/SOCKS 代理与 PAC 不是当前入口。
+macOS 主入口为 `NETransparentProxyProvider`，经随机凭据保护的 SOCKS 把 TCP/UDP flow 交给
+同进程 sing-box。这段内部中继走 Provider 私有目录里的 sock 文件（relay socket），不占用任何
+本机 TCP/UDP 端口：按 flow 占用回环端口会让长连接长期扣住临时端口，挡住别的程序要监听的
+固定端口。每代 sing-box 监听各自的 sock 文件，文件与目录仅属主可访问，入口只接受本进程的
+连接，会话凭据照旧校验；Provider 进程首次使用时清掉上一个进程的残留，监听关闭即删除文件。
+iOS / tvOS 使用 Packet Tunnel；系统 HTTP/SOCKS 代理与 PAC 不是当前入口。
 Transparent Proxy 不接管 ICMP。link-local、multicast、limited broadcast 留在 Underlay；
 RFC1918、IPv6 ULA、Tailnet 与企业单播地址仍由 Scenario 裁决，排除集合不按应用或产品扩展。
 
@@ -73,13 +77,17 @@ Scenario 先选 Line，仅最终属于 Direct 的 flow 恢复该绑定，其他 
 
 TCP flow 的结束方式如实传给应用：上游正常结束是半关闭，应用读到流的结尾；应用先结束
 发送方向时同样只半关闭上游，应答照常送回，不因出站连接外面的跟踪、计数包装而变成整条
-关闭。上游被重置、超时或以其他错误结束，数据面把回环上的入站连接按重置关闭，Provider
+关闭。上游被重置、超时或以其他错误结束，数据面把入站连接按重置关闭，Provider
 再把它作为对端重置交给 flow，不把被打断的流说成正常结束。入站连接自己先出错的（应用
 已经结束这条流）照常关闭。
+sock 文件上没有 TCP 重置可用，所以 relay socket 的两个方向都分帧：正常结束的一方发结束帧，
+没有结束帧就断开的流即被打断，两端都按重置处理。UDP 关联的数据报在握手之后沿同一条连接
+逐帧传送，不另开 UDP 端口。
 数据面 warn 及以上的日志经 Provider 进统一日志，公开部分不含地址、域名和凭据。
 
 本机 SOCKS5 由 Provider 持有 `127.0.0.1:<port>`，只接受本机无认证 TCP CONNECT，不设置
-系统代理、不监听其他地址。每条连接在接入时取得当前 generation 的会话入口，与系统 flow
+系统代理、不监听其他地址；这是给其他程序用的对外端口，它接入 sing-box 的那一跳同样走
+relay socket。每条连接在接入时取得当前 generation 的会话入口，与系统 flow
 共用 relay 登记、换代排空和停止关闭；端口不随 Switch 重建。客户端主机名只放行可打印字节，
 不能携带 Provider 的 flow metadata；该入口没有应用身份，只命中 Scenario 的非应用规则。
 
@@ -96,6 +104,9 @@ TCP flow 的结束方式如实传给应用：上游正常结束是半关闭，�
 [Provider](macos/TransparentProxyExtension/TransparentProxyProvider.swift)、
 [flow metadata](macos/Shared/TransparentProxyFlowMetadata.swift)、
 [本机 SOCKS5](macos/TransparentProxyExtension/LocalSOCKSShareListener.swift)、
+[relay socket 帧格式](macos/Shared/RelayStreamFrame.swift)与
+[入口补丁](patches/sing-box/0019-relay-transparent-flows-over-unix-socket.patch)、
+[两端对接检查](tools/relay-socket-check.swift)（`make test-relay-socket-bridge`）、
 流结束补丁（[重置](patches/sing-box/0017-reset-inbound-when-upstream-fails.patch)、
 [半关闭](patches/sing-box/0018-forward-half-close-through-transparent-wrappers.patch)）、
 [数据面日志](core/libbox/dataplane_log.go)。

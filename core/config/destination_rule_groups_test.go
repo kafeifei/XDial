@@ -42,8 +42,8 @@ func TestDestinationGroupsKeepInterleavingAndLocalPartialScope(t *testing.T) {
 	}
 	// Check actual generated DNS, application identities and route order too.
 	dir := t.TempDir()
-	rawA, e1 := GenerateSingBoxTransparentProxy(before, 29876, "test", "test", dir, "utun-underlay", []string{"192.0.2.53"})
-	rawB, e2 := GenerateSingBoxTransparentProxy(grouped, 29876, "test", "test", dir, "utun-underlay", []string{"192.0.2.53"})
+	rawA, e1 := GenerateSingBoxTransparentProxy(before, testRelaySocketPath, "test", "test", dir, "utun-underlay", []string{"192.0.2.53"})
+	rawB, e2 := GenerateSingBoxTransparentProxy(grouped, testRelaySocketPath, "test", "test", dir, "utun-underlay", []string{"192.0.2.53"})
 	if e1 != nil || e2 != nil || string(rawA) != string(rawB) {
 		t.Fatal("executable configuration changed", e1, e2)
 	}

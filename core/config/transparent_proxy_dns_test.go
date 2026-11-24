@@ -29,7 +29,7 @@ func TestTransparentProxyDNSRejectsMissingOrInvalidSystemSnapshot(t *testing.T) 
 		t.Run(test.name, func(t *testing.T) {
 			_, err := GenerateSingBoxTransparentProxy(
 				profile,
-				29876,
+				testRelaySocketPath,
 				"session-user",
 				"session-password",
 				t.TempDir(),
@@ -113,7 +113,7 @@ func TestTransparentProxyUnavailableDirectIPv6NarrowsOnlyDirectResolution(t *tes
 
 	raw, err := GenerateSingBoxTransparentProxyWithCapabilities(
 		profile,
-		29876,
+		testRelaySocketPath,
 		"session-user",
 		"session-password",
 		t.TempDir(),
@@ -841,7 +841,7 @@ func generateTransparentProxyDNSTestConfig(t *testing.T, profile *Profile) (Sing
 	t.Helper()
 	raw, err := GenerateSingBoxTransparentProxy(
 		profile,
-		29876,
+		testRelaySocketPath,
 		"session-user",
 		"session-password",
 		t.TempDir(),

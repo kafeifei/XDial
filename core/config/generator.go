@@ -82,7 +82,8 @@ var anyTLSClientFingerprints = map[string]struct{}{
 // clash_api;cache_file 必须用调用方传入的沙盒内绝对路径(basePath)。
 //
 // PlatformTransparentProxy = macOS Transparent Proxy 系统扩展：sing-box 同样作为库
-// 跑在扩展进程内，但入口是只监听 loopback、带随机会话凭据的 SOCKS5 inbound。
+// 跑在扩展进程内，但入口是监听本机 sock 文件、带随机会话凭据的 SOCKS5 inbound，
+// 不占用任何本机端口。
 // Swift 只把 NEAppProxyFlow 的字节搬到该入口；TCP/UDP/DNS 仍由同一份 sing-box
 // 配置裁决。该平台把宿主在启动前从系统默认路由读取的接口写入
 // route.default_interface；这让 Provider 进程里的出站 socket 延续既有 Underlay，
@@ -139,8 +140,30 @@ func GenerateSingBoxFor(profile *Profile, socksPort int, vpnServerIP string, pla
 	return generateSingBox(profile, socksPort, vpnServerIP, platform, basePath, nil, nil, underlayInterface, nil)
 }
 
+// TransparentProxyRelaySocketPathLimit is the longest relay socket path the
+// kernel accepts: sockaddr_un.sun_path holds 104 bytes on Darwin, one of them
+// the terminating NUL.
+const TransparentProxyRelaySocketPathLimit = 103
+
+// validateTransparentProxyRelaySocketPath rejects a path the kernel would
+// refuse or truncate before a data plane is built around it.
+func validateTransparentProxyRelaySocketPath(relaySocketPath string) error {
+	if !path.IsAbs(relaySocketPath) || path.Clean(relaySocketPath) != relaySocketPath ||
+		strings.ContainsRune(relaySocketPath, 0) {
+		return fmt.Errorf("transparent proxy relay socket path is invalid")
+	}
+	if len(relaySocketPath) > TransparentProxyRelaySocketPathLimit {
+		return fmt.Errorf(
+			"transparent proxy relay socket path is %d bytes, over the %d byte limit",
+			len(relaySocketPath),
+			TransparentProxyRelaySocketPathLimit,
+		)
+	}
+	return nil
+}
+
 type transparentProxyIngress struct {
-	port          int
+	relaySocket   string
 	username      string
 	password      string
 	addressFamily transparentProxyAddressFamilyPolicy
@@ -168,10 +191,11 @@ func (policy transparentProxyAddressFamilyPolicy) strategy(lineID string) string
 }
 
 // GenerateSingBoxTransparentProxy 生成 macOS Transparent Proxy 扩展内的配置。
-// 会话凭据只保护本机 loopback SOCKS 入口，不属于用户配置，不得持久化。
+// relaySocketPath 是扩展私有目录里的 sock 文件，会话凭据只保护这一入口；两者都不属于
+// 用户配置，不得持久化。
 func GenerateSingBoxTransparentProxy(
 	profile *Profile,
-	listenPort int,
+	relaySocketPath string,
 	username string,
 	password string,
 	basePath string,
@@ -180,7 +204,7 @@ func GenerateSingBoxTransparentProxy(
 ) ([]byte, error) {
 	return GenerateSingBoxTransparentProxyWithCapabilities(
 		profile,
-		listenPort,
+		relaySocketPath,
 		username,
 		password,
 		basePath,
@@ -196,7 +220,7 @@ func GenerateSingBoxTransparentProxy(
 // API below.
 func GenerateSingBoxTransparentProxyWithCapabilities(
 	profile *Profile,
-	listenPort int,
+	relaySocketPath string,
 	username string,
 	password string,
 	basePath string,
@@ -207,7 +231,7 @@ func GenerateSingBoxTransparentProxyWithCapabilities(
 	capabilities := legacyTransparentProxyLineCapabilities(profile, directIPv6Available)
 	return GenerateSingBoxTransparentProxyWithLineCapabilities(
 		profile,
-		listenPort,
+		relaySocketPath,
 		username,
 		password,
 		basePath,
@@ -222,7 +246,7 @@ func GenerateSingBoxTransparentProxyWithCapabilities(
 // the DNS and route data plane. Every active Line must have one measurement.
 func GenerateSingBoxTransparentProxyWithLineCapabilities(
 	profile *Profile,
-	listenPort int,
+	relaySocketPath string,
 	username string,
 	password string,
 	basePath string,
@@ -230,8 +254,8 @@ func GenerateSingBoxTransparentProxyWithLineCapabilities(
 	systemDNS []string,
 	capabilities TransparentProxyLineCapabilities,
 ) ([]byte, error) {
-	if listenPort < 1 || listenPort > 65535 {
-		return nil, fmt.Errorf("transparent proxy listen port is invalid")
+	if err := validateTransparentProxyRelaySocketPath(relaySocketPath); err != nil {
+		return nil, err
 	}
 	username = strings.TrimSpace(username)
 	password = strings.TrimSpace(password)
@@ -252,7 +276,7 @@ func GenerateSingBoxTransparentProxyWithLineCapabilities(
 		systemDNS,
 		underlayInterface,
 		&transparentProxyIngress{
-			port:          listenPort,
+			relaySocket:   relaySocketPath,
 			username:      username,
 			password:      password,
 			addressFamily: addressFamily,
@@ -791,11 +815,12 @@ func buildTransparentProxyInbound(
 			"password": ingress.password,
 		})
 	}
+	// The entry is a socket file, not a port: every relayed flow would
+	// otherwise hold a loopback port that other software may need to bind.
 	inbound := map[string]interface{}{
 		"type":                "socks",
 		"tag":                 "transparent-proxy-in",
-		"listen":              "127.0.0.1",
-		"listen_port":         ingress.port,
+		"xdial_relay_socket":  ingress.relaySocket,
 		"xdial_flow_metadata": true,
 		"users":               users,
 	}

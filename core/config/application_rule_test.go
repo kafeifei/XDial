@@ -98,7 +98,7 @@ func TestApplicationRuleSetTransparentProxyPinsRouteAndDNS(t *testing.T) {
 	})
 
 	raw, err := GenerateSingBoxTransparentProxy(
-		profile, 11080, "session-user", "session-password", t.TempDir(), "en0", []string{"1.1.1.1"},
+		profile, testRelaySocketPath, "session-user", "session-password", t.TempDir(), "en0", []string{"1.1.1.1"},
 	)
 	if err != nil {
 		t.Fatalf("GenerateSingBoxTransparentProxy: %v", err)
@@ -203,7 +203,7 @@ func TestInvertedApplicationRuleSetInvertsRouteAndDNSTogether(t *testing.T) {
 	})
 
 	raw, err := GenerateSingBoxTransparentProxy(
-		profile, 11080, "session-user", "session-password", t.TempDir(), "en0", []string{"1.1.1.1"},
+		profile, testRelaySocketPath, "session-user", "session-password", t.TempDir(), "en0", []string{"1.1.1.1"},
 	)
 	if err != nil {
 		t.Fatalf("GenerateSingBoxTransparentProxy: %v", err)

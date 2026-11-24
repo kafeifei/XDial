@@ -379,6 +379,7 @@ targets:
       - Sources/XDial/LocalSOCKSShareController.swift
       - TransparentProxyExtension/LocalSOCKSShareListener.swift
       - TransparentProxyExtension/TCPFlowSOCKSRelay.swift
+      - TransparentProxyExtension/UDPFlowSOCKSRelay.swift
       - TransparentProxyExtension/SOCKSCredentials.swift
       - Sources/XDial/ProfileLibraryStore.swift
       - Sources/XDial/Localization.swift

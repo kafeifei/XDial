@@ -215,7 +215,7 @@ func TestGenerate_TransparentProxyTailscaleMemoryHosts(t *testing.T) {
 	}
 	data, err := GenerateSingBoxTransparentProxy(
 		p,
-		29876,
+		testRelaySocketPath,
 		"session-user",
 		"session-password",
 		t.TempDir(),

@@ -112,7 +112,7 @@ func TestGroupedProfileCompactionAndRemoteBootstrap(t *testing.T) {
 	if err != nil || again != compacted {
 		t.Fatal("compaction is not idempotent")
 	}
-	bootstrapRaw, err := GenerateTransparentProxyRuleSetBootstrap(compacted, t.TempDir(), 29877, "user", "password", "utun-underlay", `["192.0.2.53"]`)
+	bootstrapRaw, err := GenerateTransparentProxyRuleSetBootstrap(compacted, t.TempDir(), testRelaySocketPath(t), "user", "password", "utun-underlay", `["192.0.2.53"]`)
 	if err != nil {
 		t.Fatal(err)
 	}

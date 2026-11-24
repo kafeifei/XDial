@@ -46,7 +46,7 @@ func generateTransparentProxyCapabilityTestConfig(
 	t.Helper()
 	raw, err := GenerateSingBoxTransparentProxyWithLineCapabilities(
 		profile,
-		29876,
+		testRelaySocketPath,
 		"session-user",
 		"session-password",
 		t.TempDir(),
@@ -558,7 +558,7 @@ func TestTransparentProxyLineCapabilitiesValidation(t *testing.T) {
 	}
 	generate := func(capabilities TransparentProxyLineCapabilities) error {
 		_, err := GenerateSingBoxTransparentProxyWithLineCapabilities(
-			profile, 29876, "user", "password", t.TempDir(), "en0",
+			profile, testRelaySocketPath, "user", "password", t.TempDir(), "en0",
 			[]string{"100.100.100.100"}, capabilities,
 		)
 		return err

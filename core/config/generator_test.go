@@ -2239,7 +2239,7 @@ func TestGenerateNETailscaleEndpointCarriesAuthKeyAndStaysPersistent(t *testing.
 	}
 }
 
-func TestGenerateTransparentProxyUsesAuthenticatedLoopbackSOCKSWithSystemUnderlay(t *testing.T) {
+func TestGenerateTransparentProxyUsesAuthenticatedRelaySocketWithSystemUnderlay(t *testing.T) {
 	p := &Profile{
 		Lines:            []Line{{ID: "direct", Type: LineTypeDirect, Enabled: true}},
 		Scenarios:        []Scenario{{ID: "scenario", DefaultLineID: "direct"}},
@@ -2247,7 +2247,7 @@ func TestGenerateTransparentProxyUsesAuthenticatedLoopbackSOCKSWithSystemUnderla
 	}
 	data, err := GenerateSingBoxTransparentProxy(
 		p,
-		29876,
+		testRelaySocketPath,
 		"session-user",
 		"session-password",
 		t.TempDir(),
@@ -2266,9 +2266,15 @@ func TestGenerateTransparentProxyUsesAuthenticatedLoopbackSOCKSWithSystemUnderla
 	}
 	inbound := cfg.Inbounds[0]
 	if inbound["type"] != "socks" ||
-		inbound["listen"] != "127.0.0.1" ||
-		inbound["listen_port"] != float64(29876) {
+		inbound["xdial_relay_socket"] != testRelaySocketPath {
 		t.Fatalf("unexpected Transparent Proxy ingress: %v", inbound)
+	}
+	// A loopback TCP entry makes every relayed flow hold an ephemeral port
+	// that another program may need to listen on.
+	for _, key := range []string{"listen", "listen_port"} {
+		if _, present := inbound[key]; present {
+			t.Fatalf("Transparent Proxy ingress takes a TCP port (%s): %v", key, inbound)
+		}
 	}
 	users := inbound["users"].([]interface{})
 	user := users[0].(map[string]interface{})
@@ -2304,7 +2310,7 @@ func TestGenerateTransparentProxyRejectsMissingSessionCredentials(t *testing.T) 
 	}
 	if _, err := GenerateSingBoxTransparentProxy(
 		p,
-		29876,
+		testRelaySocketPath,
 		"",
 		"password",
 		t.TempDir(),
@@ -2323,7 +2329,7 @@ func TestGenerateTransparentProxyRejectsMissingSystemUnderlay(t *testing.T) {
 	}
 	if _, err := GenerateSingBoxTransparentProxy(
 		p,
-		29876,
+		testRelaySocketPath,
 		"session-user",
 		"session-password",
 		t.TempDir(),

@@ -1,0 +1,1100 @@
+diff --git a/option/simple.go b/option/simple.go
+--- a/option/simple.go
++++ b/option/simple.go
+@@ -10,6 +10,7 @@
+ 	Users             []auth.User           `json:"users,omitempty"`
+ 	DomainResolver    *DomainResolveOptions `json:"domain_resolver,omitempty"`
+ 	XDialFlowMetadata bool                  `json:"xdial_flow_metadata,omitempty"`
++	XDialRelaySocket  string                `json:"xdial_relay_socket,omitempty"`
+ }
+ 
+ type HTTPMixedInboundOptions struct {
+diff --git a/protocol/socks/inbound.go b/protocol/socks/inbound.go
+--- a/protocol/socks/inbound.go
++++ b/protocol/socks/inbound.go
+@@ -4,6 +4,7 @@
+ 	std_bufio "bufio"
+ 	"context"
+ 	"net"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -16,6 +17,7 @@
+ 	"github.com/sagernet/sing/common/auth"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
+ 	"github.com/sagernet/sing/protocol/socks"
+ )
+@@ -34,6 +36,11 @@
+ 	authenticator     *auth.Authenticator
+ 	udpTimeout        time.Duration
+ 	xdialFlowMetadata bool
++
++	ctx                context.Context
++	xdialRelaySocket   string
++	xdialRelayListener *net.UnixListener
++	xdialRelayShutdown atomic.Bool
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SocksInboundOptions) (adapter.Inbound, error) {
+@@ -50,7 +57,17 @@
+ 		authenticator:     auth.NewAuthenticator(options.Users),
+ 		udpTimeout:        udpTimeout,
+ 		xdialFlowMetadata: options.XDialFlowMetadata,
++
++		ctx:              ctx,
++		xdialRelaySocket: options.XDialRelaySocket,
+ 	}
++	if inbound.xdialRelaySocket != "" {
++		// The relay socket replaces the TCP listener; it does not add to it.
++		if options.Listen != nil || options.ListenPort != 0 {
++			return nil, E.New("xdial_relay_socket cannot be combined with listen or listen_port")
++		}
++		return inbound, nil
++	}
+ 	inbound.listener = listener.New(listener.Options{
+ 		Context:           ctx,
+ 		Logger:            logger,
+@@ -65,15 +82,67 @@
+ 	if stage != adapter.StartStateStart {
+ 		return nil
+ 	}
++	if h.xdialRelaySocket != "" {
++		relayListener, err := listenXDialRelaySocket(h.xdialRelaySocket)
++		if err != nil {
++			return err
++		}
++		h.xdialRelayListener = relayListener
++		h.logger.Info("XDial relay socket started")
++		go h.loopXDialRelaySocket(relayListener)
++		return nil
++	}
+ 	return h.listener.Start()
+ }
+ 
+ func (h *Inbound) Close() error {
++	if h.xdialRelaySocket != "" {
++		h.xdialRelayShutdown.Store(true)
++		if h.xdialRelayListener == nil {
++			return nil
++		}
++		// Closing the listener also removes the socket file.
++		return h.xdialRelayListener.Close()
++	}
+ 	return h.listener.Close()
+ }
+ 
++func (h *Inbound) loopXDialRelaySocket(relayListener *net.UnixListener) {
++	for {
++		conn, err := relayListener.AcceptUnix()
++		if err != nil {
++			if h.xdialRelayShutdown.Load() || E.IsClosed(err) {
++				return
++			}
++			//nolint:staticcheck
++			if netError, isNetError := err.(net.Error); isNetError && netError.Temporary() {
++				h.logger.Error(err)
++				time.Sleep(10 * time.Millisecond)
++				continue
++			}
++			h.logger.Error("XDial relay socket closed: ", err)
++			return
++		}
++		relayConn := newXDialRelayConn(conn)
++		var metadata adapter.InboundContext
++		metadata.Source = M.SocksaddrFromNet(relayConn.RemoteAddr()).Unwrap()
++		metadata.OriginDestination = M.SocksaddrFromNet(relayConn.LocalAddr()).Unwrap()
++		ctx := log.ContextWithNewID(h.ctx)
++		go h.NewConnection(ctx, relayConn, metadata, nil)
++	}
++}
++
+ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+-	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, h.udpTimeout, metadata.Source, onClose)
++	// A relay socket connection carries its own UDP association. Any other
++	// connection reaching an inbound without a TCP listener was injected and
++	// lets sing open the association's socket itself.
++	var packetListener socks.PacketListener
++	if relayConn, isRelayConn := conn.(*xdialRelayConn); isRelayConn {
++		packetListener = relayConn
++	} else if h.listener != nil {
++		packetListener = h.listener
++	}
++	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), packetListener, h.udpTimeout, metadata.Source, onClose)
+ 	N.CloseOnHandshakeFailure(conn, onClose, err)
+ 	if err != nil {
+ 		if E.IsClosedOrCanceled(err) {
+diff --git a/protocol/socks/xdial_relay_socket.go b/protocol/socks/xdial_relay_socket.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/socks/xdial_relay_socket.go
+@@ -0,0 +1,417 @@
++package socks
++
++import (
++	std_bufio "bufio"
++	"context"
++	"errors"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"time"
++
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// XDial relay socket.
++//
++// The transparent proxy Provider and sing-box share one process. Relaying every
++// flow over loopback TCP made the kernel hand each one an ephemeral port, and a
++// long-lived flow kept that port away from whatever program meant to listen on
++// it. With xdial_relay_socket the inbound listens on a Unix stream socket and
++// takes no port.
++//
++// A Unix stream socket cannot say how it ended: a peer that was cut looks the
++// same as one that finished. Both directions are therefore framed, and a
++// direction that finished cleanly says so with a FIN frame. A stream that ends
++// without one was cut, which is what a TCP reset used to report.
++//
++//	+------+--------+---------+
++//	| type | length | payload |
++//	|  1   |   3    | length  |   length is big-endian
++//	+------+--------+---------+
++//
++//	0x01 DATA  one or more payload bytes
++//	0x02 FIN   no payload; this direction finished and sends nothing more
++//
++// A SOCKS UDP association takes no port either. Once UDP ASSOCIATE has been
++// answered, every DATA frame on its control connection is one SOCKS5 UDP
++// datagram, in both directions.
++const (
++	xdialRelayFrameData byte = 0x01
++	xdialRelayFrameFin  byte = 0x02
++
++	xdialRelayFrameHeaderLength = 4
++	// The largest SOCKS5 UDP datagram is 65507 payload bytes behind a header
++	// of at most 262 bytes.
++	xdialRelayMaxFramePayload = 1 << 17
++	// A byte stream is cut into frames of this size at most, so the Provider
++	// never has to hold much of one before it can pass the bytes on.
++	xdialRelayStreamChunk = 32 << 10
++	// The sender's buffer bounds what a Unix stream socket queues for its peer.
++	xdialRelaySocketBuffer = 256 << 10
++	xdialRelayReaderSize   = 4 << 10
++	// A graceful close announces itself with a FIN frame. It must not wait on a
++	// peer that stopped reading.
++	xdialRelayCloseTimeout = 100 * time.Millisecond
++	// sockaddr_un.sun_path holds 104 bytes on Darwin, 108 on Linux, including
++	// the terminating NUL.
++	xdialRelaySocketPathLimit = 103
++)
++
++var errXDialRelayFrame = E.New("invalid XDial relay frame")
++
++// Both ends of a relay connection are this process. The addresses only keep
++// SOCKS replies and connection metadata well formed; they name no socket.
++var (
++	xdialRelayStreamAddr net.Addr = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
++	xdialRelayPacketAddr net.Addr = &net.UDPAddr{IP: net.IPv4zero}
++	xdialRelayPacketPeer net.Addr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
++)
++
++// listenXDialRelaySocket binds the relay socket at path, replacing a socket a
++// previous process left behind. Only the owner may connect, and the entry
++// still asks every connection for the session credentials.
++func listenXDialRelaySocket(path string) (*net.UnixListener, error) {
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		return nil, E.New("XDial relay socket path is not an absolute clean path")
++	}
++	if len(path) > xdialRelaySocketPathLimit {
++		return nil, E.New("XDial relay socket path is too long: ", len(path), " bytes")
++	}
++	info, err := os.Lstat(path)
++	switch {
++	case err == nil:
++		if info.Mode()&os.ModeSocket == 0 {
++			return nil, E.New("XDial relay socket path is occupied by another file")
++		}
++		err = os.Remove(path)
++		if err != nil {
++			return nil, E.Cause(err, "remove stale XDial relay socket")
++		}
++	case !os.IsNotExist(err):
++		return nil, E.Cause(err, "inspect XDial relay socket path")
++	}
++	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
++	if err != nil {
++		return nil, E.Cause(err, "listen XDial relay socket")
++	}
++	listener.SetUnlinkOnClose(true)
++	// Connecting needs write permission on the socket file. The directory is
++	// private to the owner already; this keeps the file from depending on it.
++	err = os.Chmod(path, 0o600)
++	if err != nil {
++		listener.Close()
++		return nil, E.Cause(err, "restrict XDial relay socket")
++	}
++	return listener, nil
++}
++
++type xdialRelayTransport interface {
++	net.Conn
++	SetReadBuffer(bytes int) error
++	SetWriteBuffer(bytes int) error
++}
++
++// xdialRelayConn is the framed stream on one relay socket connection. It hides
++// the socket on purpose: anything that reached it would read and write past
++// the framing.
++type xdialRelayConn struct {
++	conn   net.Conn
++	reader *std_bufio.Reader
++
++	readAccess    sync.Mutex
++	readRemaining int
++	readFinished  bool
++	readErr       error
++	packet        []byte
++	packetLength  int
++	packetFilled  int
++
++	writeAccess   sync.Mutex
++	writeFinished bool
++	writeErr      error
++
++	abortive  atomic.Bool
++	closeOnce sync.Once
++	closeErr  error
++}
++
++func newXDialRelayConn(conn net.Conn) *xdialRelayConn {
++	if transport, isTransport := conn.(xdialRelayTransport); isTransport {
++		_ = transport.SetReadBuffer(xdialRelaySocketBuffer)
++		_ = transport.SetWriteBuffer(xdialRelaySocketBuffer)
++	}
++	return &xdialRelayConn{
++		conn:   conn,
++		reader: std_bufio.NewReaderSize(conn, xdialRelayReaderSize),
++	}
++}
++
++func (c *xdialRelayConn) Read(p []byte) (n int, err error) {
++	if len(p) == 0 {
++		return 0, nil
++	}
++	c.readAccess.Lock()
++	defer c.readAccess.Unlock()
++	for c.readRemaining == 0 {
++		length, finished, err := c.readHeader()
++		if err != nil {
++			return 0, err
++		}
++		if finished {
++			return 0, io.EOF
++		}
++		c.readRemaining = length
++	}
++	if len(p) > c.readRemaining {
++		p = p[:c.readRemaining]
++	}
++	for n == 0 {
++		n, err = c.reader.Read(p)
++		if n == 0 && err != nil {
++			return 0, c.failRead(err)
++		}
++	}
++	c.readRemaining -= n
++	return n, nil
++}
++
++// readFrame reads one whole DATA frame as a datagram. A datagram longer than p
++// is cut short, as a UDP socket would.
++func (c *xdialRelayConn) readFrame(p []byte) (n int, err error) {
++	c.readAccess.Lock()
++	defer c.readAccess.Unlock()
++	if c.readRemaining != 0 {
++		return 0, c.failRead(errXDialRelayFrame)
++	}
++	if c.packetLength == 0 {
++		length, finished, err := c.readHeader()
++		if err != nil {
++			return 0, err
++		}
++		if finished {
++			return 0, io.EOF
++		}
++		if cap(c.packet) < length {
++			c.packet = make([]byte, length)
++		}
++		c.packet = c.packet[:length]
++		c.packetLength = length
++		c.packetFilled = 0
++	}
++	// A deadline may fire between two pieces of a datagram. The pieces read so
++	// far stay here, so the next read resumes instead of losing the frame.
++	for c.packetFilled < c.packetLength {
++		read, err := c.reader.Read(c.packet[c.packetFilled:c.packetLength])
++		c.packetFilled += read
++		if err != nil && c.packetFilled < c.packetLength {
++			return 0, c.failRead(err)
++		}
++	}
++	n = copy(p, c.packet[:c.packetLength])
++	c.packetLength = 0
++	c.packetFilled = 0
++	return n, nil
++}
++
++// readHeader reads the next frame header and reports the payload length of a
++// DATA frame, or that the peer finished. Callers hold readAccess.
++func (c *xdialRelayConn) readHeader() (length int, finished bool, err error) {
++	if c.readFinished {
++		return 0, true, nil
++	}
++	if c.readErr != nil {
++		return 0, false, c.readErr
++	}
++	// Peek leaves a partial header buffered, so a deadline costs nothing.
++	header, err := c.reader.Peek(xdialRelayFrameHeaderLength)
++	if err != nil {
++		return 0, false, c.failRead(err)
++	}
++	frameType := header[0]
++	length = int(header[1])<<16 | int(header[2])<<8 | int(header[3])
++	_, _ = c.reader.Discard(xdialRelayFrameHeaderLength)
++	switch {
++	case frameType == xdialRelayFrameData && length > 0 && length <= xdialRelayMaxFramePayload:
++		return length, false, nil
++	case frameType == xdialRelayFrameFin && length == 0:
++		c.readFinished = true
++		return 0, true, nil
++	default:
++		return 0, false, c.failRead(errXDialRelayFrame)
++	}
++}
++
++// failRead turns the end of a read into what the caller should see. A stream
++// that stops short of its FIN frame was cut, and so was one that stopped making
++// sense. Deadlines pass through and may be retried.
++func (c *xdialRelayConn) failRead(err error) error {
++	if isXDialRelayTimeout(err) {
++		return c.opError("read", err)
++	}
++	if !errors.Is(err, net.ErrClosed) {
++		err = syscall.ECONNRESET
++	}
++	c.readErr = c.opError("read", err)
++	return c.readErr
++}
++
++func (c *xdialRelayConn) Write(p []byte) (n int, err error) {
++	c.writeAccess.Lock()
++	defer c.writeAccess.Unlock()
++	for len(p) > 0 {
++		chunk := p
++		if len(chunk) > xdialRelayStreamChunk {
++			chunk = chunk[:xdialRelayStreamChunk]
++		}
++		err = c.writeFrameLocked(xdialRelayFrameData, chunk)
++		if err != nil {
++			return n, err
++		}
++		n += len(chunk)
++		p = p[len(chunk):]
++	}
++	return n, nil
++}
++
++// writeFrame writes p as one DATA frame, which is one datagram.
++func (c *xdialRelayConn) writeFrame(p []byte) error {
++	if len(p) == 0 || len(p) > xdialRelayMaxFramePayload {
++		return c.opError("write", syscall.EMSGSIZE)
++	}
++	c.writeAccess.Lock()
++	defer c.writeAccess.Unlock()
++	return c.writeFrameLocked(xdialRelayFrameData, p)
++}
++
++func (c *xdialRelayConn) writeFrameLocked(frameType byte, payload []byte) error {
++	if c.writeErr != nil {
++		return c.writeErr
++	}
++	if c.writeFinished {
++		return c.opError("write", syscall.EPIPE)
++	}
++	header := [xdialRelayFrameHeaderLength]byte{
++		frameType,
++		byte(len(payload) >> 16),
++		byte(len(payload) >> 8),
++		byte(len(payload)),
++	}
++	buffers := net.Buffers{header[:]}
++	if len(payload) > 0 {
++		buffers = append(buffers, payload)
++	}
++	_, err := buffers.WriteTo(c.conn)
++	if err != nil {
++		// Part of a frame may be on the wire; nothing after it can be read.
++		c.writeErr = c.opError("write", err)
++		return c.writeErr
++	}
++	if frameType == xdialRelayFrameFin {
++		c.writeFinished = true
++	}
++	return nil
++}
++
++// CloseWrite tells the peer that this direction finished cleanly. The socket
++// stays open both ways: only the frame carries the meaning.
++func (c *xdialRelayConn) CloseWrite() error {
++	c.writeAccess.Lock()
++	defer c.writeAccess.Unlock()
++	if c.writeFinished {
++		return nil
++	}
++	return c.writeFrameLocked(xdialRelayFrameFin, nil)
++}
++
++// SetLinger keeps the TCP idiom the rest of sing-box already uses for an
++// abortive close: SetLinger(0) followed by Close ends the stream without a FIN
++// frame, and the peer reports a reset.
++func (c *xdialRelayConn) SetLinger(sec int) error {
++	c.abortive.Store(sec == 0)
++	return nil
++}
++
++func (c *xdialRelayConn) Close() error {
++	c.closeOnce.Do(func() {
++		// A writer blocked on a stalled peer holds the lock. Closing under it
++		// is not a clean end, so there is no FIN frame to wait for.
++		if !c.abortive.Load() && c.writeAccess.TryLock() {
++			if !c.writeFinished && c.writeErr == nil {
++				_ = c.conn.SetWriteDeadline(time.Now().Add(xdialRelayCloseTimeout))
++				_ = c.writeFrameLocked(xdialRelayFrameFin, nil)
++			}
++			c.writeAccess.Unlock()
++		}
++		c.closeErr = c.conn.Close()
++	})
++	return c.closeErr
++}
++
++func (c *xdialRelayConn) LocalAddr() net.Addr  { return xdialRelayStreamAddr }
++func (c *xdialRelayConn) RemoteAddr() net.Addr { return xdialRelayStreamAddr }
++
++func (c *xdialRelayConn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t) }
++func (c *xdialRelayConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
++func (c *xdialRelayConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
++
++// opError reports err as an error of this connection, so the relay can tell a
++// failure of the inbound side from one of the upstream.
++func (c *xdialRelayConn) opError(op string, err error) error {
++	var opErr *net.OpError
++	if errors.As(err, &opErr) {
++		err = opErr.Err
++	}
++	return &net.OpError{
++		Op:     op,
++		Net:    "unix",
++		Source: c.LocalAddr(),
++		Addr:   c.RemoteAddr(),
++		Err:    err,
++	}
++}
++
++func isXDialRelayTimeout(err error) bool {
++	var netErr net.Error
++	return errors.As(err, &netErr) && netErr.Timeout()
++}
++
++// ListenPacket answers UDP ASSOCIATE on this connection. The association gets
++// no socket of its own: its datagrams travel as frames on the connection that
++// asked for it.
++func (c *xdialRelayConn) ListenPacket(net.ListenConfig, context.Context, string, string) (net.PacketConn, error) {
++	return &xdialRelayPacketConn{conn: c}, nil
++}
++
++type xdialRelayPacketConn struct {
++	conn *xdialRelayConn
++}
++
++func (c *xdialRelayPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
++	n, err = c.conn.readFrame(p)
++	if err != nil {
++		return 0, nil, err
++	}
++	return n, xdialRelayPacketPeer, nil
++}
++
++func (c *xdialRelayPacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
++	err = c.conn.writeFrame(p)
++	if err != nil {
++		return 0, err
++	}
++	return len(p), nil
++}
++
++func (c *xdialRelayPacketConn) Close() error        { return c.conn.Close() }
++func (c *xdialRelayPacketConn) LocalAddr() net.Addr { return xdialRelayPacketAddr }
++
++func (c *xdialRelayPacketConn) SetDeadline(t time.Time) error     { return c.conn.SetDeadline(t) }
++func (c *xdialRelayPacketConn) SetReadDeadline(t time.Time) error { return c.conn.SetReadDeadline(t) }
++func (c *xdialRelayPacketConn) SetWriteDeadline(t time.Time) error {
++	return c.conn.SetWriteDeadline(t)
++}
+diff --git a/protocol/socks/xdial_relay_socket_test.go b/protocol/socks/xdial_relay_socket_test.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/socks/xdial_relay_socket_test.go
+@@ -0,0 +1,544 @@
++package socks
++
++import (
++	"context"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/common/uot"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++	"github.com/sagernet/sing/common/auth"
++	"github.com/sagernet/sing/common/buf"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++const xdialRelayTestTimeout = 5 * time.Second
++
++// xdialRelayTestDirectory is a short private directory: the temporary
++// directory Go hands to tests is already longer than a socket path may be.
++func xdialRelayTestDirectory(t *testing.T) string {
++	t.Helper()
++	directory, err := os.MkdirTemp("/tmp", "xdr")
++	require.NoError(t, err)
++	t.Cleanup(func() { os.RemoveAll(directory) })
++	return directory
++}
++
++// xdialRelayTestPair is one relay socket connection: the framed server end and
++// the raw client end the Provider would hold.
++func xdialRelayTestPair(t *testing.T) (*xdialRelayConn, *net.UnixConn) {
++	t.Helper()
++	path := filepath.Join(xdialRelayTestDirectory(t), "relay")
++	listener, err := listenXDialRelaySocket(path)
++	require.NoError(t, err)
++	t.Cleanup(func() { listener.Close() })
++	client, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
++	require.NoError(t, err)
++	t.Cleanup(func() { client.Close() })
++	server, err := listener.AcceptUnix()
++	require.NoError(t, err)
++	relayConn := newXDialRelayConn(server)
++	t.Cleanup(func() { relayConn.Close() })
++	deadline := time.Now().Add(xdialRelayTestTimeout)
++	require.NoError(t, client.SetDeadline(deadline))
++	require.NoError(t, relayConn.SetDeadline(deadline))
++	return relayConn, client
++}
++
++func xdialRelayTestFrame(frameType byte, payload []byte) []byte {
++	frame := []byte{frameType, byte(len(payload) >> 16), byte(len(payload) >> 8), byte(len(payload))}
++	return append(frame, payload...)
++}
++
++func xdialRelayTestReadFrame(t *testing.T, conn net.Conn) (byte, []byte) {
++	t.Helper()
++	var header [xdialRelayFrameHeaderLength]byte
++	_, err := io.ReadFull(conn, header[:])
++	require.NoError(t, err)
++	payload := make([]byte, int(header[1])<<16|int(header[2])<<8|int(header[3]))
++	_, err = io.ReadFull(conn, payload)
++	require.NoError(t, err)
++	return header[0], payload
++}
++
++func TestXDialRelaySocketFramesBothDirectionsAndEndsWithFinish(t *testing.T) {
++	server, client := xdialRelayTestPair(t)
++
++	// One frame may arrive in pieces, and one read may hold several frames.
++	stream := append(xdialRelayTestFrame(xdialRelayFrameData, []byte("hel")), xdialRelayTestFrame(xdialRelayFrameData, []byte("lo"))...)
++	stream = append(stream, xdialRelayTestFrame(xdialRelayFrameFin, nil)...)
++	_, err := client.Write(stream[:5])
++	require.NoError(t, err)
++	_, err = client.Write(stream[5:])
++	require.NoError(t, err)
++	received, err := io.ReadAll(server)
++	require.NoError(t, err, "a FIN frame is a clean end of stream")
++	require.Equal(t, "hello", string(received))
++
++	large := make([]byte, xdialRelayStreamChunk*2+1)
++	for index := range large {
++		large[index] = byte(index)
++	}
++	writeDone := make(chan error, 1)
++	go func() {
++		_, writeErr := server.Write(large)
++		if writeErr == nil {
++			writeErr = server.CloseWrite()
++		}
++		writeDone <- writeErr
++	}()
++	var reassembled []byte
++	for {
++		frameType, payload := xdialRelayTestReadFrame(t, client)
++		if frameType == xdialRelayFrameFin {
++			require.Empty(t, payload)
++			break
++		}
++		require.Equal(t, xdialRelayFrameData, frameType)
++		require.LessOrEqual(t, len(payload), xdialRelayStreamChunk)
++		reassembled = append(reassembled, payload...)
++	}
++	require.NoError(t, <-writeDone)
++	require.Equal(t, large, reassembled)
++
++	// The socket itself stays open after the FIN frame: the other direction
++	// is still in use, and only the frame means anything.
++	_, err = server.Write([]byte("late"))
++	require.ErrorIs(t, err, syscall.EPIPE)
++	require.NoError(t, server.CloseWrite(), "a second half-close is a no-op")
++}
++
++func TestXDialRelaySocketReportsStreamWithoutFinishAsReset(t *testing.T) {
++	for name, tail := range map[string][]byte{
++		"at a frame boundary": nil,
++		"inside a header":     {xdialRelayFrameData, 0x00},
++		"inside a payload":    xdialRelayTestFrame(xdialRelayFrameData, []byte("partial"))[:6],
++	} {
++		t.Run(name, func(t *testing.T) {
++			server, client := xdialRelayTestPair(t)
++			_, err := client.Write(append(xdialRelayTestFrame(xdialRelayFrameData, []byte("data")), tail...))
++			require.NoError(t, err)
++			require.NoError(t, client.Close())
++
++			received := make([]byte, 4)
++			_, err = io.ReadFull(server, received)
++			require.NoError(t, err, "bytes sent before the cut still arrive")
++			require.Equal(t, "data", string(received))
++			_, err = io.ReadAll(server)
++			require.ErrorIs(t, err, syscall.ECONNRESET)
++			var opErr *net.OpError
++			require.ErrorAs(t, err, &opErr)
++			require.Equal(t, "read", opErr.Op)
++			require.Equal(t, server.LocalAddr().String(), opErr.Source.String())
++			require.Equal(t, server.RemoteAddr().String(), opErr.Addr.String())
++		})
++	}
++}
++
++func TestXDialRelaySocketRejectsUnframedAndMalformedStreams(t *testing.T) {
++	for name, stream := range map[string][]byte{
++		"plain SOCKS greeting": {0x05, 0x01, 0x00, 0x00},
++		"empty DATA frame":     xdialRelayTestFrame(xdialRelayFrameData, nil),
++		"FIN with a payload":   xdialRelayTestFrame(xdialRelayFrameFin, []byte{0x00}),
++		"oversized DATA frame": {xdialRelayFrameData, 0x02, 0x00, 0x01},
++	} {
++		t.Run(name, func(t *testing.T) {
++			server, client := xdialRelayTestPair(t)
++			_, err := client.Write(stream)
++			require.NoError(t, err)
++			_, err = server.Read(make([]byte, 16))
++			require.ErrorIs(t, err, syscall.ECONNRESET)
++			_, err = server.Read(make([]byte, 16))
++			require.ErrorIs(t, err, syscall.ECONNRESET, "a broken stream stays broken")
++		})
++	}
++}
++
++func TestXDialRelaySocketGracefulCloseFinishesAndAbortiveCloseDoesNot(t *testing.T) {
++	t.Run("graceful", func(t *testing.T) {
++		server, client := xdialRelayTestPair(t)
++		_, err := server.Write([]byte("reply"))
++		require.NoError(t, err)
++		require.NoError(t, server.Close())
++		frameType, payload := xdialRelayTestReadFrame(t, client)
++		require.Equal(t, xdialRelayFrameData, frameType)
++		require.Equal(t, "reply", string(payload))
++		frameType, _ = xdialRelayTestReadFrame(t, client)
++		require.Equal(t, xdialRelayFrameFin, frameType, "an ordinary close ends the stream cleanly, as a TCP close does")
++		_, err = client.Read(make([]byte, 1))
++		require.ErrorIs(t, err, io.EOF)
++	})
++	t.Run("abortive", func(t *testing.T) {
++		server, client := xdialRelayTestPair(t)
++		_, err := server.Write([]byte("partial"))
++		require.NoError(t, err)
++		// The idiom sing-box and the XDial relay use to reset a TCP socket.
++		require.NoError(t, server.SetLinger(0))
++		require.NoError(t, server.Close())
++		frameType, payload := xdialRelayTestReadFrame(t, client)
++		require.Equal(t, xdialRelayFrameData, frameType)
++		require.Equal(t, "partial", string(payload))
++		_, err = client.Read(make([]byte, 1))
++		require.ErrorIs(t, err, io.EOF, "a reset stream ends without a FIN frame")
++	})
++	t.Run("close under a stalled writer", func(t *testing.T) {
++		server, client := xdialRelayTestPair(t)
++		require.NoError(t, server.SetDeadline(time.Time{}))
++		writeDone := make(chan error, 1)
++		go func() {
++			_, writeErr := server.Write(make([]byte, 8<<20))
++			writeDone <- writeErr
++		}()
++		// Nobody reads, so the writer fills the socket and blocks.
++		time.Sleep(100 * time.Millisecond)
++		closed := make(chan error, 1)
++		go func() { closed <- server.Close() }()
++		select {
++		case err := <-closed:
++			require.NoError(t, err)
++		case <-time.After(xdialRelayTestTimeout):
++			t.Fatal("close waited for a writer that could not finish")
++		}
++		require.ErrorIs(t, <-writeDone, net.ErrClosed)
++		_, err := io.Copy(io.Discard, client)
++		require.NoError(t, err)
++	})
++}
++
++func TestXDialRelaySocketCarriesDatagramsInBand(t *testing.T) {
++	server, client := xdialRelayTestPair(t)
++	packetConn, err := server.ListenPacket(net.ListenConfig{}, context.Background(), "udp4", "127.0.0.1:0")
++	require.NoError(t, err)
++	require.Equal(t, "0.0.0.0:0", packetConn.LocalAddr().String(), "the association has no relay endpoint to announce")
++
++	large := make([]byte, 65769)
++	for index := range large {
++		large[index] = byte(index * 7)
++	}
++	writeDone := make(chan error, 1)
++	go func() {
++		stream := append(xdialRelayTestFrame(xdialRelayFrameData, []byte("first")), xdialRelayTestFrame(xdialRelayFrameData, large)...)
++		stream = append(stream, xdialRelayTestFrame(xdialRelayFrameData, []byte("truncated"))...)
++		_, writeErr := client.Write(stream)
++		writeDone <- writeErr
++	}()
++	buffer := make([]byte, 1<<17)
++	n, addr, err := packetConn.ReadFrom(buffer)
++	require.NoError(t, err)
++	require.Equal(t, "first", string(buffer[:n]), "one frame is one datagram")
++	require.NotNil(t, addr)
++	n, _, err = packetConn.ReadFrom(buffer)
++	require.NoError(t, err)
++	require.Equal(t, large, buffer[:n])
++	n, _, err = packetConn.ReadFrom(buffer[:4])
++	require.NoError(t, err)
++	require.Equal(t, "trun", string(buffer[:n]), "a short buffer cuts the datagram, as a UDP socket does")
++	require.NoError(t, <-writeDone)
++
++	// A deadline between two pieces of one datagram must not lose the frame.
++	frame := xdialRelayTestFrame(xdialRelayFrameData, []byte("resumed"))
++	_, err = client.Write(frame[:7])
++	require.NoError(t, err)
++	require.NoError(t, packetConn.SetReadDeadline(time.Now().Add(50*time.Millisecond)))
++	_, _, err = packetConn.ReadFrom(buffer)
++	require.True(t, E.IsTimeout(err), "expected a timeout, got %v", err)
++	_, err = client.Write(frame[7:])
++	require.NoError(t, err)
++	require.NoError(t, packetConn.SetReadDeadline(time.Now().Add(xdialRelayTestTimeout)))
++	n, _, err = packetConn.ReadFrom(buffer)
++	require.NoError(t, err)
++	require.Equal(t, "resumed", string(buffer[:n]))
++
++	_, err = packetConn.WriteTo([]byte("reply"), nil)
++	require.NoError(t, err)
++	frameType, payload := xdialRelayTestReadFrame(t, client)
++	require.Equal(t, xdialRelayFrameData, frameType)
++	require.Equal(t, "reply", string(payload))
++	_, err = packetConn.WriteTo(make([]byte, xdialRelayMaxFramePayload+1), nil)
++	require.ErrorIs(t, err, syscall.EMSGSIZE)
++
++	require.NoError(t, client.Close())
++	_, _, err = packetConn.ReadFrom(buffer)
++	require.ErrorIs(t, err, syscall.ECONNRESET, "an association ends with its control connection")
++}
++
++func TestXDialRelaySocketListenerOwnsItsSocketFile(t *testing.T) {
++	directory := xdialRelayTestDirectory(t)
++	path := filepath.Join(directory, "relay")
++
++	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
++	require.NoError(t, err)
++	stale.SetUnlinkOnClose(false)
++	require.NoError(t, stale.Close())
++	_, err = os.Lstat(path)
++	require.NoError(t, err, "the stale socket of a crashed process is still on disk")
++
++	listener, err := listenXDialRelaySocket(path)
++	require.NoError(t, err, "a stale socket is replaced")
++	info, err := os.Lstat(path)
++	require.NoError(t, err)
++	require.NotZero(t, info.Mode()&os.ModeSocket)
++	require.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "only the owner may connect")
++	require.NoError(t, listener.Close())
++	_, err = os.Lstat(path)
++	require.True(t, os.IsNotExist(err), "closing the listener removes the socket file")
++
++	require.NoError(t, os.WriteFile(path, []byte("not a socket"), 0o600))
++	_, err = listenXDialRelaySocket(path)
++	require.Error(t, err, "a file that is not a socket is never removed")
++	content, err := os.ReadFile(path)
++	require.NoError(t, err)
++	require.Equal(t, "not a socket", string(content))
++
++	_, err = listenXDialRelaySocket("relative/relay")
++	require.Error(t, err)
++	_, err = listenXDialRelaySocket(filepath.Join(directory, strings.Repeat("a", xdialRelaySocketPathLimit)))
++	require.Error(t, err, "a path the kernel would truncate is refused")
++}
++
++type xdialRelayTestRouter struct {
++	access      sync.Mutex
++	connections []adapter.InboundContext
++	packets     []adapter.InboundContext
++}
++
++func (r *xdialRelayTestRouter) RouteConnection(context.Context, net.Conn, adapter.InboundContext) error {
++	return os.ErrInvalid
++}
++
++func (r *xdialRelayTestRouter) RoutePacketConnection(context.Context, N.PacketConn, adapter.InboundContext) error {
++	return os.ErrInvalid
++}
++
++// RouteConnectionEx echoes the stream and forwards the application's
++// half-close, unless the destination asks for the upstream to fail.
++func (r *xdialRelayTestRouter) RouteConnectionEx(_ context.Context, conn net.Conn, metadata adapter.InboundContext, _ N.CloseHandlerFunc) {
++	r.access.Lock()
++	r.connections = append(r.connections, metadata)
++	r.access.Unlock()
++	go func() {
++		if metadata.Destination.Port == 9 {
++			N.CloseOnHandshakeFailure(conn, nil, syscall.ECONNREFUSED)
++			return
++		}
++		// The connection arrives behind the deferred SOCKS reply, as it does
++		// in the connection manager, which looks through it the same way.
++		_, err := io.Copy(conn, conn)
++		if err != nil || metadata.Destination.Port == 7 {
++			lingerConn, _ := common.Cast[interface{ SetLinger(sec int) error }](conn)
++			lingerConn.SetLinger(0)
++			conn.Close()
++			return
++		}
++		writeCloser, _ := common.Cast[N.WriteCloser](conn)
++		writeCloser.CloseWrite()
++		conn.Close()
++	}()
++}
++
++func (r *xdialRelayTestRouter) RoutePacketConnectionEx(_ context.Context, conn N.PacketConn, metadata adapter.InboundContext, _ N.CloseHandlerFunc) {
++	r.access.Lock()
++	r.packets = append(r.packets, metadata)
++	r.access.Unlock()
++	go func() {
++		defer conn.Close()
++		headroom := N.CalculateFrontHeadroom(conn)
++		for {
++			buffer := buf.NewPacket()
++			destination, err := conn.ReadPacket(buffer)
++			if err != nil {
++				buffer.Release()
++				return
++			}
++			reply := buf.NewSize(headroom + buffer.Len())
++			reply.Resize(headroom, 0)
++			_, _ = reply.Write(buffer.Bytes())
++			buffer.Release()
++			err = conn.WritePacket(reply, destination)
++			if err != nil {
++				return
++			}
++		}
++	}()
++}
++
++func (r *xdialRelayTestRouter) routed() (connections []adapter.InboundContext, packets []adapter.InboundContext) {
++	r.access.Lock()
++	defer r.access.Unlock()
++	return append([]adapter.InboundContext(nil), r.connections...), append([]adapter.InboundContext(nil), r.packets...)
++}
++
++func xdialRelayTestInbound(t *testing.T) (*Inbound, *xdialRelayTestRouter, string) {
++	t.Helper()
++	path := filepath.Join(xdialRelayTestDirectory(t), "relay")
++	router := &xdialRelayTestRouter{}
++	logger := log.NewNOPFactory().NewLogger("test")
++	relayInbound := &Inbound{
++		Adapter:          inbound.NewAdapter(C.TypeSOCKS, "transparent-proxy-in"),
++		router:           uot.NewRouter(router, logger),
++		logger:           logger,
++		authenticator:    auth.NewAuthenticator([]auth.User{{Username: "session", Password: "secret"}}),
++		udpTimeout:       xdialRelayTestTimeout,
++		ctx:              context.Background(),
++		xdialRelaySocket: path,
++	}
++	return relayInbound, router, path
++}
++
++// xdialRelayTestClient speaks the relay socket's client side: SOCKS5 with
++// username and password, every byte inside DATA frames.
++type xdialRelayTestClient struct {
++	t    *testing.T
++	conn *net.UnixConn
++	rest []byte
++}
++
++func xdialRelayTestDial(t *testing.T, path string) *xdialRelayTestClient {
++	t.Helper()
++	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
++	require.NoError(t, err)
++	t.Cleanup(func() { conn.Close() })
++	require.NoError(t, conn.SetDeadline(time.Now().Add(xdialRelayTestTimeout)))
++	return &xdialRelayTestClient{t: t, conn: conn}
++}
++
++func (c *xdialRelayTestClient) send(payload ...byte) {
++	c.t.Helper()
++	_, err := c.conn.Write(xdialRelayTestFrame(xdialRelayFrameData, payload))
++	require.NoError(c.t, err)
++}
++
++func (c *xdialRelayTestClient) receive(length int) []byte {
++	c.t.Helper()
++	for len(c.rest) < length {
++		frameType, payload := xdialRelayTestReadFrame(c.t, c.conn)
++		require.Equal(c.t, xdialRelayFrameData, frameType)
++		c.rest = append(c.rest, payload...)
++	}
++	received := c.rest[:length]
++	c.rest = c.rest[length:]
++	return received
++}
++
++func (c *xdialRelayTestClient) authenticate(password string) byte {
++	c.t.Helper()
++	c.send(0x05, 0x01, 0x02)
++	require.Equal(c.t, []byte{0x05, 0x02}, c.receive(2))
++	request := append([]byte{0x01, byte(len("session"))}, "session"...)
++	request = append(request, byte(len(password)))
++	request = append(request, password...)
++	c.send(request...)
++	reply := c.receive(2)
++	require.Equal(c.t, byte(0x01), reply[0])
++	return reply[1]
++}
++
++func TestXDialRelaySocketInboundRelaysTCPWithFinishAndReset(t *testing.T) {
++	relayInbound, router, path := xdialRelayTestInbound(t)
++	require.NoError(t, relayInbound.Start(adapter.StartStateStart))
++	t.Cleanup(func() { relayInbound.Close() })
++
++	connect := func(port byte) *xdialRelayTestClient {
++		client := xdialRelayTestDial(t, path)
++		require.Zero(t, client.authenticate("secret"))
++		client.send(0x05, 0x01, 0x00, 0x01, 192, 0, 2, 1, 0x00, port)
++		return client
++	}
++
++	clean := connect(80)
++	clean.send([]byte("ping")...)
++	require.Equal(t, []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0}, clean.receive(10), "the reply names no port: the relay took none")
++	require.Equal(t, "ping", string(clean.receive(4)))
++	_, err := clean.conn.Write(xdialRelayTestFrame(xdialRelayFrameFin, nil))
++	require.NoError(t, err)
++	frameType, _ := xdialRelayTestReadFrame(t, clean.conn)
++	require.Equal(t, xdialRelayFrameFin, frameType, "an upstream that finished ends the stream with a FIN frame")
++
++	reset := connect(7)
++	reset.send([]byte("ping")...)
++	reset.receive(10)
++	require.Equal(t, "ping", string(reset.receive(4)))
++	_, err = reset.conn.Write(xdialRelayTestFrame(xdialRelayFrameFin, nil))
++	require.NoError(t, err)
++	_, err = reset.conn.Read(make([]byte, 1))
++	require.ErrorIs(t, err, io.EOF, "an upstream that failed ends the stream without a FIN frame")
++
++	refused := connect(9)
++	reply := refused.receive(10)
++	require.Equal(t, []byte{0x05, 0x05}, reply[:2], "a refused connection is still answered in SOCKS")
++
++	connections, _ := router.routed()
++	require.Len(t, connections, 3)
++	require.Equal(t, "transparent-proxy-in", connections[0].Inbound)
++	require.Equal(t, M.ParseSocksaddr("192.0.2.1:80"), connections[0].Destination)
++	require.Equal(t, "127.0.0.1:0", connections[0].Source.String())
++}
++
++func TestXDialRelaySocketInboundRelaysUDPOnItsControlConnection(t *testing.T) {
++	relayInbound, router, path := xdialRelayTestInbound(t)
++	require.NoError(t, relayInbound.Start(adapter.StartStateStart))
++	t.Cleanup(func() { relayInbound.Close() })
++
++	client := xdialRelayTestDial(t, path)
++	require.Zero(t, client.authenticate("secret"))
++	client.send(0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0)
++	require.Equal(t, []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}, client.receive(10), "the association announces no relay endpoint")
++
++	datagram := append([]byte{0x00, 0x00, 0x00, 0x01, 192, 0, 2, 53, 0x00, 53}, "query"...)
++	for range 2 {
++		client.send(datagram...)
++		frameType, payload := xdialRelayTestReadFrame(t, client.conn)
++		require.Equal(t, xdialRelayFrameData, frameType)
++		require.Equal(t, datagram, payload, "each frame is one SOCKS5 UDP datagram")
++	}
++
++	_, packets := router.routed()
++	require.Len(t, packets, 1)
++	require.Equal(t, M.ParseSocksaddr("192.0.2.53:53"), packets[0].Destination)
++}
++
++func TestXDialRelaySocketInboundKeepsAuthenticationAndRemovesItsSocket(t *testing.T) {
++	relayInbound, router, path := xdialRelayTestInbound(t)
++	require.NoError(t, relayInbound.Start(adapter.StartStateStart))
++
++	wrongPassword := xdialRelayTestDial(t, path)
++	require.NotZero(t, wrongPassword.authenticate("guess"), "the session credentials still gate the entry")
++
++	unauthenticated := xdialRelayTestDial(t, path)
++	unauthenticated.send(0x05, 0x01, 0x00)
++	require.Equal(t, []byte{0x05, 0xff}, unauthenticated.receive(2), "a client that offers no credentials is turned away")
++
++	connections, packets := router.routed()
++	require.Empty(t, connections)
++	require.Empty(t, packets)
++
++	require.NoError(t, relayInbound.Close())
++	_, err := os.Lstat(path)
++	require.True(t, os.IsNotExist(err), "stopping the inbound removes its socket file")
++	_, err = net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
++	require.Error(t, err)
++}
++
++func TestXDialRelaySocketOptionReplacesTheTCPListener(t *testing.T) {
++	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().NewLogger("test"), "transparent-proxy-in", option.SocksInboundOptions{
++		ListenOptions:    option.ListenOptions{ListenPort: 1080},
++		XDialRelaySocket: "/tmp/relay",
++	})
++	require.Error(t, err, "an entry is a socket file or a port, never both")
++}

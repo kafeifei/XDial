@@ -20,17 +20,13 @@ enum TCPFlowSOCKSRelay {
 
     static func makeHandle(
         flow: NEAppProxyTCPFlow,
-        socksPort: UInt16,
+        relaySocketPath: String,
         credentials: SOCKSCredentials? = nil,
         trialID: String,
         traffic: ProviderTrafficLedger,
         logger: Logger
     ) -> ProviderRelayHandle {
-        let connection = NWConnection(
-            host: .ipv4(IPv4Address.loopback),
-            port: Network.NWEndpoint.Port(rawValue: socksPort)!,
-            using: .tcp
-        )
+        let connection = RelayStreamConnection(socketPath: relaySocketPath)
         let resources = TCPRelayResources(
             flow: flow,
             connection: connection
@@ -46,7 +42,7 @@ enum TCPFlowSOCKSRelay {
                     do {
                         let destination = try destination(for: flow)
                         stage = "control-connect"
-                        try await start(connection)
+                        try await connection.start()
                         stage = "socks-negotiate"
                         try await negotiateSOCKS(
                             connection,
@@ -106,8 +102,11 @@ enum TCPFlowSOCKSRelay {
         switch error {
         case RelayError.invalidDestination:
             return "invalid-destination"
-        case RelayError.socksUnavailable:
+        case RelayError.socksUnavailable,
+             RelayStreamConnectionError.unavailable:
             return "socks-unavailable"
+        case RelayStreamFrameError.malformed:
+            return "relay-frame"
         case RelayError.socksProtocol, RelayError.connectRejected:
             return "socks-protocol"
         case RelayError.flowClosed:
@@ -204,16 +203,17 @@ enum TCPFlowSOCKSRelay {
         }
     }
 
+    /// SOCKS5 CONNECT against the session entry on the relay socket.
     static func negotiateSOCKS(
-        _ connection: NWConnection,
+        _ connection: RelayStreamConnection,
         credentials: SOCKSCredentials?,
         host: String,
         port: UInt16,
         encodedFlowMetadata: Data?
     ) async throws {
         let method: UInt8 = credentials == nil ? 0x00 : 0x02
-        try await send(Data([0x05, 0x01, method]), to: connection)
-        let greeting = try await receiveExactly(2, from: connection)
+        try await connection.send(Data([0x05, 0x01, method]))
+        let greeting = try await connection.receiveExactly(2)
         guard greeting == Data([0x05, method]) else {
             throw RelayError.socksProtocol("authentication rejected")
         }
@@ -248,9 +248,9 @@ enum TCPFlowSOCKSRelay {
         }
         request.append(UInt8(port >> 8))
         request.append(UInt8(port & 0xff))
-        try await send(request, to: connection)
+        try await connection.send(request)
 
-        let response = try await receiveExactly(4, from: connection)
+        let response = try await connection.receiveExactly(4)
         guard response[response.startIndex] == 0x05 else {
             throw RelayError.socksProtocol("invalid response version")
         }
@@ -261,12 +261,12 @@ enum TCPFlowSOCKSRelay {
         }
         switch response[response.index(response.startIndex, offsetBy: 3)] {
         case 0x01:
-            _ = try await receiveExactly(6, from: connection)
+            _ = try await connection.receiveExactly(6)
         case 0x04:
-            _ = try await receiveExactly(18, from: connection)
+            _ = try await connection.receiveExactly(18)
         case 0x03:
-            let length = try await receiveExactly(1, from: connection)
-            _ = try await receiveExactly(Int(length[length.startIndex]) + 2, from: connection)
+            let length = try await connection.receiveExactly(1)
+            _ = try await connection.receiveExactly(Int(length[length.startIndex]) + 2)
         default:
             throw RelayError.socksProtocol("invalid address type")
         }
@@ -274,7 +274,7 @@ enum TCPFlowSOCKSRelay {
 
     private static func authenticate(
         _ credentials: SOCKSCredentials,
-        connection: NWConnection
+        connection: RelayStreamConnection
     ) async throws {
         let username = Array(credentials.username.utf8)
         let password = Array(credentials.password.utf8)
@@ -290,8 +290,8 @@ enum TCPFlowSOCKSRelay {
         request.append(contentsOf: username)
         request.append(UInt8(password.count))
         request.append(contentsOf: password)
-        try await send(request, to: connection)
-        let response = try await receiveExactly(2, from: connection)
+        try await connection.send(request)
+        let response = try await connection.receiveExactly(2)
         guard response == Data([0x01, 0x00]) else {
             throw RelayError.socksProtocol("authentication failed")
         }
@@ -315,7 +315,7 @@ enum TCPFlowSOCKSRelay {
 
     private static func relay(
         flow: NEAppProxyTCPFlow,
-        connection: NWConnection,
+        connection: RelayStreamConnection,
         resources: TCPRelayResources,
         shutdown: RelayTaskShutdown,
         transactionID: String,
@@ -327,10 +327,10 @@ enum TCPFlowSOCKSRelay {
                     let data = try await read(from: flow)
                     if data.isEmpty {
                         resources.closeFlowRead()
-                        try await finishSending(to: connection)
+                        try await connection.finishSending()
                         return
                     }
-                    try await send(data, to: connection)
+                    try await connection.send(data)
                     traffic.recordUpload(
                         data.count,
                         transactionID: transactionID
@@ -339,33 +339,27 @@ enum TCPFlowSOCKSRelay {
             },
             second: {
                 while !Task.isCancelled {
-                    let result = try await receive(from: connection)
-                    if !result.data.isEmpty {
-                        try await write(result.data, to: flow)
-                        traffic.recordDownload(
-                            result.data.count,
-                            transactionID: transactionID
-                        )
-                    }
-                    if let error = result.error {
-                        throw error
-                    }
-                    if result.isComplete {
+                    // `nil` is the entry's FIN frame: the upstream finished.
+                    // A stream that ends without one throws a reset instead,
+                    // and the flow is closed with it.
+                    guard let data = try await connection.receive() else {
                         resources.closeFlowWrite()
                         return
                     }
-                    guard !result.data.isEmpty else {
-                        throw RelayError.socksUnavailable
-                    }
+                    try await write(data, to: flow)
+                    traffic.recordDownload(
+                        data.count,
+                        transactionID: transactionID
+                    )
                 }
             },
             shutdown: shutdown
         )
     }
 
-    /// Marks the SOCKS TCP stream complete in the sending direction. Network
-    /// framework documents this as the TCP FIN equivalent; the receive side
-    /// remains available until its own EOF or an error.
+    /// Marks a TCP stream complete in the sending direction. Network framework
+    /// documents this as the TCP FIN equivalent; the receive side remains
+    /// available until its own EOF or an error.
     static func finishSending(
         to connection: NWConnection
     ) async throws {
@@ -496,14 +490,14 @@ enum TCPFlowSOCKSRelay {
 private final class TCPRelayResources: @unchecked Sendable {
     private let lock = NSLock()
     private let flow: NEAppProxyTCPFlow
-    private let connection: NWConnection
+    private let connection: RelayStreamConnection
     private var flowReadClosed = false
     private var flowWriteClosed = false
     private var closed = false
 
     init(
         flow: NEAppProxyTCPFlow,
-        connection: NWConnection
+        connection: RelayStreamConnection
     ) {
         self.flow = flow
         self.connection = connection
@@ -544,7 +538,7 @@ private final class TCPRelayResources: @unchecked Sendable {
         flowWriteClosed = true
         lock.unlock()
 
-        RelayConnectionCancellation.cancel(connection, error: error)
+        connection.cancel(with: error)
         let sourceError = AppProxyFlowCloseError.normalize(error)
         if shouldCloseRead {
             flow.closeReadWithError(sourceError)
