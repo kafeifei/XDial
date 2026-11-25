@@ -77,8 +77,12 @@ IPv6 接口地址（临时地址在稳定网络上轮换）不进入比较；Pro
 只排除当前 XDial 会话自己登记的接口，不按名称前缀筛选、不取首候选、不生成 outbound
 `bind_interface`。缺失或不一致的快照不能启动连接。
 
-macOS 已绑定 flow 的接口是系统既有裁决，经认证且有长度上限的 metadata 传给 sing-box；
-Scenario 先选 Line，仅最终属于 Direct 的 flow 恢复该绑定，其他 Line 不继承它。
+macOS 交给 Provider 的每条 flow 都带着系统已选的接口：应用自己绑定的接口，或未绑定时
+系统路由表为该目标选的接口（Tailnet、MagicDNS 与分域 VPN 地址走那个 VPN 的 utun，
+不走默认接口）。两者都是既有裁决，经认证且有长度上限的 metadata 传给 sing-box；
+Scenario 先选 Line，仅最终属于 Direct 的 flow 恢复该接口，其他 Line 不继承它。
+按名称连接、尚无地址的 flow 没有路由事实，沿用 generation 的默认接口。UDP 关联按整条
+flow 取一次接口，同一 socket 发往不同路由的目标时以系统给 flow 的接口为准。
 TCP 的 metadata 在 CONNECT 请求里；UDP 的在 UDP ASSOCIATE 请求里，sing 的 SOCKS5 服务端
 只把首个数据报的目标交给 inbound，所以 relay socket 从本连接的握手里读回该请求，只取接口，
 路由仍按数据报目标。
@@ -218,7 +222,7 @@ Direct 使用完整 Underlay 的解析语义，不寻找绕过既有 VPN 的“�
 
 | 输入 | 解析路径 |
 |---|---|
-| 已捕获的系统 / 应用 DNS flow | sing-box 裁决为 Direct 后，经 Direct dialer 转发原 UDP/TCP 查询字节到原 resolver endpoint；flow 已绑定接口（mDNSResponder 按 scoped resolver 绑到分域 VPN 的 utun）时沿用该接口，与 Direct 恢复绑定一致；响应校验事务 ID、问题和目标 |
+| 已捕获的系统 / 应用 DNS flow | sing-box 裁决为 Direct 后，经 Direct dialer 转发原 UDP/TCP 查询字节到原 resolver endpoint；沿用 flow 的系统接口（mDNSResponder 按 scoped resolver 绑到分域 VPN 的 utun；应用自带解析器直连 MagicDNS 时由路由表选到 utun），与 Direct 恢复接口一致；响应校验事务 ID、问题和目标 |
 | 无原始 flow 的盒内主动解析 | 使用 Apple `DNSServiceGetAddrInfo`，保留系统 scoped resolver、搜索域与既有叠加 |
 
 已被接管、等待 Provider 应答的查询不能再次交给 mDNSResponder。

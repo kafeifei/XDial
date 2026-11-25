@@ -270,7 +270,8 @@ enum TransparentProxyFlowMetadata {
         return encoded
     }
 
-    /// Carries the interface choice macOS already attached to a bound flow.
+    /// Carries the interface choice macOS already made for the flow, see
+    /// `FlowSystemInterface`.
     /// The authenticated relay socket is only a transport envelope: the
     /// active Scenario still selects the outbound, and only Direct restores
     /// this interface when it is the selected Line.
@@ -299,7 +300,7 @@ enum TransparentProxyFlowMetadata {
     }
 
     /// UDP ASSOCIATE has no single remote endpoint, but its socket still owns
-    /// the original bound-interface fact for every datagram in the flow.
+    /// the original interface fact for every datagram in the flow.
     static func encodeBoundAssociation(
         boundInterface: String
     ) -> Data? {
@@ -315,15 +316,10 @@ enum TransparentProxyFlowMetadata {
         hostname: String?,
         boundInterface: String
     ) -> Data? {
-        let interfaceBytes = Data(boundInterface.utf8)
-        guard
-            !interfaceBytes.isEmpty,
-            interfaceBytes.count <= 15,
-            !interfaceBytes.contains(0),
-            interfaceBytes.allSatisfy({ $0 < 0x80 })
-        else {
+        guard FlowSystemInterface.isCarriable(boundInterface) else {
             return nil
         }
+        let interfaceBytes = Data(boundInterface.utf8)
 
         let hostnameBytes: Data?
         if let hostname {
@@ -365,5 +361,57 @@ enum TransparentProxyFlowMetadata {
             return nil
         }
         return encoded
+    }
+}
+
+/// The interface macOS chose for a flow before it reached XDial.
+///
+/// A bound socket carries its own binding. An unbound socket still went
+/// through the system routing table: a Tailnet, MagicDNS or split-VPN
+/// destination routes through that VPN's utun, not the default interface.
+/// Both are Underlay facts that Direct must keep; binding every unbound
+/// Direct socket to the default interface sends those destinations out the
+/// wrong link. Only Direct restores either kind, never another Line.
+enum FlowSystemInterface: Equatable {
+    /// No interface reported for an unbound flow: Direct keeps the
+    /// generation's default interface.
+    case none
+    case bound(String)
+    case routed(String)
+    /// A bound flow without a usable interface cannot be carried faithfully.
+    case invalid
+
+    init(isBound: Bool, interfaceName: String?) {
+        let name = interfaceName.flatMap {
+            Self.isCarriable($0) ? $0 : nil
+        }
+        switch (isBound, name) {
+        case let (true, name?):
+            self = .bound(name)
+        case (true, nil):
+            self = .invalid
+        case let (false, name?):
+            self = .routed(name)
+        case (false, nil):
+            self = .none
+        }
+    }
+
+    var name: String? {
+        switch self {
+        case let .bound(name), let .routed(name):
+            return name
+        case .none, .invalid:
+            return nil
+        }
+    }
+
+    /// Same bounds as the metadata envelope: a BSD interface name.
+    static func isCarriable(_ name: String) -> Bool {
+        let bytes = Data(name.utf8)
+        return !bytes.isEmpty
+            && bytes.count <= 15
+            && !bytes.contains(0)
+            && bytes.allSatisfy({ $0 < 0x80 })
     }
 }

@@ -142,28 +142,26 @@ enum TCPFlowSOCKSRelay {
         guard !host.isEmpty else {
             throw RelayError.invalidDestination
         }
-        let boundInterface: String?
-        if flow.isBound {
-            guard let interfaceName = flow.interface?.name,
-                  !interfaceName.isEmpty else {
-                throw RelayError.invalidDestination
-            }
-            boundInterface = interfaceName
-        } else {
-            boundInterface = nil
+        let systemInterface = FlowSystemInterface(
+            isBound: flow.isBound,
+            interfaceName: flow.interface?.name
+        )
+        if systemInterface == .invalid {
+            throw RelayError.invalidDestination
         }
-        let encodedFlowMetadata: Data?
-        if let boundInterface {
-            encodedFlowMetadata =
-                TransparentProxyFlowMetadata.encodeBoundFlow(
-                    hostname: flow.remoteHostname,
-                    endpointHost: endpointHost,
-                    boundInterface: boundInterface
-                )
-            guard encodedFlowMetadata != nil else {
-                throw RelayError.invalidDestination
-            }
-        } else {
+        var encodedFlowMetadata = systemInterface.name.flatMap {
+            TransparentProxyFlowMetadata.encodeBoundFlow(
+                hostname: flow.remoteHostname,
+                endpointHost: endpointHost,
+                boundInterface: $0
+            )
+        }
+        if case .bound = systemInterface, encodedFlowMetadata == nil {
+            throw RelayError.invalidDestination
+        }
+        // A connect-by-name flow has no routed address yet; it keeps the
+        // generation's default interface.
+        if encodedFlowMetadata == nil {
             encodedFlowMetadata = flow.remoteHostname.flatMap {
                 TransparentProxyFlowMetadata.encode(
                     hostname: $0,

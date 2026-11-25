@@ -366,22 +366,17 @@ enum UDPFlowSOCKSRelay {
         do {
             try await control.start()
             stage = "udp-associate"
-            let boundInterface: String?
-            if channel.flow.isBound {
-                guard
-                    let interfaceName = channel.flow.interface?.name,
-                    !interfaceName.isEmpty
-                else {
-                    throw RelayError.invalidEndpoint
-                }
-                boundInterface = interfaceName
-            } else {
-                boundInterface = nil
+            let systemInterface = FlowSystemInterface(
+                isBound: channel.flow.isBound,
+                interfaceName: channel.flow.interface?.name
+            )
+            if systemInterface == .invalid {
+                throw RelayError.invalidEndpoint
             }
             try await associateUDP(
                 control,
                 credentials: ticket.credentials,
-                boundInterface: boundInterface
+                boundInterface: systemInterface.name
             )
             association.markAssociated()
             guard channel.adopt(association) else {
