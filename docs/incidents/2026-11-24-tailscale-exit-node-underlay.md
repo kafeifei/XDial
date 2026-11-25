@@ -57,3 +57,13 @@ TCP（CONNECT 地址照常传入）不受影响。补上后同一探测经 `utun
 
 未验证：未绑定接口的应用 flow 去往只在非默认接口上有路由的地址（例如不开出口节点时的
 Tailnet 地址），按当前实现会经默认接口发出。
+
+## 实机验证
+
+20:53 装上四项修复（Debug 构建 1795582378），同一台机器、Tailscale 运行且系统 DNS 为 MagicDNS：
+- 连接后新名称解析 59–377 ms，HTTPS 正常；`read/dial original DNS` 错误为 0（修复前约每分钟数百条）。
+  mDNSResponder 等发往 `100.100.100.100` 的 flow 由 Provider 接管并应答。
+- Tailscale 自己的 flow 全部放行，健康检查无告警，magicsock 接收队列为 0，到出口节点走局域网直连。
+- 打开出口节点：epoch 切换重试一次后 14 s 提交，Direct 改经 `utun4`，Tailscale 仍直连，无环路。
+- 关掉出口节点：12 s 提交到 `en0`，此后 DNS 与 HTTPS 正常；切换准备期间约 10 s 探测失败，
+  因为旧 generation 仍绑在已无默认路径的 `utun4` 上。这段空窗未处理。
