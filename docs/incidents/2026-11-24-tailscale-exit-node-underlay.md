@@ -36,6 +36,14 @@
 - 原查询转发用的是 local transport 自己的 dialer，绑在默认接口上，丢了 flow 绑定的
   `utun4`，所以分域 VPN 的 resolver 不可达。
 
+20:07 装上前三项修复后重连，Tailscale 的 flow 已放行（`underlay-provider-flow released`），
+DNS 仍同样超时，用户再次退出 XDial。本地用真实数据面复现：经 relay socket 发出绑定
+`utun4`、目标 `100.100.100.100:53` 的 UDP 关联，路由时 `XDialBoundInterface` 为空。
+sing 的 SOCKS5 服务端处理 UDP ASSOCIATE 时把首个数据报的目标交给 inbound，丢弃了请求
+地址，而 Provider 正是把绑定接口编码在这个地址里；所以绑定 UDP flow 从未恢复过接口，
+TCP（CONNECT 地址照常传入）不受影响。补上后同一探测经 `utun4` 拿到应答，不绑定的对照
+仍超时。
+
 ## 修复
 
 - 另一个 Network Extension provider 进程的 flow 原样放行，按内核给出的进程路径与
@@ -44,6 +52,8 @@
   [StaleCommittedGenerationPolicy](../../macos/Shared/NetworkEpochSwitchCoordinator.swift)。
 - 原查询转发沿用 flow 绑定的接口，见
   [sing-box 补丁 0020](../../patches/sing-box/0020-bind-original-dns-to-flow-interface.patch)。
+- relay socket 从握手读回 UDP ASSOCIATE 请求，恢复绑定 UDP flow 的接口，见
+  [sing-box 补丁 0021](../../patches/sing-box/0021-keep-bound-udp-association-interface.patch)。
 
-未覆盖：未绑定接口的应用 flow 去往只在非默认接口上有路由的地址（例如不开出口节点时的
-Tailnet 地址）仍会经默认接口发出。
+未验证：未绑定接口的应用 flow 去往只在非默认接口上有路由的地址（例如不开出口节点时的
+Tailnet 地址），按当前实现会经默认接口发出。

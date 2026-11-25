@@ -1,0 +1,236 @@
+diff --git a/protocol/socks/inbound.go b/protocol/socks/inbound.go
+--- a/protocol/socks/inbound.go
++++ b/protocol/socks/inbound.go
+@@ -137,12 +137,16 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ 	// connection reaching an inbound without a TCP listener was injected and
+ 	// lets sing open the association's socket itself.
+ 	var packetListener socks.PacketListener
++	packetHandler := h.streamUserPacketConnection
+ 	if relayConn, isRelayConn := conn.(*xdialRelayConn); isRelayConn {
+ 		packetListener = relayConn
++		packetHandler = func(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++			h.streamXDialRelayPacketConnection(ctx, relayConn, conn, metadata, onClose)
++		}
+ 	} else if h.listener != nil {
+ 		packetListener = h.listener
+ 	}
+-	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), packetListener, h.udpTimeout, metadata.Source, onClose)
++	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, packetHandler), packetListener, h.udpTimeout, metadata.Source, onClose)
+ 	N.CloseOnHandshakeFailure(conn, onClose, err)
+ 	if err != nil {
+ 		if E.IsClosedOrCanceled(err) {
+diff --git a/protocol/socks/xdial_relay_association.go b/protocol/socks/xdial_relay_association.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/socks/xdial_relay_association.go
+@@ -0,0 +1,100 @@
++package socks
++
++import (
++	"bytes"
++	"context"
++
++	"github.com/sagernet/sing-box/adapter"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/protocol/socks/socks5"
++)
++
++// The handshake of one relay connection is a greeting, an optional
++// username/password exchange and one request; it never comes near this.
++const xdialRelayHandshakeLimit = 1024
++
++// recordHandshakeLocked keeps the bytes the SOCKS5 server reads before the
++// connection becomes a UDP association. sing hands the association to the
++// inbound with the first datagram's destination and drops the UDP ASSOCIATE
++// request address, which is where the Provider puts a bound flow's interface.
++func (c *xdialRelayConn) recordHandshakeLocked(p []byte) {
++	if c.handshakeDone {
++		return
++	}
++	if len(c.handshake)+len(p) > xdialRelayHandshakeLimit {
++		c.handshake = nil
++		c.handshakeDone = true
++		return
++	}
++	c.handshake = append(c.handshake, p...)
++}
++
++// associationRequest returns the destination of this connection's UDP
++// ASSOCIATE request, read back from the recorded handshake.
++func (c *xdialRelayConn) associationRequest() (M.Socksaddr, bool) {
++	c.readAccess.Lock()
++	raw := c.handshake
++	c.readAccess.Unlock()
++	return parseXDialAssociationRequest(raw)
++}
++
++func parseXDialAssociationRequest(raw []byte) (M.Socksaddr, bool) {
++	if len(raw) < 2 || raw[0] != socks5.Version {
++		return M.Socksaddr{}, false
++	}
++	offset := 2 + int(raw[1])
++	if len(raw) < offset {
++		return M.Socksaddr{}, false
++	}
++	// A username/password subnegotiation starts with its own version 1.
++	if len(raw) > offset && raw[offset] == 0x01 {
++		if len(raw) < offset+2 {
++			return M.Socksaddr{}, false
++		}
++		passwordOffset := offset + 2 + int(raw[offset+1])
++		if len(raw) < passwordOffset+1 {
++			return M.Socksaddr{}, false
++		}
++		offset = passwordOffset + 1 + int(raw[passwordOffset])
++		if len(raw) < offset {
++			return M.Socksaddr{}, false
++		}
++	}
++	request, err := socks5.ReadRequest(bytes.NewReader(raw[offset:]))
++	if err != nil || request.Command != socks5.CommandUDPAssociate {
++		return M.Socksaddr{}, false
++	}
++	return request.Destination, true
++}
++
++// streamXDialRelayPacketConnection restores the interface of a bound UDP
++// association. The metadata keeps the first datagram's destination for
++// routing; only the bound interface is taken from the association request.
++func (h *Inbound) streamXDialRelayPacketConnection(
++	ctx context.Context,
++	relayConn *xdialRelayConn,
++	conn N.PacketConn,
++	metadata adapter.InboundContext,
++	onClose N.CloseHandlerFunc,
++) {
++	if h.xdialFlowMetadata {
++		if request, loaded := relayConn.associationRequest(); loaded &&
++			bytes.HasPrefix([]byte(request.Fqdn), xdialBoundFlowMetadataMagic) {
++			association := metadata
++			association.Destination = request
++			if _, err := applyXDialFlowMetadata(&association); err != nil ||
++				association.XDialBoundInterface == "" {
++				if err == nil {
++					err = E.New("invalid XDial bound association")
++				}
++				N.CloseOnHandshakeFailure(conn, onClose, err)
++				h.logger.ErrorContext(ctx, "reject invalid XDial flow metadata")
++				return
++			}
++			metadata.XDialBoundInterface = association.XDialBoundInterface
++		}
++	}
++	h.streamUserPacketConnection(ctx, conn, metadata, onClose)
++}
+diff --git a/protocol/socks/xdial_relay_association_test.go b/protocol/socks/xdial_relay_association_test.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/socks/xdial_relay_association_test.go
+@@ -0,0 +1,75 @@
++package socks
++
++import (
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++func xdialBoundAssociationRequest(interfaceName string) []byte {
++	envelope := append(append([]byte(nil), xdialBoundFlowMetadataMagic...), xdialBoundInterfaceFlag, byte(len(interfaceName)))
++	envelope = append(envelope, interfaceName...)
++	request := append([]byte{0x05, 0x03, 0x00, 0x03, byte(len(envelope))}, envelope...)
++	return append(request, 0, 0)
++}
++
++func TestXDialRelayAssociationRequestIsReadBackFromTheHandshake(t *testing.T) {
++	request := xdialBoundAssociationRequest("utun4")
++	withAuthentication := append([]byte{0x05, 0x01, 0x02, 0x01, 7}, "session"...)
++	withAuthentication = append(append(withAuthentication, 6), "secret"...)
++	for _, greeting := range [][]byte{{0x05, 0x01, 0x00}, withAuthentication} {
++		destination, loaded := parseXDialAssociationRequest(append(append([]byte(nil), greeting...), request...))
++		require.True(t, loaded)
++		require.Equal(t, string(request[5:len(request)-2]), destination.Fqdn)
++	}
++
++	_, loaded := parseXDialAssociationRequest(append([]byte{0x05, 0x01, 0x00}, 0x05, 0x01, 0x00, 0x01, 192, 0, 2, 1, 0, 80))
++	require.False(t, loaded, "a CONNECT request is not an association")
++	_, loaded = parseXDialAssociationRequest([]byte{0x05, 0x01})
++	require.False(t, loaded, "a truncated handshake yields nothing")
++}
++
++func TestXDialRelaySocketInboundKeepsTheBoundAssociationInterface(t *testing.T) {
++	relayInbound, router, path := xdialRelayTestInbound(t)
++	relayInbound.xdialFlowMetadata = true
++	require.NoError(t, relayInbound.Start(adapter.StartStateStart))
++	t.Cleanup(func() { relayInbound.Close() })
++
++	client := xdialRelayTestDial(t, path)
++	require.Zero(t, client.authenticate("secret"))
++	client.send(xdialBoundAssociationRequest("utun4")...)
++	require.Equal(t, byte(0x00), client.receive(10)[1])
++
++	datagram := append([]byte{0x00, 0x00, 0x00, 0x01, 100, 100, 100, 100, 0x00, 53}, "query"...)
++	client.send(datagram...)
++	frameType, payload := xdialRelayTestReadFrame(t, client.conn)
++	require.Equal(t, xdialRelayFrameData, frameType)
++	require.Equal(t, datagram, payload)
++
++	_, packets := router.routed()
++	require.Len(t, packets, 1)
++	require.Equal(t, "utun4", packets[0].XDialBoundInterface)
++	require.Equal(t, M.ParseSocksaddr("100.100.100.100:53"), packets[0].Destination,
++		"routing still sees the first datagram's destination")
++}
++
++func TestXDialRelaySocketInboundLeavesAnUnboundAssociationUnbound(t *testing.T) {
++	relayInbound, router, path := xdialRelayTestInbound(t)
++	relayInbound.xdialFlowMetadata = true
++	require.NoError(t, relayInbound.Start(adapter.StartStateStart))
++	t.Cleanup(func() { relayInbound.Close() })
++
++	client := xdialRelayTestDial(t, path)
++	require.Zero(t, client.authenticate("secret"))
++	client.send(0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0)
++	require.Equal(t, byte(0x00), client.receive(10)[1])
++	client.send(append([]byte{0x00, 0x00, 0x00, 0x01, 192, 0, 2, 53, 0x00, 53}, "query"...)...)
++	xdialRelayTestReadFrame(t, client.conn)
++
++	_, packets := router.routed()
++	require.Len(t, packets, 1)
++	require.Empty(t, packets[0].XDialBoundInterface)
++}
+diff --git a/protocol/socks/xdial_relay_socket.go b/protocol/socks/xdial_relay_socket.go
+--- a/protocol/socks/xdial_relay_socket.go
++++ b/protocol/socks/xdial_relay_socket.go
+@@ -124,6 +124,8 @@ type xdialRelayConn struct {
+ 	reader *std_bufio.Reader
+ 
+ 	readAccess    sync.Mutex
++	handshake     []byte
++	handshakeDone bool
+ 	readRemaining int
+ 	readFinished  bool
+ 	readErr       error
+@@ -177,6 +179,7 @@ func (c *xdialRelayConn) Read(p []byte) (n int, err error) {
+ 		}
+ 	}
+ 	c.readRemaining -= n
++	c.recordHandshakeLocked(p[:n])
+ 	return n, nil
+ }
+ 
+@@ -384,6 +387,9 @@ func isXDialRelayTimeout(err error) bool {
+ // no socket of its own: its datagrams travel as frames on the connection that
+ // asked for it.
+ func (c *xdialRelayConn) ListenPacket(net.ListenConfig, context.Context, string, string) (net.PacketConn, error) {
++	c.readAccess.Lock()
++	c.handshakeDone = true
++	c.readAccess.Unlock()
+ 	return &xdialRelayPacketConn{conn: c}, nil
+ }
+ 

@@ -79,6 +79,9 @@ IPv6 接口地址（临时地址在稳定网络上轮换）不进入比较；Pro
 
 macOS 已绑定 flow 的接口是系统既有裁决，经认证且有长度上限的 metadata 传给 sing-box；
 Scenario 先选 Line，仅最终属于 Direct 的 flow 恢复该绑定，其他 Line 不继承它。
+TCP 的 metadata 在 CONNECT 请求里；UDP 的在 UDP ASSOCIATE 请求里，sing 的 SOCKS5 服务端
+只把首个数据报的目标交给 inbound，所以 relay socket 从本连接的握手里读回该请求，只取接口，
+路由仍按数据报目标。
 
 TCP flow 的结束方式如实传给应用：上游正常结束是半关闭，应用读到流的结尾；应用先结束
 发送方向时同样只半关闭上游，应答照常送回，不因出站连接外面的跟踪、计数包装而变成整条
