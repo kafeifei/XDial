@@ -300,15 +300,15 @@ final class GoEngine: ObservableObject {
         transparentProxy.endParkedRecovery(code: code)
     }
 
-    func committedDefaultInterfaceIsAbsent(
+    func committedDefaultInterfaceIsStale(
         expectedUnderlayFingerprint: String,
         completion: @escaping (Bool) -> Void
     ) {
-        transparentProxy.committedDefaultInterfaceIsAbsent(
+        transparentProxy.committedDefaultInterfaceIsStale(
             expectedUnderlayFingerprint: expectedUnderlayFingerprint
-        ) { absent in
+        ) { stale in
             Task { @MainActor in
-                completion(absent)
+                completion(stale)
             }
         }
     }

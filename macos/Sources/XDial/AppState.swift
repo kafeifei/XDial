@@ -1867,19 +1867,19 @@ final class AppState: ObservableObject {
 
     /// An automatic network epoch's Switch finally failed, so the committed
     /// generation keeps running on its old Underlay. When that Underlay's
-    /// default interface is gone the generation cannot be healthy: roll it
-    /// back with a full automatic recovery toward the epoch's Scenario,
-    /// which may itself end parked. While the old default interface still
-    /// exists nothing escalates.
+    /// default interface is gone or no longer carries the default path, the
+    /// generation cannot be healthy: roll it back with a full automatic
+    /// recovery toward the epoch's Scenario, which may itself end parked.
+    /// While the old interface is still the default nothing escalates.
     private func escalateStaleCommittedGenerationIfNeeded(
         after intent: NetworkEpochSwitchCoordinator.Intent,
         committedTransactionID: String
     ) {
         let targetScenarioID = intent.desiredScenarioID
-        engine.committedDefaultInterfaceIsAbsent(
+        engine.committedDefaultInterfaceIsStale(
             expectedUnderlayFingerprint: intent.underlayFingerprint
-        ) { [weak self] absent in
-            guard let self, absent else { return }
+        ) { [weak self] stale in
+            guard let self, stale else { return }
             guard
                 self.engine.status == "connected",
                 self.engine.connectionReport?.transactionID
@@ -1901,7 +1901,8 @@ final class AppState: ObservableObject {
             }
             appLog(
                 "Network epoch \(intent.epoch) Switch failed and the "
-                    + "committed generation's default interface is gone; "
+                    + "committed generation's default interface no longer "
+                    + "carries the default path; "
                     + "escalating to full automatic recovery Scenario "
                     + targetScenarioID
             )

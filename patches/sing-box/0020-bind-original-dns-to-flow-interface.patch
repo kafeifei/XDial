@@ -1,0 +1,169 @@
+diff --git a/dns/transport/local/local.go b/dns/transport/local/local.go
+--- a/dns/transport/local/local.go
++++ b/dns/transport/local/local.go
+@@ -40,6 +40,9 @@ type Transport struct {
+ 	preferGo               bool
+ 	fallback               bool
+ 	xdialUseSystemResolver bool
++	xdialDialerOptions     option.DialerOptions
++	xdialBoundDialers      map[string]N.Dialer
++	xdialBoundDialerAccess sync.Mutex
+ 	resolved               ResolvedResolver
+ 	mdnsTransport          adapter.DNSTransport
+ 	dhcpTransport          dhcpTransport
+@@ -72,6 +75,7 @@ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, opt
+ 		dialer:                 transportDialer,
+ 		preferGo:               options.PreferGo,
+ 		xdialUseSystemResolver: options.XDialUseSystemResolver,
++		xdialDialerOptions:     options.DialerOptions,
+ 		neighborSuffixes:       suffixes,
+ 	}, nil
+ }
+diff --git a/dns/transport/local/local_xdial_bound.go b/dns/transport/local/local_xdial_bound.go
+new file mode 100644
+--- /dev/null
++++ b/dns/transport/local/local_xdial_bound.go
+@@ -0,0 +1,52 @@
++package local
++
++import (
++	"context"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/dialer"
++	"github.com/sagernet/sing-box/option"
++	N "github.com/sagernet/sing/common/network"
++)
++
++func xdialBoundDialerOptions(
++	base option.DialerOptions,
++	interfaceName string,
++) option.DialerOptions {
++	base.BindInterface = interfaceName
++	return base
++}
++
++// xdialOriginalQueryDialer keeps the interface the application bound its
++// DNS socket to. mDNSResponder scopes a query to its resolver's interface,
++// such as a split-DNS VPN tunnel, and that resolver is not reachable through
++// the default Underlay interface every other Provider socket is bound to.
++// Only queries already decided for the Underlay resolver reach this
++// transport, matching Direct, which restores the same binding.
++func (t *Transport) xdialOriginalQueryDialer(
++	ctx context.Context,
++) (N.Dialer, error) {
++	metadata := adapter.ContextFrom(ctx)
++	if metadata == nil || metadata.XDialBoundInterface == "" {
++		return t.dialer, nil
++	}
++	interfaceName := metadata.XDialBoundInterface
++	t.xdialBoundDialerAccess.Lock()
++	defer t.xdialBoundDialerAccess.Unlock()
++	if boundDialer := t.xdialBoundDialers[interfaceName]; boundDialer != nil {
++		return boundDialer, nil
++	}
++	boundDialer, err := dialer.NewWithOptions(dialer.Options{
++		Context:        t.ctx,
++		Options:        xdialBoundDialerOptions(t.xdialDialerOptions, interfaceName),
++		DirectResolver: true,
++	})
++	if err != nil {
++		return nil, err
++	}
++	if t.xdialBoundDialers == nil {
++		t.xdialBoundDialers = make(map[string]N.Dialer)
++	}
++	t.xdialBoundDialers[interfaceName] = boundDialer
++	return boundDialer, nil
++}
+diff --git a/dns/transport/local/local_xdial_bound_test.go b/dns/transport/local/local_xdial_bound_test.go
+new file mode 100644
+--- /dev/null
++++ b/dns/transport/local/local_xdial_bound_test.go
+@@ -0,0 +1,67 @@
++package local
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestXDialBoundDialerOptionsOnlyOverridesInterface(t *testing.T) {
++	base := option.DialerOptions{
++		AbstractDialerOptions: option.AbstractDialerOptions{
++			DomainResolver: &option.DomainResolveOptions{
++				Server: "xdial-native-dns",
++			},
++		},
++	}
++
++	bound := xdialBoundDialerOptions(base, "utun4")
++
++	require.Empty(t, base.BindInterface)
++	require.Equal(t, "utun4", bound.BindInterface)
++	require.Equal(t, "xdial-native-dns", bound.DomainResolver.Server)
++}
++
++func TestXDialOriginalQueryUsesTransportDialerWithoutBoundInterface(t *testing.T) {
++	transport := newXDialBoundTestTransport(t)
++
++	got, err := transport.xdialOriginalQueryDialer(context.Background())
++	require.NoError(t, err)
++	require.Same(t, transport.dialer, got)
++
++	ctx := adapter.WithContext(context.Background(), &adapter.InboundContext{})
++	got, err = transport.xdialOriginalQueryDialer(ctx)
++	require.NoError(t, err)
++	require.Same(t, transport.dialer, got)
++}
++
++func TestXDialOriginalQueryKeepsTheFlowsBoundInterface(t *testing.T) {
++	transport := newXDialBoundTestTransport(t)
++	ctx := adapter.WithContext(context.Background(), &adapter.InboundContext{
++		XDialBoundInterface: "utun4",
++	})
++
++	first, err := transport.xdialOriginalQueryDialer(ctx)
++	require.NoError(t, err)
++	require.NotSame(t, transport.dialer, first)
++
++	second, err := transport.xdialOriginalQueryDialer(ctx)
++	require.NoError(t, err)
++	require.Same(t, first, second)
++}
++
++func newXDialBoundTestTransport(t *testing.T) *Transport {
++	t.Helper()
++	transport, err := NewTransport(
++		context.Background(),
++		nil,
++		"xdial-system-dns",
++		option.LocalDNSServerOptions{XDialUseSystemResolver: true},
++	)
++	require.NoError(t, err)
++	return transport.(*Transport)
++}
+diff --git a/dns/transport/local/local_xdial_darwin.go b/dns/transport/local/local_xdial_darwin.go
+--- a/dns/transport/local/local_xdial_darwin.go
++++ b/dns/transport/local/local_xdial_darwin.go
+@@ -199,9 +199,14 @@ func (t *Transport) xdialSystemExchangeAsync(
+ ) {
+ 	if originalQuery, loaded := dns.XDialOriginalQueryFromContext(ctx); loaded {
+ 		go func() {
++			originalDialer, err := t.xdialOriginalQueryDialer(ctx)
++			if err != nil {
++				callback(nil, E.Cause(err, "dial original DNS resolver"))
++				return
++			}
+ 			callback(xdialOriginalExchange(
+ 				ctx,
+-				t.dialer,
++				originalDialer,
+ 				message,
+ 				originalQuery,
+ 			))

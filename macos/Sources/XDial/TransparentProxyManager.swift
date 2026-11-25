@@ -4142,10 +4142,11 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
     // MARK: - Stale committed generation
 
     /// After an automatic network epoch's Switch finally failed, reports
-    /// whether the still-committed generation's default interface is absent
-    /// from the current Underlay. Only a successful capture of the same
-    /// settled epoch counts as evidence.
-    func committedDefaultInterfaceIsAbsent(
+    /// whether the still-committed generation's default interface no longer
+    /// carries the current Underlay's default path (absent, or no longer the
+    /// default). Only a successful capture of the same settled epoch counts
+    /// as evidence.
+    func committedDefaultInterfaceIsStale(
         expectedUnderlayFingerprint: String,
         completion: @escaping (Bool) -> Void
     ) {
@@ -4169,27 +4170,39 @@ final class TransparentProxyManager: NSObject, OSSystemExtensionRequestDelegate 
                 return
             }
             self.latestCapturedUnderlay = snapshot
-            let absent = StaleCommittedGenerationPolicy.shouldEscalate(
+            let committedDefault = StaleCommittedGenerationPolicy.Interface(
+                name: committed.defaultInterface.name,
+                index: committed.defaultInterface.index
+            )
+            let currentInterfaces = snapshot.interfaces.map {
+                StaleCommittedGenerationPolicy.Interface(
+                    name: $0.name,
+                    index: $0.index
+                )
+            }
+            let stale = StaleCommittedGenerationPolicy.shouldEscalate(
                 switchFinallyFailed: true,
                 automaticEpoch: true,
-                committedDefaultInterface: .init(
-                    name: committed.defaultInterface.name,
-                    index: committed.defaultInterface.index
+                committedDefaultInterface: committedDefault,
+                currentDefaultInterface: .init(
+                    name: snapshot.defaultInterface.name,
+                    index: snapshot.defaultInterface.index
                 ),
-                currentInterfaces: snapshot.interfaces.map {
-                    .init(name: $0.name, index: $0.index)
-                }
+                currentInterfaces: currentInterfaces
             )
-            if absent {
+            if stale {
+                let state = currentInterfaces.contains(committedDefault)
+                    ? "no longer the default"
+                    : "absent"
                 appLog(
                     "Transparent Proxy committed generation default "
                         + committed.defaultInterface.name
-                        + " is absent from the current Underlay "
+                        + " is \(state) in the current Underlay "
                         + "(default \(snapshot.defaultInterface.name)) "
                         + "transaction=\(transactionID)"
                 )
             }
-            completion(absent)
+            completion(stale)
         }
     }
 
