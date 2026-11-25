@@ -406,3 +406,68 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
         XCTAssertEqual(selectedAddress, resolver)
     }
 }
+
+final class FlowSystemInterfaceTests: XCTestCase {
+    func testBoundFlowKeepsItsBinding() {
+        XCTAssertEqual(
+            FlowSystemInterface(isBound: true, interfaceName: "utun4"),
+            .bound("utun4")
+        )
+    }
+
+    func testBoundFlowWithoutInterfaceIsInvalid() {
+        XCTAssertEqual(
+            FlowSystemInterface(isBound: true, interfaceName: nil),
+            .invalid
+        )
+        XCTAssertEqual(
+            FlowSystemInterface(isBound: true, interfaceName: ""),
+            .invalid
+        )
+    }
+
+    /// An unbound socket to a Tailnet or MagicDNS address was routed to the
+    /// VPN's utun by the system table; Direct must not send it out en0.
+    func testUnboundFlowCarriesTheRoutedInterface() {
+        let choice = FlowSystemInterface(isBound: false, interfaceName: "utun4")
+        XCTAssertEqual(choice, .routed("utun4"))
+        XCTAssertEqual(choice.name, "utun4")
+    }
+
+    func testUnboundFlowWithoutUsableInterfaceKeepsTheDefault() {
+        XCTAssertEqual(
+            FlowSystemInterface(isBound: false, interfaceName: nil),
+            .none
+        )
+        XCTAssertEqual(
+            FlowSystemInterface(
+                isBound: false,
+                interfaceName: "an-interface-name-too-long"
+            ),
+            .none
+        )
+        XCTAssertNil(FlowSystemInterface.none.name)
+    }
+
+    func testRoutedInterfaceTravelsInTheSameEnvelopeAsABinding() throws {
+        let tailnet = try XCTUnwrap(IPv4Address("100.103.86.57"))
+        let choice = FlowSystemInterface(isBound: false, interfaceName: "utun4")
+        let routed = TransparentProxyFlowMetadata.encodeBoundFlow(
+            hostname: nil,
+            endpointHost: .ipv4(tailnet),
+            boundInterface: try XCTUnwrap(choice.name)
+        )
+        let bound = TransparentProxyFlowMetadata.encodeBoundFlow(
+            hostname: nil,
+            endpointHost: .ipv4(tailnet),
+            boundInterface: "utun4"
+        )
+        XCTAssertNotNil(routed)
+        XCTAssertEqual(routed, bound)
+        XCTAssertNotNil(
+            TransparentProxyFlowMetadata.encodeBoundAssociation(
+                boundInterface: try XCTUnwrap(choice.name)
+            )
+        )
+    }
+}

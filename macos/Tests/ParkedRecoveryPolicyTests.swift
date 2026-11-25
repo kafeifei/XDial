@@ -104,33 +104,62 @@ final class StaleCommittedGenerationPolicyTests: XCTestCase {
         index: 11
     )
 
+    private let vpnTunnel = StaleCommittedGenerationPolicy.Interface(
+        name: "utun4",
+        index: 56
+    )
+
     func testEscalatesWhenCommittedDefaultInterfaceIsGone() {
         XCTAssertTrue(StaleCommittedGenerationPolicy.shouldEscalate(
             switchFinallyFailed: true,
             automaticEpoch: true,
             committedDefaultInterface: ethernet,
+            currentDefaultInterface: wifi,
             currentInterfaces: [wifi]
         ))
     }
 
-    func testDoesNotEscalateWhileOldDefaultInterfaceStillExists() {
+    func testDoesNotEscalateWhileOldInterfaceIsStillTheDefault() {
         XCTAssertFalse(StaleCommittedGenerationPolicy.shouldEscalate(
             switchFinallyFailed: true,
             automaticEpoch: true,
             committedDefaultInterface: ethernet,
+            currentDefaultInterface: ethernet,
+            currentInterfaces: [wifi, ethernet]
+        ))
+    }
+
+    /// A VPN that drops its full-tunnel route keeps its utun; the old
+    /// generation's Direct sockets stay bound to a tunnel without a path
+    /// to the Internet.
+    func testEscalatesWhenOldInterfaceRemainsButLostTheDefaultPath() {
+        XCTAssertTrue(StaleCommittedGenerationPolicy.shouldEscalate(
+            switchFinallyFailed: true,
+            automaticEpoch: true,
+            committedDefaultInterface: vpnTunnel,
+            currentDefaultInterface: wifi,
+            currentInterfaces: [wifi, vpnTunnel]
+        ))
+        XCTAssertTrue(StaleCommittedGenerationPolicy.shouldEscalate(
+            switchFinallyFailed: true,
+            automaticEpoch: true,
+            committedDefaultInterface: ethernet,
+            currentDefaultInterface: wifi,
             currentInterfaces: [wifi, ethernet]
         ))
     }
 
     func testRecreatedInterfaceWithNewIndexIsNotTheOldOne() {
+        let recreated = StaleCommittedGenerationPolicy.Interface(
+            name: "en7",
+            index: 19
+        )
         XCTAssertTrue(StaleCommittedGenerationPolicy.shouldEscalate(
             switchFinallyFailed: true,
             automaticEpoch: true,
             committedDefaultInterface: ethernet,
-            currentInterfaces: [
-                wifi,
-                .init(name: "en7", index: 19),
-            ]
+            currentDefaultInterface: recreated,
+            currentInterfaces: [wifi, recreated]
         ))
     }
 
@@ -139,12 +168,14 @@ final class StaleCommittedGenerationPolicyTests: XCTestCase {
             switchFinallyFailed: false,
             automaticEpoch: true,
             committedDefaultInterface: ethernet,
+            currentDefaultInterface: wifi,
             currentInterfaces: [wifi]
         ))
         XCTAssertFalse(StaleCommittedGenerationPolicy.shouldEscalate(
             switchFinallyFailed: true,
             automaticEpoch: false,
             committedDefaultInterface: ethernet,
+            currentDefaultInterface: wifi,
             currentInterfaces: [wifi]
         ))
         // No usable capture is not evidence that the interface is gone.
@@ -152,12 +183,21 @@ final class StaleCommittedGenerationPolicyTests: XCTestCase {
             switchFinallyFailed: true,
             automaticEpoch: true,
             committedDefaultInterface: ethernet,
+            currentDefaultInterface: wifi,
             currentInterfaces: []
         ))
         XCTAssertFalse(StaleCommittedGenerationPolicy.shouldEscalate(
             switchFinallyFailed: true,
             automaticEpoch: true,
+            committedDefaultInterface: ethernet,
+            currentDefaultInterface: nil,
+            currentInterfaces: [wifi]
+        ))
+        XCTAssertFalse(StaleCommittedGenerationPolicy.shouldEscalate(
+            switchFinallyFailed: true,
+            automaticEpoch: true,
             committedDefaultInterface: nil,
+            currentDefaultInterface: wifi,
             currentInterfaces: [wifi]
         ))
     }

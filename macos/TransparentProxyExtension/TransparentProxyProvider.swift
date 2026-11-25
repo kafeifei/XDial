@@ -3,6 +3,7 @@ import Foundation
 import Network
 @preconcurrency import NetworkExtension
 import OSLog
+import Security
 
 private struct ProviderRelayEndpoint: Sendable {
     let relaySocketPath: String
@@ -140,6 +141,10 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         subsystem: XDialBuildIdentity.transparentProxyIdentifier,
         category: "provider"
     )
+    /// Executables whose released flows were already logged; bounded so a
+    /// long session cannot grow it without limit.
+    private let underlayProviderLogAccess = NSLock()
+    private var loggedUnderlayProviders = Set<String>()
     private let engineQueue = DispatchQueue(
         label: XDialBuildIdentity.queueLabelPrefix
             + ".transparent-proxy.engine",
@@ -2235,8 +2240,13 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     }
 
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
-        // Transparent Proxy 返回 false 会让系统按原网络路径放行。只允许在启动前或显式
-        // 停止后的无会话窗口这样做；active 会话内的 TCP/UDP 转发失败必须由 relay 关流。
+        // Transparent Proxy 返回 false 会让系统按原网络路径放行。只有两种情况这样做：
+        // 另一个 Network Extension provider 自己的 flow 属于 Underlay，任何时候都放行；
+        // 其余 flow 只在启动前或显式停止后的无会话窗口放行，active 会话内的 TCP/UDP
+        // 转发失败必须由 relay 关流。
+        if isUnderlayProviderFlow(flow) {
+            return false
+        }
         let reservation: ProviderRelayRegistry<
             ProviderRelayEndpoint
         >.Reservation
@@ -2445,6 +2455,59 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             return nil
         }
         return (executablePath as NSString).standardizingPath
+    }
+
+    private func isUnderlayProviderFlow(_ flow: NEAppProxyFlow) -> Bool {
+        let auditToken = flow.metaData.sourceAppAuditToken
+        let executablePath = Self.applicationExecutablePath(
+            auditToken: auditToken
+        )
+        guard UnderlayProviderFlowPolicy.isUnderlayProvider(
+            executablePath: executablePath,
+            entitlementValue: {
+                Self.networkExtensionEntitlement(auditToken: auditToken)
+            }
+        ), let executablePath else {
+            return false
+        }
+        underlayProviderLogAccess.lock()
+        let firstSighting = loggedUnderlayProviders.count < 64
+            && loggedUnderlayProviders.insert(executablePath).inserted
+        underlayProviderLogAccess.unlock()
+        if firstSighting {
+            let processName = URL(fileURLWithPath: executablePath)
+                .lastPathComponent
+            logger.notice(
+                "underlay-provider-flow released process=\(processName, privacy: .public)"
+            )
+        }
+        return true
+    }
+
+    /// Reads the flow process's Network Extension entitlement from the
+    /// kernel's code-signing state for that exact audit token.
+    private static func networkExtensionEntitlement(
+        auditToken: Data?
+    ) -> Any? {
+        guard
+            let auditToken,
+            auditToken.count == MemoryLayout<audit_token_t>.size
+        else {
+            return nil
+        }
+        var token = audit_token_t()
+        _ = withUnsafeMutableBytes(of: &token) { destination in
+            auditToken.copyBytes(to: destination)
+        }
+        guard let task = SecTaskCreateWithAuditToken(nil, token) else {
+            return nil
+        }
+        return SecTaskCopyValueForEntitlement(
+            task,
+            UnderlayProviderFlowPolicy.networkExtensionEntitlement
+                as CFString,
+            nil
+        )
     }
 
     private static func reject(_ flow: NEAppProxyFlow) {

@@ -497,11 +497,14 @@ struct NetworkEpochTransitionPolicy {
 }
 
 /// A committed generation whose network epoch could not be switched keeps
-/// running on the Underlay it was started with. When that Underlay's default
-/// interface no longer exists the generation cannot be proven healthy, so an
-/// automatic epoch whose Switch has finally failed escalates to a full
-/// rollback and automatic recovery. While the old default interface still
-/// exists the old generation remains authoritative.
+/// running on the Underlay it was started with: its Direct sockets stay
+/// bound to that Underlay's default interface. Once the system's default
+/// route has left that interface — the interface is gone, or it remains
+/// (a VPN that dropped its full-tunnel route keeps its utun) without
+/// carrying the default path any more — the generation cannot be proven
+/// healthy, so an automatic epoch whose Switch has finally failed escalates
+/// to a full rollback and automatic recovery. While the old interface is
+/// still the default, the old generation remains authoritative.
 enum StaleCommittedGenerationPolicy {
     struct Interface: Equatable {
         let name: String
@@ -512,17 +515,21 @@ enum StaleCommittedGenerationPolicy {
         switchFinallyFailed: Bool,
         automaticEpoch: Bool,
         committedDefaultInterface: Interface?,
+        currentDefaultInterface: Interface?,
         currentInterfaces: [Interface]
     ) -> Bool {
         guard switchFinallyFailed,
               automaticEpoch,
               let committedDefaultInterface,
               !committedDefaultInterface.name.isEmpty,
+              let currentDefaultInterface,
+              !currentDefaultInterface.name.isEmpty,
               !currentInterfaces.isEmpty else {
             return false
         }
         // The generation was built with this exact interface identity; a
         // same-named interface with a new index is a different interface.
         return !currentInterfaces.contains(committedDefaultInterface)
+            || currentDefaultInterface != committedDefaultInterface
     }
 }

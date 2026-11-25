@@ -63,6 +63,11 @@ macOS 主入口为 `NETransparentProxyProvider`，经随机凭据保护的 SOCKS
 iOS / tvOS 使用 Packet Tunnel；系统 HTTP/SOCKS 代理与 PAC 不是当前入口。
 Transparent Proxy 不接管 ICMP。link-local、multicast、limited broadcast 留在 Underlay；
 RFC1918、IPv6 ULA、Tailnet 与企业单播地址仍由 Scenario 裁决，排除集合不按应用或产品扩展。
+另一个 Network Extension provider 进程自己的 flow（VPN 的隧道封包、中继与 NAT 探测、
+DNS 转发）属于 Underlay：接管它会把那个 provider 叠到 XDial 之上，隧道再绕回它自己。
+`handleNewFlow` 按内核为该 flow 给出的进程路径（已激活的 `.systemextension` 或 `.appex`
+布局）与 Network Extension 授权识别后原样放行，不看产品名、bundle ID 或接口名；
+同一产品的宿主 App 仍按普通应用进入 Scenario。
 
 Underlay 来自宿主请求连接前同一时刻的内核默认接口、完整 `NWPath.availableInterfaces`
 与系统 DNS；同一样本另取默认接口的 IPv4 地址与主服务 IPv4 / IPv6 默认路由器，只用于比较。
@@ -72,8 +77,15 @@ IPv6 接口地址（临时地址在稳定网络上轮换）不进入比较；Pro
 只排除当前 XDial 会话自己登记的接口，不按名称前缀筛选、不取首候选、不生成 outbound
 `bind_interface`。缺失或不一致的快照不能启动连接。
 
-macOS 已绑定 flow 的接口是系统既有裁决，经认证且有长度上限的 metadata 传给 sing-box；
-Scenario 先选 Line，仅最终属于 Direct 的 flow 恢复该绑定，其他 Line 不继承它。
+macOS 交给 Provider 的每条 flow 都带着系统已选的接口：应用自己绑定的接口，或未绑定时
+系统路由表为该目标选的接口（Tailnet、MagicDNS 与分域 VPN 地址走那个 VPN 的 utun，
+不走默认接口）。两者都是既有裁决，经认证且有长度上限的 metadata 传给 sing-box；
+Scenario 先选 Line，仅最终属于 Direct 的 flow 恢复该接口，其他 Line 不继承它。
+按名称连接、尚无地址的 flow 没有路由事实，沿用 generation 的默认接口。UDP 关联按整条
+flow 取一次接口，同一 socket 发往不同路由的目标时以系统给 flow 的接口为准。
+TCP 的 metadata 在 CONNECT 请求里；UDP 的在 UDP ASSOCIATE 请求里，sing 的 SOCKS5 服务端
+只把首个数据报的目标交给 inbound，所以 relay socket 从本连接的握手里读回该请求，只取接口，
+路由仍按数据报目标。
 
 TCP flow 的结束方式如实传给应用：上游正常结束是半关闭，应用读到流的结尾；应用先结束
 发送方向时同样只半关闭上游，应答照常送回，不因出站连接外面的跟踪、计数包装而变成整条
@@ -210,7 +222,7 @@ Direct 使用完整 Underlay 的解析语义，不寻找绕过既有 VPN 的“�
 
 | 输入 | 解析路径 |
 |---|---|
-| 已捕获的系统 / 应用 DNS flow | sing-box 裁决为 Direct 后，经 Direct dialer 转发原 UDP/TCP 查询字节到原 resolver endpoint；响应校验事务 ID、问题和目标 |
+| 已捕获的系统 / 应用 DNS flow | sing-box 裁决为 Direct 后，经 Direct dialer 转发原 UDP/TCP 查询字节到原 resolver endpoint；沿用 flow 的系统接口（mDNSResponder 按 scoped resolver 绑到分域 VPN 的 utun；应用自带解析器直连 MagicDNS 时由路由表选到 utun），与 Direct 恢复接口一致；响应校验事务 ID、问题和目标 |
 | 无原始 flow 的盒内主动解析 | 使用 Apple `DNSServiceGetAddrInfo`，保留系统 scoped resolver、搜索域与既有叠加 |
 
 已被接管、等待 Provider 应答的查询不能再次交给 mDNSResponder。
@@ -352,8 +364,10 @@ connected，开启恢复的事务永远不能证明。系统会话状态不带�
 
 自动场景意图的瞬态失败保留 desired Scenario，按 2 / 5 / 10 秒最多重试三次，同 epoch
 重复事件不重置。自动 epoch 的 Switch 最终失败后，若 committed generation 的默认接口
-（名称与 index）已不在当前 Underlay 中，它无法被证明健康，升级为完整回滚与自动恢复，
-结果可能是停泊；旧默认接口仍在时保留旧 generation。显式连接 / 切换失败与终止错误
+（名称与 index）已不在当前 Underlay 中，或仍在却已不是当前默认接口（例如 VPN 撤掉全局
+路由后保留 utun），它的 Direct socket 仍绑在不再承载默认路径的接口上，无法被证明健康，
+升级为完整回滚与自动恢复，结果可能是停泊；旧接口仍是默认接口时保留旧 generation。
+显式连接 / 切换失败与终止错误
 不自动循环；显式断开立即取消所有恢复。重试进度、停泊、授予、延后、原始失败与断线历史
 均为结构化事实，Underlay 指纹不对外暴露。
 
