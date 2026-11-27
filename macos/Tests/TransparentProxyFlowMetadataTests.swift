@@ -300,35 +300,80 @@ final class TransparentProxyFlowMetadataTests: XCTestCase {
         )
     }
 
-    func testEncodesBoundUDPAssociationWithoutFakeDestination() throws {
-        let encoded = try XCTUnwrap(
-            TransparentProxyFlowMetadata.encodeBoundAssociation(
-                boundInterface: "en0"
+    func testEncodesUDPAssociationSocketFacts() throws {
+        let bound = try XCTUnwrap(
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: "en0",
+                sourcePort: 5901
             )
         )
-
         XCTAssertEqual(
-            Array(encoded),
-            [0x00, 0x58, 0x44, 0x02, 0x04, 0x03, 0x65, 0x6e, 0x30]
+            Array(bound),
+            [0x00, 0x58, 0x44, 0x03, 0x0c, 0x03, 0x65, 0x6e, 0x30, 0x17, 0x0d]
         )
+
+        let unbound = try XCTUnwrap(
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: nil,
+                sourcePort: 5900
+            )
+        )
+        XCTAssertEqual(
+            Array(unbound),
+            [0x00, 0x58, 0x44, 0x03, 0x08, 0x17, 0x0c]
+        )
+
+        let specific = try XCTUnwrap(
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: nil,
+                sourcePort: 5900,
+                sourceAddress: .ipv6(IPv6Address("fd7a:115c:a1e0::1")!)
+            )
+        )
+        XCTAssertEqual(
+            Array(specific),
+            [0x00, 0x58, 0x44, 0x03, 0x18, 0x17, 0x0c, 0x04]
+                + Array(IPv6Address("fd7a:115c:a1e0::1")!.rawValue)
+        )
+
+        // The wildcard is the default bind, and a link-local address cannot
+        // be bound without its scope: neither is stated.
+        for host: Network.NWEndpoint.Host in [
+            .ipv4(.any), .ipv6(.any), .ipv6(IPv6Address("fe80::1")!),
+            .name("localhost", nil),
+        ] {
+            XCTAssertEqual(
+                TransparentProxyFlowMetadata.encodeUDPAssociation(
+                    boundInterface: nil,
+                    sourcePort: 5900,
+                    sourceAddress: host
+                ),
+                unbound
+            )
+        }
     }
 
-    func testRejectsInvalidBoundInterfaceMetadata() {
+    func testRejectsInvalidUDPAssociationMetadata() {
         XCTAssertNil(
-            TransparentProxyFlowMetadata.encodeBoundAssociation(
-                boundInterface: ""
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: nil,
+                sourcePort: nil
             )
         )
         XCTAssertNil(
-            TransparentProxyFlowMetadata.encodeBoundAssociation(
-                boundInterface: String(repeating: "a", count: 16)
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: nil,
+                sourcePort: 0
             )
         )
-        XCTAssertNil(
-            TransparentProxyFlowMetadata.encodeBoundAssociation(
-                boundInterface: "无线"
+        for boundInterface in ["", String(repeating: "a", count: 16), "无线"] {
+            XCTAssertNil(
+                TransparentProxyFlowMetadata.encodeUDPAssociation(
+                    boundInterface: boundInterface,
+                    sourcePort: 5901
+                )
             )
-        )
+        }
     }
 
     func testDatagramSOCKSHostUsesTrustedConnectByNameHostname() throws {
@@ -465,8 +510,9 @@ final class FlowSystemInterfaceTests: XCTestCase {
         XCTAssertNotNil(routed)
         XCTAssertEqual(routed, bound)
         XCTAssertNotNil(
-            TransparentProxyFlowMetadata.encodeBoundAssociation(
-                boundInterface: try XCTUnwrap(choice.name)
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: try XCTUnwrap(choice.name),
+                sourcePort: nil
             )
         )
     }

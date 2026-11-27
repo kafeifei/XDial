@@ -84,8 +84,14 @@ Scenario 先选 Line，仅最终属于 Direct 的 flow 恢复该接口，其他 
 按名称连接、尚无地址的 flow 没有路由事实，沿用 generation 的默认接口。UDP 关联按整条
 flow 取一次接口，同一 socket 发往不同路由的目标时以系统给 flow 的接口为准。
 TCP 的 metadata 在 CONNECT 请求里；UDP 的在 UDP ASSOCIATE 请求里，sing 的 SOCKS5 服务端
-只把首个数据报的目标交给 inbound，所以 relay socket 从本连接的握手里读回该请求，只取接口，
-路由仍按数据报目标。
+只把首个数据报的目标交给 inbound，所以 relay socket 从本连接的握手里读回该请求，只取 socket
+事实，路由仍按数据报目标。
+UDP flow 的绑定接口、本地端口和非通配的本地地址是 App socket 的事实，不是路由目标。
+Tailscale Line 在 tailnet 上为该 flow 自己的连接绑定同一端口，被占用时退回临时端口；
+Direct 以 `SO_REUSEPORT` 在 App 绑定的同一地址上加入 App 自己的端口（对端的数据报先投给
+地址最具体的 socket，通配 socket 收不到发往具体地址的包），App 独占该端口时退回临时端口。
+被 Transparent Proxy 接管的 socket 不再直接收包，按协商端口回送、不回送观察源端口的对端
+（如屏幕共享高性能模式）因此由这一端口接住，再回到原 flow；两端都运行 XDial 时同样成立。
 
 TCP flow 的结束方式如实传给应用：上游正常结束是半关闭，应用读到流的结尾；应用先结束
 发送方向时同样只半关闭上游，应答照常送回，不因出站连接外面的跟踪、计数包装而变成整条

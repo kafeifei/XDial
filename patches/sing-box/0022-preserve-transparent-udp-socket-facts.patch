@@ -1,0 +1,1075 @@
+diff --git a/adapter/inbound.go b/adapter/inbound.go
+--- a/adapter/inbound.go
++++ b/adapter/inbound.go
+@@ -55,6 +55,8 @@ type InboundContext struct {
+ 	Outbound                       string
+ 	XDialBoundInterface            string
+ 	XDialOriginalDestinationDomain string
++	XDialSourcePort                uint16
++	XDialSourceAddress             netip.Addr
+ 
+ 	// sniffer
+ 
+diff --git a/adapter/xdial_source_port.go b/adapter/xdial_source_port.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/xdial_source_port.go
+@@ -0,0 +1,25 @@
++package adapter
++
++import (
++	"github.com/sagernet/sing/common"
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++// XDialSourcePortFor returns the application socket's local port for the
++// flow's own packet connection to destination, or zero. Lookups made while
++// routing the flow carry the same metadata, and their sockets must never take
++// the port the flow needs.
++func (c *InboundContext) XDialSourcePortFor(destination M.Socksaddr) uint16 {
++	if c == nil || c.XDialSourcePort == 0 {
++		return 0
++	}
++	if destination.Port != c.Destination.Port {
++		return 0
++	}
++	if c.Destination.IsDomain() ||
++		destination.Addr == c.Destination.Addr ||
++		common.Contains(c.DestinationAddresses, destination.Addr) {
++		return c.XDialSourcePort
++	}
++	return 0
++}
+diff --git a/adapter/xdial_source_port_test.go b/adapter/xdial_source_port_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/xdial_source_port_test.go
+@@ -0,0 +1,45 @@
++package adapter
++
++import (
++	"net/netip"
++	"testing"
++
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++func TestXDialSourcePortOnlyForFlowDestination(t *testing.T) {
++	peer := netip.MustParseAddr("100.103.86.57")
++	flow := M.SocksaddrFrom(peer, 5901)
++	metadata := &InboundContext{Destination: flow, XDialSourcePort: 5901}
++	if port := metadata.XDialSourcePortFor(flow); port != 5901 {
++		t.Fatalf("flow destination got port %d", port)
++	}
++	if port := metadata.XDialSourcePortFor(M.ParseSocksaddrHostPort("100.100.100.100", 53)); port != 0 {
++		t.Fatalf("lookup made for the flow took its source port %d", port)
++	}
++	if port := metadata.XDialSourcePortFor(M.SocksaddrFrom(peer, 5900)); port != 0 {
++		t.Fatalf("other port of the same peer took source port %d", port)
++	}
++	byName := &InboundContext{
++		Destination:     M.Socksaddr{Fqdn: "imac16k.example.ts.net", Port: 5901},
++		XDialSourcePort: 5901,
++	}
++	if port := byName.XDialSourcePortFor(flow); port != 5901 {
++		t.Fatalf("connect-by-name flow got port %d", port)
++	}
++	resolved := &InboundContext{
++		Destination:          M.Socksaddr{Fqdn: "imac16k.example.ts.net", Port: 5901},
++		DestinationAddresses: []netip.Addr{peer},
++		XDialSourcePort:      5901,
++	}
++	if port := resolved.XDialSourcePortFor(flow); port != 5901 {
++		t.Fatalf("resolved flow got port %d", port)
++	}
++	var missing *InboundContext
++	if port := missing.XDialSourcePortFor(flow); port != 0 {
++		t.Fatalf("connection without metadata got port %d", port)
++	}
++	if port := (&InboundContext{Destination: flow}).XDialSourcePortFor(flow); port != 0 {
++		t.Fatalf("flow without a reported port got port %d", port)
++	}
++}
+diff --git a/protocol/direct/outbound.go b/protocol/direct/outbound.go
+--- a/protocol/direct/outbound.go
++++ b/protocol/direct/outbound.go
+@@ -215,10 +215,18 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	portDialer := h.xdialSourcePortDialer(ctx, destination)
+ 	ctx, metadata := adapter.ExtendContext(ctx)
+ 	metadata.Outbound = h.Tag()
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "outbound packet connection")
++	if portDialer != nil {
++		conn, portErr := portDialer.ListenPacket(ctx, destination)
++		if portErr == nil {
++			return conn, nil
++		}
++		h.logger.DebugContext(ctx, "source port is not shared by the application: ", portErr)
++	}
+ 	conn, err := outboundDialer.ListenPacket(ctx, destination)
+ 	if err != nil {
+ 		return nil, err
+@@ -310,10 +318,18 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
+ 	if err != nil {
+ 		return nil, netip.Addr{}, err
+ 	}
++	portDialer := h.xdialSourcePortDialer(ctx, destination)
+ 	ctx, metadata := adapter.ExtendContext(ctx)
+ 	metadata.Outbound = h.Tag()
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "outbound packet connection")
++	if portDialer != nil {
++		conn, newDestination, portErr := dialer.ListenSerialNetworkPacket(ctx, portDialer, destination, destinationAddresses, networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
++		if portErr == nil {
++			return conn, newDestination, nil
++		}
++		h.logger.DebugContext(ctx, "source port is not shared by the application: ", portErr)
++	}
+ 	conn, newDestination, err := dialer.ListenSerialNetworkPacket(ctx, outboundDialer, destination, destinationAddresses, networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
+ 	if err != nil {
+ 		return nil, netip.Addr{}, err
+diff --git a/protocol/direct/xdial_source_port.go b/protocol/direct/xdial_source_port.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/direct/xdial_source_port.go
+@@ -0,0 +1,70 @@
++package direct
++
++import (
++	"context"
++	"net/netip"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/dialer"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++func xdialSourcePortDialerOptions(
++	base option.DialerOptions,
++	boundInterface string,
++	sourcePort uint16,
++	sourceAddress netip.Addr,
++) option.DialerOptions {
++	if boundInterface != "" {
++		base = xdialBoundDialerOptions(base, boundInterface)
++	}
++	base.UDPBindPort = sourcePort
++	base.ReuseAddr = true
++	// A peer's datagram goes to the most specific socket on its port: a
++	// wildcard socket next to the application's own address never receives it.
++	if sourceAddress.Is4() {
++		address := badoption.Addr(sourceAddress)
++		base.Inet4BindAddress = &address
++	} else if sourceAddress.Is6() {
++		address := badoption.Addr(sourceAddress)
++		base.Inet6BindAddress = &address
++	}
++	return base
++}
++
++// xdialSourcePortDialer binds the flow's own packet connection to the
++// application socket's local port, shared through SO_REUSEPORT. macOS does not
++// deliver datagrams to a socket the transparent proxy holds, so a peer that
++// sends to the port it negotiated (Screen Sharing's media) reaches the flow
++// only through this socket. It binds the address the application bound, so the
++// two sockets match equally and the later one, the flow's, takes the peer's
++// datagrams. A port the application holds exclusively fails to bind, and the
++// caller keeps its ephemeral dialer.
++func (h *Outbound) xdialSourcePortDialer(
++	ctx context.Context,
++	destination M.Socksaddr,
++) dialer.ParallelInterfaceDialer {
++	metadata := adapter.ContextFrom(ctx)
++	sourcePort := metadata.XDialSourcePortFor(destination)
++	if sourcePort == 0 {
++		return nil
++	}
++	newDialer, err := dialer.NewWithOptions(dialer.Options{
++		Context: h.ctx,
++		Options: xdialSourcePortDialerOptions(
++			h.dialerOptions,
++			metadata.XDialBoundInterface,
++			sourcePort,
++			metadata.XDialSourceAddress,
++		),
++		RemoteIsDomain: true,
++		DirectOutbound: true,
++	})
++	if err != nil {
++		return nil
++	}
++	portDialer, _ := newDialer.(dialer.ParallelInterfaceDialer)
++	return portDialer
++}
+diff --git a/protocol/direct/xdial_source_port_test.go b/protocol/direct/xdial_source_port_test.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/direct/xdial_source_port_test.go
+@@ -0,0 +1,137 @@
++package direct
++
++import (
++	"context"
++	"net"
++	"net/netip"
++	"strconv"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/common/dialer"
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++	"golang.org/x/sys/unix"
++)
++
++func TestXDialSourcePortDialerOptionsKeepBaseAndInterface(t *testing.T) {
++	base := option.DialerOptions{
++		AbstractDialerOptions: option.AbstractDialerOptions{
++			DomainResolver: &option.DomainResolveOptions{Server: "xdial-native-dns"},
++		},
++	}
++	options := xdialSourcePortDialerOptions(base, "en0", 5901, netip.Addr{})
++	require.Equal(t, uint16(5901), options.UDPBindPort)
++	require.True(t, options.ReuseAddr)
++	require.Equal(t, "en0", options.BindInterface)
++	require.Equal(t, "xdial-native-dns", options.DomainResolver.Server)
++	require.Zero(t, base.UDPBindPort)
++	require.False(t, base.ReuseAddr)
++	require.Nil(t, options.Inet4BindAddress)
++	require.Nil(t, options.Inet6BindAddress)
++
++	unbound := xdialSourcePortDialerOptions(base, "", 5900, netip.Addr{})
++	require.Empty(t, unbound.BindInterface)
++
++	v4 := xdialSourcePortDialerOptions(base, "", 5900, netip.MustParseAddr("192.168.1.20"))
++	require.Equal(t, netip.MustParseAddr("192.168.1.20"), v4.Inet4BindAddress.Build(netip.Addr{}))
++	require.Nil(t, v4.Inet6BindAddress)
++	v6 := xdialSourcePortDialerOptions(base, "", 5900, netip.MustParseAddr("fd7a:115c:a1e0::1"))
++	require.Equal(t, netip.MustParseAddr("fd7a:115c:a1e0::1"), v6.Inet6BindAddress.Build(netip.Addr{}))
++	require.Nil(t, v6.Inet4BindAddress)
++	require.Nil(t, base.Inet4BindAddress)
++}
++
++func xdialApplicationSocket(t *testing.T, address string, share bool) uint16 {
++	t.Helper()
++	conn := xdialSharedSocket(t, address, 0, share)
++	return uint16(conn.LocalAddr().(*net.UDPAddr).Port)
++}
++
++func xdialSharedSocket(t *testing.T, address string, port uint16, share bool) net.PacketConn {
++	t.Helper()
++	listenConfig := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
++		if !share {
++			return nil
++		}
++		var optionErr error
++		err := raw.Control(func(fd uintptr) {
++			optionErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
++			if optionErr == nil {
++				optionErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
++			}
++		})
++		if err != nil {
++			return err
++		}
++		return optionErr
++	}}
++	conn, err := listenConfig.ListenPacket(context.Background(), "udp4", net.JoinHostPort(address, strconv.Itoa(int(port))))
++	require.NoError(t, err)
++	t.Cleanup(func() { conn.Close() })
++	return conn
++}
++
++func xdialListenOnSourcePort(sourcePort uint16, sourceAddress netip.Addr) (net.PacketConn, error) {
++	portDialer, err := dialer.NewDefault(context.Background(), xdialSourcePortDialerOptions(option.DialerOptions{}, "", sourcePort, sourceAddress))
++	if err != nil {
++		return nil, err
++	}
++	return portDialer.ListenPacket(context.Background(), M.ParseSocksaddrHostPort("127.0.0.1", 9))
++}
++
++// Screen Sharing's media sockets share their ports: the viewer binds the
++// wildcard address, the shared Mac its own address. The Direct socket joins
++// either on the same address, so the peer's datagrams to that port have a
++// receiver. A port the application holds exclusively refuses the bind, and
++// the flow keeps an ephemeral port.
++func TestXDialSourcePortDialerJoinsTheApplicationPort(t *testing.T) {
++	for name, application := range map[string]struct {
++		address       string
++		sourceAddress netip.Addr
++	}{
++		"shared wildcard":         {"0.0.0.0", netip.Addr{}},
++		"shared specific address": {"127.0.0.1", netip.MustParseAddr("127.0.0.1")},
++	} {
++		sourcePort := xdialApplicationSocket(t, application.address, true)
++		conn, err := xdialListenOnSourcePort(sourcePort, application.sourceAddress)
++		require.NoError(t, err, name)
++		local := conn.LocalAddr().(*net.UDPAddr)
++		require.Equal(t, int(sourcePort), local.Port, name)
++		require.Equal(t, application.address, local.IP.String(), name)
++		conn.Close()
++	}
++
++	exclusivePort := xdialApplicationSocket(t, "0.0.0.0", false)
++	_, err := xdialListenOnSourcePort(exclusivePort, netip.Addr{})
++	require.Error(t, err)
++}
++
++// Why the Direct socket binds the application's address: a peer's datagram
++// to a port goes to the socket bound to that exact address before any
++// wildcard socket. Had the flow joined a specific-address port on the
++// wildcard, the peer's media would never reach it.
++func TestXDialPeerDatagramsPreferTheApplicationAddress(t *testing.T) {
++	application := xdialSharedSocket(t, "127.0.0.1", 0, true)
++	sourcePort := uint16(application.LocalAddr().(*net.UDPAddr).Port)
++	wildcard, err := xdialListenOnSourcePort(sourcePort, netip.Addr{})
++	require.NoError(t, err)
++	defer wildcard.Close()
++
++	peer, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(sourcePort)})
++	require.NoError(t, err)
++	defer peer.Close()
++	_, err = peer.Write([]byte("media"))
++	require.NoError(t, err)
++
++	wildcard.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
++	_, _, err = wildcard.ReadFrom(make([]byte, 16))
++	require.Error(t, err, "the wildcard socket never sees the peer's datagram")
++	application.SetReadDeadline(time.Now().Add(time.Second))
++	n, _, err := application.ReadFrom(make([]byte, 16))
++	require.NoError(t, err, "the datagram went to the application's own socket")
++	require.Equal(t, len("media"), n)
++}
+diff --git a/protocol/socks/xdial_flow_metadata.go b/protocol/socks/xdial_flow_metadata.go
+--- a/protocol/socks/xdial_flow_metadata.go
++++ b/protocol/socks/xdial_flow_metadata.go
+@@ -90,37 +90,35 @@ func applyXDialBoundFlowMetadata(
+ 		hasHostname = byte(1 << 1)
+ 		knownFlags  = hasEndpoint | hasHostname | xdialBoundInterfaceFlag
+ 	)
++	// A destination always names its endpoint. The UDP ASSOCIATE request,
++	// which has none, uses its own envelope (xdialUDPAssociationMagic).
+ 	if flags&^knownFlags != 0 || flags&xdialBoundInterfaceFlag == 0 ||
+-		flags&hasHostname != 0 && flags&hasEndpoint == 0 {
++		flags&hasEndpoint == 0 {
+ 		return E.New("invalid XDial bound flow metadata flags")
+ 	}
+ 
+-	var address netip.Addr
+-	if flags&hasEndpoint != 0 {
+-		if len(raw) <= offset {
+-			return E.New("invalid XDial bound flow metadata")
+-		}
+-		addressLength := 0
+-		switch raw[offset] {
+-		case 0x01:
+-			addressLength = 4
+-		case 0x04:
+-			addressLength = 16
+-		default:
+-			return E.New("invalid XDial bound flow address family")
+-		}
+-		offset++
+-		if len(raw) < offset+addressLength {
+-			return E.New("invalid XDial bound flow address")
+-		}
+-		var valid bool
+-		address, valid = netip.AddrFromSlice(raw[offset : offset+addressLength])
+-		if !valid || address.IsUnspecified() || address.IsMulticast() {
+-			return E.New("invalid XDial bound flow address")
+-		}
+-		address = address.Unmap()
+-		offset += addressLength
++	if len(raw) <= offset {
++		return E.New("invalid XDial bound flow metadata")
+ 	}
++	addressLength := 0
++	switch raw[offset] {
++	case 0x01:
++		addressLength = 4
++	case 0x04:
++		addressLength = 16
++	default:
++		return E.New("invalid XDial bound flow address family")
++	}
++	offset++
++	if len(raw) < offset+addressLength {
++		return E.New("invalid XDial bound flow address")
++	}
++	address, valid := netip.AddrFromSlice(raw[offset : offset+addressLength])
++	if !valid || address.IsUnspecified() || address.IsMulticast() {
++		return E.New("invalid XDial bound flow address")
++	}
++	address = address.Unmap()
++	offset += addressLength
+ 
+ 	var hostname string
+ 	if flags&hasHostname != 0 {
+@@ -154,21 +152,11 @@ func applyXDialBoundFlowMetadata(
+ 		return E.New("invalid XDial bound interface")
+ 	}
+ 	interfaceBytes := raw[offset:]
+-	for _, character := range interfaceBytes {
+-		if !(character >= 'a' && character <= 'z') &&
+-			!(character >= 'A' && character <= 'Z') &&
+-			!(character >= '0' && character <= '9') &&
+-			character != '.' && character != '_' && character != '-' {
+-			return E.New("invalid XDial bound interface")
+-		}
++	if !xdialValidInterfaceName(interfaceBytes) {
++		return E.New("invalid XDial bound interface")
+ 	}
+ 
+ 	metadata.XDialBoundInterface = string(interfaceBytes)
+-	if flags&hasEndpoint == 0 {
+-		metadata.Destination = M.Socksaddr{}
+-		return nil
+-	}
+-
+ 	port := metadata.Destination.Port
+ 	metadata.Domain = hostname
+ 	metadata.XDialOriginalDestinationDomain = hostname
+diff --git a/protocol/socks/xdial_flow_metadata_test.go b/protocol/socks/xdial_flow_metadata_test.go
+--- a/protocol/socks/xdial_flow_metadata_test.go
++++ b/protocol/socks/xdial_flow_metadata_test.go
+@@ -154,7 +154,7 @@ func TestXDialBoundFlowMetadataPreservesInterfaceForDirect(t *testing.T) {
+ 	require.Equal(t, uint16(49152), metadata.Destination.Port)
+ }
+ 
+-func TestXDialBoundUDPAssociationPreservesInterfaceWithoutDestination(t *testing.T) {
++func TestXDialBoundFlowMetadataRejectsDestinationWithoutEndpoint(t *testing.T) {
+ 	raw := append([]byte(nil), xdialBoundFlowMetadataMagic...)
+ 	raw = append(raw, xdialBoundInterfaceFlag, 0x03)
+ 	raw = append(raw, "en0"...)
+@@ -163,10 +163,9 @@ func TestXDialBoundUDPAssociationPreservesInterfaceWithoutDestination(t *testing
+ 	}
+ 
+ 	encoded, err := applyXDialFlowMetadata(&metadata)
+-	require.NoError(t, err)
++	require.Error(t, err)
+ 	require.True(t, encoded)
+-	require.Equal(t, "en0", metadata.XDialBoundInterface)
+-	require.False(t, metadata.Destination.IsValid())
++	require.Empty(t, metadata.XDialBoundInterface)
+ }
+ 
+ func TestXDialBoundFlowMetadataRejectsInvalidInterface(t *testing.T) {
+diff --git a/protocol/socks/xdial_relay_association.go b/protocol/socks/xdial_relay_association.go
+--- a/protocol/socks/xdial_relay_association.go
++++ b/protocol/socks/xdial_relay_association.go
+@@ -5,7 +5,6 @@ import (
+ 	"context"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+-	E "github.com/sagernet/sing/common/exceptions"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
+ 	"github.com/sagernet/sing/protocol/socks/socks5"
+@@ -69,9 +68,10 @@ func parseXDialAssociationRequest(raw []byte) (M.Socksaddr, bool) {
+ 	return request.Destination, true
+ }
+ 
+-// streamXDialRelayPacketConnection restores the interface of a bound UDP
+-// association. The metadata keeps the first datagram's destination for
+-// routing; only the bound interface is taken from the association request.
++// streamXDialRelayPacketConnection restores the facts of the application
++// socket behind a UDP association: the interface macOS bound it to and its
++// local port. The metadata keeps the first datagram's destination for
++// routing; only the socket facts are taken from the association request.
+ func (h *Inbound) streamXDialRelayPacketConnection(
+ 	ctx context.Context,
+ 	relayConn *xdialRelayConn,
+@@ -80,20 +80,16 @@ func (h *Inbound) streamXDialRelayPacketConnection(
+ 	onClose N.CloseHandlerFunc,
+ ) {
+ 	if h.xdialFlowMetadata {
+-		if request, loaded := relayConn.associationRequest(); loaded &&
+-			bytes.HasPrefix([]byte(request.Fqdn), xdialBoundFlowMetadataMagic) {
+-			association := metadata
+-			association.Destination = request
+-			if _, err := applyXDialFlowMetadata(&association); err != nil ||
+-				association.XDialBoundInterface == "" {
+-				if err == nil {
+-					err = E.New("invalid XDial bound association")
+-				}
++		if request, loaded := relayConn.associationRequest(); loaded {
++			association, encoded, err := parseXDialUDPAssociation(request)
++			if err != nil {
+ 				N.CloseOnHandshakeFailure(conn, onClose, err)
+-				h.logger.ErrorContext(ctx, "reject invalid XDial flow metadata")
++				h.logger.ErrorContext(ctx, "reject invalid XDial UDP association: ", err)
+ 				return
+ 			}
+-			metadata.XDialBoundInterface = association.XDialBoundInterface
++			if encoded {
++				association.apply(&metadata)
++			}
+ 		}
+ 	}
+ 	h.streamUserPacketConnection(ctx, conn, metadata, onClose)
+diff --git a/protocol/socks/xdial_relay_association_test.go b/protocol/socks/xdial_relay_association_test.go
+--- a/protocol/socks/xdial_relay_association_test.go
++++ b/protocol/socks/xdial_relay_association_test.go
+@@ -1,6 +1,7 @@
+ package socks
+ 
+ import (
++	"io"
+ 	"testing"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -9,15 +10,14 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
+-func xdialBoundAssociationRequest(interfaceName string) []byte {
+-	envelope := append(append([]byte(nil), xdialBoundFlowMetadataMagic...), xdialBoundInterfaceFlag, byte(len(interfaceName)))
+-	envelope = append(envelope, interfaceName...)
++func xdialAssociationRequest(interfaceName string, sourcePort uint16) []byte {
++	envelope := xdialEncodedUDPAssociation(interfaceName, sourcePort)
+ 	request := append([]byte{0x05, 0x03, 0x00, 0x03, byte(len(envelope))}, envelope...)
+ 	return append(request, 0, 0)
+ }
+ 
+ func TestXDialRelayAssociationRequestIsReadBackFromTheHandshake(t *testing.T) {
+-	request := xdialBoundAssociationRequest("utun4")
++	request := xdialAssociationRequest("utun4", 5901)
+ 	withAuthentication := append([]byte{0x05, 0x01, 0x02, 0x01, 7}, "session"...)
+ 	withAuthentication = append(append(withAuthentication, 6), "secret"...)
+ 	for _, greeting := range [][]byte{{0x05, 0x01, 0x00}, withAuthentication} {
+@@ -32,7 +32,46 @@ func TestXDialRelayAssociationRequestIsReadBackFromTheHandshake(t *testing.T) {
+ 	require.False(t, loaded, "a truncated handshake yields nothing")
+ }
+ 
+-func TestXDialRelaySocketInboundKeepsTheBoundAssociationInterface(t *testing.T) {
++// The Provider states the application socket's facts in the UDP ASSOCIATE
++// request. They reach the routed metadata, while routing still sees the
++// first datagram's destination.
++func TestXDialRelaySocketInboundKeepsTheAssociationSocketFacts(t *testing.T) {
++	for name, testCase := range map[string]struct {
++		boundInterface string
++		sourcePort     uint16
++	}{
++		"interface and port": {boundInterface: "utun4", sourcePort: 5901},
++		"interface only":     {boundInterface: "utun4"},
++		"port only":          {sourcePort: 5900},
++	} {
++		t.Run(name, func(t *testing.T) {
++			relayInbound, router, path := xdialRelayTestInbound(t)
++			relayInbound.xdialFlowMetadata = true
++			require.NoError(t, relayInbound.Start(adapter.StartStateStart))
++			t.Cleanup(func() { relayInbound.Close() })
++
++			client := xdialRelayTestDial(t, path)
++			require.Zero(t, client.authenticate("secret"))
++			client.send(xdialAssociationRequest(testCase.boundInterface, testCase.sourcePort)...)
++			require.Equal(t, byte(0x00), client.receive(10)[1])
++
++			datagram := append([]byte{0x00, 0x00, 0x00, 0x01, 100, 100, 100, 100, 0x00, 53}, "query"...)
++			client.send(datagram...)
++			frameType, payload := xdialRelayTestReadFrame(t, client.conn)
++			require.Equal(t, xdialRelayFrameData, frameType)
++			require.Equal(t, datagram, payload)
++
++			_, packets := router.routed()
++			require.Len(t, packets, 1)
++			require.Equal(t, testCase.boundInterface, packets[0].XDialBoundInterface)
++			require.Equal(t, testCase.sourcePort, packets[0].XDialSourcePort)
++			require.Equal(t, M.ParseSocksaddr("100.100.100.100:53"), packets[0].Destination,
++				"routing still sees the first datagram's destination")
++		})
++	}
++}
++
++func TestXDialRelaySocketInboundRejectsAMalformedAssociation(t *testing.T) {
+ 	relayInbound, router, path := xdialRelayTestInbound(t)
+ 	relayInbound.xdialFlowMetadata = true
+ 	require.NoError(t, relayInbound.Start(adapter.StartStateStart))
+@@ -40,20 +79,20 @@ func TestXDialRelaySocketInboundKeepsTheBoundAssociationInterface(t *testing.T)
+ 
+ 	client := xdialRelayTestDial(t, path)
+ 	require.Zero(t, client.authenticate("secret"))
+-	client.send(xdialBoundAssociationRequest("utun4")...)
++	envelope := string(xdialUDPAssociationMagic) + string([]byte{xdialSourcePortFlag, 0, 0})
++	request := append([]byte{0x05, 0x03, 0x00, 0x03, byte(len(envelope))}, envelope...)
++	client.send(append(request, 0, 0)...)
+ 	require.Equal(t, byte(0x00), client.receive(10)[1])
++	client.send(append([]byte{0x00, 0x00, 0x00, 0x01, 192, 0, 2, 53, 0x00, 53}, "query"...)...)
+ 
+-	datagram := append([]byte{0x00, 0x00, 0x00, 0x01, 100, 100, 100, 100, 0x00, 53}, "query"...)
+-	client.send(datagram...)
+-	frameType, payload := xdialRelayTestReadFrame(t, client.conn)
+-	require.Equal(t, xdialRelayFrameData, frameType)
+-	require.Equal(t, datagram, payload)
+-
++	// The association is closed instead of routed without its socket facts.
++	var header [xdialRelayFrameHeaderLength]byte
++	_, err := io.ReadFull(client.conn, header[:])
++	if err == nil {
++		require.NotEqual(t, xdialRelayFrameData, header[0], "nothing is echoed back")
++	}
+ 	_, packets := router.routed()
+-	require.Len(t, packets, 1)
+-	require.Equal(t, "utun4", packets[0].XDialBoundInterface)
+-	require.Equal(t, M.ParseSocksaddr("100.100.100.100:53"), packets[0].Destination,
+-		"routing still sees the first datagram's destination")
++	require.Empty(t, packets)
+ }
+ 
+ func TestXDialRelaySocketInboundLeavesAnUnboundAssociationUnbound(t *testing.T) {
+diff --git a/protocol/socks/xdial_udp_association.go b/protocol/socks/xdial_udp_association.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/socks/xdial_udp_association.go
+@@ -0,0 +1,128 @@
++package socks
++
++import (
++	"bytes"
++	"encoding/binary"
++	"net/netip"
++
++	"github.com/sagernet/sing-box/adapter"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++var xdialUDPAssociationMagic = []byte{0x00, 0x58, 0x44, 0x03}
++
++const (
++	xdialSourcePortFlag    = byte(1 << 3)
++	xdialSourceAddressFlag = byte(1 << 4)
++)
++
++// xdialUDPAssociation holds what the relay states about the application
++// socket behind one UDP ASSOCIATE. These are facts of the socket, not a
++// destination: every datagram still names its own target.
++type xdialUDPAssociation struct {
++	boundInterface string
++	sourcePort     uint16
++	// sourceAddress is the address the application bound its socket to, when
++	// it is not the wildcard. A peer's datagram goes to the most specific
++	// socket on its port, so the flow's own socket must bind the same address.
++	sourceAddress netip.Addr
++}
++
++func (a xdialUDPAssociation) apply(metadata *adapter.InboundContext) {
++	metadata.XDialBoundInterface = a.boundInterface
++	metadata.XDialSourcePort = a.sourcePort
++	metadata.XDialSourceAddress = a.sourceAddress
++}
++
++// parseXDialUDPAssociation decodes the UDP ASSOCIATE request address. An
++// ordinary address carries no facts and is not an error.
++func parseXDialUDPAssociation(request M.Socksaddr) (xdialUDPAssociation, bool, error) {
++	if !request.IsDomain() {
++		return xdialUDPAssociation{}, false, nil
++	}
++	raw := []byte(request.Fqdn)
++	if !bytes.HasPrefix(raw, xdialUDPAssociationMagic) {
++		return xdialUDPAssociation{}, false, nil
++	}
++	offset := len(xdialUDPAssociationMagic)
++	if len(raw) <= offset {
++		return xdialUDPAssociation{}, true, E.New("invalid XDial UDP association")
++	}
++	flags := raw[offset]
++	offset++
++	const knownFlags = xdialBoundInterfaceFlag | xdialSourcePortFlag | xdialSourceAddressFlag
++	if flags == 0 || flags&^knownFlags != 0 {
++		return xdialUDPAssociation{}, true, E.New("invalid XDial UDP association flags")
++	}
++	if flags&xdialSourceAddressFlag != 0 && flags&xdialSourcePortFlag == 0 {
++		return xdialUDPAssociation{}, true, E.New("invalid XDial UDP association flags")
++	}
++
++	var association xdialUDPAssociation
++	if flags&xdialBoundInterfaceFlag != 0 {
++		if len(raw) <= offset {
++			return xdialUDPAssociation{}, true, E.New("invalid XDial bound interface")
++		}
++		interfaceLength := int(raw[offset])
++		offset++
++		if interfaceLength == 0 || interfaceLength > 15 ||
++			len(raw) < offset+interfaceLength ||
++			!xdialValidInterfaceName(raw[offset:offset+interfaceLength]) {
++			return xdialUDPAssociation{}, true, E.New("invalid XDial bound interface")
++		}
++		association.boundInterface = string(raw[offset : offset+interfaceLength])
++		offset += interfaceLength
++	}
++	if flags&xdialSourcePortFlag != 0 {
++		if len(raw) < offset+2 {
++			return xdialUDPAssociation{}, true, E.New("invalid XDial source port")
++		}
++		association.sourcePort = binary.BigEndian.Uint16(raw[offset:])
++		offset += 2
++		if association.sourcePort == 0 {
++			return xdialUDPAssociation{}, true, E.New("invalid XDial source port")
++		}
++	}
++	if flags&xdialSourceAddressFlag != 0 {
++		if len(raw) <= offset {
++			return xdialUDPAssociation{}, true, E.New("invalid XDial source address")
++		}
++		addressLength := 0
++		switch raw[offset] {
++		case 0x01:
++			addressLength = 4
++		case 0x04:
++			addressLength = 16
++		default:
++			return xdialUDPAssociation{}, true, E.New("invalid XDial source address family")
++		}
++		offset++
++		if len(raw) < offset+addressLength {
++			return xdialUDPAssociation{}, true, E.New("invalid XDial source address")
++		}
++		address, _ := netip.AddrFromSlice(raw[offset : offset+addressLength])
++		address = address.Unmap()
++		if address.IsUnspecified() || address.IsMulticast() {
++			return xdialUDPAssociation{}, true, E.New("invalid XDial source address")
++		}
++		association.sourceAddress = address
++		offset += addressLength
++	}
++	if offset != len(raw) {
++		return xdialUDPAssociation{}, true, E.New("invalid XDial UDP association")
++	}
++	return association, true, nil
++}
++
++func xdialValidInterfaceName(name []byte) bool {
++	for _, character := range name {
++		if !(character >= 'a' && character <= 'z') &&
++			!(character >= 'A' && character <= 'Z') &&
++			!(character >= '0' && character <= '9') &&
++			character != '.' && character != '_' && character != '-' {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/protocol/socks/xdial_udp_association_test.go b/protocol/socks/xdial_udp_association_test.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/socks/xdial_udp_association_test.go
+@@ -0,0 +1,94 @@
++package socks
++
++import (
++	"net/netip"
++	"testing"
++
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++func xdialEncodedUDPAssociation(interfaceName string, sourcePort uint16) string {
++	raw := append([]byte(nil), xdialUDPAssociationMagic...)
++	var flags byte
++	if interfaceName != "" {
++		flags |= xdialBoundInterfaceFlag
++	}
++	if sourcePort != 0 {
++		flags |= xdialSourcePortFlag
++	}
++	raw = append(raw, flags)
++	if interfaceName != "" {
++		raw = append(raw, byte(len(interfaceName)))
++		raw = append(raw, interfaceName...)
++	}
++	if sourcePort != 0 {
++		raw = append(raw, byte(sourcePort>>8), byte(sourcePort))
++	}
++	return string(raw)
++}
++
++func TestXDialUDPAssociationCarriesSocketFacts(t *testing.T) {
++	association, encoded, err := parseXDialUDPAssociation(M.Socksaddr{
++		Fqdn: xdialEncodedUDPAssociation("en0", 5901),
++	})
++	require.NoError(t, err)
++	require.True(t, encoded)
++	require.Equal(t, xdialUDPAssociation{boundInterface: "en0", sourcePort: 5901}, association)
++
++	association, encoded, err = parseXDialUDPAssociation(M.Socksaddr{
++		Fqdn: xdialEncodedUDPAssociation("", 5900),
++	})
++	require.NoError(t, err)
++	require.True(t, encoded)
++	require.Equal(t, xdialUDPAssociation{sourcePort: 5900}, association)
++
++	withAddress := xdialEncodedUDPAssociation("en0", 5901) + "\x01\xc0\xa8\x01\x14"
++	withAddress = withAddress[:len(xdialUDPAssociationMagic)] +
++		string([]byte{withAddress[len(xdialUDPAssociationMagic)] | xdialSourceAddressFlag}) +
++		withAddress[len(xdialUDPAssociationMagic)+1:]
++	association, encoded, err = parseXDialUDPAssociation(M.Socksaddr{Fqdn: withAddress})
++	require.NoError(t, err)
++	require.True(t, encoded)
++	require.Equal(t, xdialUDPAssociation{
++		boundInterface: "en0",
++		sourcePort:     5901,
++		sourceAddress:  netip.MustParseAddr("192.168.1.20"),
++	}, association)
++
++	_, encoded, err = parseXDialUDPAssociation(M.ParseSocksaddrHostPort("0.0.0.0", 0))
++	require.NoError(t, err)
++	require.False(t, encoded)
++
++	// A bound-flow envelope always names an endpoint; it is not an association.
++	_, encoded, err = parseXDialUDPAssociation(M.Socksaddr{
++		Fqdn: string(append(append([]byte(nil), xdialBoundFlowMetadataMagic...), xdialBoundInterfaceFlag, 3, 'e', 'n', '0')),
++	})
++	require.NoError(t, err)
++	require.False(t, encoded)
++}
++
++func TestXDialUDPAssociationRejectsMalformedEnvelope(t *testing.T) {
++	valid := xdialEncodedUDPAssociation("en0", 5901)
++	for name, raw := range map[string]string{
++		"no flags":      string(xdialUDPAssociationMagic) + "\x00",
++		"unknown flag":  string(xdialUDPAssociationMagic) + "\x01",
++		"zero port":     string(xdialUDPAssociationMagic) + string([]byte{xdialSourcePortFlag, 0, 0}),
++		"short port":    string(xdialUDPAssociationMagic) + string([]byte{xdialSourcePortFlag, 0x17}),
++		"trailing byte": valid + "\x00",
++		"address without port": string(xdialUDPAssociationMagic) +
++			string([]byte{xdialSourceAddressFlag, 0x01, 192, 168, 1, 20}),
++		"wildcard address": string(xdialUDPAssociationMagic) +
++			string([]byte{xdialSourcePortFlag | xdialSourceAddressFlag, 0x17, 0x0d, 0x01, 0, 0, 0, 0}),
++		"short address": string(xdialUDPAssociationMagic) +
++			string([]byte{xdialSourcePortFlag | xdialSourceAddressFlag, 0x17, 0x0d, 0x04, 0xfd}),
++		"bad family": string(xdialUDPAssociationMagic) +
++			string([]byte{xdialSourcePortFlag | xdialSourceAddressFlag, 0x17, 0x0d, 0x03, 1, 2, 3, 4}),
++		"bad interface": xdialEncodedUDPAssociation("en/0", 5901),
++	} {
++		_, encoded, err := parseXDialUDPAssociation(M.Socksaddr{Fqdn: raw})
++		require.Error(t, err, name)
++		require.True(t, encoded, name)
++	}
++}
+diff --git a/protocol/tailscale/endpoint.go b/protocol/tailscale/endpoint.go
+--- a/protocol/tailscale/endpoint.go
++++ b/protocol/tailscale/endpoint.go
+@@ -767,7 +767,7 @@ func (t *Endpoint) DialContext(ctx context.Context, network string, destination
+ 		}
+ 		return tcpConn, nil
+ 	case N.NetworkUDP:
+-		udpConn, err := gonet.DialUDP(t.stack, &localAddr, &remoteAddr, networkProtocol)
++		udpConn, err := t.xdialDialUDP(ctx, destination, localAddr, &remoteAddr, networkProtocol)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -802,7 +802,7 @@ func (t *Endpoint) listenPacketWithAddress(ctx context.Context, destination M.So
+ 		networkProtocol = header.IPv6ProtocolNumber
+ 		bind.Addr = addressFromAddr(addr6)
+ 	}
+-	udpConn, err := gonet.DialUDP(t.stack, &bind, nil, networkProtocol)
++	udpConn, err := t.xdialDialUDP(ctx, destination, bind, nil, networkProtocol)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/protocol/tailscale/xdial_udp_source_port.go b/protocol/tailscale/xdial_udp_source_port.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/tailscale/xdial_udp_source_port.go
+@@ -0,0 +1,66 @@
++//go:build with_gvisor
++
++package tailscale
++
++import (
++	"context"
++	"errors"
++	"net"
++
++	"github.com/sagernet/gvisor/pkg/tcpip"
++	"github.com/sagernet/gvisor/pkg/tcpip/adapters/gonet"
++	"github.com/sagernet/gvisor/pkg/tcpip/stack"
++	"github.com/sagernet/sing-box/adapter"
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++// xdialDialUDP opens the tailnet side of a UDP packet connection. When the
++// transparent proxy reports the application socket's local port, the netstack
++// endpoint takes that same port: peers such as macOS Screen Sharing send their
++// media to the port numbers they negotiated, not to the source port they
++// observed, so an ephemeral port leaves those datagrams without a listener.
++// A port another flow already holds falls back to an ephemeral one.
++func (t *Endpoint) xdialDialUDP(
++	ctx context.Context,
++	destination M.Socksaddr,
++	localAddr tcpip.FullAddress,
++	remoteAddr *tcpip.FullAddress,
++	networkProtocol tcpip.NetworkProtocolNumber,
++) (*gonet.UDPConn, error) {
++	sourcePort := adapter.ContextFrom(ctx).XDialSourcePortFor(destination)
++	udpConn, preserved, err := xdialDialUDPPreservingPort(
++		t.stack,
++		localAddr,
++		remoteAddr,
++		networkProtocol,
++		sourcePort,
++	)
++	if err == nil && sourcePort != 0 && !preserved {
++		t.logger.InfoContext(ctx, "source port ", sourcePort, " is taken on the tailnet, using ", udpConn.LocalAddr())
++	}
++	return udpConn, err
++}
++
++func xdialDialUDPPreservingPort(
++	ipStack *stack.Stack,
++	localAddr tcpip.FullAddress,
++	remoteAddr *tcpip.FullAddress,
++	networkProtocol tcpip.NetworkProtocolNumber,
++	sourcePort uint16,
++) (*gonet.UDPConn, bool, error) {
++	if sourcePort != 0 {
++		preservedAddr := localAddr
++		preservedAddr.Port = sourcePort
++		udpConn, err := gonet.DialUDP(ipStack, &preservedAddr, remoteAddr, networkProtocol)
++		if err == nil {
++			return udpConn, true, nil
++		}
++		var opErr *net.OpError
++		if !errors.As(err, &opErr) || opErr.Op != "bind" {
++			return nil, false, err
++		}
++	}
++	localAddr.Port = 0
++	udpConn, err := gonet.DialUDP(ipStack, &localAddr, remoteAddr, networkProtocol)
++	return udpConn, false, err
++}
+diff --git a/protocol/tailscale/xdial_udp_source_port_test.go b/protocol/tailscale/xdial_udp_source_port_test.go
+new file mode 100644
+--- /dev/null
++++ b/protocol/tailscale/xdial_udp_source_port_test.go
+@@ -0,0 +1,119 @@
++//go:build with_gvisor
++
++package tailscale
++
++import (
++	"net"
++	"net/netip"
++	"testing"
++	"time"
++
++	"github.com/sagernet/gvisor/pkg/tcpip"
++	"github.com/sagernet/gvisor/pkg/tcpip/adapters/gonet"
++	"github.com/sagernet/gvisor/pkg/tcpip/header"
++	"github.com/sagernet/gvisor/pkg/tcpip/link/loopback"
++	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv4"
++	"github.com/sagernet/gvisor/pkg/tcpip/stack"
++	"github.com/sagernet/gvisor/pkg/tcpip/transport/udp"
++)
++
++var (
++	xdialTestLocalAddress = netip.MustParseAddr("100.113.251.63")
++	xdialTestPeerAddress  = netip.MustParseAddr("100.103.86.57")
++)
++
++func xdialTestStack(t *testing.T) *stack.Stack {
++	t.Helper()
++	ipStack := stack.New(stack.Options{
++		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
++		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
++	})
++	t.Cleanup(ipStack.Close)
++	if err := ipStack.CreateNIC(1, loopback.New()); err != nil {
++		t.Fatal(err)
++	}
++	for _, address := range []netip.Addr{xdialTestLocalAddress, xdialTestPeerAddress} {
++		err := ipStack.AddProtocolAddress(1, tcpip.ProtocolAddress{
++			Protocol:          ipv4.ProtocolNumber,
++			AddressWithPrefix: tcpip.AddrFrom4(address.As4()).WithPrefix(),
++		}, stack.AddressProperties{})
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++	ipStack.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
++	return ipStack
++}
++
++func xdialTestAddress(address netip.Addr, port uint16) tcpip.FullAddress {
++	return tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(address.As4()), Port: port}
++}
++
++// macOS Screen Sharing sends media from and to the port numbers it announced,
++// so the tailnet socket must hold the application's port and receive what the
++// peer sends there.
++func TestXDialPreservedSourcePortReceivesPeerDatagrams(t *testing.T) {
++	ipStack := xdialTestStack(t)
++	flowConn, preserved, err := xdialDialUDPPreservingPort(ipStack, xdialTestAddress(xdialTestLocalAddress, 0), nil, ipv4.ProtocolNumber, 5901)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer flowConn.Close()
++	if !preserved {
++		t.Fatal("free source port was not preserved")
++	}
++	peerAddr := xdialTestAddress(xdialTestPeerAddress, 5901)
++	peerConn, err := gonet.DialUDP(ipStack, &peerAddr, nil, ipv4.ProtocolNumber)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer peerConn.Close()
++	deadline := time.Now().Add(5 * time.Second)
++	flowConn.SetDeadline(deadline)
++	peerConn.SetDeadline(deadline)
++
++	peerUDPAddr := &net.UDPAddr{IP: xdialTestPeerAddress.AsSlice(), Port: 5901}
++	if _, err = flowConn.WriteTo([]byte("rtcp"), peerUDPAddr); err != nil {
++		t.Fatal(err)
++	}
++	buffer := make([]byte, 64)
++	_, from, err := peerConn.ReadFrom(buffer)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if from.(*net.UDPAddr).Port != 5901 {
++		t.Fatalf("peer saw source port %d", from.(*net.UDPAddr).Port)
++	}
++
++	// The peer does not answer the observed source; it sends to the port it
++	// negotiated, which is the same number.
++	localUDPAddr := &net.UDPAddr{IP: xdialTestLocalAddress.AsSlice(), Port: 5901}
++	if _, err = peerConn.WriteTo([]byte("hevc"), localUDPAddr); err != nil {
++		t.Fatal(err)
++	}
++	n, from, err := flowConn.ReadFrom(buffer)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(buffer[:n]) != "hevc" || from.String() != peerUDPAddr.String() {
++		t.Fatalf("flow received %q from %v", buffer[:n], from)
++	}
++}
++
++func TestXDialTakenSourcePortFallsBackToEphemeral(t *testing.T) {
++	ipStack := xdialTestStack(t)
++	first, preserved, err := xdialDialUDPPreservingPort(ipStack, xdialTestAddress(xdialTestLocalAddress, 0), nil, ipv4.ProtocolNumber, 5901)
++	if err != nil || !preserved {
++		t.Fatalf("first flow: preserved=%v err=%v", preserved, err)
++	}
++	defer first.Close()
++	second, preserved, err := xdialDialUDPPreservingPort(ipStack, xdialTestAddress(xdialTestLocalAddress, 0), nil, ipv4.ProtocolNumber, 5901)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer second.Close()
++	port := second.LocalAddr().(*net.UDPAddr).Port
++	if preserved || port == 0 || port == 5901 {
++		t.Fatalf("taken port: preserved=%v port=%d", preserved, port)
++	}
++}
