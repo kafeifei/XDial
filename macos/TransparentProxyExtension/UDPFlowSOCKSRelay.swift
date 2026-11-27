@@ -422,6 +422,13 @@ enum UDPFlowSOCKSRelay {
         }
     }
 
+    private typealias DownlinkPipeline =
+        UDPRelayDownlinkPipeline<(Data, Network.NWEndpoint)>
+
+    /// Receiving and writing overlap: the relay connection is read by a loop
+    /// that never waits for the application flow, and the pipeline hands
+    /// everything queued during one write to the next `writeDatagrams` call.
+    /// One write in flight used to hold back every datagram behind it.
     private static func downlink(
         channel: UDPFlowChannel,
         association: UDPAssociation,
@@ -429,41 +436,101 @@ enum UDPFlowSOCKSRelay {
         traffic: ProviderTrafficLedger,
         logger: Logger
     ) async throws {
-        while !Task.isCancelled {
-            // One frame is one datagram. `nil` is the entry ending the
-            // association; a cut connection throws and ends it the same way.
-            guard let packet = try await control.receiveFrame() else {
-                return
+        let flow = channel.flow
+        let codec = channel.codec
+        let generation = association.generation
+        let pipeline = DownlinkPipeline(
+            write: { batch, completion in
+                flow.writeDatagrams(batch) { error in
+                    completion(error)
+                }
+            },
+            written: { batch, dropped in
+                if dropped > 0 {
+                    logger.debug(
+                        "udp-receive-overflow trial=\(generation, privacy: .public) dropped=\(dropped)"
+                    )
+                }
+                for (payload, _) in batch {
+                    traffic.recordDownload(
+                        payload.count,
+                        transactionID: generation
+                    )
+                }
             }
-            let decoded: (payload: Data, endpoint: Network.NWEndpoint)?
-            do {
-                decoded = try channel.codec.decode(packet: packet)
-            } catch {
-                // A single malformed datagram is not a reason to retire the
-                // association, let alone the application's socket.
-                logger.debug(
-                    "udp-receive-dropped trial=\(association.generation, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
-                )
-                continue
-            }
-            guard let decoded else {
-                logger.debug(
-                    "udp-receive-unmapped trial=\(association.generation, privacy: .public)"
-                )
-                continue
-            }
-            do {
-                try await writeDatagrams(
-                    [(decoded.payload, decoded.endpoint)],
-                    to: channel.flow
-                )
-            } catch {
-                throw FlowFailure(underlying: error)
-            }
-            traffic.recordDownload(
-                decoded.payload.count,
-                transactionID: association.generation
+        )
+        // The receive loop is not awaited: the frame it waits on ends only
+        // when the relay's shutdown tears the connection down, which happens
+        // after this returns.
+        let receiver = Task {
+            await receiveDownlink(
+                from: control,
+                into: pipeline,
+                codec: codec,
+                generation: generation,
+                logger: logger
             )
+        }
+        defer { receiver.cancel() }
+        // Cancelling this task stops the pipeline through its waiter.
+        switch await pipeline.wait() {
+        case .finished:
+            return
+        case let .receiveFailed(error):
+            throw error
+        case let .writeFailed(error):
+            throw FlowFailure(underlying: error)
+        case .stopped:
+            throw CancellationError()
+        }
+    }
+
+    /// Reads the association's datagrams until the connection ends or the
+    /// pipeline closes. A connection end or failure is reported behind the
+    /// datagrams already accepted.
+    private static func receiveDownlink(
+        from control: RelayStreamConnection,
+        into pipeline: DownlinkPipeline,
+        codec: UDPRelayDatagramCodec,
+        generation: String,
+        logger: Logger
+    ) async {
+        do {
+            while !Task.isCancelled {
+                // One frame is one datagram. `nil` is the entry ending the
+                // association; a cut connection throws and ends it the same
+                // way.
+                guard let packet = try await control.receiveFrame() else {
+                    pipeline.finish()
+                    return
+                }
+                let decoded: (payload: Data, endpoint: Network.NWEndpoint)?
+                do {
+                    decoded = try codec.decode(packet: packet)
+                } catch {
+                    // A single malformed datagram is not a reason to retire
+                    // the association, let alone the application's socket.
+                    logger.debug(
+                        "udp-receive-dropped trial=\(generation, privacy: .public) code=\(diagnosticCode(error), privacy: .public)"
+                    )
+                    continue
+                }
+                guard let decoded else {
+                    logger.debug(
+                        "udp-receive-unmapped trial=\(generation, privacy: .public)"
+                    )
+                    continue
+                }
+                let result = pipeline.push(
+                    (decoded.payload, decoded.endpoint),
+                    byteCount: decoded.payload.count
+                )
+                if result == .closed {
+                    return
+                }
+            }
+        } catch {
+            pipeline.finish(throwing: error)
         }
     }
 
@@ -639,21 +706,6 @@ enum UDPFlowSOCKSRelay {
                     completion(.failure(error))
                 } else {
                     completion(.success(datagrams))
-                }
-            }
-        }
-    }
-
-    private static func writeDatagrams(
-        _ datagrams: [(Data, Network.NWEndpoint)],
-        to flow: NEAppProxyUDPFlow
-    ) async throws {
-        let _: Void = try await awaitRelayCallback { completion in
-            flow.writeDatagrams(datagrams) { error in
-                if let error {
-                    completion(.failure(error))
-                } else {
-                    completion(.success(()))
                 }
             }
         }

@@ -93,9 +93,16 @@ final class UDPRelayDatagramCodec: @unchecked Sendable {
                     "short IPv4 UDP packet"
                 )
             }
-            host = Network.NWEndpoint.Host(
-                "\(packet[offset]).\(packet[offset + 1]).\(packet[offset + 2]).\(packet[offset + 3])"
-            )
+            guard
+                let address = IPv4Address(
+                    packet.subdata(in: offset ..< offset + 4)
+                )
+            else {
+                throw UDPRelayDatagramError.malformedPacket(
+                    "invalid IPv4 UDP packet"
+                )
+            }
+            host = .ipv4(address)
             offset += 4
         case 0x03:
             guard packet.count > offset else {
