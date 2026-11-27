@@ -69,10 +69,43 @@ final class UDPRelayAssociationTests: XCTestCase {
             control, credentials: credentials, boundInterface: "en0"
         )
         let envelope = try XCTUnwrap(
-            TransparentProxyFlowMetadata.encodeBoundAssociation(
-                boundInterface: "en0"
+            TransparentProxyFlowMetadata.encodeUDPAssociation(
+                boundInterface: "en0", sourcePort: nil
             )
         )
+        XCTAssertEqual(
+            requests.get(),
+            Data([0x05, 0x03, 0x00, 0x03, UInt8(envelope.count)])
+                + envelope + Data([0x00, 0x00])
+        )
+    }
+
+    /// The application socket's port and specific address travel with the
+    /// association, so the Line can bind the port the peer sends to.
+    func testAssociationStatesTheApplicationSocket() async throws {
+        let requests = RequestLog()
+        let entry = try RelaySocketTestEntry { [credentials] peer in
+            guard Self.authenticate(peer, credentials: credentials),
+                  let head = peer.readStream(5),
+                  let rest = peer.readStream(Int(head[4]) + 2)
+            else { return }
+            requests.set(head + rest)
+            peer.writeData(Data([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
+            _ = peer.readFrame()
+        }
+        defer { entry.stop() }
+
+        let control = RelayStreamConnection(socketPath: entry.path)
+        defer { control.cancel(with: CancellationError()) }
+        try await control.start()
+        try await UDPFlowSOCKSRelay.associateUDP(
+            control,
+            credentials: credentials,
+            boundInterface: nil,
+            sourcePort: 5901,
+            sourceAddress: .ipv4(IPv4Address("192.168.1.20")!)
+        )
+        let envelope = Data([0x00, 0x58, 0x44, 0x03, 0x18, 0x17, 0x0D, 0x01, 192, 168, 1, 20])
         XCTAssertEqual(
             requests.get(),
             Data([0x05, 0x03, 0x00, 0x03, UInt8(envelope.count)])

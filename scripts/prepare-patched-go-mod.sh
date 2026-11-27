@@ -291,6 +291,28 @@ grep -Fq 'func TestXDialRelaySocketReportsStreamWithoutFinishAsReset(' \
 	"${patched_sing_box_dir}/protocol/socks/xdial_relay_socket_test.go"
 grep -Fq 'func TestXDialRelaySocketInboundRelaysUDPOnItsControlConnection(' \
 	"${patched_sing_box_dir}/protocol/socks/xdial_relay_socket_test.go"
+grep -Eq 'XDialSourcePort[[:space:]]+uint16' \
+	"${patched_sing_box_dir}/adapter/inbound.go"
+grep -Eq 'XDialSourceAddress[[:space:]]+netip.Addr' \
+	"${patched_sing_box_dir}/adapter/inbound.go"
+grep -Fq 'association, encoded, err := parseXDialUDPAssociation(request)' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_relay_association.go"
+grep -Fq 'func TestXDialRelaySocketInboundKeepsTheAssociationSocketFacts(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_relay_association_test.go"
+grep -Fq 'func TestXDialUDPAssociationRejectsMalformedEnvelope(' \
+	"${patched_sing_box_dir}/protocol/socks/xdial_udp_association_test.go"
+grep -Fq 't.xdialDialUDP(ctx, destination, bind, nil, networkProtocol)' \
+	"${patched_sing_box_dir}/protocol/tailscale/endpoint.go"
+grep -Fq 'func TestXDialPreservedSourcePortReceivesPeerDatagrams(' \
+	"${patched_sing_box_dir}/protocol/tailscale/xdial_udp_source_port_test.go"
+grep -Fq 'func (c *InboundContext) XDialSourcePortFor(' \
+	"${patched_sing_box_dir}/adapter/xdial_source_port.go"
+grep -Fq 'portDialer := h.xdialSourcePortDialer(ctx, destination)' \
+	"${patched_sing_box_dir}/protocol/direct/outbound.go"
+grep -Fq 'func TestXDialSourcePortDialerJoinsTheApplicationPort(' \
+	"${patched_sing_box_dir}/protocol/direct/xdial_source_port_test.go"
+grep -Fq 'func TestXDialPeerDatagramsPreferTheApplicationAddress(' \
+	"${patched_sing_box_dir}/protocol/direct/xdial_source_port_test.go"
 
 patched_module_dir="${staging_dir}/tailscale"
 cp -R "${source_dir}" "${patched_module_dir}"
