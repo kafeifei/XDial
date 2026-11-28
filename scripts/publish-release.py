@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Promote a verified release and explicitly deploy its Pages update feed.
+"""Promote a verified release and deploy its Pages update feed.
 
-Run on the signing/verification Mac with the operator's existing `gh` login.
-No cross-repository credential is copied into Actions or the application.
+release.yml runs this after building the draft, with --pages follow: it makes
+the release public with the workflow's own token, and the update repository's
+follow workflow, which polls public XDial releases, deploys the feed. An
+operator can run it on a Mac with their `gh` login, where --pages dispatch (the
+default) starts the update repository's publish.yml directly. No
+cross-repository credential is copied into Actions or the application.
 
 Stable is the default channel. `--channel beta` promotes the GitHub prerelease
 vX.Y.Z-beta.N built from xdial-beta and writes beta.json. Both channels ship
@@ -32,6 +36,11 @@ SOURCE_REPOSITORY = "kafeifei/XDial"
 SOURCE_GIT_URL = f"https://github.com/{SOURCE_REPOSITORY}.git"
 PAGES_REPOSITORY = "saymiao/xdial-updates"
 PAGES_GIT_URL = f"https://github.com/{PAGES_REPOSITORY}.git"
+FOLLOW_WORKFLOW_URL = f"https://github.com/{PAGES_REPOSITORY}/actions/workflows/follow.yml"
+# dispatch: start the update repository's publish.yml from here.
+# follow: leave that to its follow workflow and wait for the feed.
+PAGES_MODES = ("dispatch", "follow")
+PAGES_TIMEOUTS = {"dispatch": 900, "follow": 3600}
 # fetch and clone otherwise start a detached `git maintenance run --auto`,
 # which can still be writing objects/maintenance.lock while the temporary
 # repository is removed.
@@ -673,10 +682,10 @@ def require_feed_format(data: bytes, channel: str) -> dict:
 
 
 def verify_feed(tag: str, build: str, digest: str, channel: str = STABLE,
-                notes: str | None = None) -> None:
+                notes: str | None = None, timeout: float = 180, interval: float = 5) -> None:
     feed_url = FEED_URLS[channel]
     opener = urllib.request.build_opener(NoRedirect())
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + timeout
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
@@ -695,7 +704,7 @@ def verify_feed(tag: str, build: str, digest: str, channel: str = STABLE,
             return
         except (OSError, ValueError) as error:
             last_error = error
-            time.sleep(5)
+            time.sleep(interval)
     raise RuntimeError(f"release is public but Pages verification is incomplete: {last_error}")
 
 
@@ -712,8 +721,19 @@ def main() -> None:
         help="stable only: confirms how a beta.json entry with a newer tag but a "
              "build not above this release's is handled in the same batch",
     )
-    parser.add_argument("--pages-timeout", type=int, default=900)
+    parser.add_argument(
+        "--pages", choices=PAGES_MODES, default="dispatch",
+        help="dispatch starts the update repository's publish.yml (operator gh login); "
+             "follow leaves it to that repository's follow workflow and waits for the feed",
+    )
+    parser.add_argument(
+        "--pages-timeout", type=int,
+        help="seconds; dispatch: each wait for a Pages run (default 900); "
+             "follow: the wait for the feed (default 3600)",
+    )
     args = parser.parse_args()
+    if args.pages_timeout is None:
+        args.pages_timeout = PAGES_TIMEOUTS[args.pages]
     if sys.platform != "darwin":
         parser.error("run on macOS so the downloaded app can pass signing and notarization gates")
     if not TAG_PATTERNS[args.channel].fullmatch(args.tag) or args.pages_timeout <= 0:
@@ -758,9 +778,10 @@ def main() -> None:
             elif args.beta_followup:
                 print("beta.json needs no follow-up; --beta-followup is ignored", flush=True)
         if release["draft"]:
-            # A pending Pages run is waited out while nothing is public yet,
-            # instead of eating into the time this release's run gets later.
-            wait_for_idle_publisher(args.pages_timeout)
+            if args.pages == "dispatch":
+                # A pending Pages run is waited out while nothing is public yet,
+                # instead of eating into the time this release's run gets later.
+                wait_for_idle_publisher(args.pages_timeout)
             # A beta must never become Latest: this script refuses a stable
             # release while Latest is not a stable tag.
             listing = ["--latest"] if args.channel == STABLE else ["--prerelease", "--latest=false"]
@@ -784,8 +805,25 @@ def main() -> None:
                     f"mark {latest_tag} Latest again before publishing the beta feed"
                 )
         print(f"Release is public: https://github.com/{SOURCE_REPOSITORY}/releases/tag/{args.tag}", flush=True)
-        dispatch_and_wait(args.tag, args.pages_timeout, args.channel)
-        verify_feed(args.tag, build, digest, args.channel, release_notes(release["body"]))
+        notes = release_notes(release["body"])
+        if args.pages == "dispatch":
+            dispatch_and_wait(args.tag, args.pages_timeout, args.channel)
+            verify_feed(args.tag, build, digest, args.channel, notes)
+        else:
+            print(f"Waiting up to {args.pages_timeout} s for {PAGES_REPOSITORY} to publish it; "
+                  f"its follow workflow checks every 10 minutes: {FOLLOW_WORKFLOW_URL}", flush=True)
+            try:
+                verify_feed(args.tag, build, digest, args.channel, notes,
+                            timeout=args.pages_timeout, interval=30)
+            except RuntimeError as error:
+                rerun = f" RELEASE_CHANNEL={args.channel}" if args.channel != STABLE else ""
+                rerun += f" RELEASE_TAG={args.tag}"
+                raise RuntimeError(
+                    f"{error}\n{PAGES_REPOSITORY} has not published {args.tag}. Check its follow "
+                    f"and publish runs ({FOLLOW_WORKFLOW_URL}); GitHub disables a schedule after "
+                    f"60 days without activity. The release stays public; after fixing the cause, "
+                    f"run make publish{rerun} on a Mac, which dispatches publish.yml itself."
+                ) from None
         print(f"Publication verified: {FEED_URLS[args.channel]} ({args.tag}, build {build})", flush=True)
         if lagging_beta is not None:
             print(beta_followup_steps(lagging_beta, args.tag, args.beta_followup), flush=True)

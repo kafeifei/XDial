@@ -193,3 +193,39 @@ jobs:
           if [ -n "${SIGNING_KEYCHAIN_PATH:-}" ]; then
             /usr/bin/security delete-keychain "$SIGNING_KEYCHAIN_PATH" || true
           fi
+
+  # The draft becomes public here, with this workflow's own token.
+  # saymiao/xdial-updates notices it (its follow.yml polls public XDial
+  # releases) and deploys the feed, so no credential for that repository is
+  # kept in this one; this job waits until the feed serves the release. Rerun
+  # only this job after a failure: the draft or public release is reused.
+  publish:
+    needs: release
+    runs-on: macos-15
+    timeout-minutes: 75
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # make publish verifies the tag against the remote branches itself and
+      # must run from main's scripts for both channels (see updates.md).
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      # release-contract.sh verify-archive reads the helper's build info with go.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Publish the release and wait for the update feed
+        run: |
+          case "$RELEASE_TAG" in
+            *-beta*) channel=beta ;;
+            *) channel=stable ;;
+          esac
+          make publish \
+            RELEASE_TAG="$RELEASE_TAG" \
+            RELEASE_CHANNEL="$channel" \
+            RELEASE_PAGES=follow

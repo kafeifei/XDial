@@ -817,15 +817,19 @@ publish_plan() {
     make -n -s --no-print-directory -C "$repository_root" publish "$@" \
         | tr -d '\\' | tr '\n\t' '  ' | tr -s ' '
 }
-grep -Fq 'scripts/publish-release.py --channel "beta" "v2.4.0-beta.1"' \
+grep -Fq 'scripts/publish-release.py --channel "beta" --pages "dispatch" "v2.4.0-beta.1"' \
     <<<"$(publish_plan RELEASE_CHANNEL=beta RELEASE_TAG=v2.4.0-beta.1)" \
     || fail "beta publish does not pass --channel beta"
-grep -Fq 'scripts/publish-release.py --channel "stable" "v2.3.5"' \
+grep -Fq 'scripts/publish-release.py --channel "stable" --pages "dispatch" "v2.3.5"' \
     <<<"$(publish_plan RELEASE_TAG=v2.3.5)" \
     || fail "stable publish changed"
-grep -Fq 'scripts/publish-release.py --channel "stable" --beta-followup "withdraw" "v2.3.5"' \
+grep -Fq 'scripts/publish-release.py --channel "stable" --pages "dispatch" --beta-followup "withdraw" "v2.3.5"' \
     <<<"$(publish_plan RELEASE_TAG=v2.3.5 RELEASE_BETA_FOLLOWUP=withdraw)" \
     || fail "publish does not pass RELEASE_BETA_FOLLOWUP"
+# release.yml publishes with follow: the update repository deploys the feed itself.
+grep -Fq 'scripts/publish-release.py --channel "beta" --pages "follow" --pages-timeout "120" "v2.4.0-beta.1"' \
+    <<<"$(publish_plan RELEASE_CHANNEL=beta RELEASE_TAG=v2.4.0-beta.1 RELEASE_PAGES=follow RELEASE_PAGES_TIMEOUT=120)" \
+    || fail "publish does not pass RELEASE_PAGES and RELEASE_PAGES_TIMEOUT"
 
 # XDialReleaseTag is how clients recognize an installed beta: beta requires the
 # exact tag, stable also accepts an empty key. Private configuration is

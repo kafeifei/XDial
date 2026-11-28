@@ -914,6 +914,64 @@ class BetaChannelTests(unittest.TestCase):
                 self.assertNotIn("build_not_newer", run.stderr.getvalue())
                 run.dispatch.assert_called_once()
 
+    def test_follow_mode_publishes_and_waits_for_the_feed_without_dispatching(self):
+        state = self.lagging_state("v1.2.2-beta.1", 90)
+        cases = [
+            (["v1.2.3"], [[[release_fixture("v1.2.3")]], {"tag_name": "v1.2.2"},
+                          release_fixture("v1.2.3", draft=False)],
+             "v1.2.3", "stable", ("--latest",), 3600),
+            (["--channel", "beta", "--pages-timeout", "120", "v1.3.0-beta.1"],
+             [[[release_fixture("v1.3.0-beta.1", prerelease=True)]], {"tag_name": "v1.2.2"},
+              release_fixture("v1.3.0-beta.1", draft=False, prerelease=True),
+              {"tag_name": "v1.2.2"}],
+             "v1.3.0-beta.1", "beta", ("--prerelease", "--latest=false"), 120),
+        ]
+        for argv, responses, tag, channel, listing, timeout in cases:
+            with self.subTest(channel=channel):
+                with self.publication(["--pages", "follow", *argv], responses, state, "200") as run:
+                    PUBLISH.main()
+                self.assertEqual(self.edits(run), [(
+                    "gh", "release", "edit", tag, "--repo", "kafeifei/XDial", "--draft=false", *listing,
+                )])
+                # Nothing touches the update repository's Actions: no wait, no dispatch.
+                run.idle.assert_not_called()
+                run.dispatch.assert_not_called()
+                run.verify_feed.assert_called_once_with(
+                    tag, "200", "digest", channel, "- 修复更新检查。", timeout=timeout, interval=30)
+                self.assertIn(PUBLISH.FOLLOW_WORKFLOW_URL, run.stdout.getvalue())
+
+    def test_follow_mode_explains_a_feed_that_never_arrives(self):
+        responses = [[[release_fixture("v1.3.0-beta.1", prerelease=True)]], {"tag_name": "v1.2.2"},
+                     release_fixture("v1.3.0-beta.1", draft=False, prerelease=True),
+                     {"tag_name": "v1.2.2"}]
+        with self.publication(["--pages", "follow", "--channel", "beta", "v1.3.0-beta.1"],
+                              responses, self.lagging_state("v1.2.2-beta.1", 90), "200") as run:
+            run.verify_feed.side_effect = RuntimeError("Pages verification is incomplete")
+            with self.assertRaisesRegex(RuntimeError, "Pages verification is incomplete") as raised:
+                PUBLISH.main()
+        message = str(raised.exception)
+        self.assertIn(PUBLISH.FOLLOW_WORKFLOW_URL, message)
+        self.assertIn("make publish RELEASE_CHANNEL=beta RELEASE_TAG=v1.3.0-beta.1", message)
+
+    def test_feed_wait_uses_the_given_timeout_and_interval(self):
+        clock = types.SimpleNamespace(now=0)
+        opener = MagicMock()
+        opener.open.side_effect = OSError("not served yet")
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.now += seconds
+
+        with (
+            patch.object(PUBLISH.urllib.request, "build_opener", return_value=opener),
+            patch.object(PUBLISH.time, "monotonic", side_effect=lambda: clock.now),
+            patch.object(PUBLISH.time, "sleep", side_effect=sleep),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not served yet"):
+                PUBLISH.verify_feed("v1.2.3", "123", "digest", timeout=90, interval=30)
+        self.assertEqual(sleeps, [30, 30, 30])
+
 
 if __name__ == "__main__":
     unittest.main()
